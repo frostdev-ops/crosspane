@@ -3119,3 +3119,25 @@ pub(crate) fn removal_entry_for_helper(
         super::removal::inventory::RemovalCopyKind::Helper,
     )
 }
+
+/// Detect and perform only admitted task or terminal-metadata repair.
+/// Payload replacement and any Stop/Start repair are deferred to WP-W4.1a6b.
+/// The Windows GUI does not call this facade until WP-W4.1a7.
+#[cfg(all(windows, not(test)))]
+#[doc(hidden)]
+pub fn begin_repair() -> NativeResult<&'static str> {
+    use super::native_io::{Cancellation, Deadline, MonotonicClock, WindowsNativeIo};
+    use super::repair::{RepairDecision, RepairOutcome};
+    use std::sync::Arc;
+
+    let clock: Arc<dyn super::native_io::Clock> = Arc::new(MonotonicClock::default());
+    let deadline = Deadline::new(30_000, clock.clone(), Cancellation::default())?;
+    // Construction and the complete diagnostic probe are read-only. In particular,
+    // no install lock or directory is created merely because the user asked for repair.
+    let probe = WindowsNativeIo::probe_repair(clock, &deadline)?;
+    match super::repair::classify(probe.observation())? {
+        RepairDecision::Healthy => Ok(RepairOutcome::Healthy.as_str()),
+        RepairDecision::Report(issue) => Ok(RepairOutcome::Report(issue).as_str()),
+        RepairDecision::Apply(plan) => Ok(probe.apply(&plan, &deadline)?.as_str()),
+    }
+}

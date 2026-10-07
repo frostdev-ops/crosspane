@@ -6,6 +6,10 @@ pub(crate) mod payload;
 // Native removal consumers are excluded from the library unit-test graph; integration fakes include this new graph.
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) mod removal;
+// Native repair adapters are excluded from the library unit-test graph; focused fakes include the model.
+#[cfg(any(windows, test))]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) mod repair;
 pub mod service;
 pub mod transport;
 

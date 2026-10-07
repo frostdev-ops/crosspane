@@ -76,6 +76,10 @@ pub enum RecordKind {
     OuterUpgrade,
     FileRecovery,
     Removal,
+    Repair,
+    RepairPublicationIntent,
+    RepairPending,
+    RepairEvidence,
     Operation,
     Supervisor,
     TaskActivation,
@@ -89,6 +93,10 @@ pub enum RecordName {
     OuterUpgrade,
     FileRecovery,
     Removal,
+    Repair,
+    RepairPublicationIntent,
+    RepairPending,
+    RepairEvidence,
     Operation([u8; 16]),
     Supervisor,
     TaskActivation,
@@ -104,6 +112,12 @@ impl RecordName {
             Self::OuterUpgrade => super::files::PrivateName::new("outer-upgrade.json"),
             Self::FileRecovery => super::files::PrivateName::new("file-recovery.json"),
             Self::Removal => super::files::PrivateName::new("removal.json"),
+            Self::Repair => super::files::PrivateName::new("repair.json"),
+            Self::RepairPublicationIntent => {
+                super::files::PrivateName::new("repair-publication-intent.json")
+            }
+            Self::RepairPending => super::files::PrivateName::new("repair-pending.json"),
+            Self::RepairEvidence => super::files::PrivateName::new("repair-evidence-index.json"),
             Self::Supervisor => super::files::PrivateName::new("supervisor.json"),
             Self::TaskActivation => super::files::PrivateName::new("task-activation.json"),
             Self::SupervisorLogon => super::files::PrivateName::new("supervisor-logon.json"),
@@ -126,6 +140,10 @@ impl RecordName {
             Self::OuterUpgrade => RecordKind::OuterUpgrade,
             Self::FileRecovery => RecordKind::FileRecovery,
             Self::Removal => RecordKind::Removal,
+            Self::Repair => RecordKind::Repair,
+            Self::RepairPublicationIntent => RecordKind::RepairPublicationIntent,
+            Self::RepairPending => RecordKind::RepairPending,
+            Self::RepairEvidence => RecordKind::RepairEvidence,
             Self::Operation(_) => RecordKind::Operation,
             Self::Supervisor => RecordKind::Supervisor,
             Self::TaskActivation => RecordKind::TaskActivation,
@@ -360,4 +378,241 @@ pub(crate) fn publish<S: RecordStore>(
         state,
         native_failure: failure,
     })
+}
+
+/// A6 fixed cold-publication protocol. These values correlate complete bytes only; the
+/// actual original-context lock and native owner remain mandatory for every write/rename.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) enum RepairPublicationTarget {
+    Repair,
+    EvidenceIndex,
+}
+#[cfg(any(windows, test))]
+#[cfg_attr(test, allow(dead_code))]
+impl RepairPublicationTarget {
+    pub(crate) fn name(self) -> RecordName {
+        match self {
+            Self::Repair => RecordName::Repair,
+            Self::EvidenceIndex => RecordName::RepairEvidence,
+        }
+    }
+}
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct RepairPublicationStamp {
+    volume: u64,
+    file: [u8; 16],
+    sha256: [u8; 32],
+    length: u64,
+}
+#[cfg(any(windows, test))]
+#[cfg_attr(test, allow(dead_code))]
+impl RepairPublicationStamp {
+    pub(crate) fn new(identity: super::files::FileIdentity, bytes: &[u8]) -> NativeResult<Self> {
+        check_read_size(bytes.len(), MAX_RECORD_BYTES)?;
+        let stamp = Self {
+            volume: identity.volume,
+            file: identity.file,
+            sha256: fingerprint(bytes),
+            length: bytes.len() as u64,
+        };
+        stamp.validate()?;
+        Ok(stamp)
+    }
+    fn validate(&self) -> NativeResult<()> {
+        if self.volume == 0
+            || self.file == [0; 16]
+            || self.sha256 == [0; 32]
+            || self.length == 0
+            || self.length > MAX_RECORD_BYTES as u64
+        {
+            return Err(NativeError::Invalid);
+        }
+        Ok(())
+    }
+    pub(crate) fn identity(&self) -> super::files::FileIdentity {
+        super::files::FileIdentity {
+            volume: self.volume,
+            file: self.file,
+        }
+    }
+}
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) enum RepairPublicationPhase {
+    Preparing,
+    PendingReady,
+    ReplaceIntent,
+    Published,
+}
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct RepairPublicationIntent {
+    schema_version: u32,
+    operation: [u8; 16],
+    target: RepairPublicationTarget,
+    old: Option<RepairPublicationStamp>,
+    new_sha256: [u8; 32],
+    new_length: u64,
+    pending: Option<RepairPublicationStamp>,
+    phase: RepairPublicationPhase,
+}
+#[cfg(any(windows, test))]
+#[cfg_attr(test, allow(dead_code))]
+impl RepairPublicationIntent {
+    pub(crate) fn new(
+        operation: [u8; 16],
+        target: RepairPublicationTarget,
+        old: Option<RepairPublicationStamp>,
+        bytes: &[u8],
+    ) -> NativeResult<Self> {
+        validate_for(&target.name(), bytes)?;
+        let value = Self {
+            schema_version: 1,
+            operation,
+            target,
+            old,
+            new_sha256: fingerprint(bytes),
+            new_length: bytes.len() as u64,
+            pending: None,
+            phase: RepairPublicationPhase::Preparing,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    pub(crate) fn validate(&self) -> NativeResult<()> {
+        if self.schema_version != 1
+            || self.operation == [0; 16]
+            || self.new_sha256 == [0; 32]
+            || self.new_length == 0
+            || self.new_length > MAX_RECORD_BYTES as u64
+        {
+            return Err(NativeError::Invalid);
+        }
+        if let Some(old) = self.old {
+            old.validate()?;
+        }
+        match (self.phase, self.pending) {
+            (RepairPublicationPhase::Preparing, None) => {}
+            (
+                RepairPublicationPhase::PendingReady
+                | RepairPublicationPhase::ReplaceIntent
+                | RepairPublicationPhase::Published,
+                Some(pending),
+            ) => {
+                pending.validate()?;
+                if pending.sha256 != self.new_sha256 || pending.length != self.new_length {
+                    return Err(NativeError::Invalid);
+                }
+            }
+            _ => return Err(NativeError::Invalid),
+        }
+        Ok(())
+    }
+    pub(crate) fn target(&self) -> RepairPublicationTarget {
+        self.target
+    }
+    pub(crate) fn phase(&self) -> RepairPublicationPhase {
+        self.phase
+    }
+    pub(crate) fn pending(&self) -> Option<RepairPublicationStamp> {
+        self.pending
+    }
+    pub(crate) fn matches_request(
+        &self,
+        operation: [u8; 16],
+        target: RepairPublicationTarget,
+        bytes: &[u8],
+    ) -> bool {
+        self.operation == operation
+            && self.target == target
+            && self.new_length == bytes.len() as u64
+            && self.new_sha256 == fingerprint(bytes)
+    }
+    pub(crate) fn pending_ready(&mut self, stamp: RepairPublicationStamp) -> NativeResult<()> {
+        if self.phase != RepairPublicationPhase::Preparing
+            || self.pending.is_some()
+            || stamp.length != self.new_length
+            || stamp.sha256 != self.new_sha256
+        {
+            return Err(NativeError::Foreign);
+        }
+        stamp.validate()?;
+        self.pending = Some(stamp);
+        self.phase = RepairPublicationPhase::PendingReady;
+        self.validate()
+    }
+    pub(crate) fn replace_intent(&mut self) -> NativeResult<()> {
+        if self.phase != RepairPublicationPhase::PendingReady {
+            return Err(NativeError::Foreign);
+        }
+        self.phase = RepairPublicationPhase::ReplaceIntent;
+        self.validate()
+    }
+    pub(crate) fn published(&mut self) -> NativeResult<()> {
+        if self.phase != RepairPublicationPhase::ReplaceIntent {
+            return Err(NativeError::Foreign);
+        }
+        self.phase = RepairPublicationPhase::Published;
+        self.validate()
+    }
+    pub(crate) fn encode(&self) -> NativeResult<Vec<u8>> {
+        self.validate()?;
+        encode_record(
+            &RecordName::RepairPublicationIntent,
+            serde_json::to_value(self).map_err(|_| NativeError::Invalid)?,
+        )
+    }
+    pub(crate) fn decode(bytes: &[u8]) -> NativeResult<Self> {
+        let value: Self = record_data(&RecordName::RepairPublicationIntent, bytes)?;
+        value.validate()?;
+        Ok(value)
+    }
+}
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) enum RepairPublicationObservation {
+    Preparing,
+    PendingReady,
+    Published,
+    Unknown,
+}
+/// A pending name without its durably recorded exact flushed stamp is ALWAYS Unknown.
+/// Destination-only exact identity can reconcile a rename; absence alone cannot.
+#[cfg(any(windows, test))]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn recover_repair_publication(
+    intent: &RepairPublicationIntent,
+    current: Option<RepairPublicationStamp>,
+    pending: Option<RepairPublicationStamp>,
+) -> RepairPublicationObservation {
+    if intent.validate().is_err() {
+        return RepairPublicationObservation::Unknown;
+    }
+    match intent.phase {
+        RepairPublicationPhase::Preparing if current == intent.old && pending.is_none() => {
+            RepairPublicationObservation::Preparing
+        }
+        RepairPublicationPhase::PendingReady | RepairPublicationPhase::ReplaceIntent
+            if current == intent.old && pending == intent.pending =>
+        {
+            RepairPublicationObservation::PendingReady
+        }
+        RepairPublicationPhase::ReplaceIntent | RepairPublicationPhase::Published
+            if current == intent.pending && pending.is_none() =>
+        {
+            RepairPublicationObservation::Published
+        }
+        _ => RepairPublicationObservation::Unknown,
+    }
 }

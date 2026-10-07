@@ -612,3 +612,114 @@ mod native {
 pub(crate) use native::TaskRunPermit;
 #[cfg(all(windows, not(test)))]
 pub(super) use native::{claim_supervisor, prepare_upgrade, start_upgrade};
+
+// A6 repair is separate from activation: registration-only, no TaskActivation claim or Run.
+#[cfg(all(windows, not(test)))]
+mod repair_native {
+    use super::super::super::{
+        native_io::{
+            Deadline, RepairTaskBinding, WindowsNativeIo,
+            process::{CallOwner, Dispatch},
+            task::{RepairTaskFailure, Scheduler},
+        },
+        repair::{RepairDiagnostic, RepairTaskObservation},
+    };
+    use super::*;
+    use std::sync::{Arc, OnceLock};
+    static PROBE: OnceLock<Arc<CallOwner>> = OnceLock::new();
+    static REGISTER: OnceLock<Arc<CallOwner>> = OnceLock::new();
+    static UNCERTAIN: OnceLock<Arc<RepairTaskBinding>> = OnceLock::new();
+    fn diagnostic(error: NativeError) -> RepairDiagnostic {
+        match error {
+            NativeError::Foreign => RepairDiagnostic::UnsafeForeign,
+            NativeError::Missing => RepairDiagnostic::Missing,
+            NativeError::Unavailable | NativeError::Busy => RepairDiagnostic::Unavailable,
+            _ => RepairDiagnostic::Unknown,
+        }
+    }
+    fn failed(error: RepairTaskFailure) -> NativeResult<RepairTaskObservation> {
+        RepairTaskObservation::new(
+            match error {
+                RepairTaskFailure::AccessDenied => RepairDiagnostic::AccessDenied,
+                RepairTaskFailure::Native(error) => diagnostic(error),
+            },
+            None,
+        )
+    }
+    pub(crate) fn probe(
+        io: Arc<WindowsNativeIo>,
+        desired: Definition,
+        deadline: &Deadline,
+    ) -> NativeResult<RepairTaskObservation> {
+        let budget = deadline.clone();
+        PROBE.get_or_init(|| Arc::new(CallOwner::default())).run(
+            Dispatch::Observation,
+            deadline,
+            move || {
+                let check = || io.admit_support(&budget).map(|_| ());
+                let scheduler = match Scheduler::connect_repair(&check) {
+                    Ok(scheduler) => scheduler,
+                    Err(error) => return failed(error),
+                };
+                let observed = match scheduler.repair_snapshot(&check) {
+                    Ok(observed) => observed,
+                    Err(error) => return failed(error),
+                };
+                // Actual disabled state is preserved BEFORE independent template or role matching.
+                if observed.as_ref().is_some_and(|task| !task.enabled) {
+                    return RepairTaskObservation::new(RepairDiagnostic::Disabled, None);
+                }
+                let expected = match scheduler.repair_expected(&desired, &check) {
+                    Ok(expected) => expected,
+                    Err(error) => return RepairTaskObservation::new(diagnostic(error), None),
+                };
+                match observed {
+                    None => RepairTaskObservation::new(RepairDiagnostic::Missing, Some(expected)),
+                    Some(task) => match scheduler.repair_whole_xml(&task.xml, &check) {
+                        Ok(actual) if actual == expected => {
+                            RepairTaskObservation::new(RepairDiagnostic::Healthy, Some(expected))
+                        }
+                        // Enabled whole-XML drift is Unknown, never a registration plan.
+                        _ => RepairTaskObservation::new(RepairDiagnostic::Unknown, None),
+                    },
+                }
+            },
+        )
+    }
+    pub(crate) fn register(
+        binding: Arc<RepairTaskBinding>,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        binding.check(deadline)?;
+        let retained = binding.clone();
+        let budget = deadline.clone();
+        let result = REGISTER.get_or_init(|| Arc::new(CallOwner::default())).run(
+            Dispatch::Mutation,
+            deadline,
+            move || {
+                binding.finish((|| {
+                    let check = || binding.check(&budget);
+                    let mut scheduler =
+                        Scheduler::connect_repair(&check).map_err(|error| match error {
+                            RepairTaskFailure::AccessDenied => NativeError::Foreign,
+                            RepairTaskFailure::Native(error) => error,
+                        })?;
+                    scheduler.register_missing_repair(
+                        binding.desired(),
+                        binding.task_xml()?,
+                        &check,
+                        &|| binding.reached(),
+                    )?;
+                    binding.check(&budget)
+                })())
+            },
+        );
+        if matches!(result, Err(NativeError::OutcomeUnknown)) {
+            retained.retire();
+            let _ = UNCERTAIN.set(retained);
+        }
+        result
+    }
+}
+#[cfg(all(windows, not(test)))]
+pub(crate) use repair_native::{probe as repair_probe, register as repair_register};

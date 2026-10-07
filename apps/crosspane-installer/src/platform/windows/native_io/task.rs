@@ -97,6 +97,37 @@ mod native {
     fn missing(error: &windows::core::Error) -> bool {
         error.code().0 as u32 == 0x80070002
     }
+    /// Read-only repair facts. XML/Enabled never grant registration or execution authority.
+    pub(crate) struct RepairTaskSnapshot {
+        pub(crate) xml: String,
+        pub(crate) enabled: bool,
+    }
+    pub(crate) enum RepairTaskFailure {
+        AccessDenied,
+        Native(NativeError),
+    }
+    impl From<NativeError> for RepairTaskFailure {
+        fn from(error: NativeError) -> Self {
+            Self::Native(error)
+        }
+    }
+    fn repair_com<T>(result: windows::core::Result<T>) -> Result<T, RepairTaskFailure> {
+        result.map_err(|error| {
+            if error.code().0 as u32 == 0x80070005 {
+                RepairTaskFailure::AccessDenied
+            } else {
+                RepairTaskFailure::Native(NativeError::Unavailable)
+            }
+        })
+    }
+    macro_rules! repair_call {
+        ($check:expr, $expr:expr) => {{
+            ($check)().map_err(RepairTaskFailure::from)?;
+            // SAFETY: this owned MTA retains all COM references and bounded output slots;
+            // the genuine read-only admission closure precedes every exact SDK call.
+            repair_com(unsafe { $expr })
+        }};
+    }
     impl Scheduler {
         pub(crate) fn connect(check: &dyn Fn() -> NativeResult<()>) -> NativeResult<Self> {
             let apartment = Apartment::new(check)?;
@@ -120,6 +151,150 @@ mod native {
                 folder,
                 _apartment: apartment,
             })
+        }
+        /// Separate diagnosis preserves the actual SDK denial before the old error mapping.
+        /// It creates no folder/task, and leaves the original connect constructor unchanged.
+        pub(crate) fn connect_repair(
+            check: &dyn Fn() -> NativeResult<()>,
+        ) -> Result<Self, RepairTaskFailure> {
+            let apartment = Apartment::new(check)?;
+            let service: ITaskService = repair_call!(
+                check,
+                CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER)
+            )?;
+            let empty = VARIANT::default();
+            repair_call!(check, service.Connect(&empty, &empty, &empty, &empty))?;
+            let root = repair_call!(check, service.GetFolder(&BSTR::from("\\")))?;
+            // Repair snapshots always re-read the fixed folder, rather than caching absence.
+            Ok(Self {
+                service,
+                root,
+                folder: None,
+                _apartment: apartment,
+            })
+        }
+        /// Read Xml and Enabled before any role/property checks, so disabled stays preserved.
+        /// No task enumeration, property-subset approval or XML rewriting occurs here.
+        pub(crate) fn repair_snapshot(
+            &self,
+            check: &dyn Fn() -> NativeResult<()>,
+        ) -> Result<Option<RepairTaskSnapshot>, RepairTaskFailure> {
+            check()?;
+            // SAFETY: fixed local folder on this owned MTA; only exact not-found is absence.
+            let folder = match unsafe { self.service.GetFolder(&BSTR::from("\\Crosspane")) } {
+                Ok(folder) => folder,
+                Err(error) if missing(&error) => return Ok(None),
+                Err(error) => return repair_com::<ITaskFolder>(Err(error)).map(|_| None),
+            };
+            check()?;
+            // SAFETY: fixed Agent leaf on this owned MTA, no alternative lookup.
+            let task = match unsafe { folder.GetTask(&BSTR::from("Agent")) } {
+                Ok(task) => task,
+                Err(error) if missing(&error) => return Ok(None),
+                Err(error) => return repair_com::<IRegisteredTask>(Err(error)).map(|_| None),
+            };
+            let enabled = repair_call!(check, task.Enabled())?.0 != 0;
+            // Proven user-disabled state is preserved even if Xml would be denied/malformed.
+            // Empty XML is a private disabled sentinel, never an approval/comparison input.
+            if !enabled {
+                return Ok(Some(RepairTaskSnapshot {
+                    xml: String::new(),
+                    enabled,
+                }));
+            }
+            let xml = bounded_bstr(&repair_call!(check, task.Xml())?, MAX_XML_BYTES)?;
+            if xml.is_empty() {
+                return Err(NativeError::Invalid.into());
+            }
+            check()?;
+            Ok(Some(RepairTaskSnapshot { xml, enabled }))
+        }
+        /// Independent whole-XML SDK form; no observed fields are copied into the expectation.
+        pub(crate) fn repair_expected(
+            &self,
+            desired: &Definition,
+            check: &dyn Fn() -> NativeResult<()>,
+        ) -> NativeResult<String> {
+            self.removal_canonical(&self.removal_template(desired, check)?, check)
+        }
+        pub(crate) fn repair_whole_xml(
+            &self,
+            xml: &str,
+            check: &dyn Fn() -> NativeResult<()>,
+        ) -> NativeResult<String> {
+            self.removal_canonical(xml, check)
+        }
+        /// Register ONLY a positively absent fixed task. Never Update, Enable an existing task,
+        /// or Run. The durable repair intent and genuine current image/agent pins come from caller.
+        pub(crate) fn register_missing_repair(
+            &mut self,
+            desired: &Definition,
+            expected: &str,
+            check: &dyn Fn() -> NativeResult<()>,
+            effect: &dyn Fn(),
+        ) -> NativeResult<()> {
+            if self.repair_expected(desired, check)? != expected {
+                return Err(NativeError::Foreign);
+            }
+            match self.repair_snapshot(check) {
+                Ok(None) => {}
+                Ok(Some(_)) => return Err(NativeError::Foreign),
+                Err(RepairTaskFailure::Native(error)) => return Err(error),
+                Err(RepairTaskFailure::AccessDenied) => return Err(NativeError::Foreign),
+            }
+            let definition = call!(check, self.service.NewTask(0))?;
+            call!(check, definition.SetXmlText(&BSTR::from(expected)))?;
+            check()?;
+            // SAFETY: fixed local folder read only; no unrelated task namespace selection.
+            let folder = match unsafe { self.service.GetFolder(&BSTR::from("\\Crosspane")) } {
+                Ok(folder) => folder,
+                Err(error) if missing(&error) => {
+                    check()?;
+                    effect();
+                    // SAFETY: only this fixed folder, after durable intent and fresh admission.
+                    unsafe {
+                        self.root
+                            .CreateFolder(&BSTR::from("Crosspane"), &VARIANT::default())
+                    }
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                }
+                Err(_) => return Err(NativeError::Unavailable),
+            };
+            // Reobserve immediately adjacent to TASK_CREATE. CREATE refuses an intervening task;
+            // it never overwrites a newly disabled or modified definition.
+            check()?;
+            // SAFETY: exact fixed leaf, read only on this owned MTA.
+            match unsafe { folder.GetTask(&BSTR::from("Agent")) } {
+                Err(error) if missing(&error) => {}
+                _ => return Err(NativeError::Foreign),
+            }
+            check()?;
+            effect();
+            // SAFETY: exact Limited/current-user logon-only template. CREATE, never UPDATE;
+            // registration-trigger suppression does not invoke Run and no time trigger exists.
+            let _registered = unsafe {
+                folder.RegisterTaskDefinition(
+                    &BSTR::from("Agent"),
+                    &definition,
+                    TASK_CREATE.0 | TASK_IGNORE_REGISTRATION_TRIGGERS.0,
+                    &VARIANT::from(desired.principal.as_str()),
+                    &VARIANT::default(),
+                    TASK_LOGON_INTERACTIVE_TOKEN,
+                    &VARIANT::default(),
+                )
+            }
+            .map_err(|_| NativeError::OutcomeUnknown)?;
+            check()?;
+            // SDK automatic registration fields may differ: retain that mismatch as Unknown;
+            // never normalize/copy them or claim exact native template equivalence.
+            let actual = match self.repair_snapshot(check) {
+                Ok(Some(actual)) => actual,
+                _ => return Err(NativeError::OutcomeUnknown),
+            };
+            if !actual.enabled || self.repair_whole_xml(&actual.xml, check)? != expected {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            check()
         }
         pub(crate) fn inspect(
             &self,
@@ -493,4 +668,4 @@ mod native {
     }
 }
 #[cfg(all(windows, not(test)))]
-pub(crate) use native::Scheduler;
+pub(crate) use native::{RepairTaskFailure, Scheduler};

@@ -413,6 +413,10 @@ pub(crate) mod selected {
                 )
             };
             if raw.is_null() {
+                #[cfg(not(test))]
+                // SAFETY: read thread-local last-error immediately after this failed OpenProcess;
+                // capture is inert outside the actual worker's scoped read-only repair diagnostic.
+                super::super::files::native::repair_capture_error(unsafe { GetLastError() });
                 return Err(NativeError::Unavailable);
             }
             // SAFETY: successful OpenProcess transferred one owned non-pseudo process handle.
@@ -463,6 +467,9 @@ pub(crate) mod selected {
                 )
             } == 0
             {
+                #[cfg(not(test))]
+                // SAFETY: immediate last-error read after this actual failed readonly SDK query.
+                super::super::files::native::repair_capture_error(unsafe { GetLastError() });
                 return Err(NativeError::Unavailable);
             }
             let creation =
@@ -530,6 +537,9 @@ pub(crate) mod selected {
                 )
             } == 0
             {
+                #[cfg(not(test))]
+                // SAFETY: immediate last-error read after this actual failed readonly SDK query.
+                super::super::files::native::repair_capture_error(unsafe { GetLastError() });
                 return Err(NativeError::Unavailable);
             }
             let created =

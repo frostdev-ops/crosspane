@@ -39,6 +39,10 @@ impl Response {
 }
 
 #[cfg(windows)]
+#[cfg_attr(test, allow(unused_imports))]
+pub(crate) use native::NativeEndpoint;
+
+#[cfg(windows)]
 pub(super) mod native {
     use super::super::super::native_io::{
         AgentObservation, SupportProof, WindowsNativeIo, process::Deadline,
@@ -131,6 +135,12 @@ pub(super) mod native {
                 )
             };
             if raw == INVALID_HANDLE_VALUE {
+                #[cfg(not(test))]
+                // SAFETY: immediate thread-local error read after the actual failed pipe open;
+                // capture has no effect except inside this worker's readonly repair diagnostic.
+                super::super::super::native_io::files::native::repair_capture_error(unsafe {
+                    GetLastError()
+                });
                 return Err(NativeError::Unavailable);
             }
             // SAFETY: successful CreateFile transferred one owned pipe handle.

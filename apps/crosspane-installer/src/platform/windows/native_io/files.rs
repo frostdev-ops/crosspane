@@ -248,7 +248,78 @@ pub(crate) mod native {
         pub user: Sid,
         pub trusted_installer: Option<Sid>,
     }
+    // A6 diagnostic scope is read-only, thread-local and never changes old error semantics.
+    // SDK and std::io errors are captured before the existing deliberately coarse mapping.
+    #[cfg(not(test))]
+    std::thread_local! {
+        static REPAIR_DENIAL: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+    #[cfg(not(test))]
+    pub(crate) enum RepairRead<T> {
+        Present(T),
+        Missing,
+        AccessDenied,
+        Unsafe,
+        Unavailable,
+        Unknown,
+    }
+    #[cfg(not(test))]
+    struct RepairDiagnosticScope(Option<bool>);
+    #[cfg(not(test))]
+    impl Drop for RepairDiagnosticScope {
+        fn drop(&mut self) {
+            REPAIR_DENIAL.with(|scope| scope.set(self.0));
+        }
+    }
+    #[cfg(not(test))]
+    pub(crate) fn repair_capture_error(code: u32) {
+        if code == ERROR_ACCESS_DENIED {
+            REPAIR_DENIAL.with(|scope| {
+                if scope.get().is_some() {
+                    scope.set(Some(true));
+                }
+            });
+        }
+    }
+    #[cfg(not(test))]
+    pub(crate) fn repair_readonly_diagnostic<T>(
+        read: impl FnOnce() -> NativeResult<Option<T>>,
+    ) -> RepairRead<T> {
+        let prior = REPAIR_DENIAL.with(|scope| scope.replace(Some(false)));
+        let _scope = RepairDiagnosticScope(prior);
+        // Nested scopes are not an authority or absence observation. RAII still restores the
+        // exact previous scope, including unwind/early-return paths.
+        if prior.is_some() {
+            return RepairRead::Unknown;
+        }
+        let result = read();
+        if REPAIR_DENIAL.with(|scope| scope.get()) == Some(true) {
+            return RepairRead::AccessDenied;
+        }
+        match result {
+            Ok(Some(value)) => RepairRead::Present(value),
+            Ok(None) | Err(NativeError::Missing) => RepairRead::Missing,
+            Err(NativeError::Invalid | NativeError::Foreign | NativeError::Oversize) => {
+                RepairRead::Unsafe
+            }
+            Err(NativeError::Unavailable | NativeError::Unsupported) => RepairRead::Unavailable,
+            Err(_) => RepairRead::Unknown,
+        }
+    }
+    fn repair_read_error(error: std::io::Error) -> NativeError {
+        #[cfg(not(test))]
+        if let Some(code) = error.raw_os_error() {
+            repair_capture_error(code as u32);
+        }
+        #[cfg(test)]
+        let _ = error;
+        // Existing callers retain exactly their old Unavailable mapping; no diagnostic scope
+        // is installed except by the newly admitted read-only repair probe.
+        NativeError::Unavailable
+    }
     pub(crate) fn error(code: u32) -> NativeError {
+        #[cfg(not(test))]
+        repair_capture_error(code);
         match code {
             ERROR_FILE_NOT_FOUND => NativeError::Missing,
             ERROR_ACCESS_DENIED => NativeError::Foreign,
@@ -969,7 +1040,7 @@ pub(crate) mod native {
             file.by_ref()
                 .take((cap + 1) as u64)
                 .read_to_end(&mut bytes)
-                .map_err(|_| NativeError::Unavailable)?;
+                .map_err(repair_read_error)?;
             check_read_size(bytes.len(), cap)?;
             deadline.check()?;
             let after = observe(&file, name.as_str(), security)?;
@@ -1153,7 +1224,7 @@ pub(crate) mod native {
                 .map_err(|_| NativeError::Oversize)?;
             let count = file
                 .seek_read(&mut block[..requested], offset)
-                .map_err(|_| NativeError::Unavailable)?;
+                .map_err(repair_read_error)?;
             if count == 0 {
                 return Err(NativeError::Unavailable);
             }
@@ -1617,6 +1688,266 @@ pub(crate) mod native {
             }
         }
     }
+    // A6: fixed metadata-only effects. The caller supplies a genuine original-context lock
+    // and durable protocol intent; these helpers cannot select another leaf or executable.
+    #[cfg(not(test))]
+    impl Anchor {
+        pub(crate) fn write_repair_publication_intent(
+            &self,
+            previous: Option<(FileIdentity, &[u8])>,
+            bytes: &[u8],
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<FileIdentity> {
+            use std::io::Write;
+            let name = PrivateName::new("repair-publication-intent.json")?;
+            self.revalidate(security, true, deadline)?;
+            check_read_size(bytes.len(), MAX_RECORD_BYTES)?;
+            let mut file = match previous {
+                Some((id, old)) => {
+                    let mut file = open_component(
+                        self.file()?,
+                        &ComponentName::new(name.as_str())?,
+                        ObjectKind::File,
+                        GENERIC_READ | GENERIC_WRITE,
+                        0,
+                        deadline,
+                    )?
+                    .ok_or(NativeError::Foreign)?;
+                    let facts = observe(&file, name.as_str(), security)?;
+                    admit_component(&facts, Admission::PrivateFile)?;
+                    if facts.identity != id || read_repair_bytes(&mut file, deadline)? != old {
+                        return Err(NativeError::Foreign);
+                    }
+                    file
+                }
+                None => self.create_private(&name, security, deadline)?,
+            };
+            let facts = observe(&file, name.as_str(), security)?;
+            admit_component(&facts, Admission::PrivateFile)?;
+            deadline.check()?;
+            // Fixed intent is deliberately not published via a random temporary. A torn write
+            // leaves a strictly malformed/Unknown fixed intent and can never be salvaged as permission.
+            file.set_len(0).map_err(|_| NativeError::OutcomeUnknown)?;
+            std::io::Seek::rewind(&mut file).map_err(|_| NativeError::OutcomeUnknown)?;
+            file.write_all(bytes)
+                .map_err(|_| NativeError::OutcomeUnknown)?;
+            deadline.check()?;
+            // SAFETY: exact retained private writable intent; ordinary flush, no path fallback.
+            if unsafe { FlushFileBuffers(file.as_raw_handle()) } == 0 {
+                return Err(last_error());
+            }
+            let id = facts.identity;
+            drop(file);
+            let (actual, observed) = self
+                .read_private(&name, security, MAX_RECORD_BYTES, deadline)?
+                .ok_or(NativeError::OutcomeUnknown)?;
+            if actual != id || observed != bytes {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            deadline.check()?;
+            Ok(id)
+        }
+        pub(crate) fn create_repair_pending(
+            &self,
+            bytes: &[u8],
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<FileIdentity> {
+            use std::io::Write;
+            check_read_size(bytes.len(), MAX_RECORD_BYTES)?;
+            let name = PrivateName::new("repair-pending.json")?;
+            // This raw fixed pending file contains the selected target envelope, NOT an
+            // independently trusted RepairPending body. Only the intent's exact target/stamp admits it.
+            let mut file = self.create_private(&name, security, deadline)?;
+            deadline.check()?;
+            file.write_all(bytes)
+                .map_err(|_| NativeError::OutcomeUnknown)?;
+            deadline.check()?;
+            // SAFETY: our one CREATE_NEW complete bounded pending record, retained through flush.
+            if unsafe { FlushFileBuffers(file.as_raw_handle()) } == 0 {
+                return Err(last_error());
+            }
+            let facts = observe(&file, name.as_str(), security)?;
+            admit_component(&facts, Admission::PrivateFile)?;
+            let id = facts.identity;
+            drop(file);
+            let (actual, observed) = self
+                .read_private(&name, security, MAX_RECORD_BYTES, deadline)?
+                .ok_or(NativeError::OutcomeUnknown)?;
+            if actual != id || observed != bytes {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(id)
+        }
+        pub(crate) fn publish_repair_pending(
+            &self,
+            target: &PrivateName,
+            pending_id: FileIdentity,
+            bytes: &[u8],
+            previous: Option<(FileIdentity, &[u8])>,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<FileIdentity> {
+            if !matches!(
+                target.as_str(),
+                "repair.json" | "repair-evidence-index.json"
+            ) {
+                return Err(NativeError::Foreign);
+            }
+            self.revalidate(security, true, deadline)?;
+            let pending = PrivateName::new("repair-pending.json")?;
+            let mut source = open_component(
+                self.file()?,
+                &ComponentName::new(pending.as_str())?,
+                ObjectKind::File,
+                GENERIC_READ | super::DELETE,
+                0,
+                deadline,
+            )?
+            .ok_or(NativeError::Foreign)?;
+            let facts = observe(&source, pending.as_str(), security)?;
+            admit_component(&facts, Admission::PrivateFile)?;
+            if facts.identity != pending_id || read_repair_bytes(&mut source, deadline)? != bytes {
+                return Err(NativeError::Foreign);
+            }
+            let actual = self.read_private(target, security, MAX_RECORD_BYTES, deadline)?;
+            match (previous, actual) {
+                (None, None) => {}
+                (Some((id, old)), Some((actual, observed))) if id == actual && old == observed => {}
+                _ => return Err(NativeError::Foreign),
+            }
+            self.publish_private(&source, target, security, deadline)?;
+            drop(source);
+            let (actual, observed) = self
+                .read_private(target, security, MAX_RECORD_BYTES, deadline)?
+                .ok_or(NativeError::OutcomeUnknown)?;
+            if actual != pending_id
+                || observed != bytes
+                || self
+                    .read_private(&pending, security, MAX_RECORD_BYTES, deadline)?
+                    .is_some()
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(actual)
+        }
+        pub(crate) fn repair_evidence_slot(
+            &self,
+            slot: u8,
+            create: bool,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<Option<Anchor>> {
+            let leaf = match slot {
+                0 => "slot-0",
+                1 => "slot-1",
+                2 => "slot-2",
+                _ => return Err(NativeError::Invalid),
+            };
+            self.revalidate(security, true, deadline)?;
+            let evidence = match self.child("repair-evidence", security, deadline)? {
+                Some(root) => root,
+                None if create => {
+                    self.create_child_directory("repair-evidence", security, deadline)?
+                }
+                None => return Ok(None),
+            };
+            match evidence.child(leaf, security, deadline)? {
+                Some(root) => Ok(Some(root)),
+                None if create => evidence
+                    .create_child_directory(leaf, security, deadline)
+                    .map(Some),
+                None => Ok(None),
+            }
+        }
+        pub(crate) fn archive_repair_metadata(
+            &self,
+            leaf: &str,
+            expected: FileIdentity,
+            bytes: &[u8],
+            destination: &Anchor,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            if !matches!(
+                leaf,
+                "outer-upgrade.json" | "file-recovery.json" | "removal.json"
+            ) {
+                return Err(NativeError::Foreign);
+            }
+            self.revalidate(security, true, deadline)?;
+            destination.revalidate(security, true, deadline)?;
+            if self.identity()?.volume != destination.identity()?.volume {
+                return Err(NativeError::Foreign);
+            }
+            let name = PrivateName::new(leaf)?;
+            if destination
+                .read_private(&name, security, MAX_RECORD_BYTES, deadline)?
+                .is_some()
+            {
+                return Err(NativeError::Foreign);
+            }
+            // Strict no-follow File adds READ_CONTROL for actual owner/DACL, unlike opaque opens.
+            let mut source = open_component(
+                self.file()?,
+                &ComponentName::new(leaf)?,
+                ObjectKind::File,
+                GENERIC_READ | super::DELETE,
+                0,
+                deadline,
+            )?
+            .ok_or(NativeError::Foreign)?;
+            let facts = observe(&source, leaf, security)?;
+            admit_component(&facts, Admission::PrivateFile)?;
+            if facts.identity != expected || read_repair_bytes(&mut source, deadline)? != bytes {
+                return Err(NativeError::Foreign);
+            }
+            rename_no_replace(&source, destination, leaf, deadline)?;
+            if raw_identity(&source)? != expected || name_of_repair_file(&source)? != leaf {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            drop(source);
+            // Neither DeletePending nor rename return is settlement. Reobserve both exact names.
+            if self
+                .read_private(&name, security, MAX_RECORD_BYTES, deadline)?
+                .is_some()
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            let (id, archived) = destination
+                .read_private(&name, security, MAX_RECORD_BYTES, deadline)?
+                .ok_or(NativeError::OutcomeUnknown)?;
+            if id != expected || archived != bytes {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            deadline.check()
+        }
+    }
+    #[cfg(not(test))]
+    fn name_of_repair_file(file: &File) -> NativeResult<String> {
+        name(file)
+    }
+    #[cfg(not(test))]
+    fn read_repair_bytes(file: &mut File, deadline: &Deadline) -> NativeResult<Vec<u8>> {
+        use std::io::{Read, Seek};
+        let standard: FILE_STANDARD_INFO = info(file, FileStandardInfo)?;
+        let length = usize::try_from(standard.EndOfFile).map_err(|_| NativeError::Oversize)?;
+        check_read_size(length, MAX_RECORD_BYTES)?;
+        deadline.check()?;
+        file.rewind().map_err(|_| NativeError::Unavailable)?;
+        let mut bytes = Vec::with_capacity(length);
+        file.take((MAX_RECORD_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| NativeError::Unavailable)?;
+        check_read_size(bytes.len(), MAX_RECORD_BYTES)?;
+        if bytes.len() != length {
+            return Err(NativeError::Foreign);
+        }
+        deadline.check()?;
+        Ok(bytes)
+    }
+
     fn rename_no_replace(
         source: &File,
         destination: &Anchor,

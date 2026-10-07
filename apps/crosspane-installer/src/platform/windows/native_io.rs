@@ -104,6 +104,9 @@ pub(crate) use adapter::{
 };
 
 #[cfg(all(windows, not(test)))]
+pub(crate) use adapter::RepairTaskBinding;
+
+#[cfg(all(windows, not(test)))]
 pub(crate) use adapter::keeper;
 
 #[cfg(windows)]
@@ -3284,6 +3287,2236 @@ mod adapter {
     }
 
     /// A5 private removal wiring. Serialized observations are never completion or mutation seals.
+    // A6 fixed metadata retirement/publication region. No Stop, Run or executable effects.
+    #[cfg(not(test))]
+    mod repair_archive {
+        use super::super::super::{
+            payload::recovery::{
+                self, FileRecordStamp, FileRecoveryCursor, FileRecoveryJournal, FileStamp,
+                OperationRecord, OuterUpgradeRecord, StageCatalog,
+            },
+            removal::{RemovalCursor, RemovalRecord},
+            repair::{
+                self, ArchiveObservation, JournalObservation, RepairDebtObservation,
+                RepairDiagnostic as Diagnostic, RepairOutcome, RepairPort, SourceKind,
+                SourceSnapshot,
+                record::{EvidenceIndex, EvidencePhase, RepairCursor, RepairRecord},
+            },
+        };
+        use super::*;
+        use aws_lc_rs::digest::{SHA256, digest};
+        use records::{
+            RepairPublicationIntent as PublicationIntent,
+            RepairPublicationObservation as PublicationObservation,
+            RepairPublicationPhase as PublicationPhase, RepairPublicationStamp as PublicationStamp,
+            RepairPublicationTarget as PublicationTarget,
+        };
+        static TERMINAL_OWNER: std::sync::OnceLock<Arc<CallOwner>> = std::sync::OnceLock::new();
+
+        fn hash(bytes: &[u8]) -> [u8; 32] {
+            let mut value = [0; 32];
+            value.copy_from_slice(digest(&SHA256, bytes).as_ref());
+            value
+        }
+        fn identity(stamp: FileStamp) -> FileIdentity {
+            FileIdentity {
+                volume: stamp.volume,
+                file: stamp.file,
+            }
+        }
+        fn stamp(id: FileIdentity) -> FileStamp {
+            FileStamp {
+                volume: id.volume,
+                file: id.file,
+            }
+        }
+        fn source_name(kind: SourceKind) -> records::RecordName {
+            match kind {
+                SourceKind::OuterUpgrade => records::RecordName::OuterUpgrade,
+                SourceKind::FileRecovery => records::RecordName::FileRecovery,
+                SourceKind::Removal => records::RecordName::Removal,
+            }
+        }
+        fn metadata_error(error: NativeError) -> NativeError {
+            match error {
+                NativeError::Invalid | NativeError::Oversize => NativeError::OutcomeUnknown,
+                other => other,
+            }
+        }
+        fn read(
+            parent: &Anchor,
+            context: &Context,
+            name: records::RecordName,
+            budget: &Deadline,
+        ) -> NativeResult<Option<(FileIdentity, Vec<u8>)>> {
+            let value = parent
+                .read_private(
+                    &name.file_name()?,
+                    &context.security,
+                    files::MAX_RECORD_BYTES,
+                    budget,
+                )
+                .map_err(metadata_error)?;
+            if let Some((_, bytes)) = &value {
+                records::validate_for(&name, bytes).map_err(metadata_error)?;
+            }
+            Ok(value)
+        }
+        fn pending(
+            parent: &Anchor,
+            context: &Context,
+            budget: &Deadline,
+        ) -> NativeResult<Option<(FileIdentity, Vec<u8>)>> {
+            // Raw fixed pending contains the intent-selected target envelope. No generic pending receipt.
+            parent.read_private(
+                &records::RecordName::RepairPending.file_name()?,
+                &context.security,
+                files::MAX_RECORD_BYTES,
+                budget,
+            )
+        }
+        fn observed(
+            value: &Option<(FileIdentity, Vec<u8>)>,
+        ) -> NativeResult<Option<PublicationStamp>> {
+            value
+                .as_ref()
+                .map(|(id, bytes)| PublicationStamp::new(*id, bytes))
+                .transpose()
+        }
+        type DurablePublication = (FileIdentity, Vec<u8>, PublicationIntent);
+        fn publication(
+            parent: &Anchor,
+            ctx: &Context,
+            budget: &Deadline,
+        ) -> NativeResult<(Option<DurablePublication>, PublicationObservation)> {
+            let intent = read(
+                parent,
+                ctx,
+                records::RecordName::RepairPublicationIntent,
+                budget,
+            )?;
+            let pending = pending(parent, ctx, budget)?;
+            match intent {
+                None if pending.is_none() => Ok((None, PublicationObservation::Published)),
+                None => Ok((None, PublicationObservation::Unknown)),
+                Some((id, bytes)) => {
+                    let intent = PublicationIntent::decode(&bytes).map_err(metadata_error)?;
+                    let current = read(parent, ctx, intent.target().name(), budget)?;
+                    if let Some((_, bytes)) = &pending {
+                        records::validate_for(&intent.target().name(), bytes)
+                            .map_err(metadata_error)?;
+                    }
+                    let state = records::recover_repair_publication(
+                        &intent,
+                        observed(&current)?,
+                        observed(&pending)?,
+                    );
+                    Ok((Some((id, bytes, intent)), state))
+                }
+            }
+        }
+        fn clean_publication(
+            parent: &Anchor,
+            ctx: &Context,
+            budget: &Deadline,
+        ) -> NativeResult<()> {
+            let (intent, state) = publication(parent, ctx, budget)?;
+            if intent.is_none()
+                && (read(parent, ctx, records::RecordName::Repair, budget)?.is_some()
+                    || read(parent, ctx, records::RecordName::RepairEvidence, budget)?.is_some())
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            if state != PublicationObservation::Published
+                || intent
+                    .as_ref()
+                    .is_some_and(|(_, _, i)| i.phase() != PublicationPhase::Published)
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(())
+        }
+        fn index(parent: &Anchor, ctx: &Context, budget: &Deadline) -> NativeResult<EvidenceIndex> {
+            match read(parent, ctx, records::RecordName::RepairEvidence, budget)? {
+                Some((_, bytes)) => EvidenceIndex::decode(&bytes).map_err(metadata_error),
+                None => {
+                    for slot in 0..3 {
+                        if parent
+                            .repair_evidence_slot(slot, false, &ctx.security, budget)?
+                            .is_some()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                    }
+                    Ok(EvidenceIndex::default())
+                }
+            }
+        }
+        fn verify_evidence(
+            parent: &Anchor,
+            ctx: &Context,
+            index: &EvidenceIndex,
+            budget: &Deadline,
+        ) -> NativeResult<()> {
+            for slot in 0..3 {
+                match index.get(slot) {
+                    None => {
+                        if parent
+                            .repair_evidence_slot(slot, false, &ctx.security, budget)?
+                            .is_some()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                    }
+                    Some(entry) => {
+                        if entry.phase() != EvidencePhase::Complete {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                        let destination = parent
+                            .repair_evidence_slot(slot, false, &ctx.security, budget)?
+                            .ok_or(NativeError::Foreign)?;
+                        for source in entry.sources() {
+                            let (id, bytes) = destination
+                                .read_private(
+                                    &PrivateName::new(source.kind().leaf())?,
+                                    &ctx.security,
+                                    files::MAX_RECORD_BYTES,
+                                    budget,
+                                )?
+                                .ok_or(NativeError::Foreign)?;
+                            records::validate_for(&source_name(source.kind()), &bytes)?;
+                            if !matches(source, id, &bytes) {
+                                return Err(NativeError::Foreign);
+                            }
+                        }
+                    }
+                }
+            }
+            budget.check()
+        }
+        /// Additive old-control exclusion. NoRepair keeps all previous authority/signatures.
+        pub(super) fn refuse_active_repair(
+            ctx: &Context,
+            lease: &LockState,
+            budget: &Deadline,
+        ) -> NativeResult<()> {
+            validate_payload_lock(ctx, lease, budget)?;
+            let current = read(&lease.parent, ctx, records::RecordName::Repair, budget)?;
+            if current.is_none() {
+                if read(
+                    &lease.parent,
+                    ctx,
+                    records::RecordName::RepairPublicationIntent,
+                    budget,
+                )?
+                .is_some()
+                    || pending(&lease.parent, ctx, budget)?.is_some()
+                    || read(
+                        &lease.parent,
+                        ctx,
+                        records::RecordName::RepairEvidence,
+                        budget,
+                    )?
+                    .is_some()
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                index(&lease.parent, ctx, budget)?;
+                return Ok(());
+            }
+            let (_, bytes) = current.ok_or(NativeError::Foreign)?;
+            let record = RepairRecord::decode(&bytes)?;
+            record.context().same_user(&ctx.target.identity)?;
+            if record.cursor() != RepairCursor::Complete {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            clean_publication(&lease.parent, ctx, budget)?;
+            let index = index(&lease.parent, ctx, budget)?;
+            verify_evidence(&lease.parent, ctx, &index, budget)
+        }
+        impl WindowsNativeIo {
+            pub(crate) fn refuse_unsettled_repair_readonly(
+                &self,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                let ctx = self.context.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    ctx.validate(&budget)?;
+                    let Some(parent) =
+                        Anchor::open(ctx.target.paths.installer(), &ctx.security, true, &budget)?
+                    else {
+                        return Ok(());
+                    };
+                    let current = read(&parent, &ctx, records::RecordName::Repair, &budget)?;
+                    match current {
+                        None => {
+                            if read(
+                                &parent,
+                                &ctx,
+                                records::RecordName::RepairPublicationIntent,
+                                &budget,
+                            )?
+                            .is_some()
+                                || pending(&parent, &ctx, &budget)?.is_some()
+                                || read(
+                                    &parent,
+                                    &ctx,
+                                    records::RecordName::RepairEvidence,
+                                    &budget,
+                                )?
+                                .is_some()
+                            {
+                                return Err(NativeError::OutcomeUnknown);
+                            }
+                            index(&parent, &ctx, &budget)?;
+                            Ok(())
+                        }
+                        Some((_, bytes)) => {
+                            let record = RepairRecord::decode(&bytes).map_err(metadata_error)?;
+                            record.context().same_user(&ctx.target.identity)?;
+                            if record.cursor() != RepairCursor::Complete {
+                                return Err(NativeError::OutcomeUnknown);
+                            }
+                            clean_publication(&parent, &ctx, &budget)?;
+                            let index = index(&parent, &ctx, &budget)?;
+                            verify_evidence(&parent, &ctx, &index, &budget)
+                        }
+                    }
+                })
+            }
+            pub(crate) fn refuse_unsettled_repair(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                self.lock_binding(proof, lock, deadline)?;
+                let ctx = self.context.clone();
+                let lease = lock.0.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    refuse_active_repair(&ctx, &lease, &budget)
+                })
+            }
+        }
+        fn check_slot(
+            parent: &Anchor,
+            ctx: &Context,
+            record: &RepairRecord,
+            budget: &Deadline,
+        ) -> NativeResult<()> {
+            if record.plan().archives().is_empty() {
+                return Ok(());
+            }
+            let slot = record.slot().ok_or(NativeError::Foreign)?;
+            let index = index(parent, ctx, budget)?;
+            let entry = index.get(slot).ok_or(NativeError::Foreign)?;
+            if entry.repair() != record.operation() || entry.sources() != record.plan().archives() {
+                return Err(NativeError::Foreign);
+            }
+            Ok(())
+        }
+        fn snapshot(
+            kind: SourceKind,
+            op: [u8; 16],
+            id: FileIdentity,
+            bytes: &[u8],
+        ) -> NativeResult<SourceSnapshot> {
+            SourceSnapshot::new(kind, op, stamp(id), hash(bytes), bytes.len() as u64)
+        }
+        fn matches(source: &SourceSnapshot, id: FileIdentity, bytes: &[u8]) -> bool {
+            source.stamp() == stamp(id)
+                && source.sha256() == hash(bytes)
+                && source.len() == bytes.len() as u64
+        }
+        fn catalog(
+            parent: &Anchor,
+            ctx: &Context,
+            budget: &Deadline,
+        ) -> NativeResult<StageCatalog> {
+            match read(parent, ctx, records::RecordName::StageCatalog, budget)? {
+                Some((_, bytes)) => {
+                    let value: StageCatalog =
+                        records::record_data(&records::RecordName::StageCatalog, &bytes)?;
+                    value.validate()?;
+                    Ok(value)
+                }
+                None => Ok(StageCatalog::default()),
+            }
+        }
+        fn copy_absent(
+            ctx: &Context,
+            operation: [u8; 16],
+            removal: bool,
+            budget: &Deadline,
+        ) -> NativeResult<()> {
+            let parent = if removal {
+                Anchor::open(
+                    &format!(
+                        "{}\\Crosspane\\runtime\\removal\\{}",
+                        ctx.target.paths.local(),
+                        records::hex(&operation)
+                    ),
+                    &ctx.security,
+                    true,
+                    budget,
+                )?
+            } else {
+                Anchor::open(ctx.target.paths.install(), &ctx.security, true, budget)?
+                    .map(|p| p.child("payload-stage", &ctx.security, budget))
+                    .transpose()?
+                    .flatten()
+                    .map(|p| p.child(&records::hex(&operation), &ctx.security, budget))
+                    .transpose()?
+                    .flatten()
+            };
+            if let Some(parent) = parent {
+                for leaf in ["keeper-copy.exe", "helper-copy.exe"] {
+                    if parent.opaque(leaf, false, &ctx.security, budget)?.is_some() {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                }
+            }
+            budget.check()
+        }
+        enum TerminalDocument {
+            Outer(Box<OuterUpgradeRecord>),
+            File(Box<FileRecoveryJournal>),
+            Removal(Box<RemovalRecord>),
+        }
+        fn terminal_document(
+            parent: &Anchor,
+            ctx: &Context,
+            kind: SourceKind,
+            bytes: &[u8],
+            budget: &Deadline,
+        ) -> NativeResult<TerminalDocument> {
+            match kind {
+                SourceKind::OuterUpgrade => {
+                    let outer = OuterUpgradeRecord::decode(bytes).map_err(metadata_error)?;
+                    outer.context().same_user(&ctx.target.identity)?;
+                    outer
+                        .context()
+                        .matches(&ctx.target.identity)
+                        .map_err(|_| NativeError::OutcomeUnknown)?;
+                    let (_, op) = read(
+                        parent,
+                        ctx,
+                        records::RecordName::Operation(outer.operation()),
+                        budget,
+                    )?
+                    .ok_or(NativeError::Foreign)?;
+                    let operation: OperationRecord = records::record_data(
+                        &records::RecordName::Operation(outer.operation()),
+                        &op,
+                    )?;
+                    let catalog = catalog(parent, ctx, budget)?;
+                    recovery::validate_outer_terminal_retirement(&outer, &operation, &catalog)?;
+                    // A6 cannot clear a cancelled catalog or delete a copy to manufacture settlement.
+                    if catalog.active.is_some() {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    copy_absent(ctx, outer.operation(), false, budget)?;
+                    Ok(TerminalDocument::Outer(Box::new(outer)))
+                }
+                SourceKind::FileRecovery => {
+                    let journal = FileRecoveryJournal::decode(bytes).map_err(metadata_error)?;
+                    if journal.cursor() != FileRecoveryCursor::Retired {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    journal
+                        .outer_snapshot()
+                        .context()
+                        .same_user(&ctx.target.identity)?;
+                    let (op_id, op_bytes) = read(
+                        parent,
+                        ctx,
+                        records::RecordName::Operation(journal.operation()),
+                        budget,
+                    )?
+                    .ok_or(NativeError::Foreign)?;
+                    let operation: OperationRecord = records::record_data(
+                        &records::RecordName::Operation(journal.operation()),
+                        &op_bytes,
+                    )?;
+                    journal.matches_sources(
+                        journal.outer_snapshot(),
+                        journal.outer_record(),
+                        &operation,
+                        FileRecordStamp::new(stamp(op_id), hash(&op_bytes))?,
+                    )?;
+                    if catalog(parent, ctx, budget)?.active.is_some()
+                        || read(parent, ctx, records::RecordName::OuterUpgrade, budget)?.is_some()
+                    {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    copy_absent(ctx, journal.operation(), false, budget)?;
+                    Ok(TerminalDocument::File(Box::new(journal)))
+                }
+                SourceKind::Removal => {
+                    let record = RemovalRecord::decode(bytes).map_err(metadata_error)?;
+                    if record.cursor() != RemovalCursor::Retired {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    record.context().same_user(&ctx.target.identity)?;
+                    record
+                        .context()
+                        .matches(&ctx.target.identity)
+                        .map_err(|_| NativeError::OutcomeUnknown)?;
+                    if catalog(parent, ctx, budget)?.active.is_some() {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    copy_absent(ctx, record.operation(), true, budget)?;
+                    Ok(TerminalDocument::Removal(Box::new(record)))
+                }
+            }
+        }
+        fn source_operation(document: &TerminalDocument) -> [u8; 16] {
+            match document {
+                TerminalDocument::Outer(r) => r.operation(),
+                TerminalDocument::File(r) => r.operation(),
+                TerminalDocument::Removal(r) => r.operation(),
+            }
+        }
+        fn diagnostic<T>(value: native::RepairRead<T>) -> Result<T, Diagnostic> {
+            match value {
+                native::RepairRead::Present(v) => Ok(v),
+                native::RepairRead::Missing => Err(Diagnostic::Missing),
+                native::RepairRead::AccessDenied => Err(Diagnostic::AccessDenied),
+                native::RepairRead::Unsafe => Err(Diagnostic::UnsafeForeign),
+                native::RepairRead::Unavailable => Err(Diagnostic::Unavailable),
+                native::RepairRead::Unknown => Err(Diagnostic::Unknown),
+            }
+        }
+        impl WindowsNativeIo {
+            pub(crate) fn inspect_repair_debt(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<RepairDebtObservation> {
+                let budget = proof.budget(self, deadline)?;
+                let ctx = self.context.clone();
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    let parent = diagnostic(native::repair_readonly_diagnostic(|| {
+                        ctx.validate(&budget)?;
+                        Anchor::open(ctx.target.paths.installer(), &ctx.security, true, &budget)
+                    }));
+                    let parent = match parent {
+                        Ok(p) => p,
+                        Err(Diagnostic::Missing) => {
+                            return RepairDebtObservation::new(
+                                vec![
+                                    JournalObservation::Absent(SourceKind::OuterUpgrade),
+                                    JournalObservation::Absent(SourceKind::FileRecovery),
+                                    JournalObservation::Absent(SourceKind::Removal),
+                                ],
+                                Diagnostic::Healthy,
+                            );
+                        }
+                        Err(d) => return RepairDebtObservation::new(Vec::new(), d),
+                    };
+                    let publication: Result<EvidenceIndex, Diagnostic> =
+                        diagnostic(native::repair_readonly_diagnostic(|| {
+                            clean_publication(&parent, &ctx, &budget)?;
+                            let index = index(&parent, &ctx, &budget)?;
+                            verify_evidence(&parent, &ctx, &index, &budget)?;
+                            if let Some((_, bytes)) =
+                                read(&parent, &ctx, records::RecordName::Repair, &budget)?
+                            {
+                                let record =
+                                    RepairRecord::decode(&bytes).map_err(metadata_error)?;
+                                record.context().same_user(&ctx.target.identity)?;
+                                if record.cursor() != RepairCursor::Complete {
+                                    return Err(NativeError::OutcomeUnknown);
+                                }
+                                if record.slot().is_some() {
+                                    check_slot(&parent, &ctx, &record, &budget)?;
+                                }
+                            } else if read(
+                                &parent,
+                                &ctx,
+                                records::RecordName::RepairEvidence,
+                                &budget,
+                            )?
+                            .is_some()
+                            {
+                                return Err(NativeError::OutcomeUnknown);
+                            }
+                            Ok(Some(index))
+                        }));
+                    let (publication, evidence) = match publication {
+                        Ok(index) => (Diagnostic::Healthy, Some(index)),
+                        Err(d) => (d, None),
+                    };
+                    let mut journals = Vec::with_capacity(3);
+                    for kind in [
+                        SourceKind::OuterUpgrade,
+                        SourceKind::FileRecovery,
+                        SourceKind::Removal,
+                    ] {
+                        let value = diagnostic(native::repair_readonly_diagnostic(|| {
+                            let Some((id, bytes)) =
+                                read(&parent, &ctx, source_name(kind), &budget)?
+                            else {
+                                return Ok(None);
+                            };
+                            let document = terminal_document(&parent, &ctx, kind, &bytes, &budget)?;
+                            Ok(Some(snapshot(
+                                kind,
+                                source_operation(&document),
+                                id,
+                                &bytes,
+                            )?))
+                        }));
+                        journals.push(match value {
+                            Ok(source) => JournalObservation::Terminal(source),
+                            Err(Diagnostic::Missing) => JournalObservation::Absent(kind),
+                            Err(d) => JournalObservation::Retained(kind, d),
+                        });
+                    }
+                    let publication = if publication == Diagnostic::Healthy
+                        && journals
+                            .iter()
+                            .any(|j| matches!(j, JournalObservation::Terminal(_)))
+                        && evidence
+                            .as_ref()
+                            .is_some_and(|i| (0..3).all(|s| i.get(s).is_some()))
+                    {
+                        Diagnostic::Unknown
+                    } else {
+                        publication
+                    };
+                    budget.check()?;
+                    RepairDebtObservation::new(journals, publication)
+                })
+            }
+        }
+
+        pub(crate) struct RepairMutationPermit {
+            io: Arc<WindowsNativeIo>,
+            bytes: Vec<u8>,
+            record: RepairRecord,
+        }
+        impl RepairMutationPermit {
+            pub(crate) fn record(&self) -> &RepairRecord {
+                &self.record
+            }
+            pub(crate) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                selection: &Arc<RepairSelection>,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.io.as_ref()) || self.record.plan() != selection.plan() {
+                    return Err(NativeError::Foreign);
+                }
+                selection.reverify(io, proof, lock, deadline)?;
+                let ctx = io.context.clone();
+                let lease = lock.0.clone();
+                let bytes = self.bytes.clone();
+                let budget = proof.budget(io, deadline)?;
+                io.owner.run(Dispatch::Observation, deadline, move || {
+                    validate_payload_lock(&ctx, &lease, &budget)?;
+                    clean_publication(&lease.parent, &ctx, &budget)?;
+                    let (_, actual) =
+                        read(&lease.parent, &ctx, records::RecordName::Repair, &budget)?
+                            .ok_or(NativeError::Foreign)?;
+                    if actual != bytes {
+                        return Err(NativeError::Foreign);
+                    }
+                    let record = RepairRecord::decode(&actual)?;
+                    record.context().matches(&ctx.target.identity)?;
+                    if record.slot().is_some() {
+                        check_slot(&lease.parent, &ctx, &record, &budget)?;
+                    }
+                    budget.check()
+                })
+            }
+        }
+        fn persist_intent(
+            parent: &Anchor,
+            ctx: &Context,
+            old: &mut Option<(FileIdentity, Vec<u8>, PublicationIntent)>,
+            intent: PublicationIntent,
+            budget: &Deadline,
+            change: &Change,
+        ) -> NativeResult<()> {
+            let bytes = intent.encode()?;
+            let previous = old.as_ref().map(|(id, b, _)| (*id, b.as_slice()));
+            change.reached();
+            let id =
+                parent.write_repair_publication_intent(previous, &bytes, &ctx.security, budget)?;
+            *old = Some((id, bytes, intent));
+            Ok(())
+        }
+        fn publish_fixed(
+            ctx: &Context,
+            lease: &LockState,
+            operation: [u8; 16],
+            target: PublicationTarget,
+            bytes: &[u8],
+            budget: &Deadline,
+            change: &Change,
+        ) -> NativeResult<()> {
+            validate_payload_lock(ctx, lease, budget)?;
+            let parent = &lease.parent;
+            if target == PublicationTarget::EvidenceIndex {
+                index(parent, ctx, budget)?
+                    .publication_successor(&EvidenceIndex::decode(bytes)?)?;
+            }
+            let (mut durable, state) = publication(parent, ctx, budget)?;
+            let same = durable
+                .as_ref()
+                .is_some_and(|(_, _, i)| i.matches_request(operation, target, bytes));
+            if same && state == PublicationObservation::Published {
+                if durable
+                    .as_ref()
+                    .is_some_and(|(_, _, i)| i.phase() != PublicationPhase::Published)
+                {
+                    let mut i = durable.as_ref().ok_or(NativeError::Foreign)?.2.clone();
+                    i.published()?;
+                    persist_intent(parent, ctx, &mut durable, i, budget, change)?;
+                }
+                return Ok(());
+            }
+            if !same {
+                if state != PublicationObservation::Published
+                    || durable
+                        .as_ref()
+                        .is_some_and(|(_, _, i)| i.phase() != PublicationPhase::Published)
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                let current = read(parent, ctx, target.name(), budget)?;
+                let intent = PublicationIntent::new(operation, target, observed(&current)?, bytes)?;
+                persist_intent(parent, ctx, &mut durable, intent, budget, change)?;
+            } else if state == PublicationObservation::Unknown {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            let mut intent = durable.as_ref().ok_or(NativeError::Foreign)?.2.clone();
+            if intent.phase() == PublicationPhase::Preparing {
+                if pending(parent, ctx, budget)?.is_some() {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                change.reached();
+                let id = parent.create_repair_pending(bytes, &ctx.security, budget)?;
+                intent.pending_ready(PublicationStamp::new(id, bytes)?)?;
+                persist_intent(parent, ctx, &mut durable, intent.clone(), budget, change)?;
+            }
+            if intent.phase() == PublicationPhase::PendingReady {
+                intent.replace_intent()?;
+                persist_intent(parent, ctx, &mut durable, intent.clone(), budget, change)?;
+            }
+            if intent.phase() != PublicationPhase::ReplaceIntent {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            let current = read(parent, ctx, target.name(), budget)?;
+            let pending = pending(parent, ctx, budget)?;
+            match records::recover_repair_publication(
+                &intent,
+                observed(&current)?,
+                observed(&pending)?,
+            ) {
+                PublicationObservation::PendingReady => {
+                    let id = intent.pending().ok_or(NativeError::Foreign)?.identity();
+                    let previous = current.as_ref().map(|(id, b)| (*id, b.as_slice()));
+                    change.reached();
+                    parent.publish_repair_pending(
+                        &target.name().file_name()?,
+                        id,
+                        bytes,
+                        previous,
+                        &ctx.security,
+                        budget,
+                    )?;
+                }
+                PublicationObservation::Published => {}
+                _ => return Err(NativeError::OutcomeUnknown),
+            }
+            intent.published()?;
+            persist_intent(parent, ctx, &mut durable, intent, budget, change)?;
+            clean_publication(parent, ctx, budget)
+        }
+        fn requested_record(
+            parent: &Anchor,
+            ctx: &Context,
+            requested: &RepairRecord,
+            budget: &Deadline,
+        ) -> NativeResult<()> {
+            requested.context().matches(&ctx.target.identity)?;
+            match read(parent, ctx, records::RecordName::Repair, budget)? {
+                None => {
+                    if requested.cursor() != RepairCursor::Selected || requested.slot().is_some() {
+                        return Err(NativeError::Foreign);
+                    }
+                    let index = index(parent, ctx, budget)?;
+                    verify_evidence(parent, ctx, &index, budget)?;
+                }
+                Some((_, old)) => {
+                    let old = RepairRecord::decode(&old)?;
+                    if old.cursor() == RepairCursor::Complete
+                        && old.operation() != requested.operation()
+                    {
+                        old.context().same_user(&ctx.target.identity)?;
+                        let index = index(parent, ctx, budget)?;
+                        verify_evidence(parent, ctx, &index, budget)?;
+                        if requested.cursor() != RepairCursor::Selected
+                            || requested.slot().is_some()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                    } else {
+                        old.publication_successor(requested)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn publish_record(
+            io: &Arc<WindowsNativeIo>,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            selection: &Arc<RepairSelection>,
+            record: &RepairRecord,
+            deadline: &Deadline,
+        ) -> NativeResult<Arc<RepairMutationPermit>> {
+            selection.reverify(io, proof, lock, deadline)?;
+            record.validate()?;
+            if record.plan() != selection.plan() {
+                return Err(NativeError::Foreign);
+            }
+            let ctx = io.context.clone();
+            let lease = lock.0.clone();
+            let budget = proof.budget(io, deadline)?;
+            let requested = record.clone();
+            let bytes = record.encode()?;
+            let output = bytes.clone();
+            let owner = io.owner.clone();
+            io.owner.run(Dispatch::Mutation, deadline, move || {
+                let change = Change::new();
+                let result = change.finish((|| {
+                    validate_payload_lock(&ctx, &lease, &budget)?;
+                    requested_record(&lease.parent, &ctx, &requested, &budget)?;
+                    publish_fixed(
+                        &ctx,
+                        &lease,
+                        requested.operation(),
+                        PublicationTarget::Repair,
+                        &bytes,
+                        &budget,
+                        &change,
+                    )
+                })());
+                if matches!(result, Err(NativeError::OutcomeUnknown)) {
+                    owner.retire_mutations();
+                }
+                result
+            })?;
+            let permit = Arc::new(RepairMutationPermit {
+                io: io.clone(),
+                bytes: output,
+                record: record.clone(),
+            });
+            let proof = io.admit_support(deadline)?;
+            permit.reverify(io, &proof, lock, selection, deadline)?;
+            Ok(permit)
+        }
+        fn reserve_index(
+            io: &Arc<WindowsNativeIo>,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &Arc<RepairMutationPermit>,
+            selection: &Arc<RepairSelection>,
+            deadline: &Deadline,
+        ) -> NativeResult<u8> {
+            permit.reverify(io, proof, lock, selection, deadline)?;
+            if permit.record.cursor() != RepairCursor::Selected || permit.record.slot().is_some() {
+                return Err(NativeError::Foreign);
+            }
+            let ctx = io.context.clone();
+            let lease = lock.0.clone();
+            let budget = proof.budget(io, deadline)?;
+            let record = permit.record.clone();
+            let expected = permit.bytes.clone();
+            let owner = io.owner.clone();
+            io.owner.run(Dispatch::Mutation, deadline, move || {
+                let change = Change::new();
+                let result = change.finish((|| {
+                    validate_payload_lock(&ctx, &lease, &budget)?;
+                    clean_publication(&lease.parent, &ctx, &budget)?;
+                    let (_, actual) =
+                        read(&lease.parent, &ctx, records::RecordName::Repair, &budget)?
+                            .ok_or(NativeError::Foreign)?;
+                    if actual != expected {
+                        return Err(NativeError::Foreign);
+                    }
+                    let mut index = index(&lease.parent, &ctx, &budget)?;
+                    let slot = index.reserve(record.operation(), record.plan().archives())?;
+                    publish_fixed(
+                        &ctx,
+                        &lease,
+                        record.operation(),
+                        PublicationTarget::EvidenceIndex,
+                        &index.encode()?,
+                        &budget,
+                        &change,
+                    )?;
+                    Ok(slot)
+                })());
+                if matches!(result, Err(NativeError::OutcomeUnknown)) {
+                    owner.retire_mutations();
+                }
+                result
+            })
+        }
+
+        struct RemovalNamespace {
+            lease: Arc<super::super::super::payload::helper::removal::RemovalKeeperLease>,
+            _server: tokio::net::windows::named_pipe::NamedPipeServer,
+            _runtime: tokio::runtime::Runtime,
+        }
+        enum Namespace {
+            Keeper(Arc<keeper::RepairNamespaceHold>),
+            Removal(Arc<RemovalNamespace>),
+        }
+        impl Namespace {
+            fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                operation: [u8; 16],
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                match self {
+                    Self::Keeper(n) => n.reverify(io, proof, deadline),
+                    Self::Removal(n) => n.lease.reverify(io, proof, operation, deadline),
+                }
+            }
+            fn bound(&self, ctx: &Context, budget: &Deadline) -> NativeResult<()> {
+                match self {
+                    Self::Keeper(n) => n.reverify_bound(ctx, budget),
+                    Self::Removal(n) => {
+                        use windows_sys::Win32::System::Pipes::{
+                            GetNamedPipeInfo, PIPE_SERVER_END,
+                        };
+                        let mut flags = 0;
+                        // SAFETY: the retained actual original removal FIRST_INSTANCE server duplicate,
+                        // not a recorded handle value; read-only exact-object information query.
+                        if unsafe {
+                            GetNamedPipeInfo(
+                                n.lease.retained_namespace().as_raw_handle(),
+                                &mut flags,
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                            )
+                        } == 0
+                            || flags & PIPE_SERVER_END == 0
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                        ctx.validate(budget)
+                    }
+                }
+            }
+        }
+        struct FileAuthority {
+            _seal: FileRecoverySeal,
+            _root: FileRecoveryRoot,
+        }
+        pub(crate) struct RepairTerminal {
+            io: Arc<WindowsNativeIo>,
+            snapshot: SourceSnapshot,
+            bytes: Vec<u8>,
+            namespace: Arc<Namespace>,
+            associated: Vec<(records::RecordName, Option<PublicationStamp>)>,
+            _file: Option<FileAuthority>,
+        }
+        fn associated(
+            parent: &Anchor,
+            ctx: &Context,
+            source: &SourceSnapshot,
+            budget: &Deadline,
+        ) -> NativeResult<Vec<(records::RecordName, Option<PublicationStamp>)>> {
+            let names = match source.kind() {
+                SourceKind::Removal => vec![records::RecordName::StageCatalog],
+                _ => vec![
+                    records::RecordName::Operation(source.source_operation()),
+                    records::RecordName::StageCatalog,
+                ],
+            };
+            names
+                .into_iter()
+                .map(|name| {
+                    let value = read(parent, ctx, name.clone(), budget)?;
+                    Ok((name, observed(&value)?))
+                })
+                .collect()
+        }
+        fn source_at(
+            parent: &Anchor,
+            ctx: &Context,
+            record: &RepairRecord,
+            source: &SourceSnapshot,
+            budget: &Deadline,
+        ) -> NativeResult<(ArchiveObservation, Option<Vec<u8>>)> {
+            let actual = read(parent, ctx, source_name(source.kind()), budget)?;
+            let destination = match record.slot() {
+                Some(slot) => {
+                    check_slot(parent, ctx, record, budget)?;
+                    parent
+                        .repair_evidence_slot(slot, false, &ctx.security, budget)?
+                        .map(|p| {
+                            p.read_private(
+                                &PrivateName::new(source.kind().leaf())?,
+                                &ctx.security,
+                                files::MAX_RECORD_BYTES,
+                                budget,
+                            )
+                        })
+                        .transpose()?
+                        .flatten()
+                }
+                None => None,
+            };
+            if actual
+                .as_ref()
+                .is_some_and(|(id, b)| !matches(source, *id, b))
+                || destination
+                    .as_ref()
+                    .is_some_and(|(id, b)| !matches(source, *id, b))
+            {
+                return Ok((ArchiveObservation::Changed, None));
+            }
+            Ok(match (actual, destination) {
+                (Some((_, b)), None) => (ArchiveObservation::SourceOnly, Some(b)),
+                (None, Some((_, b))) => (ArchiveObservation::DestinationOnly, Some(b)),
+                (Some(_), Some(_)) => (ArchiveObservation::Both, None),
+                (None, None) => (ArchiveObservation::Neither, None),
+            })
+        }
+        impl RepairTerminal {
+            fn reverify(
+                &self,
+                io: &Arc<WindowsNativeIo>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                record: &RepairRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !Arc::ptr_eq(io, &self.io) {
+                    return Err(NativeError::Foreign);
+                }
+                self.namespace
+                    .reverify(io, proof, self.snapshot.source_operation(), deadline)?;
+                let ctx = io.context.clone();
+                let lease = lock.0.clone();
+                let budget = proof.budget(io, deadline)?;
+                let source = self.snapshot.clone();
+                let bytes = self.bytes.clone();
+                let record = record.clone();
+                let associated = self.associated.clone();
+                let namespace = self.namespace.clone();
+                io.owner.run(Dispatch::Observation, deadline, move || {
+                    validate_payload_lock(&ctx, &lease, &budget)?;
+                    namespace.bound(&ctx, &budget)?;
+                    let (state, actual) =
+                        source_at(&lease.parent, &ctx, &record, &source, &budget)?;
+                    if !matches!(
+                        state,
+                        ArchiveObservation::SourceOnly | ArchiveObservation::DestinationOnly
+                    ) || actual.as_deref() != Some(bytes.as_slice())
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    terminal_document(&lease.parent, &ctx, source.kind(), &bytes, &budget)?;
+                    for (name, expected) in associated {
+                        if observed(&read(&lease.parent, &ctx, name, &budget)?)? != expected {
+                            return Err(NativeError::Foreign);
+                        }
+                    }
+                    budget.check()
+                })
+            }
+        }
+        pub(crate) struct NativeRepairPort {
+            io: Arc<WindowsNativeIo>,
+            lock: InstallerLock,
+            selection: Arc<RepairSelection>,
+            record: RepairRecord,
+            permit: Option<Arc<RepairMutationPermit>>,
+            deadline: Deadline,
+            terminals: Vec<Arc<RepairTerminal>>,
+            keeper: Option<Arc<Namespace>>,
+            removal: Option<Arc<Namespace>>,
+        }
+        impl NativeRepairPort {
+            pub(crate) fn new(
+                io: Arc<WindowsNativeIo>,
+                lock: InstallerLock,
+                selection: Arc<RepairSelection>,
+                record: RepairRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<Self> {
+                record.validate()?;
+                let proof = io.admit_support(deadline)?;
+                selection.reverify(&io, &proof, &lock, deadline)?;
+                if record.plan() != selection.plan()
+                    || record.cursor() != RepairCursor::Selected
+                    || record.slot().is_some()
+                {
+                    return Err(NativeError::Foreign);
+                }
+                if !record.plan().archives().is_empty() {
+                    let ctx = io.context.clone();
+                    let lease = lock.0.clone();
+                    let budget = proof.budget(&io, deadline)?;
+                    let candidate = record.clone();
+                    io.owner.run(Dispatch::Observation, deadline, move || {
+                        validate_payload_lock(&ctx, &lease, &budget)?;
+                        clean_publication(&lease.parent, &ctx, &budget)?;
+                        let mut current = index(&lease.parent, &ctx, &budget)?;
+                        verify_evidence(&lease.parent, &ctx, &current, &budget)?;
+                        // Capacity test is pure on observed metadata; no reservation/write yet.
+                        current
+                            .reserve(candidate.operation(), candidate.plan().archives())
+                            .map(|_| ())
+                    })?;
+                }
+                let mut port = Self {
+                    io,
+                    lock,
+                    selection,
+                    record: record.clone(),
+                    permit: None,
+                    deadline: deadline.clone(),
+                    terminals: Vec::new(),
+                    keeper: None,
+                    removal: None,
+                };
+                // All terminal facts are genuinely admitted BEFORE even selection/index writes.
+                // Candidate phases in the read-only probe grant no publication/effect authority.
+                for index in 0..record.plan().archives().len() {
+                    port.terminal(&record, index as u8)?;
+                }
+                let proof = port.io.admit_support(deadline)?;
+                let permit = publish_record(
+                    &port.io,
+                    &proof,
+                    &port.lock,
+                    &port.selection,
+                    &record,
+                    deadline,
+                )?;
+                port.permit = Some(permit);
+                if !record.plan().archives().is_empty() {
+                    let proof = port.io.admit_support(deadline)?;
+                    let slot = reserve_index(
+                        &port.io,
+                        &proof,
+                        &port.lock,
+                        port.permit()?,
+                        &port.selection,
+                        deadline,
+                    )?;
+                    let mut bound = record;
+                    bound.bind_slot(slot)?;
+                    let proof = port.io.admit_support(deadline)?;
+                    port.permit = Some(publish_record(
+                        &port.io,
+                        &proof,
+                        &port.lock,
+                        &port.selection,
+                        &bound,
+                        deadline,
+                    )?);
+                    port.record = bound;
+                }
+                Ok(port)
+            }
+            fn permit(&self) -> NativeResult<&Arc<RepairMutationPermit>> {
+                self.permit.as_ref().ok_or(NativeError::Foreign)
+            }
+            pub(crate) fn run(&mut self, deadline: &Deadline) -> NativeResult<RepairOutcome> {
+                self.deadline = deadline.clone();
+                let mut record = self.record.clone();
+                let result = repair::run_repair(self, &mut record);
+                self.record = record;
+                result
+            }
+            fn namespace(&mut self, source: &SourceSnapshot) -> NativeResult<Arc<Namespace>> {
+                let cell = if source.kind() == SourceKind::Removal {
+                    &mut self.removal
+                } else {
+                    &mut self.keeper
+                };
+                if let Some(held) = cell {
+                    let proof = self.io.admit_support(&self.deadline)?;
+                    held.reverify(&self.io, &proof, source.source_operation(), &self.deadline)?;
+                    return Ok(held.clone());
+                }
+                let proof = self.io.admit_support(&self.deadline)?;
+                let io = self.io.clone();
+                let context = io.context.clone();
+                let lease = self.lock.0.clone();
+                let budget = proof.budget(&io, &self.deadline)?;
+                let deadline = self.deadline.clone();
+                let operation = source.source_operation();
+                let removal = source.kind() == SourceKind::Removal;
+                let held=TERMINAL_OWNER.get_or_init(||Arc::new(CallOwner::default()))
+                    .run(Dispatch::Observation,&self.deadline,move||{
+                        // Original actual lock aliases remain in this worker through real native
+                        // completion, even if the caller abandons the bounded observation.
+                        validate_payload_lock(&context,&lease,&budget)?;
+                        let value=if removal{
+                            let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_|NativeError::Unavailable)?;
+                            let (server,lease)={let _entered=runtime.enter();
+                                super::super::super::payload::helper::removal::RemovalKeeperLease::reserve(
+                                    io.clone(),&proof,operation,&deadline)?};
+                            Namespace::Removal(Arc::new(RemovalNamespace{lease,_server:server,_runtime:runtime}))
+                        }else{Namespace::Keeper(Arc::new(keeper::reserve_repair_namespace(io.clone(),&proof,&deadline)?))};
+                        budget.check()?;Ok(value)
+                    })?;
+                let held = Arc::new(held);
+                *cell = Some(held.clone());
+                Ok(held)
+            }
+        }
+        impl NativeRepairPort {
+            fn terminal(
+                &mut self,
+                record: &RepairRecord,
+                index: u8,
+            ) -> NativeResult<Arc<RepairTerminal>> {
+                let proof = self.io.admit_support(&self.deadline)?;
+                self.selection
+                    .reverify(&self.io, &proof, &self.lock, &self.deadline)?;
+                if record.plan() != self.selection.plan() {
+                    return Err(NativeError::Foreign);
+                }
+                let source = record
+                    .plan()
+                    .archives()
+                    .get(usize::from(index))
+                    .ok_or(NativeError::Invalid)?
+                    .clone();
+                if let Some(held) = self.terminals.iter().find(|t| t.snapshot == source) {
+                    let proof = self.io.admit_support(&self.deadline)?;
+                    held.reverify(&self.io, &proof, &self.lock, record, &self.deadline)?;
+                    return Ok(held.clone());
+                }
+                let namespace = self.namespace(&source)?;
+                let ctx = self.io.context.clone();
+                let lease = self.lock.0.clone();
+                let budget = proof.budget(&self.io, &self.deadline)?;
+                let selected = record.clone();
+                let observed = source.clone();
+                let held_namespace = namespace.clone();
+                let (bytes, document, associated) =
+                    self.io
+                        .owner
+                        .run(Dispatch::Observation, &self.deadline, move || {
+                            validate_payload_lock(&ctx, &lease, &budget)?;
+                            held_namespace.bound(&ctx, &budget)?;
+                            let (state, bytes) =
+                                source_at(&lease.parent, &ctx, &selected, &observed, &budget)?;
+                            if !matches!(
+                                state,
+                                ArchiveObservation::SourceOnly
+                                    | ArchiveObservation::DestinationOnly
+                            ) {
+                                return Err(NativeError::Foreign);
+                            }
+                            let bytes = bytes.ok_or(NativeError::Foreign)?;
+                            let document = terminal_document(
+                                &lease.parent,
+                                &ctx,
+                                observed.kind(),
+                                &bytes,
+                                &budget,
+                            )?;
+                            if source_operation(&document) != observed.source_operation() {
+                                return Err(NativeError::Foreign);
+                            }
+                            let associated = associated(&lease.parent, &ctx, &observed, &budget)?;
+                            Ok((bytes, document, associated))
+                        })?;
+                let file = if matches!(document, TerminalDocument::File(_)) {
+                    // Existing genuine ended-logon FILE seal/convergence admission, no cleanup.
+                    // A cold already-archived FileRecovery source cannot reconstruct that seal.
+                    let proof = self.io.admit_support(&self.deadline)?;
+                    let seal = self
+                        .io
+                        .prepare_file_recovery(&proof, &self.lock, &self.deadline)?
+                        .ok_or(NativeError::Unsupported)?;
+                    let proof = self.io.admit_support(&self.deadline)?;
+                    let permit = self.io.admit_file_recovery_permit(
+                        &proof,
+                        &self.lock,
+                        &seal,
+                        &self.deadline,
+                    )?;
+                    let proof = self.io.admit_support(&self.deadline)?;
+                    let root =
+                        self.io
+                            .file_recovery_root(&proof, &self.lock, &seal, &self.deadline)?;
+                    let proof = self.io.admit_support(&self.deadline)?;
+                    root.observe_terminal(&proof, &self.lock, &seal, &permit, &self.deadline)?;
+                    Some(FileAuthority {
+                        _seal: seal,
+                        _root: root,
+                    })
+                } else {
+                    None
+                };
+                let terminal = Arc::new(RepairTerminal {
+                    io: self.io.clone(),
+                    snapshot: source,
+                    bytes,
+                    namespace,
+                    associated,
+                    _file: file,
+                });
+                let proof = self.io.admit_support(&self.deadline)?;
+                terminal.reverify(&self.io, &proof, &self.lock, record, &self.deadline)?;
+                self.terminals.push(terminal.clone());
+                Ok(terminal)
+            }
+        }
+        impl RepairPort for NativeRepairPort {
+            type Terminal = Arc<RepairTerminal>;
+            fn renew(&mut self, record: &RepairRecord) -> NativeResult<()> {
+                if record != self.permit()?.record() {
+                    return Err(NativeError::Foreign);
+                }
+                let proof = self.io.admit_support(&self.deadline)?;
+                self.permit()?.reverify(
+                    &self.io,
+                    &proof,
+                    &self.lock,
+                    &self.selection,
+                    &self.deadline,
+                )
+            }
+            fn persist(&mut self, record: &RepairRecord) -> NativeResult<()> {
+                let proof = self.io.admit_support(&self.deadline)?;
+                self.permit = Some(publish_record(
+                    &self.io,
+                    &proof,
+                    &self.lock,
+                    &self.selection,
+                    record,
+                    &self.deadline,
+                )?);
+                Ok(())
+            }
+            fn task_observe(
+                &mut self,
+                _: &RepairRecord,
+            ) -> NativeResult<repair::RepairTaskObservation> {
+                let proof = self.io.admit_support(&self.deadline)?;
+                self.io
+                    .observe_repair_task(&proof, &self.lock, &self.selection, &self.deadline)
+            }
+            fn register_task(&mut self, record: &RepairRecord) -> NativeResult<()> {
+                self.renew(record)?;
+                if record.cursor() != RepairCursor::TaskIntent {
+                    return Err(NativeError::Foreign);
+                }
+                let proof = self.io.admit_support(&self.deadline)?;
+                self.io.register_repair_task(
+                    &proof,
+                    &self.lock,
+                    &self.selection,
+                    self.permit()?,
+                    &self.deadline,
+                )
+            }
+            fn admit_terminal(
+                &mut self,
+                record: &RepairRecord,
+                index: u8,
+            ) -> NativeResult<Self::Terminal> {
+                self.renew(record)?;
+                self.terminal(record, index)
+            }
+            fn observe_archive(
+                &mut self,
+                record: &RepairRecord,
+                index: u8,
+            ) -> NativeResult<ArchiveObservation> {
+                self.renew(record)?;
+                if record.cursor() != (RepairCursor::ArchiveIntent { index }) {
+                    return Err(NativeError::Foreign);
+                }
+                let proof = self.io.admit_support(&self.deadline)?;
+                let ctx = self.io.context.clone();
+                let lease = self.lock.0.clone();
+                let record = record.clone();
+                let budget = proof.budget(&self.io, &self.deadline)?;
+                let source = record
+                    .plan()
+                    .archives()
+                    .get(usize::from(index))
+                    .ok_or(NativeError::Invalid)?
+                    .clone();
+                self.io
+                    .owner
+                    .run(Dispatch::Observation, &self.deadline, move || {
+                        validate_payload_lock(&ctx, &lease, &budget)?;
+                        Ok(source_at(&lease.parent, &ctx, &record, &source, &budget)?.0)
+                    })
+            }
+            fn archive_exact(
+                &mut self,
+                record: &RepairRecord,
+                index: u8,
+                terminal: &Self::Terminal,
+            ) -> NativeResult<()> {
+                self.renew(record)?;
+                if record.cursor() != (RepairCursor::ArchiveIntent { index }) {
+                    return Err(NativeError::Foreign);
+                }
+                let source = record
+                    .plan()
+                    .archives()
+                    .get(usize::from(index))
+                    .ok_or(NativeError::Invalid)?;
+                if terminal.snapshot != *source {
+                    return Err(NativeError::Foreign);
+                }
+                let proof = self.io.admit_support(&self.deadline)?;
+                terminal.reverify(&self.io, &proof, &self.lock, record, &self.deadline)?;
+                let ctx = self.io.context.clone();
+                let lease = self.lock.0.clone();
+                let budget = proof.budget(&self.io, &self.deadline)?;
+                let record = record.clone();
+                let terminal = terminal.clone();
+                let expected = self.permit()?.bytes.clone();
+                let owner = self.io.owner.clone();
+                self.io
+                    .owner
+                    .run(Dispatch::Mutation, &self.deadline, move || {
+                        let change = Change::new();
+                        let result = change.finish((|| {
+                            validate_payload_lock(&ctx, &lease, &budget)?;
+                            terminal.namespace.bound(&ctx, &budget)?;
+                            let (_, actual) =
+                                read(&lease.parent, &ctx, records::RecordName::Repair, &budget)?
+                                    .ok_or(NativeError::Foreign)?;
+                            if actual != expected {
+                                return Err(NativeError::Foreign);
+                            }
+                            check_slot(&lease.parent, &ctx, &record, &budget)?;
+                            if source_at(&lease.parent, &ctx, &record, &terminal.snapshot, &budget)?
+                                .0
+                                != ArchiveObservation::SourceOnly
+                            {
+                                return Err(NativeError::OutcomeUnknown);
+                            }
+                            terminal_document(
+                                &lease.parent,
+                                &ctx,
+                                terminal.snapshot.kind(),
+                                &terminal.bytes,
+                                &budget,
+                            )?;
+                            for (name, expected) in &terminal.associated {
+                                if observed(&read(&lease.parent, &ctx, name.clone(), &budget)?)?
+                                    != *expected
+                                {
+                                    return Err(NativeError::Foreign);
+                                }
+                            }
+                            change.reached();
+                            let destination = lease
+                                .parent
+                                .repair_evidence_slot(
+                                    record.slot().ok_or(NativeError::Foreign)?,
+                                    true,
+                                    &ctx.security,
+                                    &budget,
+                                )?
+                                .ok_or(NativeError::OutcomeUnknown)?;
+                            lease.parent.archive_repair_metadata(
+                                terminal.snapshot.kind().leaf(),
+                                identity(terminal.snapshot.stamp()),
+                                &terminal.bytes,
+                                &destination,
+                                &ctx.security,
+                                &budget,
+                            )?;
+                            terminal.namespace.bound(&ctx, &budget)
+                        })());
+                        if matches!(result, Err(NativeError::OutcomeUnknown)) {
+                            owner.retire_mutations();
+                        }
+                        result
+                    })
+            }
+            fn finish(&mut self, record: &RepairRecord) -> NativeResult<()> {
+                self.renew(record)?;
+                if record.cursor() != RepairCursor::Complete {
+                    return Err(NativeError::Foreign);
+                }
+                for index in 0..record.plan().archives().len() {
+                    let terminal = self.admit_terminal(record, index as u8)?;
+                    let proof = self.io.admit_support(&self.deadline)?;
+                    terminal.reverify(&self.io, &proof, &self.lock, record, &self.deadline)?;
+                }
+                if record.plan().archives().is_empty() {
+                    return Ok(());
+                }
+                let proof = self.io.admit_support(&self.deadline)?;
+                let ctx = self.io.context.clone();
+                let lease = self.lock.0.clone();
+                let budget = proof.budget(&self.io, &self.deadline)?;
+                let record = record.clone();
+                let expected = self.permit()?.bytes.clone();
+                let owner = self.io.owner.clone();
+                self.io
+                    .owner
+                    .run(Dispatch::Mutation, &self.deadline, move || {
+                        let change = Change::new();
+                        let result = change.finish((|| {
+                            validate_payload_lock(&ctx, &lease, &budget)?;
+                            clean_publication(&lease.parent, &ctx, &budget)?;
+                            let (_, actual) =
+                                read(&lease.parent, &ctx, records::RecordName::Repair, &budget)?
+                                    .ok_or(NativeError::Foreign)?;
+                            if actual != expected {
+                                return Err(NativeError::Foreign);
+                            }
+                            check_slot(&lease.parent, &ctx, &record, &budget)?;
+                            for source in record.plan().archives() {
+                                if source_at(&lease.parent, &ctx, &record, source, &budget)?.0
+                                    != ArchiveObservation::DestinationOnly
+                                {
+                                    return Err(NativeError::OutcomeUnknown);
+                                }
+                            }
+                            let mut index = index(&lease.parent, &ctx, &budget)?;
+                            index.complete(
+                                record.slot().ok_or(NativeError::Foreign)?,
+                                record.operation(),
+                            )?;
+                            publish_fixed(
+                                &ctx,
+                                &lease,
+                                record.operation(),
+                                PublicationTarget::EvidenceIndex,
+                                &index.encode()?,
+                                &budget,
+                                &change,
+                            )
+                        })());
+                        if matches!(result, Err(NativeError::OutcomeUnknown)) {
+                            owner.retire_mutations();
+                        }
+                        result
+                    })
+            }
+        }
+        impl RepairProbe {
+            pub(crate) fn apply(
+                &self,
+                plan: &repair::RepairPlan,
+                deadline: &Deadline,
+            ) -> NativeResult<RepairOutcome> {
+                let io = self.io().ok_or(NativeError::Unsupported)?.clone();
+                let proof = io.admit_support(deadline)?;
+                let lock = io.acquire_installer_lock(&proof, deadline)?;
+                let proof = io.admit_support(deadline)?;
+                let selection =
+                    io.select_repair(&proof, &lock, self.observation(), plan, deadline)?;
+                let record = RepairRecord::new(
+                    nonce()?,
+                    recovery::OuterContextCorrelation::new(io.target().identity())?,
+                    plan.clone(),
+                    None,
+                )?;
+                NativeRepairPort::new(io, lock, selection, record, deadline)?.run(deadline)
+            }
+        }
+    }
+    // A6 diagnostic/task-only region. No old constructor, Stop, keeper or payload mutation.
+    #[cfg(not(test))]
+    mod repair_probe {
+        use super::super::super::{
+            payload::inventory::ApprovedInventory,
+            repair::{
+                RepairDiagnostic as Diagnostic, RepairObservation, RepairPlan,
+                RepairTaskObservation,
+            },
+            service::task::{Definition, Logon, RunLevel, SUPERVISOR_ARGUMENT, TASK_NAME},
+            transport::{self, Endpoint, security::NativeEndpoint},
+        };
+        use super::*;
+        use crate::agent_contract::{
+            DecodedReply, InstallerRequest, ObservationSource, StatusAdmission,
+        };
+        use native::{RepairRead, repair_readonly_diagnostic};
+        use std::sync::OnceLock;
+        static STATUS: OnceLock<Arc<CallOwner>> = OnceLock::new();
+
+        pub(crate) struct RepairProbe {
+            io: Option<Arc<WindowsNativeIo>>,
+            observation: RepairObservation,
+        }
+        impl RepairProbe {
+            pub(crate) fn observation(&self) -> &RepairObservation {
+                &self.observation
+            }
+            pub(crate) fn io(&self) -> Option<&Arc<WindowsNativeIo>> {
+                self.io.as_ref()
+            }
+        }
+        fn diagnostic(error: NativeError) -> Diagnostic {
+            match error {
+                NativeError::Missing => Diagnostic::Missing,
+                NativeError::Foreign => Diagnostic::UnsafeForeign,
+                NativeError::Unavailable | NativeError::Busy => Diagnostic::Unavailable,
+                _ => Diagnostic::Unknown,
+            }
+        }
+        fn read_diagnostic<T>(read: &RepairRead<T>) -> Diagnostic {
+            match read {
+                RepairRead::Present(_) => Diagnostic::Healthy,
+                RepairRead::Missing => Diagnostic::Missing,
+                RepairRead::AccessDenied => Diagnostic::AccessDenied,
+                RepairRead::Unsafe => Diagnostic::UnsafeForeign,
+                RepairRead::Unavailable => Diagnostic::Unavailable,
+                RepairRead::Unknown => Diagnostic::Unknown,
+            }
+        }
+        fn failed(diagnostic: Diagnostic) -> NativeResult<RepairObservation> {
+            RepairObservation::new(
+                diagnostic,
+                RepairTaskObservation::new(Diagnostic::Unavailable, None)?,
+                Diagnostic::Unavailable,
+                Vec::new(),
+                Diagnostic::Unknown,
+            )
+        }
+        fn desired(io: &WindowsNativeIo, install: &str) -> Definition {
+            let user = io.context.target.identity.user.sddl();
+            Definition {
+                name: TASK_NAME.into(),
+                principal: user.clone(),
+                trigger_user: user,
+                logon: Logon::InteractiveToken,
+                run_level: RunLevel::Limited,
+                action: format!("{install}\\crosspane-installer.exe"),
+                arguments: SUPERVISOR_ARGUMENT.into(),
+                working_directory: install.into(),
+                logon_trigger_only: true,
+                ignore_new_instance: true,
+                manager_restart_count: 0,
+                enabled: true,
+            }
+        }
+        struct RepairImages {
+            module: SelfImagePin,
+            images: [OpenedPe; 4],
+            definition: Definition,
+        }
+        impl RepairImages {
+            fn check(&self, io: &WindowsNativeIo, deadline: &Deadline) -> NativeResult<()> {
+                let proof = io.admit_support(deadline)?;
+                self.module.reverify(io, &proof, deadline)?;
+                for image in &self.images {
+                    let proof = io.admit_support(deadline)?;
+                    image.reverify(io, &proof, deadline)?;
+                }
+                deadline.check()
+            }
+        }
+        fn images(
+            io: &Arc<WindowsNativeIo>,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<(Diagnostic, Option<Arc<RepairImages>>, Definition)> {
+            let fallback = desired(io, io.context.target.paths.install());
+            let inventory = match ApprovedInventory::embedded() {
+                Ok(inventory) => inventory,
+                // No manifest/current-byte/catalog fallback. Approval availability is separate.
+                Err(_) => return Ok((Diagnostic::Unknown, None, fallback)),
+            };
+            let module = match io.repair_own_image(proof, deadline)? {
+                RepairRead::Present(module) => module,
+                other => return Ok((read_diagnostic(&other), None, fallback)),
+            };
+            let installer = ApprovedPe::own_image(&module)?;
+            let pins = [
+                installer,
+                inventory.role(PayloadRole::Agent)?.clone(),
+                inventory.role(PayloadRole::Ui)?.clone(),
+                inventory.role(PayloadRole::Ctl)?.clone(),
+            ];
+            let budget = proof.budget(io, deadline)?;
+            let context = io.context.clone();
+            let value = io.owner.run(Dispatch::Observation, deadline, move || {
+                let mut definition = fallback;
+                let root = repair_readonly_diagnostic(|| {
+                    context.validate(&budget)?;
+                    Anchor::open(
+                        context.target.paths.install(),
+                        &context.security,
+                        true,
+                        &budget,
+                    )
+                    .map(|root| root.map(Arc::new))
+                });
+                let root = match root {
+                    RepairRead::Present(root) => root,
+                    other => return Ok((read_diagnostic(&other), None, definition)),
+                };
+                definition.action = format!(
+                    "{}\\crosspane-installer.exe",
+                    root.canonical_dos_path(&context.security, &budget)?
+                        .to_str()
+                        .ok_or(NativeError::Unsupported)?
+                );
+                definition.working_directory = root
+                    .canonical_dos_path(&context.security, &budget)?
+                    .to_str()
+                    .ok_or(NativeError::Unsupported)?
+                    .to_owned();
+                let mut admitted = Vec::with_capacity(4);
+                let mut damage = Diagnostic::Healthy;
+                for (role, expected) in PayloadRole::ALL.into_iter().zip(pins) {
+                    let malformed = std::cell::Cell::new(false);
+                    let read = repair_readonly_diagnostic(|| {
+                        context.validate(&budget)?;
+                        let image = match root.open_image(
+                            role.leaf(),
+                            true,
+                            expected.version(),
+                            &context.security,
+                            &budget,
+                        ) {
+                            Ok(image) => image,
+                            Err(error) => {
+                                malformed.set(matches!(
+                                    error,
+                                    NativeError::Invalid | NativeError::Unsupported
+                                ));
+                                return Err(error);
+                            }
+                        };
+                        Ok(Some(image))
+                    });
+                    match read {
+                        RepairRead::Present(image) if image.facts == *expected.facts() => {
+                            admitted.push(OpenedPe(Arc::new(ApprovedImage {
+                                target: context.target.nonce,
+                                parent: root.clone(),
+                                leaf: role.leaf().into(),
+                                image,
+                                expected,
+                            })));
+                        }
+                        RepairRead::Present(_) => {
+                            damage = combine(damage, Diagnostic::Mismatch);
+                        }
+                        other => {
+                            let fact = if malformed.get() && matches!(other, RepairRead::Unknown) {
+                                Diagnostic::Mismatch
+                            } else {
+                                read_diagnostic(&other)
+                            };
+                            damage = combine(damage, fact);
+                        }
+                    }
+                }
+                budget.check()?;
+                if damage != Diagnostic::Healthy {
+                    return Ok((damage, None, definition));
+                }
+                let images: [OpenedPe; 4] =
+                    admitted.try_into().map_err(|_| NativeError::Invalid)?;
+                Ok((damage, Some(images), definition))
+            });
+            match value {
+                Ok((diagnostic, images, definition)) => {
+                    let images = images.map(|images| {
+                        Arc::new(RepairImages {
+                            module,
+                            images,
+                            definition: definition.clone(),
+                        })
+                    });
+                    Ok((diagnostic, images, definition))
+                }
+                Err(error) => Ok((
+                    diagnostic(error),
+                    None,
+                    desired(io, io.context.target.paths.install()),
+                )),
+            }
+        }
+        fn combine(current: Diagnostic, new: Diagnostic) -> Diagnostic {
+            // Preserve proven denial/unsafe/mismatch rather than replacing it with a later missing
+            // leaf. This aggregate remains diagnostic only; every role must be Healthy to apply.
+            fn rank(value: Diagnostic) -> u8 {
+                match value {
+                    Diagnostic::Healthy => 0,
+                    Diagnostic::Missing => 1,
+                    Diagnostic::Unknown => 2,
+                    Diagnostic::Unavailable => 3,
+                    Diagnostic::Mismatch => 4,
+                    Diagnostic::UnsafeForeign => 5,
+                    Diagnostic::AccessDenied => 6,
+                    Diagnostic::Disabled => 7,
+                }
+            }
+            if rank(new) > rank(current) {
+                new
+            } else {
+                current
+            }
+        }
+        struct RepairAgent {
+            observation: AgentObservation,
+        }
+        impl RepairAgent {
+            fn check(
+                &self,
+                io: &Arc<WindowsNativeIo>,
+                images: &RepairImages,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                let proof = io.admit_support(deadline)?;
+                self.observation.revalidate(io, &proof, deadline)?;
+                if self.observation.bootstrap().phase
+                    != crate::agent_contract::BootstrapPhase::Ready
+                {
+                    return Err(NativeError::Foreign);
+                }
+                if io.agent_identity(&self.observation, &proof, deadline)?
+                    != images.images[1].identity()
+                {
+                    return Err(NativeError::Foreign);
+                }
+                // The original object/pins stay retained. Each new endpoint gets fresh support,
+                // and cannot switch to a new instance merely because the old proof aged out.
+                let proof = io.admit_support(deadline)?;
+                let endpoint = Arc::new(NativeEndpoint::admit(io.clone(), proof, deadline)?);
+                if endpoint.selected_instance()? != self.observation.bootstrap().instance_id
+                    || status(endpoint, deadline)? != Diagnostic::Healthy
+                {
+                    return Err(NativeError::Foreign);
+                }
+                deadline.check()
+            }
+        }
+        fn status(endpoint: Arc<NativeEndpoint>, deadline: &Deadline) -> NativeResult<Diagnostic> {
+            let budget = deadline.clone();
+            STATUS.get_or_init(|| Arc::new(CallOwner::default())).run(
+                Dispatch::Observation,
+                deadline,
+                move || {
+                    let read = repair_readonly_diagnostic(|| {
+                        let (reply, source) =
+                            transport::run(endpoint.as_ref(), &InstallerRequest::Status, &budget);
+                        let reply = reply.map_err(|_| NativeError::Unavailable)?;
+                        if source != ObservationSource::Live {
+                            return Ok(Some(Diagnostic::Unknown));
+                        }
+                        match reply {
+                            DecodedReply::Status(StatusAdmission::Supported(health))
+                                if health.installer().build.version
+                                    == env!("CARGO_PKG_VERSION") =>
+                            {
+                                Ok(Some(Diagnostic::Healthy))
+                            }
+                            _ => Ok(Some(Diagnostic::Unknown)),
+                        }
+                    });
+                    Ok(match read {
+                        RepairRead::Present(value) => value,
+                        other => read_diagnostic(&other),
+                    })
+                },
+            )
+        }
+        fn agent(
+            io: &Arc<WindowsNativeIo>,
+            proof: &SupportProof,
+            images: Option<&RepairImages>,
+            deadline: &Deadline,
+        ) -> NativeResult<(Diagnostic, Option<Arc<RepairAgent>>)> {
+            let read = io.repair_agent_observation(proof, deadline)?;
+            let observation = match read {
+                RepairRead::Present(value) => value,
+                other => return Ok((read_diagnostic(&other), None)),
+            };
+            if observation.bootstrap().phase != crate::agent_contract::BootstrapPhase::Ready {
+                return Ok((Diagnostic::Unknown, None));
+            }
+            let proof = io.admit_support(deadline)?;
+            let endpoint = match NativeEndpoint::admit(io.clone(), proof, deadline) {
+                Ok(endpoint) => Arc::new(endpoint),
+                Err(error) => return Ok((diagnostic(error), None)),
+            };
+            // Both factories observe the actual same original fixed instance. A concurrent restart
+            // is Unknown, never a healthy registration capability.
+            if endpoint.selected_instance()? != observation.bootstrap().instance_id {
+                return Ok((Diagnostic::Unknown, None));
+            }
+            let actual = status(endpoint.clone(), deadline)?;
+            if actual != Diagnostic::Healthy {
+                return Ok((actual, None));
+            }
+            let Some(images) = images else {
+                return Ok((Diagnostic::Unknown, None));
+            };
+            let proof = io.admit_support(deadline)?;
+            if io.agent_identity(&observation, &proof, deadline)? != images.images[1].identity() {
+                return Ok((Diagnostic::Mismatch, None));
+            }
+            Ok((
+                Diagnostic::Healthy,
+                Some(Arc::new(RepairAgent { observation })),
+            ))
+        }
+        struct Detection {
+            observation: RepairObservation,
+            images: Option<Arc<RepairImages>>,
+            agent: Option<Arc<RepairAgent>>,
+        }
+        fn detect(
+            io: &Arc<WindowsNativeIo>,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<Detection> {
+            let (payload, images, definition) = images(io, proof, deadline)?;
+            let task =
+                super::super::super::service::task::repair_probe(io.clone(), definition, deadline)?;
+            let proof = io.admit_support(deadline)?;
+            let (agent, agent_pin) = match agent(io, &proof, images.as_deref(), deadline) {
+                Ok(value) => value,
+                Err(error) => (diagnostic(error), None),
+            };
+            let proof = io.admit_support(deadline)?;
+            let debt = io.inspect_repair_debt(&proof, deadline)?;
+            let (journals, publication) = debt.into_parts();
+            let observation = RepairObservation::new(payload, task, agent, journals, publication)?;
+            Ok(Detection {
+                observation,
+                images,
+                agent: agent_pin,
+            })
+        }
+        pub(crate) struct RepairSelection {
+            io: Arc<WindowsNativeIo>,
+            plan: RepairPlan,
+            images: Arc<RepairImages>,
+            agent: Arc<RepairAgent>,
+        }
+        impl RepairSelection {
+            pub(crate) fn plan(&self) -> &RepairPlan {
+                &self.plan
+            }
+            pub(crate) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                io.lock_binding(proof, lock, deadline)?;
+                let context = io.context.clone();
+                let lease = lock.0.clone();
+                let budget = proof.budget(io, deadline)?;
+                io.owner.run(Dispatch::Observation, deadline, move || {
+                    validate_payload_lock(&context, &lease, &budget)
+                })?;
+                self.images.check(io, deadline)?;
+                self.agent.check(&self.io, &self.images, deadline)
+            }
+        }
+        /// Retains the actual current lock/pins/record before the separate MTA mutation dispatch.
+        /// This is not Clone/Deserialize, nor a capability constructible from diagnostic facts.
+        pub(crate) struct RepairTaskBinding {
+            selection: Arc<RepairSelection>,
+            lease: Arc<LockState>,
+            permit: Arc<super::repair_archive::RepairMutationPermit>,
+            change: Change,
+        }
+        impl RepairTaskBinding {
+            pub(crate) fn check(&self, deadline: &Deadline) -> NativeResult<()> {
+                let io = &self.selection.io;
+                let proof = io.admit_support(deadline)?;
+                let lock = InstallerLock(self.lease.clone());
+                self.selection.reverify(io, &proof, &lock, deadline)?;
+                let proof = io.admit_support(deadline)?;
+                self.permit
+                    .reverify(io, &proof, &lock, &self.selection, deadline)?;
+                if self.permit.record().cursor()
+                    != super::super::super::repair::record::RepairCursor::TaskIntent
+                {
+                    return Err(NativeError::Foreign);
+                }
+                deadline.check()
+            }
+            pub(crate) fn desired(&self) -> &Definition {
+                &self.selection.images.definition
+            }
+            pub(crate) fn task_xml(&self) -> NativeResult<&str> {
+                self.selection.plan.task_xml().ok_or(NativeError::Foreign)
+            }
+            pub(crate) fn reached(&self) {
+                self.change.reached();
+            }
+            pub(crate) fn finish<T>(&self, result: NativeResult<T>) -> NativeResult<T> {
+                self.change.finish(result)
+            }
+            pub(crate) fn retire(&self) {
+                self.selection.io.owner.retire_mutations();
+            }
+        }
+        impl WindowsNativeIo {
+            pub(crate) fn probe_repair(
+                clock: Arc<dyn Clock>,
+                deadline: &Deadline,
+            ) -> NativeResult<RepairProbe> {
+                identity::native::refuse_impersonation()?;
+                let owner = Arc::new(CallOwner::default());
+                let budget = deadline.clone();
+                let read = owner.run(Dispatch::Observation, deadline, move || {
+                    Ok(repair_readonly_diagnostic(|| {
+                        Context::current(&budget).map(Some)
+                    }))
+                })?;
+                let context = match read {
+                    RepairRead::Present(context) => context,
+                    other => {
+                        return Ok(RepairProbe {
+                            io: None,
+                            observation: failed(read_diagnostic(&other))?,
+                        });
+                    }
+                };
+                let io = Arc::new(Self {
+                    context: Arc::new(context),
+                    owner,
+                    clock,
+                });
+                let proof = io.admit_support(deadline)?;
+                let observed = detect(&io, &proof, deadline)?;
+                Ok(RepairProbe {
+                    io: Some(io),
+                    observation: observed.observation,
+                })
+            }
+            pub(crate) fn select_repair(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                original: &RepairObservation,
+                plan: &RepairPlan,
+                deadline: &Deadline,
+            ) -> NativeResult<Arc<RepairSelection>> {
+                self.lock_binding(proof, lock, deadline)?;
+                // Supplied model facts grant nothing: freshly observe and independently classify.
+                let actual = detect(self, proof, deadline)?;
+                if &actual.observation != original {
+                    return Err(NativeError::Foreign);
+                }
+                match super::super::super::repair::classify(&actual.observation)? {
+                    super::super::super::repair::RepairDecision::Apply(actual_plan)
+                        if &actual_plan == plan => {}
+                    _ => return Err(NativeError::Foreign),
+                }
+                let selected = Arc::new(RepairSelection {
+                    io: self.clone(),
+                    plan: plan.clone(),
+                    images: actual.images.ok_or(NativeError::Foreign)?,
+                    agent: actual.agent.ok_or(NativeError::Foreign)?,
+                });
+                let proof = self.admit_support(deadline)?;
+                selected.reverify(self, &proof, lock, deadline)?;
+                Ok(selected)
+            }
+            pub(crate) fn observe_repair_task(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                selection: &Arc<RepairSelection>,
+                deadline: &Deadline,
+            ) -> NativeResult<RepairTaskObservation> {
+                selection.reverify(self, proof, lock, deadline)?;
+                super::super::super::service::task::repair_probe(
+                    selection.io.clone(),
+                    selection.images.definition.clone(),
+                    deadline,
+                )
+            }
+            pub(crate) fn register_repair_task(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                selection: &Arc<RepairSelection>,
+                permit: &Arc<super::repair_archive::RepairMutationPermit>,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                selection.reverify(self, proof, lock, deadline)?;
+                permit.reverify(self, proof, lock, selection, deadline)?;
+                let binding = Arc::new(RepairTaskBinding {
+                    selection: selection.clone(),
+                    lease: lock.0.clone(),
+                    permit: permit.clone(),
+                    change: Change::new(),
+                });
+                super::super::super::service::task::repair_register(binding, deadline)
+            }
+            fn repair_own_image(
+                &self,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<RepairRead<SelfImagePin>> {
+                use windows_sys::Win32::System::Threading::{
+                    GetCurrentProcess, QueryFullProcessImageNameW,
+                };
+                let budget = proof.budget(self, deadline)?;
+                let context = self.context.clone();
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    Ok(repair_readonly_diagnostic(|| {
+                        context.validate(&budget)?;
+                        let mut buffer = vec![0u16; 32768];
+                        let mut size = buffer.len() as u32;
+                        // SAFETY: this process's pseudo-handle only; query own executing module path, no PID lookup.
+                        if unsafe {
+                            QueryFullProcessImageNameW(
+                                GetCurrentProcess(),
+                                0,
+                                buffer.as_mut_ptr(),
+                                &mut size,
+                            )
+                        } == 0
+                        {
+                            return Err(native::last_error());
+                        }
+                        let path = String::from_utf16(&buffer[..size as usize])
+                            .map_err(|_| NativeError::Unavailable)?;
+                        let (parent, leaf) =
+                            path.rsplit_once('\\').ok_or(NativeError::Unsupported)?;
+                        let parent = Arc::new(
+                            Anchor::open(parent, &context.security, false, &budget)?
+                                .ok_or(NativeError::Missing)?,
+                        );
+                        let image = parent.open_image(
+                            leaf,
+                            false,
+                            env!("CARGO_PKG_VERSION"),
+                            &context.security,
+                            &budget,
+                        )?;
+                        Ok(Some(SelfImagePin(Arc::new(OwnImage {
+                            target: context.target.nonce,
+                            parent,
+                            leaf: leaf.into(),
+                            image,
+                        }))))
+                    }))
+                })
+            }
+            fn repair_agent_observation(
+                &self,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<RepairRead<AgentObservation>> {
+                let budget = proof.budget(self, deadline)?;
+                let context = self.context.clone();
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    Ok(repair_readonly_diagnostic(|| {
+                        context.validate(&budget)?;
+                        let runtime = Arc::new(
+                            Anchor::open(
+                                &format!("{}\\Crosspane\\runtime", context.target.paths.local()),
+                                &context.security,
+                                true,
+                                &budget,
+                            )?
+                            .ok_or(NativeError::Missing)?,
+                        );
+                        let install = Arc::new(
+                            Anchor::open(
+                                context.target.paths.install(),
+                                &context.security,
+                                false,
+                                &budget,
+                            )?
+                            .ok_or(NativeError::Missing)?,
+                        );
+                        let runtime_canonical =
+                            runtime.canonical_dos_path(&context.security, &budget)?;
+                        let image_canonical = std::path::PathBuf::from(
+                            install.canonical_dos_path(&context.security, &budget)?,
+                        )
+                        .join("crosspane-agent.exe")
+                        .to_str()
+                        .ok_or(NativeError::Unsupported)?
+                        .to_owned();
+                        let (image, image_identity) = install.open_file_metadata(
+                            &PrivateName::new("crosspane-agent.exe")?,
+                            &context.security,
+                            &budget,
+                        )?;
+                        let (_, bytes) = runtime
+                            .read_private(
+                                &PrivateName::new("bootstrap.json")?,
+                                &context.security,
+                                crate::agent_contract::MAX_RESPONSE_BYTES,
+                                &budget,
+                            )?
+                            .ok_or(NativeError::Missing)?;
+                        let bootstrap = crate::agent_contract::parse_bootstrap(&bytes)
+                            .map_err(|_| NativeError::Invalid)?;
+                        if process::literal_path(&bootstrap.runtime_dir)?
+                            != process::literal_path(
+                                runtime_canonical.to_str().ok_or(NativeError::Unsupported)?,
+                            )?
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                        process::bootstrap_matches(&bootstrap, &bootstrap)?;
+                        let process = process::selected::SelectedProcess::admit(
+                            &bootstrap,
+                            &context.target.identity,
+                            &image_canonical,
+                            image_identity,
+                            &budget,
+                        )?;
+                        budget.check()?;
+                        Ok(Some(AgentObservation(Arc::new(AgentObservationData {
+                            target: context.target.nonce,
+                            runtime,
+                            install,
+                            runtime_canonical,
+                            image_canonical,
+                            image,
+                            image_identity,
+                            process,
+                            phase_seq: std::sync::atomic::AtomicU64::new(bootstrap.phase_seq),
+                            bootstrap,
+                        }))))
+                    }))
+                })
+            }
+        }
+    }
+    #[cfg(not(test))]
+    pub(crate) use repair_probe::{RepairProbe, RepairSelection, RepairTaskBinding};
+
     #[cfg(not(test))]
     mod removal_io {
         use super::super::super::{
@@ -3419,6 +5652,7 @@ mod adapter {
         }
         fn exclusion(context: &Context, lease: &LockState, budget: &Deadline) -> NativeResult<()> {
             validate_payload_lock(context, lease, budget)?;
+            super::repair_archive::refuse_active_repair(context, lease, budget)?;
             let catalog = lease.parent.read_private(
                 &records::RecordName::StageCatalog.file_name()?,
                 &context.security,
@@ -5037,6 +7271,7 @@ mod adapter {
                 deadline: &Deadline,
             ) -> NativeResult<Option<FileRecoverySeal>> {
                 self.lock_binding(proof, lock, deadline)?;
+                self.refuse_unsettled_repair(proof, lock, deadline)?;
                 let io = self.clone();
                 let context = self.context.clone();
                 let lease = lock.0.clone();
@@ -7437,6 +9672,7 @@ mod adapter {
                 },
             };
             self.verify_stop_lock(proof, lock, deadline)?;
+            self.refuse_unsettled_repair(proof, lock, deadline)?;
             let module = self.self_image(proof, deadline)?;
             let own = self.own_process_identity(proof, deadline)?;
             let inventory = ApprovedInventory::embedded()?;
@@ -8848,6 +11084,57 @@ mod adapter {
                 deadline.check()
             }
         }
+        // A6 actual read-only namespace hold. Copies must already be positively absent;
+        // no process/tree completion, cleanup/delete routine or image/start approval is exposed.
+        pub(super) struct RepairNamespaceHold(Arc<ExclusiveKeeperNamespace>);
+        pub(super) fn reserve_repair_namespace(
+            io: Arc<WindowsNativeIo>,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<RepairNamespaceHold> {
+            ExclusiveKeeperNamespace::reserve(io, proof, deadline).map(RepairNamespaceHold)
+        }
+        impl RepairNamespaceHold {
+            pub(super) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.0.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                self.0.reverify(proof, deadline)
+            }
+            pub(super) fn reverify_bound(
+                &self,
+                context: &Context,
+                budget: &Deadline,
+            ) -> NativeResult<()> {
+                if self.0.io.context.target.nonce != context.target.nonce {
+                    return Err(NativeError::Foreign);
+                }
+                context.validate(budget)?;
+                self.0.own.reverify(budget)?;
+                let mut flags = 0;
+                // SAFETY: actual retained FIRST_INSTANCE pipe object, bounded read-only query;
+                // no client, recorded handle, PID/name reconstruction or kernel mutation.
+                if unsafe {
+                    GetNamedPipeInfo(
+                        self.0.pipe.as_raw_handle(),
+                        &mut flags,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                } == 0
+                    || flags & PIPE_SERVER_END == 0
+                {
+                    return Err(NativeError::Foreign);
+                }
+                budget.check()
+            }
+        }
         /// Actual original process EXIT, cleanup only. Never a tree/start/Stop capability.
         pub(crate) struct SettledKeeperCopy {
             io: Arc<WindowsNativeIo>,
@@ -8971,6 +11258,7 @@ mod adapter {
                 self, OperationRecord, OriginalLeaf, Phase,
             };
             io.lock_binding(proof, lock, deadline)?;
+            io.refuse_unsettled_repair(proof, lock, deadline)?;
             let record =
                 OuterUpgradeRecord::read(io, proof, deadline)?.ok_or(NativeError::Foreign)?;
             record.context().same_user(io.target().identity())?;
