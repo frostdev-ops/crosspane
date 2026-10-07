@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- d474f300/34ffc957: official sample order; no restore or installed-kit fallback.
+       Imported explicitly before Cpp.Default.props; automatic ancestor imports disabled. -->
+  <PropertyGroup>
+    <CrosspanePackageRoot>C:\Users\Public\crosspane-w31a-pkgs\</CrosspanePackageRoot>
+    <CrosspaneWdkRoot>$(CrosspanePackageRoot)Microsoft.Windows.WDK.x64.10.0.26100.6584\c\</CrosspaneWdkRoot>
+    <CrosspaneSdkRoot>$(CrosspanePackageRoot)Microsoft.Windows.SDK.CPP.10.0.26100.6584\c\</CrosspaneSdkRoot>
+    <CrosspaneSdkLibRoot>$(CrosspanePackageRoot)Microsoft.Windows.SDK.CPP.x64.10.0.26100.6584\c\</CrosspaneSdkLibRoot>
+  </PropertyGroup>
+  <Import Project="C:\Users\Public\crosspane-w31a-pkgs\Microsoft.Windows.WDK.x64.10.0.26100.6584\build\native\Microsoft.Windows.WDK.x64.props" />
+  <Import Project="C:\Users\Public\crosspane-w31a-pkgs\Microsoft.Windows.SDK.CPP.x64.10.0.26100.6584\build\native\Microsoft.Windows.SDK.cpp.x64.props" />
+  <Import Project="C:\Users\Public\crosspane-w31a-pkgs\Microsoft.Windows.SDK.CPP.10.0.26100.6584\build\native\Microsoft.Windows.SDK.cpp.props" />
+</Project>

@@ -1,0 +1,91 @@
+{
+  "schema": 1,
+  "vendored_source": {
+    "repository": "https://github.com/VirtualDrivers/Virtual-Display-Driver",
+    "commit": "d437ebc9b44a14ce6e5cc9c8b7f6beb08d6faf77",
+    "tree": "17399bc1c0e78237cc40cc30147516fd12b787c0",
+    "license": "MIT",
+    "original_files": [
+      {
+        "upstream_path": "Virtual Display Driver (HDR)/MttVDD/MttVDD.inf",
+        "bytes": 4200,
+        "sha256": "c2e5a5b34d840b77977c82fed9a2ed9036a71dfd257ec0d7b1bb9b84516aa523",
+        "git_blob": "e6ba858c27a290845db0c2e9a8e5c3547ff05e64"
+      },
+      {
+        "upstream_path": "Virtual Display Driver (HDR)/MttVDD/MttVDD.vcxproj",
+        "bytes": 18351,
+        "sha256": "3e1c0028a2ca9d39892a5e0f38f89e3a93e5831ff196cc670aacbc7a5b7a6a6a",
+        "git_blob": "add0b2cefea60a6be31f1964d823644dd62dc1fa"
+      },
+      {
+        "upstream_path": "Virtual Display Driver (HDR)/MttVDD/Driver.cpp",
+        "bytes": 102680,
+        "sha256": "d320a69bb13f7ba7e79adbb03c999c41a09948c5d17ecf3e1ed55aacc1d8df0b",
+        "git_blob": "3012b5639cc78cbbf497f6fada4948583a5cd6f3"
+      },
+      {
+        "upstream_path": "Virtual Display Driver (HDR)/MttVDD/Driver.h",
+        "bytes": 2907,
+        "sha256": "9d62afc9c8f2678aaad68f9d9f5dfd2279cd3a4111afe737795888ba4d00ab95",
+        "git_blob": "17be5b3247795ee5c2a7ed07575f5cadc8782e89"
+      },
+      {
+        "upstream_path": "LICENSE",
+        "bytes": 1072,
+        "sha256": "c2285c867ddc9b88f43b4f8fa2c77a9eec66207166c1217b37353a2ccd62ac03",
+        "git_blob": "1c09fa8f74f33c46046b942c913f6c69709d2ba9"
+      },
+      {
+        "upstream_path": "Virtual Display Driver (HDR)/MttVDD/Trace.h",
+        "bytes": 1959,
+        "sha256": "3eca4dd904e24723e6c47546d91a7eb91f2c3e06323fb5a152c74174acd0f2d1",
+        "git_blob": "c16559013ad9c26f9295936375cf4ef93aa447c5"
+      }
+    ]
+  },
+  "modification_map": {
+    "Virtual Display Driver (HDR)/MttVDD/Driver.cpp": [
+      "src/Driver.cpp",
+      "src/Control.cpp",
+      "src/Monitor.cpp"
+    ],
+    "Virtual Display Driver (HDR)/MttVDD/Driver.h": [
+      "src/Driver.h",
+      "src/Control.h",
+      "src/Monitor.h"
+    ],
+    "Virtual Display Driver (HDR)/MttVDD/Trace.h": [
+      "src/Trace.h"
+    ],
+    "Virtual Display Driver (HDR)/MttVDD/MttVDD.vcxproj": [
+      "CrosspaneIdd.vcxproj"
+    ],
+    "Virtual Display Driver (HDR)/MttVDD/MttVDD.inf": [
+      "CrosspaneIdd.inf"
+    ]
+  },
+  "new_original_components": [
+    "include/crosspane_idd_v1.h",
+    "src/Lease.cpp",
+    "src/Lease.h",
+    "src/Edid.cpp",
+    "src/Edid.h",
+    "tests/abi_lease_tests.cpp",
+    "scripts/build.ps1",
+    "Directory.Build.props"
+  ],
+  "reference_only": {
+    "repository": "https://github.com/microsoft/Windows-driver-samples",
+    "commit": "d5569c08aa2818c6240744bb47a00f67f20fdb54",
+    "path": "video/IndirectDisplay/IddSampleDriver",
+    "license": "MS-PL",
+    "sample_bodies_copied": false,
+    "contracts": [
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/iddcx/nc-iddcx-evt_idd_cx_monitor_assign_swapchain",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/iddcx/nc-iddcx-evt_idd_cx_monitor_unassign_swapchain"
+    ],
+    "license_sha256": "07639618c7b94ab9953cc61715f6325877e1854dca611ed9b1bd54497cf5e93a"
+  },
+  "implementation_status": "in progress; native build/load not established"
+}

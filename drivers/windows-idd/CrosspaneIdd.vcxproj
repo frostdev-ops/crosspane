@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{5F7AC468-079B-4DF4-A5B1-A6E0903AB3CD}</ProjectGuid>
+    <RootNamespace>CrosspaneIdd</RootNamespace>
+    <ProjectName>CrosspaneIdd</ProjectName>
+    <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+    <VCTargetsPath>C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Microsoft\VC\v170\</VCTargetsPath>
+    <VCToolsVersion>14.44.35207</VCToolsVersion>
+    <PreferredToolArchitecture>x64</PreferredToolArchitecture>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <ImportDirectoryBuildProps>false</ImportDirectoryBuildProps>
+    <ImportDirectoryBuildTargets>false</ImportDirectoryBuildTargets>
+    <CrosspaneNativeSourceReviewed Condition="'$(CrosspaneNativeSourceReviewed)' == ''">false</CrosspaneNativeSourceReviewed>
+  </PropertyGroup>
+  <Import Project="$(MSBuildThisFileDirectory)Directory.Build.props" />
+  <Import Project="$(VCTargetsPath)Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset>WindowsUserModeDriver10.0</PlatformToolset>
+    <DriverType>UMDF</DriverType>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <TargetVersion>Windows10</TargetVersion>
+    <_NT_TARGET_VERSION>0xA000010</_NT_TARGET_VERSION>
+    <UmdfVersion>2.25</UmdfVersion>
+    <UMDF_VERSION_MAJOR>2</UMDF_VERSION_MAJOR>
+    <UMDF_VERSION_MINOR>25</UMDF_VERSION_MINOR>
+    <UMDF_MINIMUM_VERSION_REQUIRED>25</UMDF_MINIMUM_VERSION_REQUIRED>
+    <IndirectDisplayDriver>true</IndirectDisplayDriver>
+    <IDDCX_VERSION_MAJOR>1</IDDCX_VERSION_MAJOR>
+    <IDDCX_VERSION_MINOR>10</IDDCX_VERSION_MINOR>
+    <IDDCX_MINIMUM_VERSION_REQUIRED>10</IDDCX_MINIMUM_VERSION_REQUIRED>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+    <SignMode>Off</SignMode>
+    <!-- 9e9e: test builds only; distribution mitigation is W4.2. The shim assigns
+         SpectreMitigation from Driver_SpectreMitigation, so freeze both. -->
+    <Driver_SpectreMitigation>false</Driver_SpectreMitigation>
+    <SpectreMitigation>false</SpectreMitigation>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <TargetName>CrosspaneIdd</TargetName>
+    <TargetExt>.dll</TargetExt>
+    <SignMode>Off</SignMode>
+    <EnableTestSign>false</EnableTestSign>
+    <GenerateTestCertificate>false</GenerateTestCertificate>
+    <!-- LEAD167d8fa1: catalog generation belongs to W4.1c/W4.2 signing. -->
+    <EnableInf2cat>false</EnableInf2cat>
+    <Driver_SpectreMitigation>false</Driver_SpectreMitigation>
+    <SpectreMitigation>false</SpectreMitigation>
+    <RunCodeAnalysis>true</RunCodeAnalysis>
+    <CodeAnalysisVSInstallDir>C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\</CodeAnalysisVSInstallDir>
+    <CodeAnalysisRuleSet>$(CrosspaneWdkRoot)CodeAnalysis\DriverRecommendedRules.ruleset</CodeAnalysisRuleSet>
+    <OutDir>$(CrosspaneBuildRoot)bin\</OutDir>
+    <IntDir>$(CrosspaneBuildRoot)obj\</IntDir>
+    <PackageDir>$(CrosspaneBuildRoot)package\</PackageDir>
+    <!-- Seal search paths after standard UMDF props; no inherited INCLUDE/LIB,
+         installed Windows Kits, NETFX, user property sheets or arbitrary payload. -->
+    <IncludePath>$(ProjectDir)include;$(ProjectDir)src;$(VCToolsInstallDir)include;$(CrosspaneSdkRoot)Include\10.0.26100.0\ucrt;$(CrosspaneSdkRoot)Include\10.0.26100.0\shared;$(CrosspaneSdkRoot)Include\10.0.26100.0\um;$(CrosspaneWdkRoot)Include\10.0.26100.0\shared;$(CrosspaneWdkRoot)Include\10.0.26100.0\um;$(CrosspaneWdkRoot)Include\wdf\umdf\2.25;$(CrosspaneWdkRoot)Include\10.0.26100.0\um\iddcx\1.10</IncludePath>
+    <LibraryPath>$(VCToolsInstallDir)lib\onecore\x64;$(VCToolsInstallDir)lib\x64;$(CrosspaneSdkLibRoot)um\x64;$(CrosspaneSdkLibRoot)ucrt\x64;$(CrosspaneWdkRoot)lib\10.0.26100.0\um\x64;$(CrosspaneWdkRoot)lib\wdf\umdf\x64\2.25;$(CrosspaneWdkRoot)lib\10.0.26100.0\um\x64\iddcx\1.10</LibraryPath>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <MultiProcessorCompilation>false</MultiProcessorCompilation>
+      <WppEnabled>false</WppEnabled>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <PreprocessorDefinitions>IDDCX_VERSION_MAJOR=$(IDDCX_VERSION_MAJOR);IDDCX_VERSION_MINOR=$(IDDCX_VERSION_MINOR);IDDCX_MINIMUM_VERSION_REQUIRED=$(IDDCX_MINIMUM_VERSION_REQUIRED);NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)src</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(CrosspaneSdkLibRoot)um\x64\d3d11.lib;$(CrosspaneSdkLibRoot)um\x64\dxgi.lib;$(CrosspaneSdkLibRoot)um\x64\ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <TreatLinkerWarningAsErrors>true</TreatLinkerWarningAsErrors>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+    <PreBuildEvent><Command></Command></PreBuildEvent>
+    <PreLinkEvent><Command></Command></PreLinkEvent>
+    <PostBuildEvent><Command></Command></PostBuildEvent>
+    <Inf><CopyOutput>$(IntDir)CrosspaneIdd.inf</CopyOutput></Inf>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="src\Driver.cpp" />
+    <ClCompile Include="src\Control.cpp" />
+    <ClCompile Include="src\Monitor.cpp" />
+    <ClCompile Include="src\Lease.cpp" />
+    <ClCompile Include="src\Edid.cpp" />
+    <ClInclude Include="include\crosspane_idd_v1.h" />
+    <ClInclude Include="src\Driver.h" />
+    <ClInclude Include="src\Control.h" />
+    <ClInclude Include="src\Monitor.h" />
+    <ClInclude Include="src\Lease.h" />
+    <ClInclude Include="src\Edid.h" />
+    <ClInclude Include="src\Trace.h" />
+    <Inf Include="CrosspaneIdd.inf" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)Microsoft.Cpp.targets" />
+  <Import Project="C:\Users\Public\crosspane-w31a-pkgs\Microsoft.Windows.SDK.CPP.10.0.26100.6584\build\native\Microsoft.Windows.SDK.cpp.targets" />
+  <!-- Original Microsoft Telemetry/Telemetry_Packaging targets are intentionally
+       retained under d474f300; no inferred opt-out or target replacement. -->
+  <Target Name="CrosspaneValidateFrozenBuild" BeforeTargets="PrepareForBuild;ClCompile;Link;DriverPackageTarget">
+    <Error Condition="'$(CrosspaneNativeSourceReviewed)' != 'true'" Text="Crosspane native source checkpoint is not released for a driver build." />
+    <Error Condition="'$(Configuration)' != 'Release' or '$(Platform)' != 'x64' or '$(PlatformToolset)' != 'WindowsUserModeDriver10.0' or '$(IsUserModeToolset)' != 'true'" Text="Unsupported Crosspane configuration or driver toolset." />
+    <Error Condition="'$(VCToolsVersion)' != '14.44.35207' or '$(VCTargetsPath)' != 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Microsoft\VC\v170\'" Text="Crosspane compiler/toolset baseline drift." />
+    <Error Condition="'$(WDKContentRoot)' != '$(CrosspaneWdkRoot)' or '$(WDK_NuGet)' != 'true' or '$(TargetPlatformSdkRootOverride)\' != '$(CrosspaneSdkRoot)' or '$(winsdk_cpp_x64_root)\' != '$(CrosspaneSdkLibRoot)'" Text="Crosspane kit roots must resolve to the frozen local NuGet packages." />
+    <Error Condition="'$(WindowsTargetPlatformVersion)' != '10.0.26100.0' or '$(TargetPlatformVersion)' != '10.0.26100.0' or '$(WDKBuildFolder)' != '10.0.26100.0'" Text="Crosspane kit build-version drift." />
+    <Error Condition="'$(UmdfVersion)' != '2.25' or '$(UMDF_MINIMUM_VERSION_REQUIRED)' != '25' or '$(IDDCX_VERSION_MAJOR)' != '1' or '$(IDDCX_VERSION_MINOR)' != '10' or '$(IDDCX_MINIMUM_VERSION_REQUIRED)' != '10'" Text="Crosspane UMDF/IddCx version drift." />
+    <Error Condition="'$(SignMode)' != 'Off' or '$(GenerateTestCertificate)' != 'false' or '$(EnableTestSign)' != 'false' or '$(EnableInf2cat)' != 'false' or '$(Driver_SpectreMitigation)' != 'false' or '$(SpectreMitigation)' != 'false'" Text="Crosspane unsigned test-build properties drifted." />
+    <Error Condition="'$(CrosspaneBuildRoot)' == '' or '$(OutDir)' != '$(CrosspaneBuildRoot)bin\' or '$(IntDir)' != '$(CrosspaneBuildRoot)obj\' or '$(PackageDir)' != '$(CrosspaneBuildRoot)package\'" Text="Crosspane build outputs require the fixed script's own target directory." />
+  </Target>
+</Project>

@@ -1,0 +1,74 @@
+; Crosspane IddCx twin driver development INF. Not installed by build.ps1.
+; Fork provenance/notices: UPSTREAM.json, NOTICE.md and LICENSE.
+; Device-object properties are per-device DDInstall.HW entries, never class-wide.
+
+[Version]
+Signature="$Windows NT$"
+Class=Display
+ClassGuid={4D36E968-E325-11CE-BFC1-08002BE10318}
+ClassVer=2.0
+Provider=%ProviderName%
+CatalogFile=CrosspaneIdd.cat
+DriverVer=10/06/2026,0.1.0.0
+PnpLockdown=1
+
+[Manufacturer]
+%ProviderName%=CrosspaneModels,NTamd64.10.0...26100
+
+[CrosspaneModels.NTamd64.10.0...26100]
+%DeviceName%=CrosspaneTwin, Crosspane\IddTwinV1
+
+[SourceDisksNames]
+1=%DiskName%
+
+[SourceDisksFiles]
+CrosspaneIdd.dll=1
+
+[DestinationDirs]
+CrosspaneBinary=13
+
+[CrosspaneBinary]
+CrosspaneIdd.dll
+
+[CrosspaneTwin.NT]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT
+CopyFiles=CrosspaneBinary
+
+[CrosspaneTwin.NT.HW]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.HW
+AddReg=CrosspaneHardware
+
+[CrosspaneHardware]
+HKR,,UpperFilters,0x00010000,"IndirectKmd"
+; UMDF has no WdfDeviceInitSetDeviceType: the frozen IOCTL DeviceType is set here.
+HKR,,DeviceType,0x00010001,0x8337
+; FILE_DEVICE_SECURE_OPEN, including namespace suffixes (also refused in FileCreate).
+HKR,,DeviceCharacteristics,0x00010001,0x100
+HKR,,Exclusive,0x00010001,0
+; Protected device DACL: network and anonymous deny; local interactive read/write.
+; IU includes interactive RDP users; this is the admitted/documented v1 limitation.
+HKR,,Security,0x00000000,"D:P(D;;GA;;;NU)(D;;GA;;;AN)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)"
+
+[CrosspaneTwin.NT.Services]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.Services
+
+[CrosspaneTwin.NT.Wdf]
+UmdfService=CrosspaneIdd,CrosspaneUmdf
+UmdfServiceOrder=CrosspaneIdd
+UmdfHostProcessSharing=ProcessSharingDisabled
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+UmdfFileObjectPolicy=RejectNullAndUnknownFileObjects
+UmdfMethodNeitherAction=Reject
+
+[CrosspaneUmdf]
+UmdfLibraryVersion=2.25.0
+ServiceBinary=%13%\CrosspaneIdd.dll
+UmdfExtensions=IddCx0102
+
+[Strings]
+ProviderName="Crosspane"
+DeviceName="Crosspane IddCx Twin V1"
+DiskName="Crosspane IddCx development driver"
