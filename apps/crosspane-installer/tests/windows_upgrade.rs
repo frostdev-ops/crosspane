@@ -1970,3 +1970,790 @@ mod a4d_outer {
         assert_eq!(second_port.launches, 0);
     }
 }
+
+/// FILE-only fixtures operate on authored slot observations and the actual production driver.
+/// None constructs a native seal, stop proof, approved old image, handle or installed context.
+mod a4e_files {
+    use super::*;
+    use native_io::identity::{Sid, TokenFacts};
+    use payload::inventory::{ApprovedPe, PayloadRole};
+    use payload::recovery::*;
+    use std::collections::BTreeMap;
+
+    fn stamp(n: u8) -> FileStamp {
+        FileStamp {
+            volume: 7,
+            file: [n; 16],
+        }
+    }
+    fn facts(n: u8) -> PeFacts {
+        PeFacts {
+            size: 4096,
+            sha256: [n; 32],
+            machine: 0x8664,
+            subsystem: 2,
+            version: format!("fixture-{n}"),
+        }
+    }
+    fn sid(parts: &[u32]) -> Sid {
+        let mut b = vec![1, parts.len() as u8, 0, 0, 0, 0, 0, 5];
+        for p in parts {
+            b.extend_from_slice(&p.to_le_bytes());
+        }
+        Sid::from_bytes(b).unwrap()
+    }
+    fn token(old: bool) -> TokenFacts {
+        TokenFacts {
+            user: sid(&[21, 7]),
+            logon: sid(&[5, 9, if old { 11 } else { 12 }]),
+            authentication_id: if old { 17 } else { 18 },
+            session: if old { 2 } else { 3 },
+            elevated: false,
+            integrity: 0x2000,
+            impersonating: false,
+        }
+    }
+    fn outer() -> OuterUpgradeRecord {
+        let value = OuterUpgradeRecord::new(
+            [7; 16],
+            OuterProcessCorrelation::new(101, 200, stamp(70), facts(10)).unwrap(),
+            OuterContextCorrelation::new(&token(true)).unwrap(),
+            [facts(11), facts(12), facts(13)],
+        )
+        .unwrap();
+        let mut json = serde_json::to_value(value).unwrap();
+        json["phase"] = serde_json::json!("committed");
+        json["keeper_image"] = serde_json::to_value(stamp(71)).unwrap();
+        json["keeper"] = serde_json::to_value(
+            OuterProcessCorrelation::new(102, 201, stamp(71), facts(10)).unwrap(),
+        )
+        .unwrap();
+        json["inherited_parent_handle"] = serde_json::json!(64);
+        json["launch_stage"] = serde_json::json!("resumed");
+        let result: OuterUpgradeRecord = serde_json::from_value(json).unwrap();
+        result.validate().unwrap();
+        result
+    }
+    fn new_image(i: usize) -> ImageObservation {
+        ImageObservation {
+            identity: stamp(40 + i as u8),
+            facts: facts(10 + i as u8),
+        }
+    }
+    fn index(role: PayloadRole) -> usize {
+        PayloadRole::ALL.iter().position(|r| *r == role).unwrap()
+    }
+    #[derive(Clone)]
+    struct World {
+        views: [ReopenedRole; 4],
+        fixed_contents: [Option<PeFacts>; 4],
+        original_contents: [PeFacts; 4],
+        copy: bool,
+        catalog: bool,
+        outer: bool,
+        completed: bool,
+        operation: OperationRecord,
+        selection: OuterUpgradeRecord,
+        journal: Option<Vec<u8>>,
+        renames: Vec<(&'static str, PayloadRole)>,
+        terminal_effects: Vec<&'static str>,
+        flushes: usize,
+        writes: usize,
+    }
+    impl World {
+        fn new(forward: bool) -> Self {
+            let mut operation = OperationRecord::new([7; 16]).unwrap();
+            for (i, role) in PayloadRole::ALL.into_iter().enumerate() {
+                let row = operation.role_mut(role).unwrap();
+                row.original = OriginalLeaf::Present(stamp(20 + i as u8));
+                row.staged = Some(new_image(i));
+                if i < if forward { 1 } else { 2 } {
+                    row.backup = Some(stamp(20 + i as u8));
+                    row.published = Some(new_image(i));
+                }
+            }
+            operation.advance(
+                if forward {
+                    Phase::PublishIntent
+                } else {
+                    Phase::BackupIntent
+                },
+                Some(if forward {
+                    PayloadRole::Agent
+                } else {
+                    PayloadRole::Ui
+                }),
+            );
+            let views = std::array::from_fn(|i| {
+                let published = i < if forward { 1 } else { 2 };
+                let moved = i == if forward { 1 } else { 2 };
+                ReopenedRole {
+                    staged: if published {
+                        StageObservation::Missing
+                    } else {
+                        StageObservation::Ready(new_image(i))
+                    },
+                    fixed: if published {
+                        FixedObservation::Published(new_image(i))
+                    } else if moved {
+                        FixedObservation::Missing
+                    } else {
+                        FixedObservation::Original(stamp(20 + i as u8))
+                    },
+                    backup: if published || moved {
+                        Some(stamp(20 + i as u8))
+                    } else {
+                        None
+                    },
+                    unknown_backup: false,
+                }
+            });
+            // Physical contents are separate authored observations, not approval from journal IDs.
+            let original_contents = std::array::from_fn(|i| facts(30 + i as u8));
+            let fixed_contents = std::array::from_fn(|i| match &views[i].fixed {
+                FixedObservation::Original(_) => Some(original_contents[i].clone()),
+                FixedObservation::Published(image) => Some(image.facts.clone()),
+                _ => None,
+            });
+            Self {
+                views,
+                fixed_contents,
+                original_contents,
+                copy: true,
+                catalog: true,
+                outer: true,
+                completed: false,
+                operation,
+                selection: outer(),
+                journal: None,
+                renames: Vec::new(),
+                terminal_effects: Vec::new(),
+                flushes: 0,
+                writes: 0,
+            }
+        }
+        fn plan(&self) -> NativeResult<FileRecoveryJournal> {
+            FileRecoveryJournal::prepare(
+                self.selection.clone(),
+                FileRecordStamp::new(stamp(80), [80; 32])?,
+                &self.operation,
+                FileRecordStamp::new(stamp(81), [81; 32])?,
+                self.views.clone(),
+            )
+        }
+    }
+    struct Port {
+        world: World,
+        status: i32,
+        data: bool,
+        timely: bool,
+        calls: usize,
+        fail: Option<(usize, bool)>,
+    }
+    impl Port {
+        fn new(forward: bool) -> Self {
+            Self {
+                world: World::new(forward),
+                status: 0xC000005Fu32 as i32,
+                data: false,
+                timely: true,
+                calls: 0,
+                fail: None,
+            }
+        }
+        fn before(&mut self) -> NativeResult<()> {
+            self.calls += 1;
+            if self.fail == Some((self.calls, false)) {
+                Err(NativeError::OutcomeUnknown)
+            } else {
+                Ok(())
+            }
+        }
+        fn after(&self) -> NativeResult<()> {
+            if self.fail == Some((self.calls, true)) {
+                Err(NativeError::OutcomeUnknown)
+            } else {
+                Ok(())
+            }
+        }
+        fn journal_copy(&self) -> FileRecoveryJournal {
+            FileRecoveryJournal::decode(self.world.journal.as_ref().unwrap()).unwrap()
+        }
+        fn begin(&mut self) -> NativeResult<FileRecoveryJournal> {
+            let journal = self.world.plan()?;
+            self.renew(&journal)?;
+            self.journal(&journal)?;
+            Ok(journal)
+        }
+        fn intent(
+            &mut self,
+            j: &FileRecoveryJournal,
+            role: PayloadRole,
+            step: FileRecoveryRoleStep,
+        ) -> NativeResult<()> {
+            self.renew(j)?;
+            assert_eq!(j.cursor(), FileRecoveryCursor::Role { role, step });
+            self.before()
+        }
+        fn rename(&mut self, kind: &'static str, role: PayloadRole) {
+            assert!(
+                !self.world.renames.contains(&(kind, role)),
+                "completed rename replayed"
+            );
+            self.world.renames.push((kind, role));
+        }
+        fn terminal(
+            &mut self,
+            j: &FileRecoveryJournal,
+            cursor: FileRecoveryCursor,
+        ) -> NativeResult<()> {
+            self.renew(j)?;
+            assert_eq!(j.cursor(), cursor);
+            self.before()
+        }
+    }
+    impl FileRecoveryPort for Port {
+        fn renew(&mut self, j: &FileRecoveryJournal) -> NativeResult<()> {
+            assert_eq!(
+                file_recovery_prior_logon(&self.world.selection, &token(false))?,
+                Some(17)
+            );
+            native_io::epoch_archive::classify_prior_logon_status(self.status, self.data)?;
+            if !self.timely {
+                return Err(NativeError::Timeout);
+            }
+            j.matches_sources(
+                &self.world.selection,
+                FileRecordStamp::new(stamp(80), [80; 32])?,
+                &self.world.operation,
+                FileRecordStamp::new(stamp(81), [81; 32])?,
+            )?;
+            if !self.world.outer
+                && !matches!(
+                    j.cursor(),
+                    FileRecoveryCursor::OuterRetireIntent | FileRecoveryCursor::Retired
+                )
+            {
+                return Err(NativeError::Foreign);
+            }
+            Ok(())
+        }
+        fn journal(&mut self, j: &FileRecoveryJournal) -> NativeResult<()> {
+            self.renew(j)?;
+            self.before()?;
+            if let Some(bytes) = &self.world.journal {
+                let mut previous = FileRecoveryJournal::decode(bytes)?;
+                previous.same_plan(j)?;
+                previous.advance(j.cursor())?;
+                assert_eq!(previous, *j);
+            }
+            self.world.journal = Some(j.encode()?);
+            self.world.writes += 1;
+            self.after()
+        }
+        fn observe_role(
+            &mut self,
+            j: &FileRecoveryJournal,
+            role: PayloadRole,
+        ) -> NativeResult<ReopenedRole> {
+            self.renew(j)?;
+            Ok(self.world.views[index(role)].clone())
+        }
+        fn return_published(
+            &mut self,
+            j: &FileRecoveryJournal,
+            role: PayloadRole,
+        ) -> NativeResult<()> {
+            self.intent(j, role, FileRecoveryRoleStep::ReturnPublishedIntent)?;
+            let i = index(role);
+            let view = &mut self.world.views[i];
+            assert!(matches!(view.staged, StageObservation::Missing));
+            let FixedObservation::Published(image) = &view.fixed else {
+                panic!("not published");
+            };
+            assert_eq!(Some(image), j.role(role)?.new_image());
+            view.staged = StageObservation::Ready(image.clone());
+            view.fixed = FixedObservation::Missing;
+            self.world.fixed_contents[i] = None;
+            self.rename("return", role);
+            self.after()
+        }
+        fn restore_original(
+            &mut self,
+            j: &FileRecoveryJournal,
+            role: PayloadRole,
+        ) -> NativeResult<()> {
+            self.intent(j, role, FileRecoveryRoleStep::RestoreOriginalIntent)?;
+            let view = &mut self.world.views[index(role)];
+            assert!(matches!(view.fixed, FixedObservation::Missing));
+            let old = view.backup.take().ok_or(NativeError::Foreign)?;
+            assert_eq!(j.role(role)?.original(), OriginalLeaf::Present(old));
+            view.fixed = FixedObservation::Original(old);
+            self.world.fixed_contents[index(role)] =
+                Some(self.world.original_contents[index(role)].clone());
+            self.rename("restore", role);
+            self.after()
+        }
+        fn settle_stage(&mut self, j: &FileRecoveryJournal, role: PayloadRole) -> NativeResult<()> {
+            self.intent(j, role, FileRecoveryRoleStep::SettleStageIntent)?;
+            assert!(
+                matches!(&self.world.views[index(role)].staged,StageObservation::Ready(image) if Some(image)==j.role(role).unwrap().new_image())
+            );
+            self.world.flushes += 1;
+            self.after()
+        }
+        fn backup_original(
+            &mut self,
+            j: &FileRecoveryJournal,
+            role: PayloadRole,
+        ) -> NativeResult<()> {
+            self.intent(j, role, FileRecoveryRoleStep::BackupOriginalIntent)?;
+            let view = &mut self.world.views[index(role)];
+            assert!(view.backup.is_none());
+            let FixedObservation::Original(id) = view.fixed else {
+                panic!("not original");
+            };
+            assert_eq!(j.role(role)?.original(), OriginalLeaf::Present(id));
+            view.backup = Some(id);
+            view.fixed = FixedObservation::Missing;
+            self.world.fixed_contents[index(role)] = None;
+            self.rename("backup", role);
+            self.after()
+        }
+        fn publish_stage(
+            &mut self,
+            j: &FileRecoveryJournal,
+            role: PayloadRole,
+        ) -> NativeResult<()> {
+            self.intent(j, role, FileRecoveryRoleStep::PublishStageIntent)?;
+            let view = &mut self.world.views[index(role)];
+            assert!(matches!(view.fixed, FixedObservation::Missing));
+            let StageObservation::Ready(image) = &view.staged else {
+                panic!("no stage");
+            };
+            assert_eq!(Some(image), j.role(role)?.new_image());
+            self.world.fixed_contents[index(role)] = Some(image.facts.clone());
+            self.world.flushes += 1;
+            view.fixed = FixedObservation::Published(image.clone());
+            view.staged = StageObservation::Missing;
+            self.rename("publish", role);
+            self.after()
+        }
+        fn cleanup_keeper_copy(&mut self, j: &FileRecoveryJournal) -> NativeResult<()> {
+            self.terminal(j, FileRecoveryCursor::CopyDeleteIntent)?;
+            if self.world.copy {
+                self.world.copy = false;
+                self.world.terminal_effects.push("copy");
+            }
+            self.after()
+        }
+        fn retire_catalog(&mut self, j: &FileRecoveryJournal) -> NativeResult<()> {
+            self.terminal(j, FileRecoveryCursor::CatalogRetireIntent)?;
+            assert!(!self.world.copy);
+            assert!(!self.world.completed);
+            if self.world.catalog {
+                self.world.catalog = false;
+                self.world.terminal_effects.push("catalog");
+            }
+            self.after()
+        }
+        fn retire_outer(&mut self, j: &FileRecoveryJournal) -> NativeResult<()> {
+            self.terminal(j, FileRecoveryCursor::OuterRetireIntent)?;
+            assert!(!self.world.copy && !self.world.catalog);
+            assert!(!self.world.completed);
+            if self.world.outer {
+                self.world.outer = false;
+                self.world.terminal_effects.push("outer");
+            }
+            self.after()
+        }
+        fn observe_terminal(&mut self, j: &FileRecoveryJournal) -> NativeResult<()> {
+            self.renew(j)?;
+            if self.world.copy || self.world.catalog || self.world.outer || self.world.completed {
+                Err(NativeError::Foreign)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    fn assert_targets(p: &Port, forward: bool) {
+        for (i, view) in p.world.views.iter().enumerate() {
+            if forward {
+                assert_eq!(view.fixed, FixedObservation::Published(new_image(i)));
+                assert_eq!(view.staged, StageObservation::Missing);
+                assert_eq!(view.backup, Some(stamp(20 + i as u8)));
+            } else {
+                assert_eq!(view.fixed, FixedObservation::Original(stamp(20 + i as u8)));
+                assert_eq!(view.staged, StageObservation::Ready(new_image(i)));
+                assert!(view.backup.is_none());
+            }
+        }
+        assert!(!p.world.copy && !p.world.catalog && !p.world.outer && !p.world.completed);
+    }
+    /// Independent fresh-build approval and the existing a4c lifecycle driver are separate from
+    /// FILE convergence. These authored image approvals are never derived from old opaque IDs.
+    struct FreshEpoch {
+        approved: [ApprovedPe; 4],
+        views: [ReopenedRole; 4],
+        fixed_contents: [Option<PeFacts>; 4],
+        events: Vec<&'static str>,
+    }
+    impl service::supervisor::InitialEpochPort for FreshEpoch {
+        type Child = u8;
+        type Ready = u8;
+        fn prepare_epoch(&mut self) -> NativeResult<()> {
+            for (i, expected) in self.approved.iter().enumerate() {
+                if expected.role() != PayloadRole::ALL[i]
+                    || !expected.facts().valid()
+                    || !matches!(
+                        self.views[i].fixed,
+                        FixedObservation::Original(_) | FixedObservation::Published(_)
+                    )
+                    || self.fixed_contents[i].as_ref() != Some(expected.facts())
+                {
+                    return Err(NativeError::Foreign);
+                }
+            }
+            self.events.push("fresh approval/disposition");
+            Ok(())
+        }
+        fn create(&mut self) -> NativeResult<u8> {
+            assert_eq!(self.events.len(), 1);
+            self.events.push("create");
+            Ok(1)
+        }
+        fn await_ready(&mut self, _: &u8) -> NativeResult<u8> {
+            self.events.push("actual authored Ready");
+            Ok(2)
+        }
+        fn publish_running(&mut self, _: &u8) -> NativeResult<()> {
+            self.events.push("Bound");
+            Ok(())
+        }
+    }
+    fn independent_epoch(world: &World, forward: bool) -> NativeResult<()> {
+        let mut fresh = FreshEpoch {
+            approved: std::array::from_fn(|i| {
+                ApprovedPe::fixture(
+                    PayloadRole::ALL[i],
+                    facts(if forward { 10 + i as u8 } else { 30 + i as u8 }),
+                )
+            }),
+            views: world.views.clone(),
+            fixed_contents: world.fixed_contents.clone(),
+            events: Vec::new(),
+        };
+        let result = service::supervisor::initialize_epoch(&mut fresh);
+        if result.is_err() {
+            assert!(fresh.events.is_empty());
+            return result.map(|_| ());
+        }
+        assert_eq!(result, Ok(2));
+        assert_eq!(
+            fresh.events,
+            [
+                "fresh approval/disposition",
+                "create",
+                "actual authored Ready",
+                "Bound"
+            ]
+        );
+        Ok(())
+    }
+    fn interrupted_matrix(forward: bool) {
+        let mut baseline = Port::new(forward);
+        let mut j = baseline.begin().unwrap();
+        assert_eq!(
+            recover_file_only(&mut baseline, &mut j).unwrap(),
+            if forward {
+                FileRecoveryDecision::FilesForwardComplete
+            } else {
+                FileRecoveryDecision::FilesRestored
+            }
+        );
+        let count = baseline.calls;
+        assert_targets(&baseline, forward);
+        for point in 1..=count {
+            for after in [false, true] {
+                let mut port = Port::new(forward);
+                port.fail = Some((point, after));
+                let result = port
+                    .begin()
+                    .and_then(|mut journal| recover_file_only(&mut port, &mut journal));
+                assert_eq!(
+                    result,
+                    Err(NativeError::OutcomeUnknown),
+                    "point {point}, after {after}"
+                );
+                let world = port.world.clone();
+                let mut reopened = Port {
+                    world,
+                    status: port.status,
+                    data: false,
+                    timely: true,
+                    calls: 0,
+                    fail: None,
+                };
+                let mut journal = match &reopened.world.journal {
+                    Some(_) => reopened.journal_copy(),
+                    None => reopened.begin().unwrap(),
+                };
+                let result = recover_file_only(&mut reopened, &mut journal).unwrap();
+                assert_eq!(
+                    result,
+                    if forward {
+                        FileRecoveryDecision::FilesForwardComplete
+                    } else {
+                        FileRecoveryDecision::FilesRestored
+                    }
+                );
+                assert_targets(&reopened, forward);
+                independent_epoch(&reopened.world, forward).unwrap();
+                assert_eq!(
+                    reopened.world.terminal_effects,
+                    ["copy", "catalog", "outer"]
+                );
+            }
+        }
+    }
+    #[test]
+    fn mid_backup_rolls_back_files_before_independent_a4c_start() {
+        interrupted_matrix(false);
+        let mut p = Port::new(false);
+        // A missing original remains missing after rollback; it never becomes an approved image.
+        p.world
+            .operation
+            .role_mut(PayloadRole::Ctl)
+            .unwrap()
+            .original = OriginalLeaf::Missing;
+        p.world.views[3].fixed = FixedObservation::Missing;
+        p.world.fixed_contents[3] = None;
+        let mut journal = p.begin().unwrap();
+        assert_eq!(
+            recover_file_only(&mut p, &mut journal),
+            Ok(FileRecoveryDecision::FilesRestored)
+        );
+        assert_eq!(p.world.views[3].fixed, FixedObservation::Missing);
+        assert_eq!(
+            independent_epoch(&p.world, false),
+            Err(NativeError::Foreign)
+        );
+    }
+    #[test]
+    fn mid_publish_finishes_files_before_independent_a4c_start() {
+        interrupted_matrix(true);
+        let mut repaired = Port::new(true);
+        let mut journal = repaired.begin().unwrap();
+        recover_file_only(&mut repaired, &mut journal).unwrap();
+        independent_epoch(&repaired.world, true).unwrap();
+        repaired.world.fixed_contents[0] = Some(facts(99));
+        assert_eq!(
+            independent_epoch(&repaired.world, true),
+            Err(NativeError::Foreign)
+        );
+        for case in 0..5 {
+            let mut p = Port::new(true);
+            match case {
+                0 => p.world.views[2].staged = StageObservation::Missing,
+                1 => p.world.views[2].staged = StageObservation::Unknown,
+                2 => p.world.views[2].staged = StageObservation::Ready(new_image(3)),
+                3 => p.world.views[2].backup = Some(stamp(22)),
+                _ => p.world.views[0].staged = StageObservation::Ready(new_image(0)),
+            }
+            assert!(p.begin().is_err());
+            assert_eq!(p.world.writes, 0);
+            assert!(p.world.renames.is_empty());
+        }
+    }
+    #[test]
+    fn still_live_prior_logon_refuses_before_any_file_or_journal_effect() {
+        let mut p = Port::new(false);
+        p.status = 0;
+        p.data = true;
+        assert!(p.begin().is_err());
+        assert_eq!(p.world.writes, 0);
+        assert!(p.world.renames.is_empty());
+        assert_eq!(
+            file_recovery_prior_logon(&p.world.selection, &token(true)),
+            Ok(None)
+        );
+        let mut reused = token(false);
+        reused.authentication_id = 17;
+        assert_eq!(
+            file_recovery_prior_logon(&p.world.selection, &reused),
+            Err(NativeError::Foreign)
+        );
+        reused = token(false);
+        reused.logon = token(true).logon;
+        assert_eq!(
+            file_recovery_prior_logon(&p.world.selection, &reused),
+            Err(NativeError::Foreign)
+        );
+    }
+    #[test]
+    fn missing_or_changed_lineage_never_yields_file_authority() {
+        let mut p = Port::new(false);
+        let journal = p.world.plan().unwrap();
+        assert!(FileRecoveryJournal::decode(b"{}").is_err());
+        assert!(
+            journal
+                .matches_sources(
+                    &p.world.selection,
+                    FileRecordStamp::new(stamp(82), [80; 32]).unwrap(),
+                    &p.world.operation,
+                    FileRecordStamp::new(stamp(81), [81; 32]).unwrap()
+                )
+                .is_err()
+        );
+        assert!(
+            journal
+                .matches_sources(
+                    &p.world.selection,
+                    FileRecordStamp::new(stamp(80), [80; 32]).unwrap(),
+                    &p.world.operation,
+                    FileRecordStamp::new(stamp(81), [82; 32]).unwrap()
+                )
+                .is_err()
+        );
+        // A rewritten same-operation pointer must not take the ordinary current-context bypass
+        // ahead of exact pending source matching. The classifier alone returns None here.
+        let mut rewritten = serde_json::to_value(&p.world.selection).unwrap();
+        rewritten["context"] =
+            serde_json::to_value(OuterContextCorrelation::new(&token(false)).unwrap()).unwrap();
+        let rewritten: OuterUpgradeRecord = serde_json::from_value(rewritten).unwrap();
+        assert_eq!(
+            file_recovery_prior_logon(&rewritten, &token(false)),
+            Ok(None)
+        );
+        assert_eq!(
+            journal
+                .matches_sources(
+                    &rewritten,
+                    journal.outer_record(),
+                    &p.world.operation,
+                    journal.operation_record()
+                )
+                .and_then(|_| file_recovery_prior_logon(&rewritten, &token(false))),
+            Err(NativeError::Foreign)
+        );
+        let mut operation = p.world.operation.clone();
+        operation.set_phase(Phase::Unknown);
+        assert!(
+            journal
+                .matches_sources(
+                    &p.world.selection,
+                    journal.outer_record(),
+                    &operation,
+                    journal.operation_record()
+                )
+                .is_err()
+        );
+        let mut alien = token(false);
+        alien.user = sid(&[21, 99]);
+        assert_eq!(
+            file_recovery_prior_logon(&p.world.selection, &alien),
+            Err(NativeError::Foreign)
+        );
+        let mut body = serde_json::to_value(&journal).unwrap();
+        body["healthy"] = serde_json::json!(true);
+        let bytes =
+            native_io::records::encode_record(&native_io::records::RecordName::FileRecovery, body)
+                .unwrap();
+        assert!(FileRecoveryJournal::decode(&bytes).is_err());
+        p.world.views[2].unknown_backup = true;
+        assert!(p.begin().is_err());
+        assert_eq!(p.world.writes, 0);
+    }
+    #[test]
+    fn denied_ambiguous_or_late_lsa_results_refuse_without_file_effects() {
+        for (status, data, timely) in [
+            (0xC0000022u32 as i32, false, true),
+            (0, false, true),
+            (0xC000005Fu32 as i32, true, true),
+            (0xC000005Fu32 as i32, false, false),
+            (-1, false, true),
+        ] {
+            let mut p = Port::new(true);
+            p.status = status;
+            p.data = data;
+            p.timely = timely;
+            assert!(p.begin().is_err());
+            assert_eq!(p.world.writes, 0);
+            assert!(p.world.renames.is_empty());
+        }
+    }
+    #[test]
+    fn terminal_recovery_is_read_only_and_never_replays_effects() {
+        for forward in [false, true] {
+            let mut p = Port::new(forward);
+            let mut journal = p.begin().unwrap();
+            recover_file_only(&mut p, &mut journal).unwrap();
+            let writes = p.world.writes;
+            let renames = p.world.renames.clone();
+            let effects = p.world.terminal_effects.clone();
+            let mut reopened = p.journal_copy();
+            assert_eq!(reopened.cursor(), FileRecoveryCursor::Retired);
+            recover_file_only(&mut p, &mut reopened).unwrap();
+            assert_eq!(p.world.writes, writes);
+            assert_eq!(p.world.renames, renames);
+            assert_eq!(p.world.terminal_effects, effects);
+            // A new conflicting pointer or changed converged fixed image is not cleared.
+            p.world.outer = true;
+            assert_eq!(
+                recover_file_only(&mut p, &mut reopened),
+                Err(NativeError::Foreign)
+            );
+            assert_eq!(p.world.writes, writes);
+            p.world.outer = false;
+            p.world.views[0].fixed = FixedObservation::Unknown;
+            assert_eq!(
+                recover_file_only(&mut p, &mut reopened),
+                Ok(FileRecoveryDecision::Retained)
+            );
+            assert_eq!(p.world.writes, writes);
+        }
+    }
+    #[test]
+    fn exit_receipt_reads_state_parent_once_and_never_runtime_fallback() {
+        let local = r"C:\fixture\LocalAppData";
+        let state = format!("{local}\\Crosspane");
+        let runtime = format!("{state}\\runtime");
+        let receipt = |id| {
+            serde_json::to_vec(&serde_json::json!({"schema_version":1,"instance_id":id,
+            "stopped_unix_ms":500,"clean":true,"parking":"restored","input_journals_empty":true,"audio_stopped":true})).unwrap()
+        };
+        let mut leaves = BTreeMap::new();
+        leaves.insert(
+            (state.clone(), "last_exit.json".to_string()),
+            receipt(41u64),
+        );
+        leaves.insert((runtime, "last_exit.json".to_string()), receipt(99u64));
+        let mut calls = 0;
+        let bytes = native_io::with_state_exit_receipt(local, |root, leaf| {
+            calls += 1;
+            leaves
+                .get(&(root.to_string(), leaf.to_string()))
+                .cloned()
+                .ok_or(NativeError::Missing)
+        })
+        .unwrap();
+        let parsed = agent_contract::parse_last_exit(&bytes).unwrap();
+        assert_eq!(parsed.instance_id, 41);
+        assert_eq!(parsed.stopped_unix_ms, 500);
+        assert!(parsed.clean);
+        assert_eq!(calls, 1);
+        leaves.remove(&(state, "last_exit.json".to_string()));
+        calls = 0;
+        assert_eq!(
+            native_io::with_state_exit_receipt(local, |root, leaf| {
+                calls += 1;
+                leaves
+                    .get(&(root.to_string(), leaf.to_string()))
+                    .cloned()
+                    .ok_or(NativeError::Missing)
+            }),
+            Err(NativeError::Missing)
+        );
+        assert_eq!(calls, 1);
+    }
+}

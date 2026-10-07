@@ -1000,6 +1000,10 @@ mod native {
         let clock: Arc<dyn native_io::Clock> = Arc::new(MonotonicClock::default());
         let deadline = Deadline::new(30_000, clock.clone(), Cancellation::default())?;
         let io = Arc::new(WindowsNativeIo::current(clock, &deadline)?);
+        // Same-context classification grants no file authority and preserves the original
+        // parent-before-lock order. Cold eligibility is fully reselected under a genuine lock.
+        #[cfg(not(test))]
+        super::super::recover_prior_logon_files_for_entry(&io, &deadline)?;
         drive_entry(&mut Entry {
             io,
             deadline,

@@ -52,6 +52,15 @@ pub enum NativeError {
     OutcomeUnknown,
 }
 pub type NativeResult<T> = Result<T, NativeError>;
+/// Select only the state's fixed exit receipt. The callback receives one exact parent/leaf;
+/// it cannot fall back to runtime or search another directory after a missing receipt.
+pub(crate) fn with_state_exit_receipt<T>(
+    local_root: &str,
+    read: impl FnOnce(&str, &str) -> NativeResult<T>,
+) -> NativeResult<T> {
+    let state = format!("{local_root}\\Crosspane");
+    read(&state, "last_exit.json")
+}
 pub use process::{Cancellation, Clock, Deadline, MonotonicClock};
 
 #[cfg(windows)]
@@ -84,6 +93,9 @@ pub(crate) use adapter::{
 
 #[cfg(all(windows, not(test)))]
 pub(crate) use adapter::{OuterCompletionAdmission, OuterPeerImage};
+
+#[cfg(all(windows, not(test)))]
+pub(crate) use adapter::{FileRecoveryKeeperAbsent, FileRecoveryRoot, FileRecoverySeal};
 
 #[cfg(all(windows, not(test)))]
 pub(crate) use adapter::keeper;
@@ -3109,25 +3121,32 @@ mod adapter {
                 match observed.process.observe_exit(&budget)? {
                     process::selected::ProcessExit::Running => Ok(ExitObservation::Running),
                     process::selected::ProcessExit::Exited { creation, code } => {
-                        let receipt = observed
-                            .runtime
-                            .read_private(
-                                &PrivateName::new("last_exit.json")?,
-                                &context.security,
-                                crate::agent_contract::MAX_RESPONSE_BYTES,
-                                &budget,
-                            )?
-                            .map(|(_, bytes)| {
-                                let receipt = crate::agent_contract::parse_last_exit(&bytes)
-                                    .map_err(|_| NativeError::Invalid)?;
-                                if receipt.instance_id != observed.bootstrap.instance_id
-                                    || receipt.stopped_unix_ms < observed.bootstrap.started_unix_ms
-                                {
-                                    return Err(NativeError::Foreign);
-                                }
-                                Ok(receipt)
-                            })
-                            .transpose()?;
+                        let receipt = with_state_exit_receipt(
+                            context.target.paths.local(),
+                            |state, leaf| {
+                                // The retained runtime pins its ancestors; reopen ONLY its fixed
+                                // state parent through the same no-follow private Anchor admission.
+                                let state = Anchor::open(state, &context.security, true, &budget)?
+                                    .ok_or(NativeError::Missing)?;
+                                state.read_private(
+                                    &PrivateName::new(leaf)?,
+                                    &context.security,
+                                    crate::agent_contract::MAX_RESPONSE_BYTES,
+                                    &budget,
+                                )
+                            },
+                        )?
+                        .map(|(_, bytes)| {
+                            let receipt = crate::agent_contract::parse_last_exit(&bytes)
+                                .map_err(|_| NativeError::Invalid)?;
+                            if receipt.instance_id != observed.bootstrap.instance_id
+                                || receipt.stopped_unix_ms < observed.bootstrap.started_unix_ms
+                            {
+                                return Err(NativeError::Foreign);
+                            }
+                            Ok(receipt)
+                        })
+                        .transpose()?;
                         budget.check()?;
                         Ok(ExitObservation::Exited {
                             creation,
@@ -3257,6 +3276,1482 @@ mod adapter {
             self.read(name)
         }
     }
+
+    /// File-only ended-logon authority. None of these private capabilities can be converted to
+    /// RetainedTreeCompletion, UpgradeStopProof, image approval, task submission, or Run evidence.
+    #[cfg(not(test))]
+    mod file_recovery {
+        use super::super::super::payload::recovery::{
+            self, FileRecordStamp, FileRecoveryCursor as Cursor,
+            FileRecoveryDirection as Direction, FileRecoveryJournal as Journal,
+            FileRecoveryMutationPermit as Permit, FileRecoveryRoleStep as Step, FixedObservation,
+            ImageObservation, OperationRecord, OriginalLeaf, OuterPhase, OuterUpgradeRecord,
+            ReopenedRole, StageCatalog, StageObservation,
+        };
+        use super::*;
+
+        struct Selection {
+            outer: OuterUpgradeRecord,
+            outer_stamp: FileRecordStamp,
+            operation: OperationRecord,
+            operation_stamp: FileRecordStamp,
+        }
+        pub(crate) struct FileRecoverySeal(Arc<SealData>);
+        struct SealData {
+            io: Arc<WindowsNativeIo>,
+            selected: Selection,
+        }
+        pub(crate) struct FileRecoveryRoot(Arc<RootData>);
+        struct RootData {
+            io: Arc<WindowsNativeIo>,
+            root: PayloadRoot,
+            own: SelfImagePin,
+            approved: [ApprovedPe; 4],
+        }
+        pub(crate) struct FileRecoveryPlanning(Selection, [ReopenedRole; 4]);
+        impl FileRecoveryPlanning {
+            pub(crate) fn into_parts(
+                self,
+            ) -> (
+                OuterUpgradeRecord,
+                FileRecordStamp,
+                OperationRecord,
+                FileRecordStamp,
+                [ReopenedRole; 4],
+            ) {
+                (
+                    self.0.outer,
+                    self.0.outer_stamp,
+                    self.0.operation,
+                    self.0.operation_stamp,
+                    self.1,
+                )
+            }
+        }
+        pub(crate) struct FileTerminalObservation(Arc<TerminalData>);
+        pub(super) struct TerminalData {
+            io: Arc<WindowsNativeIo>,
+            root: Arc<RootData>,
+            seal: Arc<SealData>,
+            journal: Journal,
+        }
+        fn stamp(identity: FileIdentity, bytes: &[u8]) -> NativeResult<FileRecordStamp> {
+            FileRecordStamp::new(identity.into(), epoch_hash(bytes))
+        }
+        fn read(
+            parent: &Anchor,
+            context: &Context,
+            name: records::RecordName,
+            budget: &Deadline,
+        ) -> NativeResult<Option<(FileIdentity, Vec<u8>)>> {
+            parent.read_private(
+                &name.file_name()?,
+                &context.security,
+                files::MAX_RECORD_BYTES,
+                budget,
+            )
+        }
+        fn selected(
+            parent: &Anchor,
+            context: &Context,
+            budget: &Deadline,
+        ) -> NativeResult<Option<Selection>> {
+            let pointer = read(parent, context, records::RecordName::OuterUpgrade, budget)?;
+            let progress = read(parent, context, records::RecordName::FileRecovery, budget)?
+                .map(|(_, bytes)| Journal::decode(&bytes))
+                .transpose()?;
+            let catalog = read(parent, context, records::RecordName::StageCatalog, budget)?
+                .map(|(_, bytes)| {
+                    records::record_data::<StageCatalog>(&records::RecordName::StageCatalog, &bytes)
+                })
+                .transpose()?;
+            if let Some(catalog) = &catalog {
+                catalog.validate()?
+            }
+            let (outer, outer_stamp) = match pointer {
+                Some((id, bytes)) => (OuterUpgradeRecord::decode(&bytes)?, stamp(id, &bytes)?),
+                None => match progress.as_ref() {
+                    Some(j)
+                        if matches!(j.cursor(), Cursor::OuterRetireIntent | Cursor::Retired) =>
+                    {
+                        (j.outer_snapshot().clone(), j.outer_record())
+                    }
+                    Some(_) => return Err(NativeError::Foreign),
+                    None => {
+                        if catalog.as_ref().is_some_and(|c| c.active.is_some()) {
+                            return Err(NativeError::Foreign);
+                        }
+                        return Ok(None);
+                    }
+                },
+            };
+            outer.context().same_user(&context.target.identity)?;
+            let (id, bytes) = read(
+                parent,
+                context,
+                records::RecordName::Operation(outer.operation()),
+                budget,
+            )?
+            .ok_or(NativeError::Missing)?;
+            let operation: OperationRecord =
+                records::record_data(&records::RecordName::Operation(outer.operation()), &bytes)?;
+            operation.validate()?;
+            if operation.operation() != outer.operation() {
+                return Err(NativeError::Foreign);
+            }
+            // A current-context or healthy-terminal no-op cannot mask a changed same-op
+            // source pair. Only unrelated already-Retired history may remain nonapplicable.
+            if let Some(j) = &progress {
+                if j.operation() == outer.operation() {
+                    j.matches_sources(&outer, outer_stamp, &operation, stamp(id, &bytes)?)?;
+                } else if j.cursor() != Cursor::Retired {
+                    return Err(NativeError::Foreign);
+                }
+            }
+            let catalog = catalog.ok_or(NativeError::Missing)?;
+            // Healthy terminal history is nonapplicable only with its exact operation/catalog
+            // correlation. It neither settles a copy nor replaces old cleanup/tree authority.
+            if matches!(outer.phase(), OuterPhase::Complete | OuterPhase::Cancelled) {
+                if progress
+                    .as_ref()
+                    .is_some_and(|j| j.cursor() != Cursor::Retired)
+                {
+                    return Err(NativeError::Foreign);
+                }
+                if outer.phase() == OuterPhase::Complete {
+                    if operation.phase() != Phase::Complete || catalog.active.is_some() {
+                        return Err(NativeError::Foreign);
+                    }
+                } else {
+                    if !matches!(operation.phase(), Phase::Intent | Phase::RolledBack)
+                        || catalog.active.is_some_and(|op| op != outer.operation())
+                        || operation.current_role().is_some()
+                        || operation.original_instance().is_some()
+                        || operation.new_instance().is_some()
+                        || operation.handoff().is_some()
+                        || operation.retention_incomplete()
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    for role in PayloadRole::ALL {
+                        let row = operation.role(role)?;
+                        if row.original != OriginalLeaf::Unobserved
+                            || row.staged.is_some()
+                            || row.backup.is_some()
+                            || row.published.is_some()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                    }
+                }
+                budget.check()?;
+                return Ok(None);
+            }
+            // The actual full current context remains on its original warm path. Still require
+            // a strict paired operation/catalog; malformed/missing required lineage is retained.
+            if recovery::file_recovery_prior_logon(&outer, &context.target.identity)?.is_none() {
+                if catalog.active != Some(outer.operation()) {
+                    return Err(NativeError::Foreign);
+                }
+                return Ok(None);
+            }
+            if outer.phase() != OuterPhase::Committed
+                || operation.handoff().is_some()
+                || !matches!(
+                    operation.phase(),
+                    Phase::BackupIntent | Phase::BackedUp | Phase::PublishIntent | Phase::Published
+                )
+            {
+                return Err(NativeError::Unsupported);
+            }
+            let selection = Selection {
+                outer,
+                outer_stamp,
+                operation,
+                operation_stamp: stamp(id, &bytes)?,
+            };
+            let terminal = progress.as_ref().is_some_and(|j| {
+                j.operation() == selection.outer.operation()
+                    && matches!(
+                        j.cursor(),
+                        Cursor::CatalogRetireIntent
+                            | Cursor::CatalogInactive
+                            | Cursor::OuterRetireIntent
+                            | Cursor::Retired
+                    )
+            });
+            if catalog.active != Some(selection.outer.operation())
+                && !(terminal && catalog.active.is_none())
+            {
+                return Err(NativeError::Foreign);
+            }
+            if !catalog
+                .generations
+                .iter()
+                .any(|g| g.operation == selection.outer.operation() && !g.completed)
+            {
+                return Err(NativeError::Foreign);
+            }
+            budget.check()?;
+            Ok(Some(selection))
+        }
+        fn matches_selection(selection: &Selection, journal: &Journal) -> NativeResult<()> {
+            journal.matches_sources(
+                &selection.outer,
+                selection.outer_stamp,
+                &selection.operation,
+                selection.operation_stamp,
+            )
+        }
+        fn renew(
+            data: &SealData,
+            context: &Context,
+            lease: &LockState,
+            expected: Option<&[u8]>,
+            owner: &CallOwner,
+            budget: &Deadline,
+        ) -> NativeResult<()> {
+            validate_payload_lock(context, lease, budget)?;
+            let fresh = selected(&lease.parent, context, budget)?.ok_or(NativeError::Foreign)?;
+            if fresh.outer_stamp != data.selected.outer_stamp
+                || fresh.operation_stamp != data.selected.operation_stamp
+                || fresh.outer != data.selected.outer
+            {
+                return Err(NativeError::Foreign);
+            }
+            if let Some(bytes) = expected {
+                let (_, current) = read(
+                    &lease.parent,
+                    context,
+                    records::RecordName::FileRecovery,
+                    budget,
+                )?
+                .ok_or(NativeError::Missing)?;
+                if current != bytes {
+                    return Err(NativeError::Foreign);
+                }
+                matches_selection(&data.selected, &Journal::decode(bytes)?)?;
+            }
+            if let Some((_, bytes)) = read(
+                &lease.parent,
+                context,
+                records::RecordName::FileRecovery,
+                budget,
+            )? {
+                let current = Journal::decode(&bytes)?;
+                if current.operation() == fresh.outer.operation()
+                    && current.cursor() == Cursor::FilesConverged
+                {
+                    // Do not create a delete intent to explain a copy that was already missing.
+                    // Only a previously durable CopyDeleteIntent may reconcile positive absence.
+                    let root = Anchor::open(
+                        context.target.paths.install(),
+                        &context.security,
+                        true,
+                        budget,
+                    )?
+                    .ok_or(NativeError::Missing)?;
+                    let parent =
+                        generation(&root, "payload-stage", current.operation(), context, budget)?;
+                    let actual = parent
+                        .as_ref()
+                        .map(|p| p.opaque("keeper-copy.exe", false, &context.security, budget))
+                        .transpose()?
+                        .flatten()
+                        .map(|leaf| epoch_stamp(leaf.identity));
+                    if actual != fresh.outer.keeper_image() {
+                        return Err(NativeError::Foreign);
+                    }
+                    if let Some(parent) = parent
+                        && parent
+                            .opaque("helper-copy.exe", false, &context.security, budget)?
+                            .is_some()
+                    {
+                        return Err(NativeError::Unsupported);
+                    }
+                }
+            }
+            let luid = recovery::file_recovery_prior_logon(&fresh.outer, &context.target.identity)?
+                .ok_or(NativeError::Foreign)?;
+            query_ended_logon(context, owner, luid, budget)?;
+            validate_payload_lock(context, lease, budget)
+        }
+        impl FileRecoverySeal {
+            pub(crate) fn operation(&self) -> [u8; 16] {
+                self.0.selected.outer.operation()
+            }
+            pub(crate) fn matches_journal(&self, journal: &Journal) -> NativeResult<()> {
+                matches_selection(&self.0.selected, journal)
+            }
+            pub(crate) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.0.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                io.lock_binding(proof, lock, deadline)?;
+                let data = self.0.clone();
+                let context = io.context.clone();
+                let lease = lock.0.clone();
+                let owner = io.owner.clone();
+                let budget = proof.budget(io, deadline)?;
+                io.owner.run(Dispatch::Observation, deadline, move || {
+                    renew(&data, &context, &lease, None, &owner, &budget)
+                })?;
+                proof.budget(io, deadline)?.check()
+            }
+        }
+        impl WindowsNativeIo {
+            /// This read-only classifier avoids taking the warm helper parent's actual lock.
+            /// Its boolean can only request locked reselection; it cannot construct a seal.
+            pub(crate) fn file_recovery_requires_lock(
+                &self,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<bool> {
+                let context = self.context.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    context.validate(&budget)?;
+                    let parent = Anchor::open(
+                        context.target.paths.installer(),
+                        &context.security,
+                        true,
+                        &budget,
+                    )?;
+                    let found = match parent {
+                        Some(parent) => selected(&parent, &context, &budget)?.is_some(),
+                        None => false,
+                    };
+                    context.validate(&budget)?;
+                    Ok(found)
+                })
+            }
+            pub(crate) fn prepare_file_recovery(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<Option<FileRecoverySeal>> {
+                self.lock_binding(proof, lock, deadline)?;
+                let io = self.clone();
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let owner = self.owner.clone();
+                let budget = proof.budget(self, deadline)?;
+                let value = self.owner.run(Dispatch::Observation, deadline, move || {
+                    validate_payload_lock(&context, &lease, &budget)?;
+                    let Some(selection) = selected(&lease.parent, &context, &budget)? else {
+                        return Ok(None);
+                    };
+                    let data = Arc::new(SealData {
+                        io,
+                        selected: selection,
+                    });
+                    renew(&data, &context, &lease, None, &owner, &budget)?;
+                    Ok(Some(FileRecoverySeal(data)))
+                })?;
+                proof.budget(self, deadline)?.check()?;
+                Ok(value)
+            }
+            pub(crate) fn admit_file_recovery_permit(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                seal: &FileRecoverySeal,
+                deadline: &Deadline,
+            ) -> NativeResult<Permit> {
+                recovery::admit_file_recovery_permit(self, proof, lock, seal, deadline)
+            }
+            pub(crate) fn file_recovery_root(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                seal: &FileRecoverySeal,
+                deadline: &Deadline,
+            ) -> NativeResult<FileRecoveryRoot> {
+                seal.reverify(self, proof, lock, deadline)?;
+                let inventory =
+                    super::super::super::payload::inventory::ApprovedInventory::embedded()?;
+                let own = self.self_image(proof, deadline)?;
+                let approved = [
+                    ApprovedPe::own_image(&own)?,
+                    inventory.role(PayloadRole::Agent)?.clone(),
+                    inventory.role(PayloadRole::Ui)?.clone(),
+                    inventory.role(PayloadRole::Ctl)?.clone(),
+                ];
+                let root = self.payload_root(proof, lock, deadline)?;
+                let result = FileRecoveryRoot(Arc::new(RootData {
+                    io: self.clone(),
+                    root,
+                    own,
+                    approved,
+                }));
+                seal.reverify(self, proof, lock, deadline)?;
+                Ok(result)
+            }
+        }
+        fn root_check(
+            data: &RootData,
+            context: &Context,
+            budget: &Deadline,
+        ) -> NativeResult<Arc<Anchor>> {
+            let own = &data.own.0;
+            if own.target != context.target.nonce {
+                return Err(NativeError::Foreign);
+            }
+            let fresh = own.parent.open_image(
+                &own.leaf,
+                false,
+                env!("CARGO_PKG_VERSION"),
+                &context.security,
+                budget,
+            )?;
+            if fresh.identity != own.image.identity || fresh.facts != own.image.facts {
+                return Err(NativeError::Foreign);
+            }
+            drop(fresh);
+            data.root
+                .check(context, budget)?
+                .ok_or(NativeError::Missing)
+        }
+        fn generation(
+            root: &Anchor,
+            branch: &str,
+            operation: [u8; 16],
+            context: &Context,
+            budget: &Deadline,
+        ) -> NativeResult<Option<Anchor>> {
+            root.child(branch, &context.security, budget)?
+                .map(|parent| parent.child(&records::hex(&operation), &context.security, budget))
+                .transpose()
+                .map(|value| value.flatten())
+        }
+        fn expected(data: &RootData, role: PayloadRole) -> NativeResult<&ApprovedPe> {
+            data.approved
+                .iter()
+                .find(|pin| pin.role() == role)
+                .ok_or(NativeError::Invalid)
+        }
+        fn opaque(
+            parent: Option<&Anchor>,
+            role: PayloadRole,
+            context: &Context,
+            budget: &Deadline,
+        ) -> NativeResult<Option<native::OpaqueData>> {
+            parent
+                .map(|p| p.opaque(role.leaf(), false, &context.security, budget))
+                .transpose()
+                .map(|v| v.flatten())
+        }
+        /// All three slots are independently opened through retained no-follow parents. Measured
+        /// new bytes are correlation for rollback; forward separately checks embedded approval.
+        fn observe(
+            data: &RootData,
+            seal: &SealData,
+            journal: Option<&Journal>,
+            role: PayloadRole,
+            context: &Context,
+            budget: &Deadline,
+        ) -> NativeResult<ReopenedRole> {
+            let root = root_check(data, context, budget)?;
+            let op = seal.selected.outer.operation();
+            let stage = generation(&root, "payload-stage", op, context, budget)?;
+            let backups = generation(&root, "payload-backups", op, context, budget)?;
+            let source = seal.selected.operation.role(role)?;
+            let (original, new) = if let Some(j) = journal {
+                let row = j.role(role)?;
+                (row.original(), row.new_image().cloned())
+            } else {
+                (source.original, source.staged.clone())
+            };
+            let new = new.ok_or(NativeError::Foreign)?;
+            let staged = match opaque(stage.as_ref(), role, context, budget)? {
+                None => StageObservation::Missing,
+                Some(leaf) => {
+                    let id = leaf.identity;
+                    drop(leaf);
+                    let image = stage
+                        .as_ref()
+                        .ok_or(NativeError::Missing)?
+                        .open_staged_image(
+                            role.leaf(),
+                            &new.facts.version,
+                            &context.security,
+                            budget,
+                        )?;
+                    if image.identity == id
+                        && image.identity == epoch_identity(new.identity)
+                        && image.facts == new.facts
+                    {
+                        StageObservation::Ready(new.clone())
+                    } else {
+                        StageObservation::Unknown
+                    }
+                }
+            };
+            let fixed = match opaque(Some(&root), role, context, budget)? {
+                None => FixedObservation::Missing,
+                Some(leaf) => {
+                    let id = leaf.identity;
+                    drop(leaf);
+                    if id == epoch_identity(new.identity) {
+                        let image = root.open_image(
+                            role.leaf(),
+                            false,
+                            &new.facts.version,
+                            &context.security,
+                            budget,
+                        )?;
+                        if image.identity == id && image.facts == new.facts {
+                            FixedObservation::Published(new.clone())
+                        } else {
+                            FixedObservation::Unknown
+                        }
+                    } else if original == OriginalLeaf::Unobserved
+                        || original == OriginalLeaf::Present(id.into())
+                    {
+                        FixedObservation::Original(id.into())
+                    } else {
+                        FixedObservation::Unknown
+                    }
+                }
+            };
+            let backup =
+                opaque(backups.as_ref(), role, context, budget)?.map(|leaf| leaf.identity.into());
+            let allowed = match original {
+                OriginalLeaf::Present(id) => Some(id),
+                _ => source.backup,
+            };
+            let unknown_backup = backup.is_some() && backup != allowed;
+            if journal.is_some_and(|j| j.direction() == Direction::Forward)
+                && new.facts != *expected(data, role)?.facts()
+            {
+                return Err(NativeError::Unsupported);
+            }
+            Ok(ReopenedRole {
+                staged,
+                fixed,
+                backup,
+                unknown_backup,
+            })
+        }
+        fn verify_converged(
+            data: &RootData,
+            seal: &SealData,
+            journal: &Journal,
+            context: &Context,
+            budget: &Deadline,
+        ) -> NativeResult<()> {
+            for role in PayloadRole::ALL {
+                let row = journal.role(role)?;
+                let view = observe(data, seal, Some(journal), role, context, budget)?;
+                if view.unknown_backup {
+                    return Err(NativeError::Foreign);
+                }
+                let correct = match journal.direction() {
+                    Direction::Rollback => {
+                        view.staged
+                            == StageObservation::Ready(
+                                row.new_image().ok_or(NativeError::Foreign)?.clone(),
+                            )
+                            && match row.original() {
+                                OriginalLeaf::Missing => {
+                                    matches!(view.fixed, FixedObservation::Missing)
+                                        && view.backup.is_none()
+                                }
+                                OriginalLeaf::Present(id) => {
+                                    view.fixed == FixedObservation::Original(id)
+                                        && view.backup.is_none()
+                                }
+                                OriginalLeaf::Unobserved => false,
+                            }
+                    }
+                    Direction::Forward => {
+                        matches!(&view.fixed,FixedObservation::Published(image)
+                        if Some(image)==row.new_image())
+                            && matches!(view.staged, StageObservation::Missing)
+                            && view.backup
+                                == match row.original() {
+                                    OriginalLeaf::Present(id) => Some(id),
+                                    _ => None,
+                                }
+                    }
+                };
+                if !correct {
+                    return Err(NativeError::Foreign);
+                }
+            }
+            budget.check()
+        }
+        impl FileRecoveryRoot {
+            // Each sealed proof/lock/record/deadline boundary remains independently explicit.
+            #[allow(clippy::too_many_arguments)]
+            fn run<T: Send + 'static>(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                seal: &FileRecoverySeal,
+                permit: &Permit,
+                dispatch: Dispatch,
+                deadline: &Deadline,
+                work: impl FnOnce(
+                    &RootData,
+                    &SealData,
+                    &Journal,
+                    &Context,
+                    &Arc<LockState>,
+                    &Deadline,
+                    &Change,
+                ) -> NativeResult<T>
+                + Send
+                + 'static,
+            ) -> NativeResult<T> {
+                let io = &self.0.io;
+                if !std::ptr::eq(io.as_ref(), seal.0.io.as_ref())
+                    || !std::ptr::eq(io.as_ref(), permit.io().as_ref())
+                {
+                    return Err(NativeError::Foreign);
+                }
+                permit.reverify(io, proof, lock, seal, deadline)?;
+                let data = self.0.clone();
+                let seal = seal.0.clone();
+                let context = io.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes().to_vec();
+                let owner = io.owner.clone();
+                let budget = proof.budget(io, deadline)?;
+                io.owner.run(dispatch, deadline, move || {
+                    let change = Change::new();
+                    let result = change.finish((|| {
+                        renew(&seal, &context, &lease, Some(&bytes), &owner, &budget)?;
+                        let journal = Journal::decode(&bytes)?;
+                        root_check(&data, &context, &budget)?;
+                        let value =
+                            work(&data, &seal, &journal, &context, &lease, &budget, &change)?;
+                        budget.check()?;
+                        context.validate(&budget)?;
+                        Ok(value)
+                    })());
+                    if matches!(result, Err(NativeError::OutcomeUnknown)) {
+                        owner.retire_mutations()
+                    }
+                    result
+                })
+            }
+            pub(crate) fn planning(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                seal: &FileRecoverySeal,
+                deadline: &Deadline,
+            ) -> NativeResult<FileRecoveryPlanning> {
+                seal.reverify(&self.0.io, proof, lock, deadline)?;
+                let data = self.0.clone();
+                let seal = seal.0.clone();
+                let context = self.0.io.context.clone();
+                let lease = lock.0.clone();
+                let budget = proof.budget(&self.0.io, deadline)?;
+                let owner = self.0.io.owner.clone();
+                self.0
+                    .io
+                    .owner
+                    .run(Dispatch::Observation, deadline, move || {
+                        renew(&seal, &context, &lease, None, &owner, &budget)?;
+                        let views = PayloadRole::ALL
+                            .into_iter()
+                            .map(|role| observe(&data, &seal, None, role, &context, &budget))
+                            .collect::<NativeResult<Vec<_>>>()?
+                            .try_into()
+                            .map_err(|_| NativeError::Invalid)?;
+                        // Planner itself validates all roles before a new journal can be published.
+                        let candidate = Journal::prepare(
+                            seal.selected.outer.clone(),
+                            seal.selected.outer_stamp,
+                            &seal.selected.operation,
+                            seal.selected.operation_stamp,
+                            views,
+                        )?;
+                        if candidate.direction() == Direction::Forward {
+                            for role in PayloadRole::ALL {
+                                if candidate
+                                    .role(role)?
+                                    .new_image()
+                                    .ok_or(NativeError::Foreign)?
+                                    .facts
+                                    != *expected(&data, role)?.facts()
+                                {
+                                    return Err(NativeError::Unsupported);
+                                }
+                            }
+                        }
+                        let views = PayloadRole::ALL
+                            .into_iter()
+                            .map(|role| {
+                                observe(&data, &seal, Some(&candidate), role, &context, &budget)
+                            })
+                            .collect::<NativeResult<Vec<_>>>()?
+                            .try_into()
+                            .map_err(|_| NativeError::Invalid)?;
+                        let selection = Selection {
+                            outer: seal.selected.outer.clone(),
+                            outer_stamp: seal.selected.outer_stamp,
+                            operation: seal.selected.operation.clone(),
+                            operation_stamp: seal.selected.operation_stamp,
+                        };
+                        budget.check()?;
+                        Ok(FileRecoveryPlanning(selection, views))
+                    })
+            }
+            pub(crate) fn observe_role(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                seal: &FileRecoverySeal,
+                permit: &Permit,
+                role: PayloadRole,
+                deadline: &Deadline,
+            ) -> NativeResult<ReopenedRole> {
+                self.run(
+                    proof,
+                    lock,
+                    seal,
+                    permit,
+                    Dispatch::Observation,
+                    deadline,
+                    move |data, seal, journal, ctx, _, budget, _| {
+                        observe(data, seal, Some(journal), role, ctx, budget)
+                    },
+                )
+            }
+            // The closed role/cursor is separate from the native capabilities and deadline.
+            #[allow(clippy::too_many_arguments)]
+            fn effect(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                seal: &FileRecoverySeal,
+                permit: &Permit,
+                role: PayloadRole,
+                step: Step,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if permit.cursor() != (Cursor::Role { role, step }) {
+                    return Err(NativeError::Foreign);
+                }
+                self.run(
+                    proof,
+                    lock,
+                    seal,
+                    permit,
+                    Dispatch::Mutation,
+                    deadline,
+                    move |data, seal, journal, ctx, _, budget, change| {
+                        let root = root_check(data, ctx, budget)?;
+                        let op = seal.selected.outer.operation();
+                        let row = journal.role(role)?;
+                        let view = observe(data, seal, Some(journal), role, ctx, budget)?;
+                        if view.unknown_backup
+                            || matches!(view.fixed, FixedObservation::Unknown)
+                            || matches!(view.staged, StageObservation::Unknown)
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                        match step {
+                            Step::ReturnPublishedIntent => {
+                                if journal.direction() != Direction::Rollback {
+                                    return Err(NativeError::Foreign);
+                                }
+                                match (&view.fixed, &view.staged) {
+                                    (FixedObservation::Missing, StageObservation::Ready(image))
+                                        if Some(image) == row.new_image() =>
+                                    {
+                                        return Ok(());
+                                    }
+                                    (
+                                        FixedObservation::Published(image),
+                                        StageObservation::Missing,
+                                    ) if Some(image) == row.new_image() => {}
+                                    _ => return Err(NativeError::Foreign),
+                                }
+                                let stage = ensure_payload_child(
+                                    &root,
+                                    "payload-stage",
+                                    ctx,
+                                    budget,
+                                    change,
+                                )?;
+                                let parent = ensure_payload_child(
+                                    &stage,
+                                    &records::hex(&op),
+                                    ctx,
+                                    budget,
+                                    change,
+                                )?;
+                                let source = root
+                                    .opaque(role.leaf(), false, &ctx.security, budget)?
+                                    .ok_or(NativeError::Missing)?;
+                                if source.identity
+                                    != epoch_identity(
+                                        row.new_image().ok_or(NativeError::Foreign)?.identity,
+                                    )
+                                {
+                                    return Err(NativeError::Foreign);
+                                }
+                                change.reached();
+                                root.move_opaque(
+                                    source,
+                                    &parent,
+                                    role.leaf(),
+                                    &ctx.security,
+                                    budget,
+                                )?;
+                            }
+                            Step::RestoreOriginalIntent => {
+                                if journal.direction() != Direction::Rollback {
+                                    return Err(NativeError::Foreign);
+                                }
+                                match row.original() {
+                                    OriginalLeaf::Missing => {
+                                        if matches!(view.fixed, FixedObservation::Missing)
+                                            && view.backup.is_none()
+                                        {
+                                            return Ok(());
+                                        }
+                                        return Err(NativeError::Foreign);
+                                    }
+                                    OriginalLeaf::Present(id) => {
+                                        if view.fixed == FixedObservation::Original(id)
+                                            && view.backup.is_none()
+                                        {
+                                            return Ok(());
+                                        }
+                                        if !matches!(view.fixed, FixedObservation::Missing)
+                                            || view.backup != Some(id)
+                                        {
+                                            return Err(NativeError::Foreign);
+                                        }
+                                        let backup =
+                                            generation(&root, "payload-backups", op, ctx, budget)?
+                                                .ok_or(NativeError::Missing)?;
+                                        let source = backup
+                                            .opaque(role.leaf(), false, &ctx.security, budget)?
+                                            .ok_or(NativeError::Missing)?;
+                                        if source.identity != epoch_identity(id) {
+                                            return Err(NativeError::Foreign);
+                                        }
+                                        change.reached();
+                                        backup.move_opaque(
+                                            source,
+                                            &root,
+                                            role.leaf(),
+                                            &ctx.security,
+                                            budget,
+                                        )?;
+                                    }
+                                    OriginalLeaf::Unobserved => return Err(NativeError::Foreign),
+                                }
+                            }
+                            Step::SettleStageIntent => {
+                                if journal.direction() != Direction::Forward {
+                                    return Err(NativeError::Foreign);
+                                }
+                                let new = row.new_image().ok_or(NativeError::Foreign)?;
+                                if view.staged != StageObservation::Ready(new.clone()) {
+                                    return Err(NativeError::Foreign);
+                                }
+                                let parent = generation(&root, "payload-stage", op, ctx, budget)?
+                                    .ok_or(NativeError::Missing)?;
+                                flush_stage(&parent, role, new, data, ctx, budget, change)?;
+                            }
+                            Step::BackupOriginalIntent => {
+                                if journal.direction() != Direction::Forward {
+                                    return Err(NativeError::Foreign);
+                                }
+                                match row.original() {
+                                    OriginalLeaf::Missing => {
+                                        if matches!(view.fixed, FixedObservation::Missing)
+                                            && view.backup.is_none()
+                                        {
+                                            return Ok(());
+                                        }
+                                        return Err(NativeError::Foreign);
+                                    }
+                                    OriginalLeaf::Present(id) => {
+                                        if matches!(view.fixed, FixedObservation::Missing)
+                                            && view.backup == Some(id)
+                                        {
+                                            return Ok(());
+                                        }
+                                        if view.fixed != FixedObservation::Original(id)
+                                            || view.backup.is_some()
+                                        {
+                                            return Err(NativeError::Foreign);
+                                        }
+                                        let branch = ensure_payload_child(
+                                            &root,
+                                            "payload-backups",
+                                            ctx,
+                                            budget,
+                                            change,
+                                        )?;
+                                        let backup = ensure_payload_child(
+                                            &branch,
+                                            &records::hex(&op),
+                                            ctx,
+                                            budget,
+                                            change,
+                                        )?;
+                                        let source = root
+                                            .opaque(role.leaf(), false, &ctx.security, budget)?
+                                            .ok_or(NativeError::Missing)?;
+                                        if source.identity != epoch_identity(id) {
+                                            return Err(NativeError::Foreign);
+                                        }
+                                        change.reached();
+                                        root.move_opaque(
+                                            source,
+                                            &backup,
+                                            role.leaf(),
+                                            &ctx.security,
+                                            budget,
+                                        )?;
+                                    }
+                                    OriginalLeaf::Unobserved => return Err(NativeError::Foreign),
+                                }
+                            }
+                            Step::PublishStageIntent => {
+                                if journal.direction() != Direction::Forward {
+                                    return Err(NativeError::Foreign);
+                                }
+                                let new = row.new_image().ok_or(NativeError::Foreign)?;
+                                if view.fixed == FixedObservation::Published(new.clone())
+                                    && matches!(view.staged, StageObservation::Missing)
+                                {
+                                    return Ok(());
+                                }
+                                if !matches!(view.fixed, FixedObservation::Missing)
+                                    || view.staged != StageObservation::Ready(new.clone())
+                                {
+                                    return Err(NativeError::Foreign);
+                                }
+                                let stage = generation(&root, "payload-stage", op, ctx, budget)?
+                                    .ok_or(NativeError::Missing)?;
+                                // An interrupted process may have lost its old settled stage handle.
+                                // Re-measure and flush this SAME reopened file before the no-replace move.
+                                let image =
+                                    flush_stage(&stage, role, new, data, ctx, budget, change)?;
+                                change.reached();
+                                stage.publish_image(
+                                    &image,
+                                    &root,
+                                    role.leaf(),
+                                    &ctx.security,
+                                    budget,
+                                )?;
+                            }
+                            _ => return Err(NativeError::Foreign),
+                        }
+                        let after = observe(data, seal, Some(journal), role, ctx, budget)?;
+                        let valid = match step {
+                            Step::ReturnPublishedIntent => {
+                                matches!(after.fixed, FixedObservation::Missing)
+                                    && after.staged
+                                        == StageObservation::Ready(
+                                            row.new_image().ok_or(NativeError::Foreign)?.clone(),
+                                        )
+                            }
+                            Step::RestoreOriginalIntent => {
+                                after.backup.is_none()
+                                    && match row.original() {
+                                        OriginalLeaf::Missing => {
+                                            matches!(after.fixed, FixedObservation::Missing)
+                                        }
+                                        OriginalLeaf::Present(id) => {
+                                            after.fixed == FixedObservation::Original(id)
+                                        }
+                                        _ => false,
+                                    }
+                            }
+                            Step::SettleStageIntent => {
+                                after.staged
+                                    == StageObservation::Ready(
+                                        row.new_image().ok_or(NativeError::Foreign)?.clone(),
+                                    )
+                            }
+                            Step::BackupOriginalIntent => {
+                                matches!(after.fixed, FixedObservation::Missing)
+                                    && after.backup
+                                        == match row.original() {
+                                            OriginalLeaf::Present(id) => Some(id),
+                                            _ => None,
+                                        }
+                            }
+                            Step::PublishStageIntent => {
+                                after.fixed
+                                    == FixedObservation::Published(
+                                        row.new_image().ok_or(NativeError::Foreign)?.clone(),
+                                    )
+                                    && matches!(after.staged, StageObservation::Missing)
+                            }
+                            _ => false,
+                        };
+                        if !valid {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                        Ok(())
+                    },
+                )
+            }
+            pub(crate) fn return_published(
+                &self,
+                p: &SupportProof,
+                l: &InstallerLock,
+                s: &FileRecoverySeal,
+                m: &Permit,
+                r: PayloadRole,
+                d: &Deadline,
+            ) -> NativeResult<()> {
+                self.effect(p, l, s, m, r, Step::ReturnPublishedIntent, d)
+            }
+            pub(crate) fn restore_original(
+                &self,
+                p: &SupportProof,
+                l: &InstallerLock,
+                s: &FileRecoverySeal,
+                m: &Permit,
+                r: PayloadRole,
+                d: &Deadline,
+            ) -> NativeResult<()> {
+                self.effect(p, l, s, m, r, Step::RestoreOriginalIntent, d)
+            }
+            pub(crate) fn settle_stage(
+                &self,
+                p: &SupportProof,
+                l: &InstallerLock,
+                s: &FileRecoverySeal,
+                m: &Permit,
+                r: PayloadRole,
+                d: &Deadline,
+            ) -> NativeResult<()> {
+                self.effect(p, l, s, m, r, Step::SettleStageIntent, d)
+            }
+            pub(crate) fn backup_original(
+                &self,
+                p: &SupportProof,
+                l: &InstallerLock,
+                s: &FileRecoverySeal,
+                m: &Permit,
+                r: PayloadRole,
+                d: &Deadline,
+            ) -> NativeResult<()> {
+                self.effect(p, l, s, m, r, Step::BackupOriginalIntent, d)
+            }
+            pub(crate) fn publish_stage(
+                &self,
+                p: &SupportProof,
+                l: &InstallerLock,
+                s: &FileRecoverySeal,
+                m: &Permit,
+                r: PayloadRole,
+                d: &Deadline,
+            ) -> NativeResult<()> {
+                self.effect(p, l, s, m, r, Step::PublishStageIntent, d)
+            }
+            pub(crate) fn observe_convergence(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                seal: &FileRecoverySeal,
+                permit: &Permit,
+                deadline: &Deadline,
+            ) -> NativeResult<FileTerminalObservation> {
+                let root = self.0.clone();
+                let sealed = seal.0.clone();
+                let io = self.0.io.clone();
+                self.run(
+                    proof,
+                    lock,
+                    seal,
+                    permit,
+                    Dispatch::Observation,
+                    deadline,
+                    move |data, seal, journal, ctx, _, budget, _| {
+                        verify_converged(data, seal, journal, ctx, budget)?;
+                        Ok(FileTerminalObservation(Arc::new(TerminalData {
+                            io,
+                            root,
+                            seal: sealed,
+                            journal: journal.clone(),
+                        })))
+                    },
+                )
+            }
+            pub(crate) fn retire_catalog(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                seal: &FileRecoverySeal,
+                permit: &Permit,
+                absence: &super::keeper::FileRecoveryKeeperAbsent,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if permit.cursor() != Cursor::CatalogRetireIntent {
+                    return Err(NativeError::Foreign);
+                }
+                absence.reverify(&self.0.io, proof, lock, seal, deadline)?;
+                let namespace = absence.retain_namespace();
+                self.run(
+                    proof,
+                    lock,
+                    seal,
+                    permit,
+                    Dispatch::Mutation,
+                    deadline,
+                    move |data, seal, journal, ctx, lease, budget, change| {
+                        namespace.reverify(ctx, budget)?;
+                        verify_converged(data, seal, journal, ctx, budget)?;
+                        verify_copy_absent(ctx, journal, budget)?;
+                        let (_, bytes) = read(
+                            &lease.parent,
+                            ctx,
+                            records::RecordName::StageCatalog,
+                            budget,
+                        )?
+                        .ok_or(NativeError::Missing)?;
+                        let mut catalog: StageCatalog =
+                            records::record_data(&records::RecordName::StageCatalog, &bytes)?;
+                        catalog.validate()?;
+                        if catalog.active.is_none() {
+                            return Ok(());
+                        }
+                        if catalog.active != Some(journal.operation()) {
+                            return Err(NativeError::Foreign);
+                        }
+                        catalog.active = None; // Retain ALL incomplete generations/backups; no healthy/prune claim.
+                        let bytes = records::encode_record(
+                            &records::RecordName::StageCatalog,
+                            serde_json::to_value(&catalog).map_err(|_| NativeError::Invalid)?,
+                        )?;
+                        change.reached();
+                        let mut store = NativeStore {
+                            context: data.io.context.clone(),
+                            lease: lease.clone(),
+                            budget: budget.clone(),
+                            name: records::RecordName::StageCatalog,
+                            change: Change::new(),
+                        };
+                        let result = records::publish(&mut store, &bytes, budget)?;
+                        if result.state != records::PublicationRecovery::NewPublished
+                            || result.native_failure.is_some()
+                        {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                        let (_, actual) = read(
+                            &lease.parent,
+                            ctx,
+                            records::RecordName::StageCatalog,
+                            budget,
+                        )?
+                        .ok_or(NativeError::Missing)?;
+                        if actual != bytes {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                        Ok(())
+                    },
+                )
+            }
+            pub(crate) fn retire_outer(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                seal: &FileRecoverySeal,
+                permit: &Permit,
+                absence: &super::keeper::FileRecoveryKeeperAbsent,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if permit.cursor() != Cursor::OuterRetireIntent {
+                    return Err(NativeError::Foreign);
+                }
+                absence.reverify(&self.0.io, proof, lock, seal, deadline)?;
+                let namespace = absence.retain_namespace();
+                self.run(
+                    proof,
+                    lock,
+                    seal,
+                    permit,
+                    Dispatch::Mutation,
+                    deadline,
+                    move |data, seal, journal, ctx, lease, budget, change| {
+                        namespace.reverify(ctx, budget)?;
+                        verify_converged(data, seal, journal, ctx, budget)?;
+                        verify_copy_absent(ctx, journal, budget)?;
+                        verify_catalog_inactive(lease, ctx, budget)?;
+                        match read(
+                            &lease.parent,
+                            ctx,
+                            records::RecordName::OuterUpgrade,
+                            budget,
+                        )? {
+                            None => Ok(()),
+                            Some((id, bytes)) => {
+                                if stamp(id, &bytes)? != journal.outer_record() {
+                                    return Err(NativeError::Foreign);
+                                }
+                                change.reached();
+                                lease.parent.delete_recovered_outer_record(
+                                    id,
+                                    &ctx.security,
+                                    budget,
+                                )
+                            }
+                        }
+                    },
+                )
+            }
+            pub(crate) fn observe_terminal(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                seal: &FileRecoverySeal,
+                permit: &Permit,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !matches!(permit.cursor(), Cursor::OuterRetireIntent | Cursor::Retired) {
+                    return Err(NativeError::Foreign);
+                }
+                self.run(
+                    proof,
+                    lock,
+                    seal,
+                    permit,
+                    Dispatch::Observation,
+                    deadline,
+                    move |data, seal, journal, ctx, lease, budget, _| {
+                        verify_converged(data, seal, journal, ctx, budget)?;
+                        verify_copy_absent(ctx, journal, budget)?;
+                        verify_catalog_inactive(lease, ctx, budget)?;
+                        if read(
+                            &lease.parent,
+                            ctx,
+                            records::RecordName::OuterUpgrade,
+                            budget,
+                        )?
+                        .is_some()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                        Ok(())
+                    },
+                )
+            }
+        }
+        fn flush_stage(
+            parent: &Anchor,
+            role: PayloadRole,
+            new: &ImageObservation,
+            data: &RootData,
+            ctx: &Context,
+            budget: &Deadline,
+            change: &Change,
+        ) -> NativeResult<native::ImageData> {
+            if new.facts != *expected(data, role)?.facts() {
+                return Err(NativeError::Unsupported);
+            }
+            let image =
+                parent.open_staged_image(role.leaf(), &new.facts.version, &ctx.security, budget)?;
+            if image.identity != epoch_identity(new.identity) || image.facts != new.facts {
+                return Err(NativeError::Foreign);
+            }
+            change.reached();
+            // SAFETY: this exact freshly measured writable stage is pinned under its durable
+            // file-only intent. No other file or unapproved content is flushed or executed.
+            if unsafe { FlushFileBuffers(image.file.as_raw_handle()) } == 0 {
+                return Err(native::last_error());
+            }
+            budget.check()?;
+            Ok(image)
+        }
+        fn verify_catalog_inactive(
+            lease: &LockState,
+            ctx: &Context,
+            budget: &Deadline,
+        ) -> NativeResult<()> {
+            let (_, bytes) = read(
+                &lease.parent,
+                ctx,
+                records::RecordName::StageCatalog,
+                budget,
+            )?
+            .ok_or(NativeError::Missing)?;
+            let catalog: StageCatalog =
+                records::record_data(&records::RecordName::StageCatalog, &bytes)?;
+            catalog.validate()?;
+            if catalog.active.is_some() {
+                return Err(NativeError::Foreign);
+            }
+            Ok(())
+        }
+        pub(super) fn verify_copy_absent(
+            ctx: &Context,
+            journal: &Journal,
+            budget: &Deadline,
+        ) -> NativeResult<()> {
+            if let Some(root) =
+                Anchor::open(ctx.target.paths.install(), &ctx.security, true, budget)?
+                && let Some(parent) =
+                    generation(&root, "payload-stage", journal.operation(), ctx, budget)?
+                && (parent
+                    .opaque("keeper-copy.exe", false, &ctx.security, budget)?
+                    .is_some()
+                    || parent
+                        .opaque("helper-copy.exe", false, &ctx.security, budget)?
+                        .is_some())
+            {
+                return Err(NativeError::Foreign);
+            }
+            Ok(())
+        }
+        impl FileTerminalObservation {
+            pub(super) fn held(&self) -> Arc<TerminalData> {
+                self.0.clone()
+            }
+            pub(super) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                seal: &FileRecoverySeal,
+                deadline: &Deadline,
+            ) -> NativeResult<Journal> {
+                if !std::ptr::eq(io, self.0.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                self.0.matches_seal(seal)?;
+                seal.reverify(io, proof, lock, deadline)?;
+                let actual = recovery::read_file_recovery(io, proof, deadline)?
+                    .ok_or(NativeError::Missing)?;
+                self.0.journal.same_plan(&actual)?;
+                let permit =
+                    recovery::admit_file_recovery_permit(&self.0.io, proof, lock, seal, deadline)?;
+                let root = FileRecoveryRoot(self.0.root.clone());
+                root.run(
+                    proof,
+                    lock,
+                    seal,
+                    &permit,
+                    Dispatch::Observation,
+                    deadline,
+                    |data, seal, journal, ctx, _, budget, _| {
+                        verify_converged(data, seal, journal, ctx, budget)
+                    },
+                )?;
+                Ok(actual)
+            }
+        }
+        impl TerminalData {
+            pub(super) fn matches_seal(&self, seal: &FileRecoverySeal) -> NativeResult<()> {
+                if !Arc::ptr_eq(&seal.0, &self.seal) {
+                    return Err(NativeError::Foreign);
+                }
+                Ok(())
+            }
+            pub(super) fn validate_current(
+                &self,
+                context: &Context,
+                lease: &LockState,
+                owner: &CallOwner,
+                budget: &Deadline,
+            ) -> NativeResult<Journal> {
+                renew(&self.seal, context, lease, None, owner, budget)?;
+                let (_, bytes) = read(
+                    &lease.parent,
+                    context,
+                    records::RecordName::FileRecovery,
+                    budget,
+                )?
+                .ok_or(NativeError::Missing)?;
+                let journal = Journal::decode(&bytes)?;
+                self.journal.same_plan(&journal)?;
+                matches_selection(&self.seal.selected, &journal)?;
+                verify_converged(&self.root, &self.seal, &journal, context, budget)?;
+                Ok(journal)
+            }
+        }
+    }
+    #[cfg(not(test))]
+    pub(crate) use file_recovery::{FileRecoveryRoot, FileRecoverySeal, FileTerminalObservation};
+
+    #[cfg(not(test))]
+    pub(crate) use keeper::FileRecoveryKeeperAbsent;
+
+    /// Shared bounded exact-LUID worker. Inputs are supplied only by freshly matched native
+    /// supervisor/file lineage; this observation never constructs a tree or start capability.
+    #[cfg(not(test))]
+    fn query_ended_logon(
+        context: &Context,
+        owner: &CallOwner,
+        authentication_id: u64,
+        budget: &Deadline,
+    ) -> NativeResult<()> {
+        use windows_sys::Win32::{
+            Foundation::LUID,
+            Security::{
+                Authentication::Identity::LsaGetLogonSessionData,
+                Credentials::STATUS_NO_SUCH_LOGON_SESSION,
+            },
+        };
+        context.validate(budget)?;
+        if LOGON_QUERY_QUARANTINE.get().is_some() {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        if LOGON_QUERY_BUSY
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(NativeError::Busy);
+        }
+        let _in_flight = LogonQueryGuard;
+        if LOGON_QUERY_QUARANTINE.get().is_some() {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        let luid = LUID {
+            LowPart: authentication_id as u32,
+            HighPart: (authentication_id >> 32) as u32 as i32,
+        };
+        let mut data = std::ptr::null_mut();
+        // SAFETY: one exact captured same-user prior AuthenticationId, initialized output.
+        // This never enumerates sessions or uses a record/PID to open a process.
+        let status = unsafe { LsaGetLogonSessionData(&luid, &mut data) };
+        if status == 0 {
+            if !data.is_null() {
+                let buffer = LsaBuffer(data);
+                // Only documented successful ownership is freed. Names/content stay unread.
+                drop(buffer);
+            }
+            budget.check()?;
+            context.validate(budget)?;
+            return Err(NativeError::Foreign);
+        }
+        if !data.is_null() {
+            // Failed-output ownership is undocumented. Quarantine one opaque value and
+            // retire all mutations; neither dereference nor free this ambiguous output.
+            let _ = LOGON_QUERY_QUARANTINE.set(data as usize);
+            owner.retire_mutations();
+            return Err(NativeError::OutcomeUnknown);
+        }
+        super::epoch_archive::classify_prior_logon_status(status, false)?;
+        if status != STATUS_NO_SUCH_LOGON_SESSION {
+            return Err(NativeError::Foreign);
+        }
+        budget.check()?;
+        context.validate(budget)
+    }
+
     impl WindowsNativeIo {
         pub fn current(clock: Arc<dyn Clock>, deadline: &Deadline) -> NativeResult<Self> {
             identity::native::refuse_impersonation()?;
@@ -4145,13 +5640,6 @@ mod adapter {
             prior: &MatchedLogonProvenance,
             deadline: &Deadline,
         ) -> NativeResult<()> {
-            use windows_sys::Win32::{
-                Foundation::LUID,
-                Security::{
-                    Authentication::Identity::LsaGetLogonSessionData,
-                    Credentials::STATUS_NO_SUCH_LOGON_SESSION,
-                },
-            };
             if !std::ptr::eq(self, prior.io.as_ref())
                 || prior.epoch.user() != self.context.target.identity.user.sddl()
                 || prior.epoch.authentication_id() == self.context.target.identity.authentication_id
@@ -4166,51 +5654,7 @@ mod adapter {
             let owner = self.owner.clone();
             let authentication_id = prior.epoch.authentication_id();
             self.owner.run(Dispatch::Observation, deadline, move || {
-                context.validate(&budget)?;
-                if LOGON_QUERY_QUARANTINE.get().is_some() {
-                    return Err(NativeError::OutcomeUnknown);
-                }
-                if LOGON_QUERY_BUSY
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    return Err(NativeError::Busy);
-                }
-                let _in_flight = LogonQueryGuard;
-                if LOGON_QUERY_QUARANTINE.get().is_some() {
-                    return Err(NativeError::OutcomeUnknown);
-                }
-                let luid = LUID {
-                    LowPart: authentication_id as u32,
-                    HighPart: (authentication_id >> 32) as u32 as i32,
-                };
-                let mut data = std::ptr::null_mut();
-                // SAFETY: one exact captured same-user prior AuthenticationId, initialized output.
-                // This never enumerates sessions or uses a record/PID to open a process.
-                let status = unsafe { LsaGetLogonSessionData(&luid, &mut data) };
-                if status == 0 {
-                    if !data.is_null() {
-                        let buffer = LsaBuffer(data);
-                        // Only documented successful ownership is freed. Names/content stay unread.
-                        drop(buffer);
-                    }
-                    budget.check()?;
-                    context.validate(&budget)?;
-                    return Err(NativeError::Foreign);
-                }
-                if !data.is_null() {
-                    // Failed-output ownership is undocumented. Quarantine one opaque value and
-                    // retire all mutations; neither dereference nor free this ambiguous output.
-                    let _ = LOGON_QUERY_QUARANTINE.set(data as usize);
-                    owner.retire_mutations();
-                    return Err(NativeError::OutcomeUnknown);
-                }
-                super::epoch_archive::classify_prior_logon_status(status, false)?;
-                if status != STATUS_NO_SUCH_LOGON_SESSION {
-                    return Err(NativeError::Foreign);
-                }
-                budget.check()?;
-                context.validate(&budget)
+                query_ended_logon(&context, &owner, authentication_id, &budget)
             })?;
             proof.budget(self, deadline)?.check()
         }
@@ -6395,6 +7839,177 @@ mod adapter {
                     identity,
                 };
                 absence.reverify(self, &self.admit_support(deadline)?, lock, deadline)?;
+                Ok(absence)
+            }
+        }
+
+        /// Native positive fixed-copy absence, kept with the actual sole current user/session
+        /// namespace. It is file finalization only, never old tree completion or start approval.
+        pub(crate) struct FileRecoveryKeeperAbsent {
+            io: Arc<WindowsNativeIo>,
+            namespace: Arc<ExclusiveKeeperNamespace>,
+            terminal: Arc<super::file_recovery::TerminalData>,
+        }
+
+        pub(super) struct FileRecoveryNamespaceHold(Arc<ExclusiveKeeperNamespace>);
+        impl FileRecoveryNamespaceHold {
+            pub(super) fn reverify(
+                &self,
+                context: &Context,
+                budget: &Deadline,
+            ) -> NativeResult<()> {
+                context.validate(budget)?;
+                self.0.own.reverify(budget)?;
+                let mut flags = 0;
+                // SAFETY: this is the retained original FIRST_INSTANCE server handle. No name or
+                // recorded handle value is reopened; the hold survives any abandoned caller.
+                if unsafe {
+                    GetNamedPipeInfo(
+                        self.0.pipe.as_raw_handle(),
+                        &mut flags,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                } == 0
+                    || flags & PIPE_SERVER_END == 0
+                {
+                    return Err(NativeError::Foreign);
+                }
+                budget.check()
+            }
+        }
+        impl FileRecoveryKeeperAbsent {
+            pub(super) fn retain_namespace(&self) -> FileRecoveryNamespaceHold {
+                FileRecoveryNamespaceHold(self.namespace.clone())
+            }
+            pub(crate) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                seal: &super::FileRecoverySeal,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                self.namespace.reverify(proof, deadline)?;
+                self.terminal.matches_seal(seal)?;
+                seal.reverify(io, proof, lock, deadline)?;
+                let terminal = self.terminal.clone();
+                let context = io.context.clone();
+                let lease = lock.0.clone();
+                let owner = io.owner.clone();
+                let namespace = self.namespace.clone();
+                let budget = proof.budget(io, deadline)?;
+                io.owner.run(Dispatch::Observation,deadline,move|| {
+                    namespace.own.reverify(&budget)?;
+                    let journal=terminal.validate_current(&context,&lease,&owner,&budget)?;
+                    if !matches!(journal.cursor(),super::super::super::payload::recovery::FileRecoveryCursor::CopyDeleteIntent
+                        |super::super::super::payload::recovery::FileRecoveryCursor::CopyAbsent
+                        |super::super::super::payload::recovery::FileRecoveryCursor::CatalogRetireIntent
+                        |super::super::super::payload::recovery::FileRecoveryCursor::CatalogInactive
+                        |super::super::super::payload::recovery::FileRecoveryCursor::OuterRetireIntent
+                        |super::super::super::payload::recovery::FileRecoveryCursor::Retired){return Err(NativeError::Foreign)}
+                    super::file_recovery::verify_copy_absent(&context,&journal,&budget)
+                })
+            }
+        }
+        impl WindowsNativeIo {
+            pub(crate) fn cleanup_file_recovery_keeper(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                seal: &super::FileRecoverySeal,
+                terminal: &super::FileTerminalObservation,
+                deadline: &Deadline,
+            ) -> NativeResult<FileRecoveryKeeperAbsent> {
+                use super::super::super::payload::recovery::FileRecoveryCursor as Cursor;
+                self.lock_binding(proof, lock, deadline)?;
+                terminal.reverify(self, proof, lock, seal, deadline)?;
+                let namespace = ExclusiveKeeperNamespace::reserve(self.clone(), proof, deadline)?;
+                let data = terminal.held();
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let owner = self.owner.clone();
+                let held_namespace = namespace.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Mutation, deadline, move || {
+                    let change = Change::new();
+                    let result = change.finish((|| {
+                        held_namespace.own.reverify(&budget)?;
+                        let journal = data.validate_current(&context, &lease, &owner, &budget)?;
+                        let allow_delete = match journal.cursor() {
+                            Cursor::CopyDeleteIntent => true,
+                            Cursor::CopyAbsent
+                            | Cursor::CatalogRetireIntent
+                            | Cursor::CatalogInactive
+                            | Cursor::OuterRetireIntent
+                            | Cursor::Retired => false,
+                            _ => return Err(NativeError::Foreign),
+                        };
+                        let root = Anchor::open(
+                            context.target.paths.install(),
+                            &context.security,
+                            true,
+                            &budget,
+                        )?
+                        .ok_or(NativeError::Missing)?;
+                        let stage = root.child("payload-stage", &context.security, &budget)?;
+                        let parent = stage
+                            .map(|p| {
+                                p.child(
+                                    &records::hex(&journal.operation()),
+                                    &context.security,
+                                    &budget,
+                                )
+                            })
+                            .transpose()?
+                            .flatten();
+                        if let Some(parent) = parent {
+                            // No unrelated helper copy may be interpreted as a settled old owner.
+                            if parent
+                                .opaque("helper-copy.exe", false, &context.security, &budget)?
+                                .is_some()
+                            {
+                                return Err(NativeError::Unsupported);
+                            }
+                            let actual = parent.opaque(
+                                "keeper-copy.exe",
+                                false,
+                                &context.security,
+                                &budget,
+                            )?;
+                            if let Some(actual) = actual {
+                                let expected = journal
+                                    .outer_snapshot()
+                                    .keeper_image()
+                                    .ok_or(NativeError::Foreign)?;
+                                if actual.identity != epoch_identity(expected) || !allow_delete {
+                                    return Err(NativeError::Foreign);
+                                }
+                                let id = actual.identity;
+                                drop(actual);
+                                change.reached();
+                                parent.delete_keeper_copy(id, &context.security, &budget)?;
+                            }
+                        }
+                        super::file_recovery::verify_copy_absent(&context, &journal, &budget)?;
+                        validate_payload_lock(&context, &lease, &budget)?;
+                        Ok(())
+                    })());
+                    if matches!(result, Err(NativeError::OutcomeUnknown)) {
+                        owner.retire_mutations()
+                    }
+                    result
+                })?;
+                let absence = FileRecoveryKeeperAbsent {
+                    io: self.clone(),
+                    namespace,
+                    terminal: terminal.held(),
+                };
+                absence.reverify(self, proof, lock, seal, deadline)?;
                 Ok(absence)
             }
         }

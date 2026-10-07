@@ -1477,6 +1477,54 @@ pub(crate) mod native {
                 Some(_) => Err(NativeError::OutcomeUnknown),
             }
         }
+        /// A4e literal Outer pointer retirement after timely OuterRetireIntent under the
+        /// actual installer lock. Exact file identity and same-handle DELETE only; no arbitrary leaf.
+        #[cfg(not(test))]
+        pub(crate) fn delete_recovered_outer_record(
+            &self,
+            expected: FileIdentity,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            const LEAF: &str = "outer-upgrade.json";
+            self.revalidate(security, true, deadline)?;
+            let source = open_component(
+                self.file()?,
+                &ComponentName::new(LEAF)?,
+                ObjectKind::File,
+                super::DELETE,
+                0,
+                deadline,
+            )?
+            .ok_or(NativeError::Foreign)?;
+            let facts = observe(&source, LEAF, security)?;
+            super::admit_component(&facts, super::Admission::PrivateFile)?;
+            if facts.identity != expected {
+                return Err(NativeError::Foreign);
+            }
+            let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            deadline.check()?;
+            // SAFETY: exact admitted private non-reparse single-link record with expected FileId;
+            // opened relative with DELETE/no-follow. The effect never reopens a claimed name.
+            if unsafe {
+                SetFileInformationByHandle(
+                    source.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            // DeletePending is not completion; close the actual source before observing absence.
+            drop(source);
+            deadline.check()?;
+            match self.opaque(LEAF, false, security, deadline)? {
+                None => Ok(()),
+                Some(_) => Err(NativeError::OutcomeUnknown),
+            }
+        }
         /// A4d exact-identity fixed lifecycle copy under the actual installer lock and admitted
         /// durable cleanup intent. Caller renews its live exclusive namespace plus strict terminal
         /// selection, optionally also its positive retained-peer exit; FS-only cleanup grants no

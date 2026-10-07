@@ -242,6 +242,12 @@ impl<L> LockHandoff<'_, L> {
     }
 }
 
+/// Observation of the file-only preflight, never a startup or old-tree capability.
+#[cfg(all(windows, not(test)))]
+pub(crate) struct PriorLogonFileCheck {
+    recovered: bool,
+}
+
 #[cfg(windows)]
 mod native {
     use super::super::native_io::{
@@ -325,6 +331,14 @@ mod native {
             inputs: Vec<PayloadInput>,
             deadline: &Deadline,
         ) -> NativeResult<recovery::RecoveryDecision> {
+            #[cfg(not(test))]
+            {
+                let proof = self.io.admit_support(deadline)?;
+                if super::recover_prior_logon_files(&self.io, &proof, lock, deadline)?.recovered {
+                    // File retirement cannot make this old ServicePort path healthy or Run it.
+                    return Ok(recovery::RecoveryDecision::RecoveryRequired);
+                }
+            }
             if inputs.iter().enumerate().any(|(i, input)| {
                 input.role == PayloadRole::Installer
                     || inputs[..i].iter().any(|old| old.role == input.role)
@@ -385,6 +399,14 @@ mod native {
             inputs: Vec<PayloadInput>,
             deadline: &Deadline,
         ) -> NativeResult<recovery::RecoveryDecision> {
+            #[cfg(not(test))]
+            {
+                let proof = self.io.admit_support(deadline)?;
+                if super::recover_prior_logon_files(&self.io, &proof, &lock, deadline)?.recovered {
+                    // A cold file-only repair needs a separate fresh a4c admission, not this port.
+                    return Ok(recovery::RecoveryDecision::RecoveryRequired);
+                }
+            }
             if inputs.iter().enumerate().any(|(i, input)| {
                 input.role == PayloadRole::Installer
                     || inputs[..i].iter().any(|old| old.role == input.role)
@@ -418,6 +440,316 @@ mod native {
                 .stage_helper(&self.io, &proof, lock, permit, &self.module, deadline)
         }
     }
+    /// This bridge has no ServicePort, Stop/Run method, input source or health capability.
+    #[cfg(not(test))]
+    struct NativeFileRecoveryPort<'a> {
+        io: &'a Arc<WindowsNativeIo>,
+        root: super::super::native_io::FileRecoveryRoot,
+        seal: super::super::native_io::FileRecoverySeal,
+        lock: &'a InstallerLock,
+        deadline: &'a Deadline,
+        permit: Option<recovery::FileRecoveryMutationPermit>,
+        copy_absence: Option<super::super::native_io::FileRecoveryKeeperAbsent>,
+    }
+    #[cfg(not(test))]
+    impl NativeFileRecoveryPort<'_> {
+        fn proof(&self) -> NativeResult<SupportProof> {
+            self.io.admit_support(self.deadline)
+        }
+        fn permit(&self) -> NativeResult<&recovery::FileRecoveryMutationPermit> {
+            self.permit.as_ref().ok_or(NativeError::Foreign)
+        }
+        fn ensure_copy_absence(
+            &mut self,
+            journal: &recovery::FileRecoveryJournal,
+        ) -> NativeResult<()> {
+            if self.copy_absence.is_none() {
+                // Reopening CopyAbsent/later cursors renews genuine absence without replaying
+                // DELETE. The native factory enforces the actual persisted cursor and identity.
+                recovery::FileRecoveryPort::cleanup_keeper_copy(self, journal)?;
+            }
+            Ok(())
+        }
+    }
+    #[cfg(not(test))]
+    impl recovery::FileRecoveryPort for NativeFileRecoveryPort<'_> {
+        fn renew(&mut self, journal: &recovery::FileRecoveryJournal) -> NativeResult<()> {
+            journal.validate()?;
+            if journal.operation() != self.seal.operation() {
+                return Err(NativeError::Foreign);
+            }
+            let proof = self.proof()?;
+            self.seal
+                .reverify(self.io, &proof, self.lock, self.deadline)
+        }
+        fn journal(&mut self, journal: &recovery::FileRecoveryJournal) -> NativeResult<()> {
+            let proof = self.proof()?;
+            // Drop the previous permit before an ambiguous publication; only a timely successful
+            // actual durable record publication may authorize the following file effect.
+            self.permit = None;
+            self.permit = Some(recovery::publish_file_recovery(
+                self.io,
+                &proof,
+                self.lock,
+                &self.seal,
+                journal,
+                self.deadline,
+            )?);
+            Ok(())
+        }
+        fn observe_role(
+            &mut self,
+            _journal: &recovery::FileRecoveryJournal,
+            role: PayloadRole,
+        ) -> NativeResult<recovery::ReopenedRole> {
+            let proof = self.proof()?;
+            self.root.observe_role(
+                &proof,
+                self.lock,
+                &self.seal,
+                self.permit()?,
+                role,
+                self.deadline,
+            )
+        }
+        fn return_published(
+            &mut self,
+            _journal: &recovery::FileRecoveryJournal,
+            role: PayloadRole,
+        ) -> NativeResult<()> {
+            let proof = self.proof()?;
+            self.root.return_published(
+                &proof,
+                self.lock,
+                &self.seal,
+                self.permit()?,
+                role,
+                self.deadline,
+            )
+        }
+        fn restore_original(
+            &mut self,
+            _journal: &recovery::FileRecoveryJournal,
+            role: PayloadRole,
+        ) -> NativeResult<()> {
+            let proof = self.proof()?;
+            self.root.restore_original(
+                &proof,
+                self.lock,
+                &self.seal,
+                self.permit()?,
+                role,
+                self.deadline,
+            )
+        }
+        fn settle_stage(
+            &mut self,
+            _journal: &recovery::FileRecoveryJournal,
+            role: PayloadRole,
+        ) -> NativeResult<()> {
+            let proof = self.proof()?;
+            self.root.settle_stage(
+                &proof,
+                self.lock,
+                &self.seal,
+                self.permit()?,
+                role,
+                self.deadline,
+            )
+        }
+        fn backup_original(
+            &mut self,
+            _journal: &recovery::FileRecoveryJournal,
+            role: PayloadRole,
+        ) -> NativeResult<()> {
+            let proof = self.proof()?;
+            self.root.backup_original(
+                &proof,
+                self.lock,
+                &self.seal,
+                self.permit()?,
+                role,
+                self.deadline,
+            )
+        }
+        fn publish_stage(
+            &mut self,
+            _journal: &recovery::FileRecoveryJournal,
+            role: PayloadRole,
+        ) -> NativeResult<()> {
+            let proof = self.proof()?;
+            self.root.publish_stage(
+                &proof,
+                self.lock,
+                &self.seal,
+                self.permit()?,
+                role,
+                self.deadline,
+            )
+        }
+        fn cleanup_keeper_copy(
+            &mut self,
+            _journal: &recovery::FileRecoveryJournal,
+        ) -> NativeResult<()> {
+            let proof = self.proof()?;
+            let terminal = self.root.observe_convergence(
+                &proof,
+                self.lock,
+                &self.seal,
+                self.permit()?,
+                self.deadline,
+            )?;
+            let proof = self.proof()?;
+            self.copy_absence = Some(self.io.cleanup_file_recovery_keeper(
+                &proof,
+                self.lock,
+                &self.seal,
+                &terminal,
+                self.deadline,
+            )?);
+            Ok(())
+        }
+        fn retire_catalog(&mut self, journal: &recovery::FileRecoveryJournal) -> NativeResult<()> {
+            self.ensure_copy_absence(journal)?;
+            let proof = self.proof()?;
+            self.root.retire_catalog(
+                &proof,
+                self.lock,
+                &self.seal,
+                self.permit()?,
+                self.copy_absence.as_ref().ok_or(NativeError::Foreign)?,
+                self.deadline,
+            )
+        }
+        fn retire_outer(&mut self, journal: &recovery::FileRecoveryJournal) -> NativeResult<()> {
+            self.ensure_copy_absence(journal)?;
+            let proof = self.proof()?;
+            self.root.retire_outer(
+                &proof,
+                self.lock,
+                &self.seal,
+                self.permit()?,
+                self.copy_absence.as_ref().ok_or(NativeError::Foreign)?,
+                self.deadline,
+            )
+        }
+        fn observe_terminal(
+            &mut self,
+            _journal: &recovery::FileRecoveryJournal,
+        ) -> NativeResult<()> {
+            let proof = self.proof()?;
+            self.root
+                .observe_terminal(&proof, self.lock, &self.seal, self.permit()?, self.deadline)
+        }
+    }
+
+    /// Entry-only classification cannot take a mutation lock ahead of a genuine warm helper's
+    /// original parent wait. The Boolean creates no authority; cold recovery reselects under lock.
+    #[cfg(not(test))]
+    pub(crate) fn recover_prior_logon_files_for_entry(
+        io: &Arc<WindowsNativeIo>,
+        deadline: &Deadline,
+    ) -> NativeResult<super::PriorLogonFileCheck> {
+        let inventory = ApprovedInventory::embedded()?;
+        let proof = io.admit_support(deadline)?;
+        let module = io.self_image(&proof, deadline)?;
+        let installer = ApprovedPe::own_image(&module)?;
+        inventory.check_staging_budget(&installer, true)?;
+        let proof = io.admit_support(deadline)?;
+        module.reverify(io, &proof, deadline)?;
+        let proof = io.admit_support(deadline)?;
+        if !io.file_recovery_requires_lock(&proof, deadline)? {
+            return Ok(super::PriorLogonFileCheck { recovered: false });
+        }
+        let proof = io.admit_support(deadline)?;
+        let lock = io.acquire_installer_lock(&proof, deadline)?;
+        let proof = io.admit_support(deadline)?;
+        let check = recover_prior_logon_files(io, &proof, &lock, deadline)?;
+        drop(lock);
+        Ok(check)
+    }
+
+    /// Admit this executing build and original current context before classifying a cold recovery.
+    /// A returned observation can never substitute for fixed-image or startup admission.
+    #[cfg(not(test))]
+    pub(crate) fn recover_prior_logon_files(
+        io: &Arc<WindowsNativeIo>,
+        proof: &SupportProof,
+        lock: &InstallerLock,
+        deadline: &Deadline,
+    ) -> NativeResult<super::PriorLogonFileCheck> {
+        let payload = WindowsPayload::new(io.clone(), proof, lock, deadline)?;
+        let proof = io.admit_support(deadline)?;
+        payload.module.reverify(io, &proof, deadline)?;
+        let proof = io.admit_support(deadline)?;
+        let Some(seal) = io.prepare_file_recovery(&proof, lock, deadline)? else {
+            // Exact same-context ordinary/warm flow and positively classified no-op cases grant
+            // no new authority. The caller still needs its original live/approved admissions.
+            return Ok(super::PriorLogonFileCheck { recovered: false });
+        };
+        let proof = io.admit_support(deadline)?;
+        let root = io.file_recovery_root(&proof, lock, &seal, deadline)?;
+        let proof = io.admit_support(deadline)?;
+        let existing = recovery::read_file_recovery(io, &proof, deadline)?;
+        let (mut journal, new_journal) = match existing {
+            Some(journal) if journal.operation() == seal.operation() => (journal, false),
+            Some(journal) if matches!(journal.cursor(), recovery::FileRecoveryCursor::Retired) => {
+                let proof = io.admit_support(deadline)?;
+                let (outer, outer_stamp, operation, operation_stamp, views) =
+                    root.planning(&proof, lock, &seal, deadline)?.into_parts();
+                (
+                    recovery::FileRecoveryJournal::prepare(
+                        outer,
+                        outer_stamp,
+                        &operation,
+                        operation_stamp,
+                        views,
+                    )?,
+                    true,
+                )
+            }
+            Some(_) => return Err(NativeError::Foreign),
+            None => {
+                let proof = io.admit_support(deadline)?;
+                let (outer, outer_stamp, operation, operation_stamp, views) =
+                    root.planning(&proof, lock, &seal, deadline)?.into_parts();
+                (
+                    recovery::FileRecoveryJournal::prepare(
+                        outer,
+                        outer_stamp,
+                        &operation,
+                        operation_stamp,
+                        views,
+                    )?,
+                    true,
+                )
+            }
+        };
+        let mut port = NativeFileRecoveryPort {
+            io,
+            root,
+            seal,
+            lock,
+            deadline,
+            permit: None,
+            copy_absence: None,
+        };
+        if new_journal {
+            recovery::FileRecoveryPort::journal(&mut port, &journal)?;
+        } else {
+            // Fresh rooted read admission avoids any journal replay on successful reopen.
+            let proof = port.proof()?;
+            port.permit = Some(io.admit_file_recovery_permit(&proof, lock, &port.seal, deadline)?);
+        }
+        match recovery::recover_file_only(&mut port, &mut journal)? {
+            recovery::FileRecoveryDecision::FilesRestored
+            | recovery::FileRecoveryDecision::FilesForwardComplete => {
+                Ok(super::PriorLogonFileCheck { recovered: true })
+            }
+            recovery::FileRecoveryDecision::Retained => Err(NativeError::OutcomeUnknown),
+        }
+    }
+
     struct NativePayloadPort<'a, S> {
         payload: &'a WindowsPayload,
         service: &'a mut S,
@@ -893,6 +1225,8 @@ mod native {
 }
 #[cfg(windows)]
 pub(crate) use native::WindowsPayload;
+#[cfg(all(windows, not(test)))]
+pub(crate) use native::{recover_prior_logon_files, recover_prior_logon_files_for_entry};
 #[cfg(windows)]
 #[allow(unused_imports)]
 // Keep the frozen borrowed helper re-export; native entry transfers its owned lock.

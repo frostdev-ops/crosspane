@@ -1227,6 +1227,9 @@ mod keeper_runtime {
         let proof = io.admit_support(&initial)?;
         let lock = io.acquire_installer_lock(&proof, &initial)?;
         let proof = io.admit_support(&initial)?;
+        payload::recover_prior_logon_files(&io, &proof, &lock, &initial)?;
+        // File-only retirement never substitutes for this keeper's actual source admission.
+        let proof = io.admit_support(&initial)?;
         let selected = io.keeper_selection(&proof, &lock, &initial)?;
         let server = KeeperServer::reserve(io.clone(), selected, &initial)?;
         drop(lock);
@@ -1304,6 +1307,9 @@ mod keeper_runtime {
         let io = Arc::new(WindowsNativeIo::current(clock, &deadline)?);
         let proof = io.admit_support(&deadline)?;
         let lock = io.acquire_installer_lock(&proof, &deadline)?;
+        let proof = io.admit_support(&deadline)?;
+        payload::recover_prior_logon_files(&io, &proof, &lock, &deadline)?;
+        // A same-logon resident/readonly continuation is still admitted by the old live path.
         let proof = io.admit_support(&deadline)?;
         if let Some(prior) = recovery::OuterUpgradeRecord::read(&io, &proof, &deadline)? {
             if matches!(
@@ -1391,15 +1397,35 @@ pub enum SupervisorExit {
     InstallerStopped,
 }
 
+/// File recovery runs before fixed images are opened. Its result grants no startup authority.
+#[cfg(all(windows, not(test)))]
+fn recover_prior_logon_files_before_images() -> NativeResult<()> {
+    use super::native_io::{Cancellation, Deadline, MonotonicClock, WindowsNativeIo};
+    use std::sync::Arc;
+
+    // Executing-build approval is independent of whichever fixed images need repair.
+    super::payload::inventory::ApprovedInventory::embedded()?;
+    let clock: Arc<dyn super::native_io::Clock> = Arc::new(MonotonicClock::default());
+    let deadline = Deadline::new(30_000, clock.clone(), Cancellation::default())?;
+    let io = Arc::new(WindowsNativeIo::current(clock, &deadline)?);
+    super::payload::recover_prior_logon_files_for_entry(&io, &deadline)?;
+    // The preflight releases any own lease before unchanged TrustedImages takes a fresh lease.
+    Ok(())
+}
+
 /// Windows-only early entry; it cannot start a GUI or manufacture image approval.
 #[cfg(windows)]
 pub fn supervisor_entry() -> NativeResult<SupervisorExit> {
+    #[cfg(not(test))]
+    recover_prior_logon_files_before_images()?;
     let trusted = TrustedImages::current()?;
     supervisor::native_entry(&trusted)
 }
 
 /// A4 must supply genuine fixed installer/agent role and PE/hash approval before this can start.
 pub fn start_supported() -> NativeResult<()> {
+    #[cfg(all(windows, not(test)))]
+    recover_prior_logon_files_before_images()?;
     let trusted = TrustedImages::current()?;
     task::native_start(&trusted)
 }
