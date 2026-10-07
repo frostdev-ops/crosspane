@@ -10,7 +10,8 @@ use crate::{
         Latest, MonitorSnapshotReader, MonitorTarget, TargetState, crop_rect, end_reason,
         failure_reason, refresh_monitor, resolve_monitor, surface_ready, validate_crop,
     },
-    window::{NativeWindow, WindowResolver},
+    model::popup,
+    window::{NativeWindow, PopupObserver, WindowResolver},
 };
 use crosspane_platform::{
     CaptureTarget, EventSink, Frame, FrameCapture, FrameEvent, FrameImage, IoGate, NativeImage,
@@ -67,6 +68,78 @@ use windows::{
 const BOUND: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(5);
 
+#[cfg(test)]
+fn popup_diagnostics() -> bool {
+    std::env::var("CROSSPANE_WINDOWS_POPUP_PROBE").as_deref() == Ok("1")
+        && std::env::var("CROSSPANE_WINDOWS_POPUP_SELECTOR").as_deref() == Ok("menu")
+}
+
+#[cfg(test)]
+static POPUP_LAST_STAGE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+fn popup_stage(code: u8) {
+    if !popup_diagnostics() {
+        return;
+    }
+    let flag = match code {
+        11 => 1 << 0,
+        12 => 1 << 1,
+        21 => 1 << 2,
+        30 => 1 << 3,
+        31 => 1 << 4,
+        32 => 1 << 5,
+        33 => 1 << 6,
+        40 => 1 << 7,
+        41 => 1 << 8,
+        42 => 1 << 9,
+        43 => 1 << 10,
+        44 => 1 << 11,
+        60 => 1 << 12,
+        62 => 1 << 13,
+        70 => 1 << 14,
+        71 => 1 << 15,
+        72 => 1 << 16,
+        73 => 1 << 17,
+        _ => return,
+    };
+    // Last observed boundary, never a claim that a native call blocked or closed successfully.
+    POPUP_LAST_STAGE.store(code, Ordering::Relaxed);
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SEEN.fetch_or(flag, Ordering::Relaxed) & flag != 0 {
+        return;
+    }
+    static LINES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if LINES
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            (n < 64).then(|| n + 1)
+        })
+        .is_err()
+    {
+        return;
+    }
+    use std::io::Write as _;
+    let mut output = std::io::stdout().lock();
+    let _ = writeln!(output, "W22C_CAPTURE_STAGE code={code}");
+    let _ = output.flush();
+}
+
+#[cfg(test)]
+fn popup_stop_witness(done: bool, joined: bool, fault: bool) {
+    use std::io::Write as _;
+    let mut output = std::io::stdout().lock();
+    let last_stage = POPUP_LAST_STAGE.load(Ordering::Relaxed);
+    let _ = writeln!(
+        output,
+        "W22C_CAPTURE_STOP done={} join_attempted={} joined={} fault={} last_stage={last_stage}",
+        u8::from(done),
+        u8::from(done),
+        u8::from(joined),
+        u8::from(fault)
+    );
+    let _ = output.flush();
+}
+
 fn backend(operation: &'static str) -> PlatformError {
     PlatformError::Backend(operation.into())
 }
@@ -98,6 +171,8 @@ struct Shared {
     fault: AtomicBool,
     #[cfg(feature = "gpu")]
     gpu: Mutex<Option<Arc<crate::gpu::WindowsGpu>>>,
+    #[cfg(test)]
+    popup_probes: Mutex<BTreeMap<StreamId, PopupProbeSnapshot>>,
 }
 impl Shared {
     fn permitted(&self, epoch: u64) -> bool {
@@ -146,6 +221,32 @@ enum Operation {
     },
     Crop(StreamId, Option<PixelRect>),
     Stop(StreamId),
+    #[cfg(test)]
+    QualifyPopup {
+        stream: StreamId,
+        hwnd: u64,
+        region: PixelRect,
+        expected: [u8; 4],
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Numeric private diagnostics consumed only by the owned ignored harness.
+pub(crate) struct PopupProbeItem {
+    pub candidate: popup::Candidate,
+    pub content: Option<PixelSize>,
+    pub clip: Option<popup::Blit>,
+    pub alpha: popup::AlphaCounts,
+}
+#[cfg(test)]
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct PopupProbeSnapshot {
+    pub snapshot: popup::Snapshot,
+    pub root_content: PixelSize,
+    pub popups: Vec<PopupProbeItem>,
+    pub alpha: popup::Alpha,
 }
 
 /// Command facade. W2.5 supplies `WindowSource::resolver()` from the same live source.
@@ -205,6 +306,8 @@ impl WindowsFrameCapture {
             fault: AtomicBool::new(false),
             #[cfg(feature = "gpu")]
             gpu: Mutex::new(None),
+            #[cfg(test)]
+            popup_probes: Mutex::new(BTreeMap::new()),
         });
         let (commands, receive) = mpsc::sync_channel(1);
         let (ready, initialized) = mpsc::sync_channel(1);
@@ -279,9 +382,38 @@ impl WindowsFrameCapture {
         let Some(thread) = self.thread.take() else {
             return false;
         };
-        self.done.recv_timeout(BOUND).is_ok()
-            && thread.join().is_ok()
-            && !self.shared.fault.load(Ordering::Acquire)
+        let done = self.done.recv_timeout(BOUND).is_ok();
+        let joined = done && thread.join().is_ok();
+        let result = joined && !self.shared.fault.load(Ordering::Acquire);
+        #[cfg(test)]
+        if popup_diagnostics() {
+            // Diagnostic load is separate; the original short-circuit result stays unchanged.
+            popup_stop_witness(done, joined, self.shared.fault.load(Ordering::Acquire));
+        }
+        result
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // Only the separately compiled Limited popup harness calls this hook.
+    pub(crate) fn popup_probe_snapshot(&self, stream: StreamId) -> Option<PopupProbeSnapshot> {
+        self.shared.popup_probes.lock().ok()?.get(&stream).cloned()
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn qualify_popup_premultiplied(
+        &mut self,
+        stream: StreamId,
+        hwnd: u64,
+        region: PixelRect,
+        expected: [u8; 4],
+    ) -> Result<(), PlatformError> {
+        self.call(Operation::QualifyPopup {
+            stream,
+            hwnd,
+            region,
+            expected,
+        })
     }
 }
 impl FrameCapture for WindowsFrameCapture {
@@ -350,8 +482,12 @@ impl Runtime {
 }
 impl Drop for Runtime {
     fn drop(&mut self) {
+        #[cfg(test)]
+        popup_stage(72);
         // SAFETY: only this thread's successful RoInitialize is balanced, after WinRT objects drop.
         unsafe { RoUninitialize() };
+        #[cfg(test)]
+        popup_stage(73);
     }
 }
 struct Gpu {
@@ -705,6 +841,704 @@ impl Binding {
     }
 }
 
+struct PopupAccess<'a> {
+    shared: &'a Shared,
+    epoch: u64,
+    until: Instant,
+    observer: Option<(&'a mut PopupObserver, &'a popup::Snapshot)>,
+}
+impl PopupAccess<'_> {
+    fn ready(&self) -> Result<bool, PlatformError> {
+        if !self.shared.permitted(self.epoch) {
+            return Err(PlatformError::Locked);
+        }
+        Ok(Instant::now() < self.until)
+    }
+    fn local(&self) -> Result<(), PlatformError> {
+        if self.ready()? {
+            Ok(())
+        } else {
+            Err(PlatformError::Timeout)
+        }
+    }
+    /// Must only run outside the D3D context lock; all observer native calls may reenter.
+    fn check(&mut self) -> Result<(), PlatformError> {
+        self.local()?;
+        if let Some((observer, snapshot)) = &mut self.observer
+            && !observer.unchanged(snapshot, self.until)
+        {
+            return Err(backend("popup admission changed"));
+        }
+        self.local()
+    }
+}
+
+/// Read only the already admitted surface region. A single composition turn shares its
+/// two-second deadline; cancellation surrounds driver calls but cannot preempt a driver.
+fn read_region(
+    access: &mut PopupAccess<'_>,
+    gpu: &Gpu,
+    texture: &ID3D11Texture2D,
+    surface: PixelSize,
+    roi: PixelRect,
+) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, PlatformError> {
+    access.check()?;
+    if !surface_ready(surface, roi)? {
+        return Ok(None);
+    }
+    let size = PixelSize::new(roi.width() as u32, roi.height() as u32);
+    let count = popup::bytes(size).map_err(|_| backend("popup readback budget"))?;
+    if count > popup::WORKING_BYTES {
+        return Ok(None);
+    }
+    access.check()?; // Before creating another staging allocation.
+    let staging = gpu.texture(size, true)?;
+    access.check()?; // Exact topology before source Copy; no context lock held here.
+    let context = match gpu.context.try_lock() {
+        Ok(context) => context,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        Err(std::sync::TryLockError::Poisoned(_)) => return Err(backend("D3D context poisoned")),
+    };
+    let area = D3D11_BOX {
+        left: roi.min.x as u32,
+        top: roi.min.y as u32,
+        front: 0,
+        right: roi.max.x as u32,
+        bottom: roi.max.y as u32,
+        back: 1,
+    };
+    access.local()?;
+    // SAFETY: equal BGRA single-sample same-device textures, verified source ROI and locked context.
+    unsafe { context.CopySubresourceRegion(&staging, 0, 0, 0, 0, texture, 0, Some(&area)) };
+    drop(context);
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    let context = loop {
+        access.check()?; // Each Map attempt freshly corroborates the snapshot outside the lock.
+        let context = match gpu.context.try_lock() {
+            Ok(context) => context,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(backend("D3D context poisoned"));
+            }
+        };
+        access.local()?;
+        // SAFETY: own CPU-readable staging texture and initialized exact output; nonblocking Map.
+        match unsafe {
+            context.Map(
+                &staging,
+                0,
+                D3D11_MAP_READ,
+                D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                Some(&mut mapped),
+            )
+        } {
+            Ok(()) => break context,
+            Err(e) if e.code() == DXGI_ERROR_WAS_STILL_DRAWING => {
+                drop(context);
+                thread::sleep(Duration::from_millis(1))
+            }
+            Err(e) => return Err(api("popup map", e)),
+        }
+    };
+    let mapping = Mapped {
+        context: &context,
+        texture: &staging,
+    };
+    let row = size
+        .width
+        .checked_mul(4)
+        .ok_or_else(|| backend("popup readback row"))?;
+    if mapped.pData.is_null() || mapped.RowPitch < row {
+        return Err(backend("popup mapping"));
+    }
+    access.local()?; // A slow successful Map cannot authorize another allocation after expiry.
+    let mut pixels = zeroize::Zeroizing::new(vec![0; count]);
+    for y in 0..size.height as usize {
+        access.local()?;
+        let offset = y
+            .checked_mul(mapped.RowPitch as usize)
+            .filter(|n| {
+                n.checked_add(row as usize)
+                    .is_some_and(|n| n <= isize::MAX as usize)
+            })
+            .ok_or_else(|| backend("popup mapping offset"))?;
+        // SAFETY: Map supplies initialized bytes for each verified texture row; padding is excluded.
+        let source = unsafe {
+            std::slice::from_raw_parts(mapped.pData.cast::<u8>().add(offset), row as usize)
+        };
+        pixels[y * row as usize..(y + 1) * row as usize].copy_from_slice(source);
+    }
+    drop(mapping);
+    drop(context);
+    access.check()?; // Before any caller can commit these bytes to its cache.
+    Ok(Some(pixels))
+}
+
+struct PopupCapture {
+    candidate: popup::Candidate,
+    item: GraphicsCaptureItem,
+    pool: Direct3D11CaptureFramePool,
+    session: GraphicsCaptureSession,
+    token: i64,
+    closed: Arc<AtomicBool>,
+    pixels: Option<zeroize::Zeroizing<Vec<u8>>>,
+    content: Option<PixelSize>,
+    counts: popup::AlphaCounts,
+}
+impl Drop for PopupCapture {
+    fn drop(&mut self) {
+        self.pixels.take();
+        #[cfg(test)]
+        popup_stage(30);
+        let _ = self.session.Close();
+        #[cfg(test)]
+        popup_stage(31);
+        let _ = self.pool.Close();
+        #[cfg(test)]
+        popup_stage(32);
+        let _ = self.item.RemoveClosed(self.token);
+        #[cfg(test)]
+        popup_stage(33);
+    }
+}
+impl PopupCapture {
+    fn new(
+        access: &mut PopupAccess<'_>,
+        graphics: &Graphics,
+        candidate: popup::Candidate,
+    ) -> Result<Self, PlatformError> {
+        access.check()?;
+        let interop: IGraphicsCaptureItemInterop =
+            factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+                .map_err(|e| api("popup item interop", e))?;
+        access.check()?;
+        // SAFETY: exact freshly process/thread/owner/generation-admitted popup HWND; no picker.
+        let item: GraphicsCaptureItem = unsafe {
+            interop.CreateForWindow(HWND(candidate.token.identity.hwnd as usize as *mut _))
+        }
+        .map_err(|e| api("popup item", e))?;
+        access.check()?;
+        let pool_size = item.Size().map_err(|e| api("popup item size", e))?;
+        if size(pool_size)? != candidate.geometry.content {
+            return Err(backend("popup capture origin mismatch"));
+        }
+        access.check()?;
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &graphics.capture,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2,
+            pool_size,
+        )
+        .map_err(|e| api("popup pool", e))?;
+        let session = match access.check().and_then(|()| {
+            pool.CreateCaptureSession(&item)
+                .map_err(|e| api("popup session", e))
+        }) {
+            Ok(session) => session,
+            Err(e) => {
+                let _ = pool.Close();
+                return Err(e);
+            }
+        };
+        let closed = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&closed);
+        let handler = TypedEventHandler::new(move |_, _| {
+            signal.store(true, Ordering::Release);
+            Ok(())
+        });
+        let token = match access.check().and_then(|()| {
+            item.Closed(&handler)
+                .map_err(|e| api("popup close event", e))
+        }) {
+            Ok(token) => token,
+            Err(e) => {
+                let _ = session.Close();
+                let _ = pool.Close();
+                return Err(e);
+            }
+        };
+        let capture = Self {
+            candidate,
+            item,
+            pool,
+            session,
+            token,
+            closed,
+            pixels: None,
+            content: None,
+            counts: popup::AlphaCounts::default(),
+        };
+        access.check()?;
+        capture
+            .session
+            .SetIsCursorCaptureEnabled(false)
+            .map_err(|e| api("popup cursor disable", e))?;
+        access.check()?;
+        capture
+            .session
+            .SetIsBorderRequired(true)
+            .map_err(|e| api("popup border required", e))?;
+        access.check()?;
+        capture
+            .session
+            .SetIncludeSecondaryWindows(false)
+            .map_err(|e| api("popup secondary disable", e))?;
+        access.check()?;
+        if capture
+            .session
+            .IncludeSecondaryWindows()
+            .map_err(|e| api("popup secondary state", e))?
+        {
+            return Err(backend("popup session admission"));
+        }
+        access.check()?;
+        if !capture
+            .session
+            .IsBorderRequired()
+            .map_err(|e| api("popup border state", e))?
+        {
+            return Err(backend("popup session admission"));
+        }
+        access.check()?;
+        capture
+            .session
+            .StartCapture()
+            .map_err(|e| api("popup capture start", e))?;
+        access.check()?;
+        Ok(capture)
+    }
+
+    fn update(
+        &mut self,
+        access: &mut PopupAccess<'_>,
+        graphics: &Graphics,
+    ) -> Result<bool, PlatformError> {
+        access.check()?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(PlatformError::NotFound);
+        }
+        let mut latest = None;
+        for _ in 0..4 {
+            access.check()?;
+            match frame_result(self.pool.TryGetNextFrame()).map_err(|e| api("popup dequeue", e))? {
+                Some(frame) => {
+                    latest = Some(Held(frame));
+                }
+                None => break,
+            }
+        }
+        let Some(held) = latest else {
+            return Ok(false);
+        };
+        access.check()?; // Dequeued frame has not yet been acquired/copied into our cache.
+        let content = size(
+            held.0
+                .ContentSize()
+                .map_err(|e| api("popup content size", e))?,
+        )?;
+        if content != self.candidate.geometry.content {
+            return Err(backend("popup capture origin mismatch"));
+        }
+        access.check()?;
+        let surface: IDirect3DDxgiInterfaceAccess = held
+            .0
+            .Surface()
+            .and_then(|s| s.cast())
+            .map_err(|e| api("popup surface", e))?;
+        access.check()?;
+        // SAFETY: documented retrieval from this admitted frame's retained surface.
+        let texture: ID3D11Texture2D =
+            unsafe { surface.GetInterface() }.map_err(|e| api("popup texture", e))?;
+        access.check()?;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: owned live texture and initialized descriptor output.
+        unsafe { texture.GetDesc(&mut desc) };
+        if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM || desc.SampleDesc.Count != 1 {
+            return Err(backend("popup surface format"));
+        }
+        let roi = PixelRect::new(
+            (0, 0).into(),
+            (content.width as i32, content.height as i32).into(),
+        );
+        if let Some(pixels) = read_region(
+            access,
+            &graphics.gpu,
+            &texture,
+            PixelSize::new(desc.Width, desc.Height),
+            roi,
+        )? {
+            access.check()?;
+            if self.closed.load(Ordering::Acquire) {
+                return Err(PlatformError::NotFound);
+            }
+            self.pixels = Some(pixels);
+            self.content = Some(content);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+struct Baseline {
+    geometry: popup::Geometry,
+    crop: PixelRect,
+    size: PixelSize,
+    texture: ID3D11Texture2D,
+}
+struct PopupState {
+    observer: PopupObserver,
+    snapshot: Option<popup::Snapshot>,
+    sources: BTreeMap<u64, PopupCapture>,
+    baseline: Option<Baseline>,
+    dirty: bool,
+    alpha: popup::Alpha,
+    reported: Option<(usize, popup::Refusal)>,
+    alpha_reported: bool,
+}
+impl Drop for PopupState {
+    fn drop(&mut self) {
+        self.sources.clear();
+        self.baseline.take();
+        // The same-thread observer/hooks and process handle drop only after all popup captures.
+    }
+}
+impl PopupState {
+    fn new(
+        native: NativeWindow,
+        resolver: WindowResolver,
+        until: Instant,
+    ) -> Result<Self, PlatformError> {
+        Ok(Self {
+            observer: PopupObserver::new(native, resolver, until)?,
+            snapshot: None,
+            sources: BTreeMap::new(),
+            baseline: None,
+            dirty: true,
+            alpha: popup::Alpha::Threshold128,
+            reported: None,
+            alpha_reported: false,
+        })
+    }
+    fn refresh(
+        &mut self,
+        shared: &Shared,
+        graphics: &Graphics,
+        epoch: u64,
+        root_size: PixelSize,
+        until: Instant,
+    ) -> Result<(), PlatformError> {
+        let mut snapshot = self.observer.snapshot(until)?;
+        if snapshot.geometry.content != root_size {
+            snapshot.popups.clear();
+            snapshot.reason = popup::Refusal::Geometry;
+            self.baseline = None;
+        }
+        if self.snapshot.as_ref() != Some(&snapshot) {
+            #[cfg(test)]
+            if snapshot.popups.is_empty() {
+                popup_stage(60);
+            }
+            self.dirty = true;
+            if self
+                .baseline
+                .as_ref()
+                .is_some_and(|base| base.geometry != snapshot.geometry)
+            {
+                self.baseline = None;
+            }
+        }
+        self.sources.retain(|hwnd, source| {
+            snapshot
+                .popups
+                .iter()
+                .any(|p| p.token.identity.hwnd == *hwnd && p == &source.candidate)
+        });
+        let mut refused = snapshot.refused;
+        let mut reason = snapshot.reason;
+        for candidate in &snapshot.popups {
+            let mut access = PopupAccess {
+                shared,
+                epoch,
+                until,
+                observer: Some((&mut self.observer, &snapshot)),
+            };
+            access.check()?; // Do not admit/dequeue the next candidate after this turn expires.
+            let hwnd = candidate.token.identity.hwnd;
+            if let std::collections::btree_map::Entry::Vacant(entry) = self.sources.entry(hwnd) {
+                match PopupCapture::new(&mut access, graphics, candidate.clone()) {
+                    Ok(source) => {
+                        entry.insert(source);
+                    }
+                    Err(PlatformError::Locked) => return Err(PlatformError::Locked),
+                    Err(PlatformError::Timeout) => return Err(PlatformError::Timeout),
+                    Err(_) => {
+                        refused += 1;
+                        reason = popup::Refusal::Capture;
+                    }
+                }
+            }
+            if let Some(source) = self.sources.get_mut(&hwnd) {
+                match source.update(&mut access, graphics) {
+                    Ok(changed) => self.dirty |= changed,
+                    Err(PlatformError::Locked) => return Err(PlatformError::Locked),
+                    Err(PlatformError::Timeout) => return Err(PlatformError::Timeout),
+                    Err(_) => {
+                        self.sources.remove(&hwnd);
+                        refused += 1;
+                        reason = popup::Refusal::Capture;
+                        self.dirty = true;
+                    }
+                }
+            }
+            access.check()?; // Changed snapshot retires all admissions via caller invalidation.
+        }
+        let report = (refused, reason);
+        if self.reported != Some(report) && report.1 != popup::Refusal::None {
+            eprintln!(
+                "WINDOWS_POPUP refused={} reason={}",
+                report.0,
+                report.1.code()
+            );
+        }
+        self.reported = Some(report);
+        self.snapshot = Some(snapshot);
+        Ok(())
+    }
+    fn invalidate(&mut self) {
+        self.sources.clear();
+        self.snapshot = None;
+        self.dirty = true;
+    }
+    fn baseline(
+        &mut self,
+        shared: &Shared,
+        graphics: &Graphics,
+        epoch: u64,
+        texture: &ID3D11Texture2D,
+        crop: PixelRect,
+        until: Instant,
+    ) -> Result<bool, PlatformError> {
+        // False defers this fresh root for retry; true preserves the existing root-only fallback.
+        // A newer root frame must never leave an older A baseline available after B delivery.
+        let previous = self.baseline.take();
+        let Some(snapshot) = &self.snapshot else {
+            return Ok(true);
+        };
+        if popup::bytes(snapshot.geometry.content)
+            .ok()
+            .and_then(|n| n.checked_mul(3))
+            .is_none_or(|n| n > popup::WORKING_BYTES)
+        {
+            return Ok(true);
+        }
+        let mut access = PopupAccess {
+            shared,
+            epoch,
+            until,
+            observer: Some((&mut self.observer, snapshot)),
+        };
+        access.check()?;
+        let output = PixelSize::new(crop.width() as u32, crop.height() as u32);
+        let base = match previous {
+            Some(base) if base.geometry == snapshot.geometry && base.crop == crop => base,
+            previous => {
+                drop(previous); // Keep the admitted 3R live-resource reservation.
+                access.check()?;
+                Baseline {
+                    geometry: snapshot.geometry,
+                    crop,
+                    size: output,
+                    texture: graphics.gpu.texture(output, false)?,
+                }
+            }
+        };
+        access.check()?;
+        let context = match graphics.gpu.context.try_lock() {
+            Ok(context) => context,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                popup_stage(11);
+                return Ok(false);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(backend("D3D context poisoned"));
+            }
+        };
+        access.local()?;
+        let area = D3D11_BOX {
+            left: crop.min.x as u32,
+            top: crop.min.y as u32,
+            front: 0,
+            right: crop.max.x as u32,
+            bottom: crop.max.y as u32,
+            back: 1,
+        };
+        // SAFETY: root source bounds checked by caller; same-device/format free private baseline.
+        unsafe {
+            context.CopySubresourceRegion(&base.texture, 0, 0, 0, 0, texture, 0, Some(&area))
+        };
+        drop(context);
+        access.check()?;
+        self.baseline = Some(base);
+        self.dirty = true;
+        #[cfg(test)]
+        popup_stage(12);
+        Ok(true)
+    }
+    fn clean_texture(&self, crop: PixelRect) -> Option<ID3D11Texture2D> {
+        let base = self.baseline.as_ref()?;
+        (base.crop == crop
+            && self
+                .snapshot
+                .as_ref()
+                .is_none_or(|snapshot| base.geometry == snapshot.geometry))
+        .then(|| base.texture.clone())
+    }
+    fn compose(
+        &mut self,
+        output: PixelSize,
+        crop: PixelRect,
+        shared: &Shared,
+        graphics: &Graphics,
+        epoch: u64,
+        until: Instant,
+    ) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, PlatformError> {
+        let (Some(base), Some(snapshot)) = (&self.baseline, &self.snapshot) else {
+            return Ok(None);
+        };
+        if base.geometry != snapshot.geometry
+            || base.crop != crop
+            || base.size != output
+            || !self.sources.values().any(|source| source.pixels.is_some())
+        {
+            return Ok(None);
+        }
+        let full = PixelRect::new(
+            (0, 0).into(),
+            (output.width as i32, output.height as i32).into(),
+        );
+        let mut access = PopupAccess {
+            shared,
+            epoch,
+            until,
+            observer: Some((&mut self.observer, snapshot)),
+        };
+        let Some(baseline) = read_region(&mut access, &graphics.gpu, &base.texture, output, full)?
+        else {
+            return Ok(None);
+        };
+        let mut keys = Vec::new();
+        let mut layers = Vec::new();
+        for candidate in &snapshot.popups {
+            access.local()?;
+            if let Some(source) = self.sources.get(&candidate.token.identity.hwnd)
+                && let Some(input) = &source.pixels
+                && let Some(blit) = popup::clip(snapshot.geometry, candidate.geometry, crop)
+                    .map_err(|_| backend("popup clip geometry"))?
+            {
+                keys.push(candidate.token.identity.hwnd);
+                layers.push(popup::Layer {
+                    pixels: input,
+                    size: candidate.geometry.content,
+                    blit,
+                });
+            }
+        }
+        access.check()?;
+        let (pixels, counts) = popup::rebuild(&baseline, output, &layers, self.alpha)
+            .map_err(|_| backend("popup composite geometry"))?;
+        access.check()?;
+        for (hwnd, counts) in keys.into_iter().zip(counts) {
+            if counts.fractional != 0
+                && self.alpha == popup::Alpha::Threshold128
+                && !self.alpha_reported
+            {
+                eprintln!("WINDOWS_POPUP alpha=threshold128 status=U");
+                self.alpha_reported = true;
+            }
+            if let Some(source) = self.sources.get_mut(&hwnd) {
+                source.counts = counts;
+            }
+        }
+        Ok(Some(pixels))
+    }
+    fn unchanged(&mut self, until: Instant) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|snapshot| self.observer.unchanged(snapshot, until))
+    }
+    #[cfg(test)]
+    fn qualify(
+        &mut self,
+        hwnd: u64,
+        region: PixelRect,
+        expected: [u8; 4],
+        until: Instant,
+    ) -> Result<(), PlatformError> {
+        if !self.unchanged(until) || expected[3] != 128 || expected[..3].iter().any(|c| *c > 128) {
+            return Err(backend("popup alpha qualification"));
+        }
+        let source = self.sources.get(&hwnd).ok_or(PlatformError::NotFound)?;
+        let pixels = source
+            .pixels
+            .as_ref()
+            .ok_or_else(|| backend("popup alpha not ready"))?;
+        let size = source.candidate.geometry.content;
+        if !surface_ready(size, region)? || region.min.x < 0 || region.min.y < 0 {
+            return Err(backend("popup alpha region"));
+        }
+        for y in region.min.y as usize..region.max.y as usize {
+            if Instant::now() >= until {
+                return Err(PlatformError::Timeout);
+            }
+            for x in region.min.x as usize..region.max.x as usize {
+                let offset = (y * size.width as usize + x) * 4;
+                if pixels[offset..offset + 4] != expected {
+                    return Err(PlatformError::Unsupported(
+                        "popup fractional alpha convention",
+                    ));
+                }
+            }
+        }
+        if !self.unchanged(until) {
+            return Err(backend("popup alpha qualification"));
+        }
+        self.alpha = popup::Alpha::Premultiplied;
+        self.dirty = true;
+        Ok(())
+    }
+    #[cfg(test)]
+    fn probe(
+        &self,
+        root_content: PixelSize,
+        crop: Option<PixelRect>,
+    ) -> Option<PopupProbeSnapshot> {
+        let snapshot = self.snapshot.clone()?;
+        let roi = crop_rect(root_content, crop)?;
+        let popups = snapshot
+            .popups
+            .iter()
+            .map(|candidate| {
+                let source = self.sources.get(&candidate.token.identity.hwnd);
+                PopupProbeItem {
+                    candidate: candidate.clone(),
+                    content: source.and_then(|s| s.content),
+                    clip: popup::clip(snapshot.geometry, candidate.geometry, roi)
+                        .ok()
+                        .flatten(),
+                    alpha: source.map_or_else(popup::AlphaCounts::default, |s| s.counts),
+                }
+            })
+            .collect();
+        Some(PopupProbeSnapshot {
+            snapshot,
+            root_content,
+            popups,
+            alpha: self.alpha,
+        })
+    }
+}
+
 struct Stream {
     binding: Binding,
     epoch: u64,
@@ -720,13 +1554,26 @@ struct Stream {
     crop: Option<PixelRect>,
     slots: Vec<Arc<Image>>,
     cursor: crate::cursor::StreamCursor,
+    popups: Option<PopupState>,
+    delivery_popup: Option<(popup::Snapshot, Instant)>,
 }
 impl Drop for Stream {
     fn drop(&mut self) {
+        #[cfg(test)]
+        popup_stage(40);
+        self.popups.take();
+        #[cfg(test)]
+        popup_stage(41);
         self.latest.clear();
         let _ = self.session.Close();
+        #[cfg(test)]
+        popup_stage(42);
         let _ = self.pool.Close();
+        #[cfg(test)]
+        popup_stage(43);
         let _ = self.item.RemoveClosed(self.token);
+        #[cfg(test)]
+        popup_stage(44);
     }
 }
 impl Stream {
@@ -794,6 +1641,18 @@ impl Stream {
                 return Err(api("WGC close event", e));
             }
         };
+        let popups = match &binding {
+            Binding::Window { native, .. } => {
+                match PopupState::new(*native, shared.resolver.clone(), call.until) {
+                    Ok(popups) => Some(popups),
+                    Err(_) => {
+                        eprintln!("WINDOWS_POPUP refused=1 reason=observer");
+                        None
+                    }
+                }
+            }
+            Binding::Display(_) => None,
+        };
         let mut stream = Self {
             binding,
             epoch: call.epoch,
@@ -809,12 +1668,27 @@ impl Stream {
             crop,
             slots: Vec::new(),
             cursor: crate::cursor::StreamCursor::default(),
+            popups,
+            delivery_popup: None,
         };
         stream
             .session
             .SetIsCursorCaptureEnabled(false)
             .map_err(|e| api("disable WGC cursor", e))?;
         // Leave the border REQUIRED. Setter readback cannot establish borderless consent.
+        if matches!(stream.binding, Binding::Window { .. }) {
+            stream
+                .session
+                .SetIncludeSecondaryWindows(false)
+                .map_err(|e| api("disable root secondary capture", e))?;
+            if stream
+                .session
+                .IncludeSecondaryWindows()
+                .map_err(|e| api("root secondary capture state", e))?
+            {
+                return Err(backend("root secondary capture enabled"));
+            }
+        }
         call.check(shared)?;
         stream.refresh(shared)?;
         call.check(shared)?;
@@ -843,6 +1717,17 @@ impl Stream {
         graphics: &Graphics,
         _start: Instant,
     ) -> Result<Option<Frame>, PlatformError> {
+        let until = Instant::now() + BOUND;
+        self.delivery_popup = None;
+        let access = PopupAccess {
+            shared,
+            epoch: self.epoch,
+            until,
+            observer: None,
+        };
+        if !access.ready()? {
+            return Ok(None);
+        }
         #[cfg(feature = "gpu")]
         if let Ok(gpu) = shared.gpu.lock()
             && let Some(gpu) = gpu.as_ref()
@@ -851,9 +1736,15 @@ impl Stream {
         }
         // Drain a bounded number, replacing/releasing older pool frames immediately.
         for _ in 0..4 {
+            if !access.ready()? {
+                return Ok(None);
+            }
             match frame_result(self.pool.TryGetNextFrame()) {
                 Ok(Some(frame)) => {
                     let held = Held(frame);
+                    if !access.ready()? {
+                        return Ok(None);
+                    }
                     let content = held
                         .0
                         .ContentSize()
@@ -862,9 +1753,15 @@ impl Stream {
                     if content != self.pool_size {
                         self.latest.clear();
                         drop(held);
+                        if !access.ready()? {
+                            return Ok(None);
+                        }
                         self.refresh(shared)?;
                         if !shared.permitted(self.epoch) {
                             return Err(PlatformError::Locked);
+                        }
+                        if !access.ready()? {
+                            return Ok(None);
                         }
                         self.pool
                             .Recreate(
@@ -876,13 +1773,39 @@ impl Stream {
                             .map_err(|e| api("recreate WGC pool", e))?;
                         self.pool_size = content;
                         self.slots.clear();
+                        if let Some(popups) = &mut self.popups {
+                            popups.invalidate();
+                            popups.baseline = None;
+                        }
                         break;
+                    }
+                    if !access.ready()? {
+                        return Ok(None);
                     }
                     drop(self.latest.push(held));
                 }
                 Ok(None) => break,
                 Err(e) => return Err(api("dequeue WGC frame", e)),
             }
+        }
+        #[cfg(test)]
+        let popup_pixels = std::env::var("CROSSPANE_WINDOWS_WGC_DESCRIPTOR").as_deref() != Ok("1");
+        #[cfg(not(test))]
+        let popup_pixels = true;
+        if !access.ready()? {
+            return Ok(None);
+        }
+        if popup_pixels && let Some(popups) = &mut self.popups {
+            match popups.refresh(shared, graphics, self.epoch, size(self.pool_size)?, until) {
+                Ok(()) => {}
+                Err(PlatformError::Locked) => return Err(PlatformError::Locked),
+                Err(_) => {
+                    popups.invalidate();
+                }
+            }
+        }
+        if !access.ready()? {
+            return Ok(None);
         }
         let now = crate::clock::now();
         if !self.latest.due(now) {
@@ -909,6 +1832,10 @@ impl Stream {
         if self.slots.first().is_none_or(|image| image.size != output) {
             self.slots.clear();
             for _ in 0..2 {
+                if !access.ready()? {
+                    self.slots.clear();
+                    return Ok(None);
+                }
                 #[cfg(feature = "gpu")]
                 let surface = shared
                     .gpu
@@ -917,20 +1844,29 @@ impl Stream {
                     .as_ref()
                     .filter(|gpu| gpu.healthy().is_ok())
                     .and_then(|gpu| crate::gpu::Surface::new(gpu.clone(), output).ok());
+                let texture = {
+                    #[cfg(feature = "gpu")]
+                    if let Some(surface) = &surface {
+                        surface.shared.texture.clone()
+                    } else {
+                        if !access.ready()? {
+                            self.slots.clear();
+                            return Ok(None);
+                        }
+                        graphics.gpu.texture(output, false)?
+                    }
+                    #[cfg(not(feature = "gpu"))]
+                    {
+                        if !access.ready()? {
+                            self.slots.clear();
+                            return Ok(None);
+                        }
+                        graphics.gpu.texture(output, false)?
+                    }
+                };
                 self.slots.push(Arc::new(Image {
                     size: output,
-                    texture: {
-                        #[cfg(feature = "gpu")]
-                        if let Some(surface) = &surface {
-                            surface.shared.texture.clone()
-                        } else {
-                            graphics.gpu.texture(output, false)?
-                        }
-                        #[cfg(not(feature = "gpu"))]
-                        {
-                            graphics.gpu.texture(output, false)?
-                        }
-                    },
+                    texture,
                     gpu: Arc::clone(&graphics.gpu),
                     gate: Arc::clone(&shared.gate),
                     epoch: self.epoch,
@@ -960,23 +1896,45 @@ impl Stream {
         else {
             return Ok(None);
         };
-        let Some(held) = self.latest.take(now) else {
+        if !access.ready()? {
+            return Ok(None);
+        }
+        let mut held = self.latest.take(now);
+        let texture = if let Some(held) = &held {
+            let surface: IDirect3DDxgiInterfaceAccess = held
+                .0
+                .Surface()
+                .and_then(|s| s.cast())
+                .map_err(|e| api("WGC surface interface", e))?;
+            if !access.ready()? {
+                return Ok(None);
+            }
+            // SAFETY: documented interface retrieval from this frame's owned D3D11 surface.
+            let texture: ID3D11Texture2D =
+                unsafe { surface.GetInterface() }.map_err(|e| api("WGC texture", e))?;
+            texture
+        } else if let Some(popups) = &self.popups {
+            if !popups.dirty {
+                return Ok(None);
+            }
+            let Some(texture) = popups.clean_texture(roi) else {
+                return Ok(None);
+            };
+            texture
+        } else {
             return Ok(None);
         };
-        let access: IDirect3DDxgiInterfaceAccess = held
-            .0
-            .Surface()
-            .and_then(|s| s.cast())
-            .map_err(|e| api("WGC surface interface", e))?;
-        // SAFETY: documented interface retrieval from this frame's owned D3D11 surface.
-        let texture: ID3D11Texture2D =
-            unsafe { access.GetInterface() }.map_err(|e| api("WGC texture", e))?;
+        if !access.ready()? {
+            return Ok(None);
+        }
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: live same-device frame texture and initialized descriptor output.
         unsafe { texture.GetDesc(&mut desc) };
         #[cfg(test)]
         if std::env::var("CROSSPANE_WINDOWS_WGC_DESCRIPTOR").as_deref() == Ok("1") {
             let content = held
+                .as_ref()
+                .ok_or_else(|| backend("diagnostic cached frame"))?
                 .0
                 .ContentSize()
                 .map_err(|e| api("diagnostic content size", e))?;
@@ -999,44 +1957,165 @@ impl Stream {
         if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM || desc.SampleDesc.Count != 1 {
             return Err(backend("WGC texture/content mismatch"));
         }
-        if !surface_ready(PixelSize::new(desc.Width, desc.Height), roi)? {
+        let source_roi = if held.is_some() {
+            roi
+        } else {
+            PixelRect::new(
+                (0, 0).into(),
+                (output.width as i32, output.height as i32).into(),
+            )
+        };
+        if !surface_ready(PixelSize::new(desc.Width, desc.Height), source_roi)? {
             return Ok(None);
         }
         #[cfg(test)]
         if std::env::var("CROSSPANE_WINDOWS_WGC_DESCRIPTOR").as_deref() == Ok("1") {
             return Ok(None); // Owned metadata only: never copy/map pixels.
         }
+        if !access.ready()? {
+            return Ok(None);
+        }
         self.refresh(shared)?;
+        if let Some(popups) = &mut self.popups
+            && held.is_some()
+        {
+            if popups.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.geometry.content == size(self.pool_size).unwrap_or(PixelSize::new(0, 0))
+            }) {
+                match popups.baseline(shared, graphics, self.epoch, &texture, roi, until) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // Keep the exact unclosed B in the existing newest-frame slot.
+                        if let Some(held) = held.take() {
+                            drop(self.latest.push(held));
+                        }
+                        return Ok(None);
+                    }
+                    Err(PlatformError::Locked) => return Err(PlatformError::Locked),
+                    Err(_) => popups.invalidate(),
+                }
+            } else {
+                // This fresh B may be delivered root-only. Do not later recompose older A.
+                popups.baseline = None;
+            }
+        }
+        if !access.ready()? {
+            return Ok(None);
+        }
+        let composite = if let Some(popups) = &mut self.popups {
+            match popups.compose(output, roi, shared, graphics, self.epoch, until) {
+                Ok(pixels) => pixels,
+                Err(PlatformError::Locked) => return Err(PlatformError::Locked),
+                Err(_) => {
+                    popups.invalidate();
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // Fresh topology at the upload boundary, outside the D3D lock.
+        if let Some(popups) = &mut self.popups
+            && composite.is_some()
+            && !popups.unchanged(until)
+        {
+            popups.invalidate();
+            return Ok(None);
+        }
+        if !access.ready()? {
+            return Ok(None);
+        }
         let context = match graphics.gpu.context.try_lock() {
             Ok(context) => context,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // Retry this fresh B; no stale A restore or additional held slot.
+                if let Some(held) = held.take() {
+                    drop(self.latest.push(held));
+                }
+                #[cfg(test)]
+                popup_stage(21);
+                return Ok(None);
+            }
             Err(std::sync::TryLockError::Poisoned(_)) => {
                 return Err(backend("D3D context poisoned"));
             }
         };
         let area = D3D11_BOX {
-            left: roi.min.x as u32,
-            top: roi.min.y as u32,
+            left: source_roi.min.x as u32,
+            top: source_roi.min.y as u32,
             front: 0,
-            right: roi.max.x as u32,
-            bottom: roi.max.y as u32,
+            right: source_roi.max.x as u32,
+            bottom: source_roi.max.y as u32,
             back: 1,
         };
-        if !shared.permitted(self.epoch) {
-            return Err(PlatformError::Locked);
+        if !access.ready()? {
+            return Ok(None);
         }
-        // SAFETY: verified source bounds, equal BGRA format, distinct same-device output texture.
-        unsafe {
-            context.CopySubresourceRegion(&image.texture, 0, 0, 0, 0, &texture, 0, Some(&area))
-        };
-        #[cfg(feature = "gpu")]
-        if let Some(surface) = &image.surface {
-            surface.copied(&context)?;
+        if let Some(pixels) = &composite {
+            let row = output
+                .width
+                .checked_mul(4)
+                .ok_or_else(|| backend("popup upload stride"))?;
+            // SAFETY: bounded initialized full BGRA rows, free same-device DEFAULT output slot.
+            // UpdateSubresource snapshots source bytes before returning; no delivered slot is written.
+            unsafe {
+                context.UpdateSubresource(&image.texture, 0, None, pixels.as_ptr().cast(), row, 0)
+            };
+        } else {
+            // SAFETY: verified source bounds, equal BGRA format, distinct same-device output texture.
+            unsafe {
+                context.CopySubresourceRegion(&image.texture, 0, 0, 0, 0, &texture, 0, Some(&area))
+            };
         }
         drop(context);
+        // All native acquisition used secondary=false. Revalidate numeric topology before
+        // publication; changed ownership/geometry never delivers the provisional composition.
+        if let Some(popups) = &mut self.popups
+            && composite.is_some()
+            && !popups.unchanged(until)
+        {
+            popups.invalidate();
+            return Ok(None);
+        }
+        if !access.ready()? {
+            return Ok(None);
+        }
+        self.refresh(shared)?;
+        if !access.ready()? {
+            return Ok(None);
+        }
+        #[cfg(feature = "gpu")]
+        if let Some(surface) = &image.surface {
+            let context = match graphics.gpu.context.try_lock() {
+                Ok(context) => context,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(backend("D3D context poisoned"));
+                }
+            };
+            if !access.ready()? {
+                return Ok(None);
+            }
+            surface.copied(&context)?;
+        }
+        #[cfg(test)]
+        let cached_root = held.is_none();
         drop(held);
-        if !shared.permitted(self.epoch) {
-            return Err(PlatformError::Locked);
+        if !access.ready()? {
+            return Ok(None);
+        }
+        if composite.is_some() {
+            self.delivery_popup = self
+                .popups
+                .as_ref()
+                .and_then(|popups| popups.snapshot.clone().map(|snapshot| (snapshot, until)));
+        }
+        if let Some(popups) = &mut self.popups {
+            #[cfg(test)]
+            if cached_root && popups.sources.is_empty() {
+                popup_stage(62);
+            }
+            popups.dirty = !popups.sources.is_empty() && composite.is_none();
         }
         Ok(Some(Frame {
             size: output,
@@ -1057,6 +2136,10 @@ fn end(
     reason: StreamEndReason,
 ) {
     if let Some(stream) = streams.remove(&id) {
+        #[cfg(test)]
+        if let Ok(mut probes) = shared.popup_probes.lock() {
+            probes.remove(&id);
+        }
         let sink = Arc::clone(&stream.sink);
         let epoch = stream.epoch;
         drop(stream); // close native sources before terminal delivery
@@ -1104,6 +2187,7 @@ fn worker(
     let mut streams = BTreeMap::new();
     let _ = ready.send(Ok(()));
     while shared.alive.load(Ordering::Acquire) && !shared.fault.load(Ordering::Acquire) {
+        crate::window::pump_popups();
         if let Ok(call) = receive.recv_timeout(POLL) {
             let result = call.check(shared).and_then(|()| match &call.operation {
                 #[cfg(feature = "gpu")]
@@ -1149,7 +2233,28 @@ fn worker(
                     stream.latest.clear();
                     stream.crop = *crop;
                     stream.slots.clear();
+                    if let Some(popups) = &mut stream.popups {
+                        popups.baseline = None;
+                        popups.dirty = true;
+                    }
                     Ok(())
+                }
+                #[cfg(test)]
+                Operation::QualifyPopup {
+                    stream,
+                    hwnd,
+                    region,
+                    expected,
+                } => {
+                    let stream = streams.get_mut(stream).ok_or(PlatformError::NotFound)?;
+                    stream.refresh(shared)?;
+                    call.check(shared)?;
+                    stream
+                        .popups
+                        .as_mut()
+                        .ok_or(PlatformError::NotFound)?
+                        .qualify(*hwnd, *region, *expected, call.until)?;
+                    call.check(shared)
                 }
                 Operation::Stop(id) => {
                     if !streams.contains_key(id) {
@@ -1230,10 +2335,39 @@ fn worker(
                 // Cursor observation/consumer failure never ends the pixel stream.
                 emit(&stream.sink, event);
             }
-            match stream.poll(shared, &graphics, start) {
+            let polled = stream.poll(shared, &graphics, start);
+            #[cfg(test)]
+            if let Ok(mut probes) = shared.popup_probes.lock() {
+                if let Some(probe) = stream.popups.as_ref().and_then(|popups| {
+                    popups.probe(
+                        size(stream.pool_size).unwrap_or(PixelSize::new(0, 0)),
+                        stream.crop,
+                    )
+                }) {
+                    probes.insert(id, probe);
+                } else {
+                    probes.remove(&id);
+                }
+            }
+            match polled {
                 Ok(Some(mut frame)) => {
                     if !shared.permitted(stream.epoch) {
                         end(shared, &mut streams, id, StreamEndReason::Blocked);
+                        continue;
+                    }
+                    if stream
+                        .delivery_popup
+                        .as_ref()
+                        .is_some_and(|(_, until)| Instant::now() >= *until)
+                    {
+                        stream.delivery_popup = None;
+                        if let Some(popups) = &mut stream.popups {
+                            popups.invalidate();
+                        }
+                        #[cfg(test)]
+                        if let Ok(mut probes) = shared.popup_probes.lock() {
+                            probes.remove(&id);
+                        }
                         continue;
                     }
                     if let Err(error) = stream.refresh(shared) {
@@ -1246,6 +2380,32 @@ fn worker(
                         continue;
                     }
                     frame.at = crate::clock::now();
+                    if !shared.permitted(stream.epoch) {
+                        end(shared, &mut streams, id, StreamEndReason::Blocked);
+                        continue;
+                    }
+                    if let Some((snapshot, until)) = stream.delivery_popup.take() {
+                        let valid = stream
+                            .popups
+                            .as_mut()
+                            .is_some_and(|popups| popups.observer.unchanged(&snapshot, until));
+                        if !valid {
+                            if let Some(popups) = &mut stream.popups {
+                                popups.invalidate();
+                            }
+                            #[cfg(test)]
+                            if let Ok(mut probes) = shared.popup_probes.lock() {
+                                probes.remove(&id);
+                            }
+                            continue; // Drop provisional pixels; recomposition remains dirty.
+                        }
+                        if Instant::now() >= until {
+                            if let Some(popups) = &mut stream.popups {
+                                popups.dirty = true; // Keep the dropped composition pending for retry.
+                            }
+                            continue;
+                        }
+                    }
                     if !shared.permitted(stream.epoch) {
                         end(shared, &mut streams, id, StreamEndReason::Blocked);
                         continue;
@@ -1276,9 +2436,13 @@ fn worker(
     } else {
         StreamEndReason::Requested
     };
+    #[cfg(test)]
+    popup_stage(70);
     for id in streams.keys().copied().collect::<Vec<_>>() {
         end(shared, &mut streams, id, reason);
     }
+    #[cfg(test)]
+    popup_stage(71);
 }
 
 #[cfg(test)]

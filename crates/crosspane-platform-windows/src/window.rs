@@ -11,11 +11,12 @@
 
 use std::{
     cell::RefCell,
-    collections::VecDeque,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
     mem::size_of,
     path::PathBuf,
     ptr::{null, null_mut},
+    rc::{Rc, Weak},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -43,12 +44,10 @@ use windows_sys::Win32::{
 
 use crate::model::{
     geometry::{DisplayIds, MonitorProbe},
+    popup,
     window::{self, Identity, Observation, Windows},
     winevent::{self, RawWinEvent},
 };
-
-#[cfg(test)]
-use std::collections::BTreeSet;
 
 const BOUND: Duration = Duration::from_secs(2);
 const RAW_LIMIT: usize = 4096;
@@ -1348,6 +1347,589 @@ fn run(
     }
     drop(native);
     CONTEXT.with(|slot| slot.borrow_mut().take());
+}
+
+// Private, per-root capture observation. It never enters the projectable window table.
+// Hooks and callbacks live only on the capture worker's message-loop thread.
+// Existing window-only integration fixtures source-include this adapter without frame_capture.
+// Suppress only these new private popup items in test copies; product dead_code stays active.
+#[cfg_attr(test, allow(dead_code))]
+struct PopupQueue {
+    root: NativeWindow,
+    events: RefCell<VecDeque<(u32, u64)>>,
+    fault: std::cell::Cell<bool>,
+}
+thread_local! {
+    static POPUP_HOOKS: RefCell<BTreeMap<usize, Weak<PopupQueue>>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+#[cfg_attr(test, allow(dead_code))]
+unsafe extern "system" fn popup_callback(
+    hook: HWINEVENTHOOK,
+    event: u32,
+    window: HWND,
+    object: i32,
+    child: i32,
+    event_tid: u32,
+    _: u32,
+) {
+    // No native field calls and no outstanding RefCell borrow across reentrancy.
+    let queue = POPUP_HOOKS.with(|hooks| {
+        hooks
+            .try_borrow()
+            .ok()
+            .and_then(|hooks| hooks.get(&(hook as usize)).and_then(Weak::upgrade))
+    });
+    let Some(queue) = queue else {
+        return;
+    };
+    if window.is_null()
+        || object != winevent::OBJID_WINDOW
+        || child != winevent::CHILDID_SELF
+        || event_tid != queue.root.tid
+    {
+        return;
+    }
+    if let Ok(mut events) = queue.events.try_borrow_mut() {
+        if events.len() < popup::EVENT_CAP {
+            events.push_back((event, number(window)));
+        } else {
+            queue.fault.set(true);
+        }
+    } else {
+        queue.fault.set(true);
+    }
+}
+
+/// Same-thread capture observer; an Rc prevents sending native hooks across threads.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct PopupObserver {
+    root: NativeWindow,
+    resolver: WindowResolver,
+    process: HANDLE,
+    hooks: Vec<HWINEVENTHOOK>,
+    queue: Rc<PopupQueue>,
+    generations: popup::Generations,
+}
+impl fmt::Debug for PopupObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PopupObserver").finish_non_exhaustive()
+    }
+}
+
+impl Drop for PopupObserver {
+    fn drop(&mut self) {
+        for hook in self.hooks.drain(..) {
+            // SAFETY: exact retained hook, removed on its installing thread while queue lives.
+            let removed = unsafe { UnhookWinEvent(hook) } != 0;
+            POPUP_HOOKS.with(|hooks| {
+                hooks.borrow_mut().remove(&(hook as usize));
+            });
+            if !removed {
+                // A later callback has no registered state and therefore cannot dereference us.
+                self.queue.fault.set(true);
+            }
+        }
+        // SAFETY: exactly this observer's successful metadata/lifetime process handle.
+        unsafe { CloseHandle(self.process) };
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+struct ThreadDpi(DPI_AWARENESS_CONTEXT);
+#[cfg_attr(test, allow(dead_code))]
+impl ThreadDpi {
+    fn physical() -> Result<Self, PlatformError> {
+        // SAFETY: changes only this worker thread; scope restores the exact previous context.
+        let previous =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if previous.is_null() {
+            Err(backend("popup DPI context"))
+        } else {
+            Ok(Self(previous))
+        }
+    }
+}
+impl Drop for ThreadDpi {
+    fn drop(&mut self) {
+        // SAFETY: balances this same thread's scoped awareness change after physical queries.
+        unsafe { SetThreadDpiAwarenessContext(self.0) };
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+impl PopupObserver {
+    pub(crate) fn new(
+        root: NativeWindow,
+        resolver: WindowResolver,
+        until: Instant,
+    ) -> Result<Self, PlatformError> {
+        popup_deadline(until)?;
+        if resolver.resolve(WindowId(root.generation)) != Some(root) {
+            return Err(PlatformError::NotFound);
+        }
+        popup_deadline(until)?;
+        // SAFETY: already resolver-admitted root PID; read-only identity/lifetime rights only.
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                root.pid,
+            )
+        };
+        if process.is_null() {
+            return Err(backend("popup process identity"));
+        }
+        let mut observer = Self {
+            root,
+            resolver,
+            process,
+            hooks: Vec::new(),
+            generations: popup::Generations::default(),
+            queue: Rc::new(PopupQueue {
+                root,
+                events: RefCell::new(VecDeque::new()),
+                fault: std::cell::Cell::new(false),
+            }),
+        };
+        if !observer.root_valid(until) {
+            return Err(PlatformError::NotFound);
+        }
+        for (first, last) in [
+            (
+                winevent::EVENT_OBJECT_CREATE,
+                winevent::EVENT_OBJECT_REORDER,
+            ),
+            (
+                winevent::EVENT_OBJECT_LOCATIONCHANGE,
+                winevent::EVENT_OBJECT_LOCATIONCHANGE,
+            ),
+            (
+                winevent::EVENT_OBJECT_CLOAKED,
+                winevent::EVENT_OBJECT_UNCLOAKED,
+            ),
+        ] {
+            popup_deadline(until)?;
+            // SAFETY: static extern-system callback, exact nonzero PID/TID, same thread pumps it.
+            let hook = unsafe {
+                SetWinEventHook(
+                    first,
+                    last,
+                    null_mut(),
+                    Some(popup_callback),
+                    root.pid,
+                    root.tid,
+                    winevent::WINEVENT_OUTOFCONTEXT,
+                )
+            };
+            if hook.is_null() {
+                return Err(backend("popup event hook"));
+            }
+            observer.hooks.push(hook);
+            POPUP_HOOKS.with(|hooks| {
+                hooks
+                    .borrow_mut()
+                    .insert(hook as usize, Rc::downgrade(&observer.queue));
+            });
+        }
+        Ok(observer)
+    }
+
+    fn process_valid(&self, until: Instant) -> bool {
+        if Instant::now() >= until {
+            return false;
+        }
+        // SAFETY: read-only zero wait on our independently retained process handle.
+        if unsafe { WaitForSingleObject(self.process, 0) } != WAIT_TIMEOUT {
+            return false;
+        }
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        if Instant::now() >= until {
+            return false;
+        }
+        // SAFETY: initialized exact FILETIME outputs and a live own query handle.
+        (unsafe {
+            GetProcessTimes(
+                self.process,
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        }) != 0
+            && Instant::now() < until
+            && ((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+                == self.root.process_created
+    }
+
+    fn root_valid(&self, until: Instant) -> bool {
+        self.process_valid(until)
+            && self.resolver.resolve(WindowId(self.root.generation)) == Some(self.root)
+            && Instant::now() < until
+    }
+
+    fn identity(&self, window: u64, until: Instant) -> Result<Identity, PlatformError> {
+        popup_deadline(until)?;
+        let mut pid = 0;
+        // SAFETY: the only not-yet-admitted HWND query is creator PID/TID metadata.
+        let tid = unsafe { GetWindowThreadProcessId(hwnd(window), &mut pid) };
+        if window == 0 || pid != self.root.pid || tid != self.root.tid || !self.process_valid(until)
+        {
+            return Err(PlatformError::NotFound);
+        }
+        let allowed = match self.resolver.state.admission.as_ref() {
+            #[cfg(test)]
+            Some(Admission::Fixture { identity, .. }) => {
+                *identity
+                    == Identity {
+                        hwnd: self.root.hwnd,
+                        pid: self.root.pid,
+                        tid: self.root.tid,
+                        process_created: self.root.process_created,
+                    }
+            }
+            admission => admission.is_none_or(|a| a.allows(window)),
+        };
+        popup_deadline(until)?;
+        if !allowed {
+            return Err(PlatformError::NotFound);
+        }
+        Ok(Identity {
+            hwnd: window,
+            pid,
+            tid,
+            process_created: self.root.process_created,
+        })
+    }
+
+    pub(crate) fn unchanged(&mut self, expected: &popup::Snapshot, until: Instant) -> bool {
+        self.snapshot(until).is_ok_and(|fresh| fresh == *expected)
+    }
+
+    fn geometry(
+        &self,
+        identity: Identity,
+        until: Instant,
+    ) -> Result<popup::Geometry, PlatformError> {
+        if self.identity(identity.hwnd, until)? != identity {
+            return Err(PlatformError::NotFound);
+        }
+        let mut bounds = RECT::default();
+        popup_deadline(until)?;
+        // SAFETY: own-admitted exact HWND and initialized RECT storage; physical DWM screen bounds.
+        if unsafe {
+            DwmGetWindowAttribute(
+                hwnd(identity.hwnd),
+                DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+                (&mut bounds as *mut RECT).cast(),
+                size_of::<RECT>() as u32,
+            )
+        } < 0
+        {
+            return Err(backend("popup capture geometry"));
+        }
+        if self.identity(identity.hwnd, until)? != identity {
+            return Err(PlatformError::NotFound);
+        }
+        popup_deadline(until)?;
+        // SAFETY: only the freshly admitted own target's DPI, used as a label, not another scaling.
+        let dpi = unsafe { GetDpiForWindow(hwnd(identity.hwnd)) };
+        let width = u32::try_from(i64::from(bounds.right) - i64::from(bounds.left))
+            .map_err(|_| backend("popup capture geometry"))?;
+        let height = u32::try_from(i64::from(bounds.bottom) - i64::from(bounds.top))
+            .map_err(|_| backend("popup capture geometry"))?;
+        let geometry = popup::Geometry {
+            bounds: crosspane_types::geom::PixelRect::new(
+                (bounds.left, bounds.top).into(),
+                (bounds.right, bounds.bottom).into(),
+            ),
+            content: crosspane_types::geom::PixelSize::new(width, height),
+            dpi,
+        };
+        if !popup::geometry_valid(geometry) || self.identity(identity.hwnd, until)? != identity {
+            return Err(backend("popup capture geometry"));
+        }
+        Ok(geometry)
+    }
+
+    fn candidate(
+        &mut self,
+        window: u64,
+        root: popup::Token,
+        until: Instant,
+    ) -> Result<popup::Candidate, PlatformError> {
+        let identity = self.identity(window, until)?;
+        let raw = hwnd(window);
+        popup_deadline(until)?;
+        // SAFETY: own PID/TID/process corroborated before class/style/visibility/geometry fields.
+        let style = unsafe { GetWindowLongPtrW(raw, GWL_STYLE) as u32 };
+        self.identity(window, until)?;
+        popup_deadline(until)?;
+        // SAFETY: freshly creator/process-admitted own extended style only.
+        let ex_style = unsafe { GetWindowLongPtrW(raw, GWL_EXSTYLE) as u32 };
+        self.identity(window, until)?;
+        popup_deadline(until)?;
+        // SAFETY: freshly creator/process-admitted own visibility only.
+        let visible = unsafe { IsWindowVisible(raw) != 0 };
+        self.identity(window, until)?;
+        popup_deadline(until)?;
+        // SAFETY: freshly creator/process-admitted own iconic state only.
+        let iconic = unsafe { IsIconic(raw) != 0 };
+        let mut cloaked = 0_u32;
+        let mut class = [0_u16; 256];
+        if self.identity(window, until)? != identity {
+            return Err(PlatformError::NotFound);
+        }
+        popup_deadline(until)?;
+        // SAFETY: bounded own class buffer, no caption or content query.
+        let length = unsafe { GetClassNameW(raw, class.as_mut_ptr(), class.len() as i32) };
+        if length <= 0 {
+            return Err(backend("popup class classification"));
+        }
+        if self.identity(window, until)? != identity {
+            return Err(PlatformError::NotFound);
+        }
+        popup_deadline(until)?;
+        // SAFETY: exact initialized u32 output for only the re-admitted own HWND.
+        if unsafe {
+            DwmGetWindowAttribute(
+                raw,
+                DWMWA_CLOAKED as u32,
+                (&mut cloaked as *mut u32).cast(),
+                size_of::<u32>() as u32,
+            )
+        } < 0
+        {
+            return Err(backend("popup visibility"));
+        }
+        let class = String::from_utf16_lossy(&class[..length as usize]);
+        let kind = if matches!(class.as_str(), "IME" | "MSCTFIME UI" | "CiceroUIWndFrame") {
+            popup::Kind::Ime
+        } else if class == "#32770" || style & WS_CAPTION == WS_CAPTION {
+            popup::Kind::Dialog
+        } else if style & WS_CHILD == 0
+            && (style & WS_POPUP != 0 || ex_style & WS_EX_TOOLWINDOW != 0)
+        {
+            popup::Kind::Popup
+        } else {
+            popup::Kind::Other
+        };
+        if self.identity(window, until)? != identity {
+            return Err(PlatformError::NotFound);
+        }
+        let token = self
+            .generations
+            .observe(identity)
+            .map_err(|_| backend("popup observed generation"))?;
+        let mut owners = Vec::new();
+        let mut seen = BTreeSet::from([window]);
+        let mut link = window;
+        for _ in 0..popup::OWNER_CAP {
+            self.identity(link, until)?;
+            popup_deadline(until)?;
+            // SAFETY: ownership relationship of only an admitted same-PID/TID link.
+            let owner = number(unsafe { GetWindow(hwnd(link), GW_OWNER) });
+            if owner == 0 || !seen.insert(owner) {
+                return Err(backend("popup owner chain"));
+            }
+            let owner_identity = self.identity(owner, until)?;
+            let owner_token = if owner == root.identity.hwnd {
+                if owner_identity != root.identity {
+                    return Err(PlatformError::NotFound);
+                }
+                root
+            } else {
+                self.generations
+                    .observe(owner_identity)
+                    .map_err(|_| backend("popup observed generation"))?
+            };
+            owners.push(owner_token);
+            if owner_token == root {
+                break;
+            }
+            link = owner;
+        }
+        let geometry = self.geometry(identity, until)?;
+        if self.identity(window, until)? != identity {
+            return Err(PlatformError::NotFound);
+        }
+        Ok(popup::Candidate {
+            token,
+            owners,
+            geometry,
+            kind,
+            visible: visible && !iconic && cloaked == 0,
+            topmost: ex_style & WS_EX_TOPMOST != 0,
+        })
+    }
+
+    pub(crate) fn snapshot(&mut self, until: Instant) -> Result<popup::Snapshot, PlatformError> {
+        popup_deadline(until)?;
+        let _dpi = ThreadDpi::physical()?;
+        if !self.root_valid(until) {
+            return Err(PlatformError::NotFound);
+        }
+        let root = popup::Token {
+            identity: Identity {
+                hwnd: self.root.hwnd,
+                pid: self.root.pid,
+                tid: self.root.tid,
+                process_created: self.root.process_created,
+            },
+            generation: self.root.generation,
+        };
+        let geometry = self.geometry(root.identity, until)?;
+        let mut snapshot = popup::Snapshot {
+            root,
+            geometry,
+            popups: Vec::new(),
+            refused: 0,
+            reason: popup::Refusal::None,
+        };
+        if self.queue.fault.get() {
+            snapshot.reason = popup::Refusal::Events;
+            return Ok(snapshot);
+        }
+        for (event, window) in self.queue.events.borrow_mut().drain(..) {
+            if matches!(
+                event,
+                winevent::EVENT_OBJECT_CREATE
+                    | winevent::EVENT_OBJECT_DESTROY
+                    | winevent::EVENT_OBJECT_HIDE
+            ) {
+                self.generations.retire(window);
+            }
+        }
+        let mut enumeration = PopupEnumeration {
+            root: self.root,
+            windows: Vec::new(),
+            overflow: false,
+            until,
+        };
+        popup_deadline(until)?;
+        // SAFETY: exact retained root's UI thread; synchronous callback reads creator metadata only.
+        let complete = unsafe {
+            EnumThreadWindows(
+                self.root.tid,
+                Some(popup_enumerate),
+                (&mut enumeration as *mut PopupEnumeration) as LPARAM,
+            )
+        } != 0;
+        if !complete || enumeration.overflow {
+            snapshot.reason = popup::Refusal::Cap;
+            snapshot.refused = 1;
+            return Ok(snapshot);
+        }
+        let observed: BTreeSet<_> = enumeration.windows.iter().copied().collect();
+        self.generations.retain(&observed);
+        let mut candidates = Vec::new();
+        for window in enumeration.windows {
+            popup_deadline(until)?;
+            if window == self.root.hwnd {
+                continue;
+            }
+            if let Ok(candidate) = self.candidate(window, root, until)
+                && candidate.kind == popup::Kind::Popup
+                && candidate.visible
+            {
+                candidates.push(candidate);
+            }
+        }
+        let (selected, refused, reason) = popup::select(root, geometry.content, candidates);
+        snapshot.refused = refused;
+        snapshot.reason = reason;
+        let mut edges = Vec::new();
+        let mut remaining = popup::STACK_CAP;
+        for candidate in &selected {
+            let mut current = candidate.token.identity.hwnd;
+            let mut seen = BTreeSet::from([current]);
+            while remaining != 0 {
+                popup_deadline(until)?;
+                remaining -= 1;
+                // SAFETY: admitted start; subsequent handles only walk relationships/equality.
+                // Foreign handles supply NO PID/class/style/geometry/title/content/logging data.
+                let above = number(unsafe { GetWindow(hwnd(current), GW_HWNDPREV) });
+                if above == 0 || above == self.root.hwnd {
+                    break;
+                }
+                if !seen.insert(above) {
+                    snapshot.reason = popup::Refusal::Stack;
+                    return Ok(snapshot);
+                }
+                if selected.iter().any(|p| p.token.identity.hwnd == above) {
+                    edges.push((candidate.token.identity.hwnd, above));
+                }
+                current = above;
+            }
+        }
+        match popup::order(selected, &edges) {
+            Ok(popups) => snapshot.popups = popups,
+            Err(reason) => {
+                snapshot.reason = reason;
+                snapshot.refused += 1;
+            }
+        }
+        // Corroborate every admitted identity, owner chain and geometry after z-order observation.
+        for candidate in snapshot.popups.clone() {
+            if self.candidate(candidate.token.identity.hwnd, root, until)? != candidate {
+                snapshot.popups.clear();
+                snapshot.reason = popup::Refusal::Stale;
+                break;
+            }
+        }
+        if !self.root_valid(until) || self.geometry(root.identity, until)? != geometry {
+            snapshot.popups.clear();
+            snapshot.reason = popup::Refusal::Stale;
+        }
+        popup_deadline(until)?;
+        Ok(snapshot)
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+struct PopupEnumeration {
+    root: NativeWindow,
+    windows: Vec<u64>,
+    overflow: bool,
+    until: Instant,
+}
+#[cfg_attr(test, allow(dead_code))]
+unsafe extern "system" fn popup_enumerate(window: HWND, parameter: LPARAM) -> i32 {
+    // SAFETY: EnumThreadWindows synchronously borrows this exact live stack context.
+    let enumeration = unsafe { &mut *(parameter as *mut PopupEnumeration) };
+    if Instant::now() >= enumeration.until {
+        enumeration.overflow = true;
+        return 0;
+    }
+    let mut pid = 0;
+    // SAFETY: creator metadata only, preceding all potential own-window fields.
+    let tid = unsafe { GetWindowThreadProcessId(window, &mut pid) };
+    if pid == enumeration.root.pid && tid == enumeration.root.tid {
+        if enumeration.windows.len() == popup::CANDIDATE_CAP {
+            enumeration.overflow = true;
+            return 0;
+        }
+        enumeration.windows.push(number(window));
+    }
+    1
+}
+
+/// Pump only the capture worker's own message queue so its exact-PID/TID hooks can run.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn pump_popups() {
+    pump();
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn popup_deadline(until: Instant) -> Result<(), PlatformError> {
+    if Instant::now() >= until {
+        Err(PlatformError::Timeout)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
