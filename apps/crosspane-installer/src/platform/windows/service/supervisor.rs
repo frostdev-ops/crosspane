@@ -424,7 +424,8 @@ mod native {
     use super::super::super::{
         native_io::{
             AgentObservation, Cancellation, Clock, Deadline, ExitObservation, InstallerLock,
-            LogonArchiveResult, MonotonicClock, OwnedArchiveResult, SupportProof, WindowsNativeIo,
+            LogonArchiveResult, MonotonicClock, OwnedArchiveResult, RepairArchiveResult,
+            SupportProof, WindowsNativeIo,
             activation::EntrySelection,
             jobs::{ChildStartPermit, CreatedChild, SupervisorOwner},
             supervisor_owner::{OuterOwnerServer, OwnerServer},
@@ -601,6 +602,7 @@ mod native {
     }
     enum InitialArchive {
         Installer(OwnedArchiveResult),
+        Repair(RepairArchiveResult),
         Logon(LogonArchiveResult),
     }
     struct InitialReady {
@@ -633,6 +635,15 @@ mod native {
                         deadline,
                     )
                 }
+                (Some(InitialArchive::Repair(archive)), EntryPermit::Installer(permit)) => archive
+                    .reverify(
+                        self.owner.io(),
+                        support,
+                        lock,
+                        permit,
+                        &self.owner,
+                        deadline,
+                    ),
                 (Some(InitialArchive::Logon(archive)), EntryPermit::Logon(permit)) => archive
                     .reverify(
                         self.owner.io(),
@@ -662,6 +673,15 @@ mod native {
                         deadline,
                     )
                 }
+                (Some(InitialArchive::Repair(archive)), EntryPermit::Installer(permit)) => archive
+                    .publish_bound(
+                        self.owner.io(),
+                        support,
+                        lock,
+                        permit,
+                        &self.owner,
+                        deadline,
+                    ),
                 (Some(InitialArchive::Logon(archive)), EntryPermit::Logon(permit)) => archive
                     .publish_bound(
                         self.owner.io(),
@@ -688,6 +708,15 @@ mod native {
             // Both variants retain the real archive admission and Preparing provenance until
             // Ready/publication. The logon path cannot turn its proof into an installer task claim.
             self.archive = Some(match &self.permit {
+                EntryPermit::Installer(permit) if permit.is_repair() => {
+                    InitialArchive::Repair(self.owner.io().prepare_repair_epoch(
+                        &support,
+                        &lock,
+                        permit,
+                        &self.owner,
+                        self.deadline,
+                    )?)
+                }
                 EntryPermit::Installer(permit) => {
                     InitialArchive::Installer(self.owner.io().prepare_supervisor_epoch(
                         &support,

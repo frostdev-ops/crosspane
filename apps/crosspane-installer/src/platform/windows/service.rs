@@ -1224,6 +1224,9 @@ mod keeper_runtime {
         // Build approval must exist before any native keeper context/connection is admitted.
         payload::inventory::ApprovedInventory::embedded()?;
         let io = Arc::new(WindowsNativeIo::current(clock, &initial)?);
+        if super::repair_payload_native::maybe_entry(io.clone(), &initial)? {
+            return Ok(());
+        }
         payload::recover_prior_logon_files_for_entry(&io, &initial)?;
         if super::removal_native::maybe_entry(
             io.clone(),
@@ -1491,6 +1494,59 @@ pub fn begin_removal(erase_identity: bool) -> NativeResult<RemovalContinuation> 
     }
 }
 
+/// Explicit-source operation; wizard submission and orderly parent exit belong to WP-W4.1a7.
+#[doc(hidden)]
+pub struct RepairContinuation {
+    #[cfg(all(windows, not(test)))]
+    child: Option<super::native_io::payload_repair_keeper::RepairChild>,
+    status: &'static str,
+}
+impl std::fmt::Debug for RepairContinuation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepairContinuation")
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+impl RepairContinuation {
+    pub fn status(&self) -> NativeResult<&'static str> {
+        #[cfg(all(windows, not(test)))]
+        if let Some(child) = &self.child {
+            let budget = super::native_io::Deadline::new(
+                5_000,
+                std::sync::Arc::new(super::native_io::MonotonicClock::default()),
+                super::native_io::Cancellation::default(),
+            )?;
+            return child.status(&budget).map(|state| match state {
+                super::native_io::payload_repair_keeper::State::Committed => {
+                    "payload repair committed; keeper owns continuation"
+                }
+                super::native_io::payload_repair_keeper::State::Complete => {
+                    "payload repair complete; keeper copy retained"
+                }
+                super::native_io::payload_repair_keeper::State::Ready => {
+                    "payload repair prepared; old tree retained"
+                }
+                _ => "payload repair retained: reinstall required",
+            });
+        }
+        Ok(self.status)
+    }
+}
+#[doc(hidden)]
+pub fn begin_payload_repair(
+    inputs: [Box<dyn std::io::Read + Send>; 3],
+) -> NativeResult<RepairContinuation> {
+    #[cfg(all(windows, not(test)))]
+    {
+        repair_payload_native::begin(inputs)
+    }
+    #[cfg(any(not(windows), test))]
+    {
+        let _ = inputs;
+        Err(NativeError::Unsupported)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2007,7 +2063,7 @@ pub(crate) mod removal_runtime {
                 .ok_or(NativeError::OutcomeUnknown)?
                 .clone();
             finished.phase = super::journal::Phase::Finished;
-            finished.stop_instance = Some(generation.instance);
+            finished.stop_instance = None;
             let observed = super::journal::Journal::read(
                 &self.io,
                 &self.io.admit_support(deadline)?,
@@ -3139,5 +3195,1147 @@ pub fn begin_repair() -> NativeResult<&'static str> {
         RepairDecision::Healthy => Ok(RepairOutcome::Healthy.as_str()),
         RepairDecision::Report(issue) => Ok(RepairOutcome::Report(issue).as_str()),
         RepairDecision::Apply(plan) => Ok(probe.apply(&plan, &deadline)?.as_str()),
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+mod repair_stop_runtime {
+    use super::super::{
+        native_io::{
+            Deadline, InstallerLock, NativeError, NativeResult, SupportProof, WindowsNativeIo,
+            supervisor_owner::RetainedTreeCompletion,
+        },
+        repair::payload_record::PayloadRepairRecord,
+    };
+    use super::supervisor::Generation;
+    use std::sync::Arc;
+    pub(super) struct StopRuntime {
+        io: Arc<WindowsNativeIo>,
+        operation: [u8; 16],
+        sequence: super::super::native_io::supervisor_owner::StopSequence,
+        attempted: bool,
+        owner: Option<super::super::native_io::supervisor_owner::AdmittedRepairOwner>,
+        settlement: Option<super::super::transport::StopSettlement>,
+        lease: Option<Arc<super::super::native_io::StopLockLease>>,
+        journal: Option<super::journal::Journal>,
+        generation: Option<Generation>,
+        started_unix_ms: Option<u64>,
+        completed: Option<Arc<RetainedTreeCompletion>>,
+    }
+    impl StopRuntime {
+        pub(super) fn new(io: Arc<WindowsNativeIo>, operation: [u8; 16]) -> Self {
+            Self {
+                io,
+                operation,
+                sequence: Default::default(),
+                attempted: false,
+                owner: None,
+                settlement: None,
+                lease: None,
+                journal: None,
+                generation: None,
+                started_unix_ms: None,
+                completed: None,
+            }
+        }
+        fn selected(
+            &self,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<PayloadRepairRecord> {
+            let permit = self.io.admit_payload_repair_permit(proof, lock, deadline)?;
+            permit.reverify(&self.io, proof, lock, deadline)?;
+            let record = permit.document()?;
+            if record.operation() != self.operation
+                || record.phase()
+                    != super::super::repair::payload_record::PayloadRepairPhase::StopIntent
+            {
+                return Err(NativeError::Foreign);
+            }
+            record.context().matches(self.io.target().identity())?;
+            Ok(record)
+        }
+        pub(super) fn stop_once(
+            &mut self,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<Arc<RetainedTreeCompletion>> {
+            use super::super::{
+                native_io::supervisor_owner::{AdmittedRepairOwner, TerminalStopPort},
+                transport::WindowsAgentPort,
+            };
+            if self.attempted {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            let proof = self.io.admit_support(deadline)?;
+            self.selected(&proof, lock, deadline)?;
+            // Reserve before owner/RPC dispatch; any late/error result uses observations only.
+            self.attempted = true;
+            let original = self.io.observe_agent(&proof, deadline)?;
+            let generation = self.io.agent_generation(&original, &proof, deadline)?;
+            let journal = super::journal::Journal::read(&self.io, &proof, deadline)?
+                .ok_or(NativeError::Missing)?;
+            let selected = self.selected(&proof, lock, deadline)?;
+            if journal.current != Some(generation)
+                || generation != selected.original_generation()
+                || original.bootstrap().started_unix_ms != selected.original_started_unix_ms()
+            {
+                return Err(NativeError::Foreign);
+            }
+            let original_clone = self.io.clone_agent(&original, &proof, deadline)?;
+            let lease = self.io.lease_stop_lock(&proof, lock, deadline)?;
+            let admission =
+                self.io
+                    .prepare_repair_completion(&proof, &lease, self.operation, deadline)?;
+            self.owner = Some(AdmittedRepairOwner::admit(
+                self.io.clone(),
+                original_clone,
+                lease.clone(),
+                admission,
+                deadline,
+            )?);
+            self.lease = Some(lease);
+            self.generation = Some(generation);
+            self.started_unix_ms = Some(original.bootstrap().started_unix_ms);
+            if self.started_unix_ms == Some(0) {
+                return Err(NativeError::Foreign);
+            }
+            self.journal = Some(journal);
+            let agent = WindowsAgentPort::new(
+                self.io.clone(),
+                self.io.admit_support(deadline)?,
+                self.io.bound_clock(),
+                deadline,
+            )?;
+            self.settlement = Some(agent.stop_settlement());
+            let io = self.io.clone();
+            let lease = self.lease.as_ref().cloned().ok_or(NativeError::Foreign)?;
+            let timeout = deadline
+                .remaining_ms()?
+                .min(crate::agent_contract::MAX_TIMEOUT_MS);
+            let native = super::supervisor::NativeStop {
+                io: &io,
+                proof: &proof,
+                lock: lease.lock(),
+                journal: self.journal.as_mut().ok_or(NativeError::Foreign)?,
+                port: Some(agent),
+                deadline,
+                timeout_ms: timeout,
+            };
+            struct Ordered<'a> {
+                native: super::supervisor::NativeStop<'a>,
+                owner: &'a AdmittedRepairOwner,
+                operation: [u8; 16],
+                generation: Generation,
+                deadline: &'a Deadline,
+            }
+            impl TerminalStopPort for Ordered<'_> {
+                fn persist(&mut self) -> NativeResult<()> {
+                    super::supervisor::StopPort::persist_stop(
+                        &mut self.native,
+                        self.generation.instance,
+                    )
+                }
+                fn arm(&mut self) -> NativeResult<()> {
+                    self.owner.arm_terminal(self.operation, self.deadline)
+                }
+                fn submit(&mut self) -> NativeResult<()> {
+                    super::supervisor::StopPort::submit_stop(
+                        &mut self.native,
+                        self.generation.instance,
+                    )
+                }
+            }
+            let mut ordered = Ordered {
+                native,
+                owner: self.owner.as_ref().ok_or(NativeError::Foreign)?,
+                operation: self.operation,
+                generation,
+                deadline,
+            };
+            let submitted = self.sequence.run_once(&mut ordered);
+            drop(ordered);
+            drop(original);
+            if !self.sequence.submitted() {
+                return submitted.and(Err(NativeError::OutcomeUnknown));
+            }
+            // One completion command only. Result is retained by the actual repair sidecar.
+            let _ = self
+                .owner
+                .as_ref()
+                .ok_or(NativeError::Foreign)?
+                .observe_completion(self.operation, deadline);
+            self.finish(lock, deadline)?
+                .ok_or(NativeError::OutcomeUnknown)
+        }
+        pub(super) fn finish(
+            &mut self,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<Option<Arc<RetainedTreeCompletion>>> {
+            if !self.attempted || !self.sequence.submitted() {
+                return Ok(None);
+            }
+            let proof = self.io.admit_support(deadline)?;
+            self.selected(&proof, lock, deadline)?;
+            // This physical transport barrier is BEFORE consuming the owner sidecar/broker.
+            self.settlement
+                .as_ref()
+                .ok_or(NativeError::OutcomeUnknown)?
+                .wait(deadline)?;
+            if self.completed.is_none() {
+                let Some(owner) = self.owner.as_mut() else {
+                    return Ok(None);
+                };
+                let Some(tree) = owner.finish_settled(deadline)? else {
+                    return Ok(None);
+                };
+                // Preserve the unchanged actual proof before a later Finished publication can fail.
+                self.completed = Some(tree);
+            }
+            let tree = self
+                .completed
+                .as_ref()
+                .cloned()
+                .ok_or(NativeError::OutcomeUnknown)?;
+            tree.reverify(deadline)?;
+            let generation = self.generation.ok_or(NativeError::OutcomeUnknown)?;
+            let mut finished = self
+                .journal
+                .as_ref()
+                .ok_or(NativeError::OutcomeUnknown)?
+                .clone();
+            finished.phase = super::journal::Phase::Finished;
+            finished.stop_instance = None;
+            let observed = super::journal::Journal::read(
+                &self.io,
+                &self.io.admit_support(deadline)?,
+                deadline,
+            )?
+            .ok_or(NativeError::OutcomeUnknown)?;
+            if observed.encode()? != finished.encode()? {
+                finished.publish(&self.io, &self.io.admit_support(deadline)?, lock, deadline)?;
+            }
+            // Source worker, connected pipes, old image pins and both global/client alias slots
+            // have settled before this bare tree can reach any repair file/task callback.
+            // Finish every fallible admission while the resident slot still retains the actual
+            // proof. A deadline/error here cannot discard the sole completed recovery capability.
+            if tree.operation() != self.operation || tree.original_instance() != generation.instance
+            {
+                return Err(NativeError::Foreign);
+            }
+            let completion = tree;
+            self.owner.take();
+            self.settlement.take();
+            self.lease.take();
+            self.journal.take();
+            self.completed.take();
+            Ok(Some(completion))
+        }
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+mod repair_payload_native {
+    use super::super::{
+        native_io::{
+            self, Cancellation, Deadline, InstallerLock, MonotonicClock, NativeError,
+            NativePayloadRepairSelection, NativeResult, OpenedPe, RepairFixedPayload,
+            RepairMutationPermit, StagedPe, SupportProof, WindowsNativeIo,
+            payload_repair_keeper::{
+                self as keeper, RepairChild, RepairCommit, RepairServer, State,
+            },
+            supervisor_owner::{
+                RetainedTreeCompletion, probe_source_repair_support, prove_repair_ready,
+            },
+        },
+        payload::{
+            self, ApprovedOuterSources, PayloadInput,
+            inventory::{ApprovedInventory, ApprovedPe, PayloadRole},
+            recovery::{FileStamp, ImageObservation, OriginalLeaf},
+        },
+        repair::{
+            RepairTaskObservation,
+            payload::{
+                self as controller, PayloadRepairDecision, PayloadRepairOutcome, PayloadRepairPort,
+                PayloadRepairState,
+            },
+            payload_record::{
+                PayloadRepairPhase as Phase, PayloadRepairProcess, PayloadRepairRecord,
+                source_can_cancel,
+            },
+        },
+    };
+    use super::*;
+    use std::{
+        sync::{Arc, Mutex, OnceLock},
+        time::Duration,
+    };
+    enum Owner {
+        Source(RepairChild),
+        Keeper(Arc<RepairCommit>),
+    }
+    struct Port {
+        io: Arc<WindowsNativeIo>,
+        selected: Arc<NativePayloadRepairSelection>,
+        lock: Option<InstallerLock>,
+        permit: Option<RepairMutationPermit>,
+        deadline: Deadline,
+        record: PayloadRepairRecord,
+        sources: Arc<ApprovedOuterSources>,
+        inventory: ApprovedInventory,
+        state: Option<PayloadRepairState<Self>>,
+        owner: Option<Arc<Owner>>,
+        cancellation: Option<Arc<keeper::SourceCancellation>>,
+        copy: Option<Arc<OpenedPe>>,
+        stages: [Option<StagedPe>; 4],
+        backups: [Option<Option<FileStamp>>; 4],
+        published: [Option<Arc<OpenedPe>>; 4],
+        verified: Option<RepairFixedPayload>,
+        started: Option<Arc<task::TaskRunEvidence>>,
+        stop: super::repair_stop_runtime::StopRuntime,
+    }
+    impl Port {
+        fn proof(&self) -> NativeResult<SupportProof> {
+            self.io.admit_support(&self.deadline)
+        }
+        fn lock(&self) -> NativeResult<&InstallerLock> {
+            self.lock.as_ref().ok_or(NativeError::OutcomeUnknown)
+        }
+        fn permit(&self) -> NativeResult<&RepairMutationPermit> {
+            self.permit.as_ref().ok_or(NativeError::OutcomeUnknown)
+        }
+        fn commit(&self) -> NativeResult<&Arc<RepairCommit>> {
+            match self.owner.as_deref() {
+                Some(Owner::Keeper(commit)) => Ok(commit),
+                _ => Err(NativeError::Foreign),
+            }
+        }
+        fn expected(&self, role: PayloadRole) -> NativeResult<ApprovedPe> {
+            if role == PayloadRole::Installer {
+                ApprovedPe::own_image(self.selected.module())
+            } else {
+                self.inventory.role(role).cloned()
+            }
+        }
+        fn observe_pin(&self, pin: &OpenedPe) -> NativeResult<ImageObservation> {
+            pin.reverify(&self.io, &self.proof()?, &self.deadline)?;
+            Ok(ImageObservation {
+                identity: pin.identity().into(),
+                facts: pin.approved().facts().clone(),
+            })
+        }
+        fn drive(&mut self) -> NativeResult<PayloadRepairOutcome> {
+            let mut current = self.record.clone();
+            let result = controller::drive(self, &mut current);
+            self.record = current;
+            result
+        }
+        fn cancel_source_before_resume(&mut self) -> NativeResult<()> {
+            if matches!(self.owner.as_deref(), Some(Owner::Keeper(_)))
+                || !(source_can_cancel(self.record.phase(), false)
+                    || self.record.phase() == Phase::Cancelled)
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            // Fresh bounded cleanup budget; exhausted verification/effect budgets cannot
+            // remove the source's terminal path. A Resume attempt always refuses cancellation.
+            let cleanup = Deadline::new(30_000, self.io.bound_clock(), Cancellation::default())?;
+            if self.lock.is_none() {
+                self.lock = Some(
+                    self.io
+                        .acquire_installer_lock(&self.io.admit_support(&cleanup)?, &cleanup)?,
+                );
+            }
+            if self.cancellation.is_none() {
+                self.cancellation = Some(Arc::new(keeper::cancel_source(
+                    self.io.clone(),
+                    self.record.operation(),
+                    &cleanup,
+                )?));
+            }
+            let settled = self
+                .cancellation
+                .as_ref()
+                .cloned()
+                .ok_or(NativeError::OutcomeUnknown)?;
+            // Drop all source/controller copy pins AFTER actual worker/child settlement,
+            // BEFORE the exact nonexecuting-copy DELETE. No keeper capability is discarded.
+            self.state.take();
+            self.owner.take();
+            self.copy.take();
+            let cancelled = self.io.cancel_payload_repair(
+                &self.io.admit_support(&cleanup)?,
+                self.lock()?,
+                &self.selected,
+                settled,
+                &cleanup,
+            )?;
+            self.record = cancelled;
+            self.permit.take();
+            Ok(())
+        }
+        fn observe_new_ready(
+            &self,
+            record: &PayloadRepairRecord,
+            fixed: &RepairFixedPayload,
+        ) -> NativeResult<Option<supervisor::Generation>> {
+            fixed.reverify(&self.io, &self.proof()?, &self.deadline)?;
+            let proof = self.proof()?;
+            let agent = match self.io.observe_agent(&proof, &self.deadline) {
+                Ok(agent) => agent,
+                Err(NativeError::Missing | NativeError::Unavailable) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if agent.bootstrap().phase != crate::agent_contract::BootstrapPhase::Ready {
+                return Ok(None);
+            }
+            let generation = self.io.agent_generation(&agent, &proof, &self.deadline)?;
+            if generation.instance == record.original_generation().instance
+                || generation.pid == record.original_generation().pid
+                    && generation.creation == record.original_generation().creation
+                || self.io.agent_identity(&agent, &proof, &self.deadline)?
+                    != fixed.identity(PayloadRole::Agent)
+            {
+                return Err(NativeError::Foreign);
+            }
+            let Some(journal) = journal::Journal::read(&self.io, &self.proof()?, &self.deadline)?
+            else {
+                return Ok(None);
+            };
+            if journal.phase != journal::Phase::Running
+                || journal.current != Some(generation)
+                || journal.operation != record.operation()
+            {
+                return Ok(None);
+            }
+            prove_repair_ready(self.io.clone(), &agent, fixed, &self.deadline)?;
+            agent.revalidate(&self.io, &self.proof()?, &self.deadline)?;
+            fixed.reverify(&self.io, &self.proof()?, &self.deadline)?;
+            Ok(Some(generation))
+        }
+        fn settle_start(&mut self) -> NativeResult<()> {
+            if self.lock.is_some() {
+                return Ok(());
+            }
+            let started = self.started.as_ref().ok_or(NativeError::OutcomeUnknown)?;
+            let fixed = self.verified.as_ref().ok_or(NativeError::OutcomeUnknown)?;
+            if started.operation() != fixed.operation() {
+                return Err(NativeError::Foreign);
+            }
+            // Keep the installer's lock dropped while the newly launched supervisor needs it
+            // for claim/archive/Create/Ready/Running. These retries only observe the same result.
+            loop {
+                self.deadline.check()?;
+                match self.observe_new_ready(&self.record, fixed) {
+                    Ok(Some(_)) => break,
+                    Ok(None)
+                    | Err(NativeError::Busy | NativeError::Missing | NativeError::Unavailable) => {}
+                    Err(error) => return Err(error),
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let lock = self
+                .io
+                .acquire_installer_lock(&self.proof()?, &self.deadline)?;
+            let permit =
+                self.io
+                    .admit_payload_repair_permit(&self.proof()?, &lock, &self.deadline)?;
+            self.lock = Some(lock);
+            self.permit = Some(permit);
+            Ok(())
+        }
+    }
+    impl PayloadRepairPort for Port {
+        type Sources = Arc<ApprovedOuterSources>;
+        type Owner = Arc<Owner>;
+        type Completion = Arc<RetainedTreeCompletion>;
+        type Verified = RepairFixedPayload;
+        type Started = Arc<task::TaskRunEvidence>;
+        fn take_state(&mut self) -> NativeResult<PayloadRepairState<Self>> {
+            self.state.take().ok_or(NativeError::OutcomeUnknown)
+        }
+        fn retain_state(&mut self, state: PayloadRepairState<Self>) {
+            self.state = Some(state);
+        }
+        fn renew(&mut self, record: &PayloadRepairRecord) -> NativeResult<()> {
+            self.selected
+                .reverify(&self.io, &self.proof()?, self.lock()?, &self.deadline)?;
+            self.permit()?
+                .reverify(&self.io, &self.proof()?, self.lock()?, &self.deadline)?;
+            if self.permit()?.document()?.encode()? != record.encode()? {
+                return Err(NativeError::Foreign);
+            }
+            if let Some(Owner::Keeper(commit)) = self.owner.as_deref() {
+                commit.reverify(&self.deadline)?;
+            }
+            Ok(())
+        }
+        fn persist(&mut self, record: &PayloadRepairRecord) -> NativeResult<()> {
+            let permit = self.io.publish_payload_repair(
+                &self.proof()?,
+                self.lock()?,
+                &self.selected,
+                record,
+                &self.deadline,
+            )?;
+            self.permit = Some(permit);
+            self.record = record.clone();
+            Ok(())
+        }
+        fn task_observe(
+            &mut self,
+            _record: &PayloadRepairRecord,
+        ) -> NativeResult<RepairTaskObservation> {
+            Ok(self
+                .io
+                .observe_payload_repair(&self.proof()?, &self.deadline)?
+                .task()
+                .clone())
+        }
+        fn verify_sources(&mut self, record: &PayloadRepairRecord) -> NativeResult<Self::Sources> {
+            self.renew(record)?;
+            if self.sources.facts() != &record.sources()[1..] {
+                return Err(NativeError::Foreign);
+            }
+            Ok(self.sources.clone())
+        }
+        fn recover_sources(
+            &mut self,
+            record: &PayloadRepairRecord,
+        ) -> NativeResult<Option<Self::Sources>> {
+            self.verify_sources(record).map(Some)
+        }
+        fn keeper_copy(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            _sources: &Self::Sources,
+        ) -> NativeResult<ImageObservation> {
+            if self.owner.is_some() {
+                return Err(NativeError::Foreign);
+            }
+            let pin = Arc::new(self.io.prepare_repair_copy(
+                &self.proof()?,
+                self.lock()?,
+                self.permit()?,
+                self.selected.module(),
+                &self.deadline,
+            )?);
+            let result = self.observe_pin(&pin)?;
+            self.copy = Some(pin);
+            Ok(result)
+        }
+        fn recover_copy(
+            &mut self,
+            _record: &PayloadRepairRecord,
+        ) -> NativeResult<Option<ImageObservation>> {
+            self.copy
+                .as_ref()
+                .map(|pin| self.observe_pin(pin))
+                .transpose()
+        }
+        fn keeper_prepare(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            _sources: &Self::Sources,
+        ) -> NativeResult<Self::Owner> {
+            if self.owner.is_some() {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            let child = keeper::prepare(
+                self.io.clone(),
+                &self.proof()?,
+                self.lock()?,
+                self.permit()?,
+                self.copy.as_ref().cloned().ok_or(NativeError::Foreign)?,
+                &self.deadline,
+            )?;
+            let owner = Arc::new(Owner::Source(child));
+            self.owner = Some(owner.clone());
+            Ok(owner)
+        }
+        fn recover_owner(
+            &mut self,
+            _record: &PayloadRepairRecord,
+        ) -> NativeResult<Option<Self::Owner>> {
+            Ok(self.owner.clone())
+        }
+        fn keeper_facts(
+            &self,
+            owner: &Self::Owner,
+        ) -> NativeResult<(PayloadRepairProcess, PayloadRepairProcess, u64)> {
+            match owner.as_ref() {
+                Owner::Source(child) => child.facts(),
+                Owner::Keeper(_) => Err(NativeError::Foreign),
+            }
+        }
+        fn keeper_resume(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            owner: &Self::Owner,
+        ) -> NativeResult<()> {
+            match owner.as_ref() {
+                Owner::Source(child) => child.resume(&self.deadline),
+                Owner::Keeper(_) => Err(NativeError::Foreign),
+            }
+        }
+        fn keeper_ready(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            owner: &Self::Owner,
+        ) -> NativeResult<bool> {
+            match owner.as_ref() {
+                Owner::Source(child) => child.ready(&self.sources, &self.deadline),
+                Owner::Keeper(_) => Err(NativeError::Foreign),
+            }
+        }
+        fn keeper_commit(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            owner: &Self::Owner,
+        ) -> NativeResult<()> {
+            let Owner::Source(child) = owner.as_ref() else {
+                return Err(NativeError::Foreign);
+            };
+            // The real owned lock is consumed before atomic commit, never bypassed or borrowed.
+            self.permit.take();
+            let lock = self.lock.take().ok_or(NativeError::OutcomeUnknown)?;
+            drop(lock);
+            child.commit(&self.deadline)
+        }
+        fn commit_authorized(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            owner: &Self::Owner,
+        ) -> NativeResult<bool> {
+            match owner.as_ref() {
+                Owner::Source(_) => Ok(false),
+                Owner::Keeper(commit) => {
+                    commit.reverify(&self.deadline)?;
+                    Ok(true)
+                }
+            }
+        }
+        fn stop_once(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            _owner: &Self::Owner,
+        ) -> NativeResult<Self::Completion> {
+            self.commit()?.reverify(&self.deadline)?;
+            self.stop.stop_once(
+                self.lock.as_ref().ok_or(NativeError::Foreign)?,
+                &self.deadline,
+            )
+        }
+        fn recover_completion(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            _owner: &Self::Owner,
+        ) -> NativeResult<Option<Self::Completion>> {
+            self.commit()?.reverify(&self.deadline)?;
+            self.stop.finish(
+                self.lock.as_ref().ok_or(NativeError::Foreign)?,
+                &self.deadline,
+            )
+        }
+        fn settled(
+            &mut self,
+            record: &PayloadRepairRecord,
+            _owner: &Self::Owner,
+            tree: &Self::Completion,
+        ) -> NativeResult<()> {
+            self.commit()?.parent_settled(&self.deadline)?;
+            if tree.operation() != record.operation()
+                || tree.original_instance() != record.original_generation().instance
+            {
+                return Err(NativeError::Foreign);
+            }
+            tree.reverify(&self.deadline)
+        }
+        fn stage(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            role: PayloadRole,
+            _sources: &Self::Sources,
+            tree: &Self::Completion,
+        ) -> NativeResult<ImageObservation> {
+            self.commit()?.parent_settled(&self.deadline)?;
+            let expected = self.expected(role)?;
+            let input: Box<dyn std::io::Read + Send> = if role == PayloadRole::Installer {
+                self.io
+                    .self_image_reader(self.selected.module(), &self.proof()?, &self.deadline)?
+            } else {
+                Box::new(std::io::Cursor::new(
+                    self.sources
+                        .roles()
+                        .iter()
+                        .find(|(r, _)| *r == role)
+                        .ok_or(NativeError::Foreign)?
+                        .1
+                        .clone(),
+                ))
+            };
+            let actual = self.io.stage_repair(
+                &self.proof()?,
+                self.lock()?,
+                self.permit()?,
+                tree.clone(),
+                role,
+                input,
+                &expected,
+                &self.deadline,
+            )?;
+            let observed = actual.observation();
+            self.stages[role as usize] = Some(actual);
+            Ok(observed)
+        }
+        fn recover_stage(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            role: PayloadRole,
+            tree: &Self::Completion,
+        ) -> NativeResult<Option<ImageObservation>> {
+            tree.reverify(&self.deadline)?;
+            Ok(self.stages[role as usize]
+                .as_ref()
+                .map(StagedPe::observation))
+        }
+        fn observe_original(
+            &mut self,
+            record: &PayloadRepairRecord,
+            role: PayloadRole,
+            tree: &Self::Completion,
+        ) -> NativeResult<OriginalLeaf> {
+            self.commit()?.parent_settled(&self.deadline)?;
+            tree.reverify(&self.deadline)?;
+            let root = self
+                .io
+                .payload_root(&self.proof()?, self.lock()?, &self.deadline)?;
+            let actual = root
+                .observe_opaque(&self.io, &self.proof()?, role, &self.deadline)?
+                .map(|pin| OriginalLeaf::Present(pin.identity().into()))
+                .unwrap_or(OriginalLeaf::Missing);
+            if actual != record.selection().fixed(role) {
+                return Err(NativeError::Foreign);
+            }
+            Ok(actual)
+        }
+        fn backup(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            role: PayloadRole,
+            tree: &Self::Completion,
+        ) -> NativeResult<Option<FileStamp>> {
+            self.commit()?.parent_settled(&self.deadline)?;
+            let actual = self.io.backup_repair(
+                &self.proof()?,
+                self.lock()?,
+                self.permit()?,
+                tree.clone(),
+                role,
+                &self.deadline,
+            )?;
+            self.backups[role as usize] = Some(actual);
+            Ok(actual)
+        }
+        fn recover_backup(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            role: PayloadRole,
+            tree: &Self::Completion,
+        ) -> NativeResult<Option<Option<FileStamp>>> {
+            tree.reverify(&self.deadline)?;
+            Ok(self.backups[role as usize])
+        }
+        fn publish(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            role: PayloadRole,
+            tree: &Self::Completion,
+        ) -> NativeResult<ImageObservation> {
+            self.commit()?.parent_settled(&self.deadline)?;
+            let staged = self.stages[role as usize]
+                .take()
+                .ok_or(NativeError::OutcomeUnknown)?;
+            let actual = Arc::new(self.io.publish_repair(
+                &self.proof()?,
+                self.lock()?,
+                self.permit()?,
+                tree.clone(),
+                staged,
+                &self.deadline,
+            )?);
+            let observed = self.observe_pin(&actual)?;
+            self.published[role as usize] = Some(actual);
+            Ok(observed)
+        }
+        fn recover_publish(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            role: PayloadRole,
+            tree: &Self::Completion,
+        ) -> NativeResult<Option<ImageObservation>> {
+            tree.reverify(&self.deadline)?;
+            self.published[role as usize]
+                .as_ref()
+                .map(|pin| self.observe_pin(pin))
+                .transpose()
+        }
+        fn verify_fixed(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            tree: &Self::Completion,
+        ) -> NativeResult<Self::Verified> {
+            let actual = self.io.verify_repaired_payload(
+                &self.proof()?,
+                self.lock()?,
+                self.permit()?,
+                tree.clone(),
+                &self.deadline,
+            )?;
+            self.verified = Some(actual.clone());
+            Ok(actual)
+        }
+        fn recover_verified(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            tree: &Self::Completion,
+        ) -> NativeResult<Option<Self::Verified>> {
+            tree.reverify(&self.deadline)?;
+            if let Some(fixed) = &self.verified {
+                fixed.reverify(&self.io, &self.proof()?, &self.deadline)?;
+            }
+            Ok(self.verified.clone())
+        }
+        fn start_once(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            fixed: &Self::Verified,
+            tree: &Self::Completion,
+        ) -> NativeResult<Self::Started> {
+            self.commit()?.parent_settled(&self.deadline)?;
+            tree.reverify(&self.deadline)?;
+            let selection = task::prepare_repair(self.io.clone(), fixed, &self.deadline)?;
+            self.permit.take();
+            let lock = self.lock.take().ok_or(NativeError::OutcomeUnknown)?;
+            drop(lock);
+            let trusted = TrustedImages::current()?;
+            let started = Arc::new(task::start_repair(&trusted, &selection, &self.deadline)?);
+            // Retain the ACTUAL submission result before lock reentry/observation can fail.
+            self.started = Some(started.clone());
+            drop(trusted);
+            drop(selection);
+            self.settle_start()?;
+            Ok(started)
+        }
+        fn recover_started(
+            &mut self,
+            _record: &PayloadRepairRecord,
+            fixed: &Self::Verified,
+        ) -> NativeResult<Option<Self::Started>> {
+            fixed.reverify_completion(&self.io, &self.proof()?, &self.deadline)?;
+            Ok(self.started.clone())
+        }
+        fn submission(&self, started: &Self::Started) -> NativeResult<String> {
+            native_io::activation::repair_submission(
+                &self.io,
+                &self.proof()?,
+                started.operation(),
+                &self.deadline,
+            )
+        }
+        fn health(
+            &mut self,
+            record: &PayloadRepairRecord,
+            fixed: &Self::Verified,
+            _started: &Self::Started,
+        ) -> NativeResult<Option<supervisor::Generation>> {
+            self.observe_new_ready(record, fixed)
+        }
+        fn retire_settled(&mut self, _record: &PayloadRepairRecord) -> NativeResult<bool> {
+            Ok(false)
+        }
+    }
+    static SOURCE: OnceLock<Mutex<Option<Arc<Mutex<Port>>>>> = OnceLock::new();
+    fn budget(io: &WindowsNativeIo) -> NativeResult<Deadline> {
+        Deadline::new(5_000, io.bound_clock(), Cancellation::default())
+    }
+    pub(super) fn begin(
+        inputs: [Box<dyn std::io::Read + Send>; 3],
+    ) -> NativeResult<RepairContinuation> {
+        let clock: Arc<dyn native_io::Clock> = Arc::new(MonotonicClock::default());
+        let initial = Deadline::new(30_000, clock.clone(), Cancellation::default())?;
+        let probe = WindowsNativeIo::probe_repair(clock, &initial)?;
+        let status = match controller::classify(probe.observation())? {
+            PayloadRepairDecision::Healthy => Some("healthy; no repair needed"),
+            PayloadRepairDecision::Disabled => {
+                Some("user-disabled task preserved; reinstall required")
+            }
+            PayloadRepairDecision::ReinstallRequired => {
+                Some("payload repair unavailable; reinstall required")
+            }
+            PayloadRepairDecision::Eligible => None,
+        };
+        if let Some(status) = status {
+            return Ok(RepairContinuation {
+                child: None,
+                status,
+            });
+        }
+        let io = probe.io().ok_or(NativeError::Unsupported)?.clone();
+        let mut source_slot = SOURCE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .map_err(|_| NativeError::OutcomeUnknown)?;
+        if let Some(source) = source_slot.as_ref().cloned() {
+            drop(source_slot);
+            let mut held = source.lock().map_err(|_| NativeError::OutcomeUnknown)?;
+            let result = held.cancel_source_before_resume();
+            held.permit.take();
+            held.lock.take();
+            result?;
+            let mut slot = SOURCE
+                .get()
+                .ok_or(NativeError::Foreign)?
+                .lock()
+                .map_err(|_| NativeError::OutcomeUnknown)?;
+            if !slot
+                .as_ref()
+                .is_some_and(|actual| Arc::ptr_eq(actual, &source))
+            {
+                return Err(NativeError::Foreign);
+            }
+            slot.take();
+            return Ok(RepairContinuation {
+                child: None,
+                status: "payload repair cancelled; reinstall required",
+            });
+        }
+        let lock = io.acquire_installer_lock(&io.admit_support(&initial)?, &initial)?;
+        let module = io.self_image(&io.admit_support(&initial)?, &initial)?;
+        // Read-only actual peer + freshly measured fixed Installer pins. An older owner
+        // is refused BEFORE any selection/catalog/copy publication, regardless of damage.
+        if probe_source_repair_support(io.clone(), &lock, &module, &initial).is_err() {
+            return Ok(RepairContinuation {
+                child: None,
+                status: "payload repair unavailable; reinstall required",
+            });
+        }
+        let inventory = ApprovedInventory::embedded()?;
+        let installer = ApprovedPe::own_image(&module)?;
+        let inputs = [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl]
+            .into_iter()
+            .zip(inputs)
+            .map(|(role, content)| PayloadInput { role, content })
+            .collect();
+        // Explicit source verification has its own budget and never makes Stop eligible.
+        let sources = Arc::new(payload::buffer_outer_sources(
+            inputs, &inventory, &installer, &initial,
+        )?);
+        // Adopt an exact interrupted retirement BEFORE the general clean-publication selection
+        // checks. The fresh retirement budget is independent of source buffering.
+        let retirement = Deadline::new(30_000, io.bound_clock(), Cancellation::default())?;
+        io.retire_settled_repair_copy(&io.admit_support(&retirement)?, &lock, &retirement)?;
+        let effect = Deadline::new(30_000, io.bound_clock(), Cancellation::default())?;
+        probe_source_repair_support(io.clone(), &lock, &module, &effect)?;
+        let selected = io.select_payload_repair(
+            &io.admit_support(&effect)?,
+            &lock,
+            probe.observation(),
+            &effect,
+        )?;
+        let operation = io.bridge_nonce(&io.admit_support(&effect)?, &effect)?;
+        let record = io.reserve_payload_repair(
+            &io.admit_support(&effect)?,
+            &lock,
+            &selected,
+            operation,
+            &effect,
+        )?;
+        let port = Arc::new(Mutex::new(Port {
+            stop: super::repair_stop_runtime::StopRuntime::new(io.clone(), operation),
+            io,
+            selected,
+            lock: Some(lock),
+            permit: None,
+            deadline: effect,
+            record,
+            sources,
+            inventory,
+            state: Some(Default::default()),
+            owner: None,
+            cancellation: None,
+            copy: None,
+            stages: std::array::from_fn(|_| None),
+            backups: [None; 4],
+            published: std::array::from_fn(|_| None),
+            verified: None,
+            started: None,
+        }));
+        *source_slot = Some(port.clone());
+        drop(source_slot);
+        let mut held = match port.lock() {
+            Ok(held) => held,
+            Err(error) => {
+                let mut held = error.into_inner();
+                held.permit.take();
+                held.lock.take();
+                return Err(NativeError::OutcomeUnknown);
+            }
+        };
+        let result = (|| {
+            held.permit = Some(held.io.admit_payload_repair_permit(
+                &held.proof()?,
+                held.lock()?,
+                &held.deadline,
+            )?);
+            held.drive()
+        })();
+        if !matches!(held.owner.as_deref(), Some(Owner::Keeper(_))) {
+            let cancelled = source_can_cancel(held.record.phase(), false)
+                && held.cancel_source_before_resume().is_ok();
+            // Release before any further fallible source-slot bookkeeping. Ambiguous native
+            // worker leases remain with their genuine bounded owners, never in Port.lock.
+            held.permit.take();
+            held.lock.take();
+            if cancelled {
+                let mut source_slot = SOURCE
+                    .get()
+                    .ok_or(NativeError::Foreign)?
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                if source_slot
+                    .as_ref()
+                    .is_some_and(|actual| Arc::ptr_eq(actual, &port))
+                {
+                    source_slot.take();
+                } else {
+                    return Err(NativeError::Foreign);
+                }
+            }
+        }
+        let child = match held.owner.as_deref() {
+            Some(Owner::Source(child)) => Some(child.clone()),
+            _ => None,
+        };
+        if child.is_some() {
+            return Ok(RepairContinuation {
+                child,
+                status: "payload repair retained: inspect continuation",
+            });
+        }
+        if held.record.phase() == Phase::Cancelled {
+            return Ok(RepairContinuation {
+                child: None,
+                status: "payload repair cancelled; reinstall required",
+            });
+        }
+        result?;
+        Ok(RepairContinuation {
+            child: None,
+            status: "payload repair retained: reinstall required",
+        })
+    }
+    pub(super) fn maybe_entry(io: Arc<WindowsNativeIo>, initial: &Deadline) -> NativeResult<bool> {
+        let Some(record) = io.read_payload_repair(&io.admit_support(initial)?, initial)? else {
+            return Ok(false);
+        };
+        if matches!(
+            record.phase(),
+            Phase::Complete | Phase::Retired | Phase::Cancelled
+        ) {
+            return Ok(false);
+        }
+        let mut server = RepairServer::new(io.clone(), initial)?;
+        let commit = Arc::new(server.await_commit(initial)?);
+        // Atomic commit is the lifetime boundary. All later setup failures keep the actual
+        // server/commit/parent/source pins resident; retries here acquire/validate only.
+        eprintln!("Crosspane payload repair keeper phase: initializing");
+        let mut port = loop {
+            if let Ok(first) = budget(&io) {
+                let prepared = (|| {
+                    commit.reverify(&first)?;
+                    let lock = io.acquire_installer_lock(&io.admit_support(&first)?, &first)?;
+                    let selected = io.admitted_keeper_repair_selection(
+                        &io.admit_support(&first)?,
+                        &lock,
+                        &first,
+                    )?;
+                    let current = io
+                        .read_payload_repair(&io.admit_support(&first)?, &first)?
+                        .ok_or(NativeError::Missing)?;
+                    if !current.same_selection(commit.selection().record()) {
+                        return Err(NativeError::Foreign);
+                    }
+                    let permit =
+                        io.admit_payload_repair_permit(&io.admit_support(&first)?, &lock, &first)?;
+                    let operation = current.operation();
+                    Ok(Port {
+                        stop: super::repair_stop_runtime::StopRuntime::new(io.clone(), operation),
+                        io: io.clone(),
+                        selected,
+                        lock: Some(lock),
+                        permit: Some(permit),
+                        deadline: first.clone(),
+                        record: current,
+                        sources: commit.sources().clone(),
+                        inventory: ApprovedInventory::embedded()?,
+                        state: Some(Default::default()),
+                        owner: Some(Arc::new(Owner::Keeper(commit.clone()))),
+                        cancellation: None,
+                        copy: None,
+                        stages: std::array::from_fn(|_| None),
+                        backups: [None; 4],
+                        published: std::array::from_fn(|_| None),
+                        verified: None,
+                        started: None,
+                    })
+                })();
+                if let Ok(port) = prepared {
+                    break port;
+                }
+                if let Ok(status_budget) = budget(&io) {
+                    let _ = server.poll_status(State::Retained, &status_budget);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let mut previous = None;
+        loop {
+            if previous != Some(port.record.phase()) {
+                eprintln!(
+                    "Crosspane payload repair keeper phase: {:?}",
+                    port.record.phase()
+                );
+                previous = Some(port.record.phase());
+            }
+            let Ok(next) = budget(&io) else {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            };
+            port.deadline = next;
+            // An ambiguous Run never re-enters the controller. Only a retained actual Run
+            // result can make bounded readiness/lock reentry progress, with no second Run.
+            let result = if port.lock.is_none() {
+                port.settle_start().and_then(|()| port.drive())
+            } else {
+                port.drive()
+            };
+            let state = match result {
+                Ok(PayloadRepairOutcome::Complete | PayloadRepairOutcome::Retired) => {
+                    State::Complete
+                }
+                _ => State::Retained,
+            };
+            if let Ok(status_budget) = budget(&io) {
+                let _ = server.poll_status(state, &status_budget);
+            }
+            if state == State::Complete {
+                return Ok(true);
+            }
+            // One bounded owner survives unresolved post-Commit work; no wall-time abandonment.
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }

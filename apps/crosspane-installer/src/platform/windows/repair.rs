@@ -1,4 +1,10 @@
 //! Repair decisions never supply image, process, task or file authority.
+#[cfg(any(windows, test))]
+#[path = "repair/payload.rs"]
+pub(crate) mod payload;
+#[cfg(any(windows, test))]
+#[path = "repair/payload_record.rs"]
+pub(crate) mod payload_record;
 #[path = "repair/record.rs"]
 pub(crate) mod record;
 use super::native_io::{NativeError, NativeResult, files::MAX_RECORD_BYTES};

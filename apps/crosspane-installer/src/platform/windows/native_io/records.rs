@@ -80,6 +80,10 @@ pub enum RecordKind {
     RepairPublicationIntent,
     RepairPending,
     RepairEvidence,
+    RepairPayload,
+    RepairPayloadPublicationIntent,
+    RepairPayloadPending,
+    RepairPayloadCatalog,
     Operation,
     Supervisor,
     TaskActivation,
@@ -97,6 +101,10 @@ pub enum RecordName {
     RepairPublicationIntent,
     RepairPending,
     RepairEvidence,
+    RepairPayload,
+    RepairPayloadPublicationIntent,
+    RepairPayloadPending,
+    RepairPayloadCatalog,
     Operation([u8; 16]),
     Supervisor,
     TaskActivation,
@@ -118,6 +126,16 @@ impl RecordName {
             }
             Self::RepairPending => super::files::PrivateName::new("repair-pending.json"),
             Self::RepairEvidence => super::files::PrivateName::new("repair-evidence-index.json"),
+            Self::RepairPayload => super::files::PrivateName::new("repair-payload.json"),
+            Self::RepairPayloadPublicationIntent => {
+                super::files::PrivateName::new("repair-payload-publication-intent.json")
+            }
+            Self::RepairPayloadPending => {
+                super::files::PrivateName::new("repair-payload-pending.json")
+            }
+            Self::RepairPayloadCatalog => {
+                super::files::PrivateName::new("repair-payload-catalog.json")
+            }
             Self::Supervisor => super::files::PrivateName::new("supervisor.json"),
             Self::TaskActivation => super::files::PrivateName::new("task-activation.json"),
             Self::SupervisorLogon => super::files::PrivateName::new("supervisor-logon.json"),
@@ -144,6 +162,10 @@ impl RecordName {
             Self::RepairPublicationIntent => RecordKind::RepairPublicationIntent,
             Self::RepairPending => RecordKind::RepairPending,
             Self::RepairEvidence => RecordKind::RepairEvidence,
+            Self::RepairPayload => RecordKind::RepairPayload,
+            Self::RepairPayloadPublicationIntent => RecordKind::RepairPayloadPublicationIntent,
+            Self::RepairPayloadPending => RecordKind::RepairPayloadPending,
+            Self::RepairPayloadCatalog => RecordKind::RepairPayloadCatalog,
             Self::Operation(_) => RecordKind::Operation,
             Self::Supervisor => RecordKind::Supervisor,
             Self::TaskActivation => RecordKind::TaskActivation,

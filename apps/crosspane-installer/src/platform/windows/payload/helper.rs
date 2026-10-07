@@ -2510,3 +2510,10 @@ pub(crate) mod removal {
         Ok((child, record))
     }
 }
+
+// A6b keeps the old upgrade/removal helper constructors and argv untouched. The distinct
+// repair role is implemented by the checked original-IO bridge, not a disguised removal.
+#[cfg(all(windows, not(test)))]
+pub(crate) mod repair {
+    pub(crate) use super::super::super::native_io::payload_repair_keeper::RepairParent;
+}

@@ -920,6 +920,8 @@ mod native {
     ) -> NativeResult<StageCatalog> {
         #[cfg(not(test))]
         io.refuse_unsettled_repair_readonly(proof, deadline)?;
+        #[cfg(not(test))]
+        io.refuse_unsettled_payload_repair_readonly(proof, deadline)?;
         // Removal is a distinct operation: observing its unresolved selection grants no
         // upgrade authority and cannot be disguised as an empty upgrade catalog.
         #[cfg(not(test))]

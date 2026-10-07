@@ -978,3 +978,43 @@ impl KeeperApplyAttempt {
         Ok(())
     }
 }
+
+/// Native repair lineage facade delegates to the same pure model exercised by the new
+/// focused fakes. Older source-included test graphs need no new repair module.
+#[cfg(all(windows, not(test)))]
+pub(crate) use super::super::repair::payload_record::PayloadRepairLineage as RepairLineage;
+/// Matches only the strict repair selection and its exact completed predecessor. No upgrade
+/// OperationRecord is fabricated and no native ownership is inferred from these bytes.
+#[cfg(all(windows, not(test)))]
+pub(crate) fn correlate_repair(
+    operation: [u8; 16],
+    user: &str,
+    selected: &super::super::repair::payload_record::PayloadRepairRecord,
+    predecessor: &super::super::service::journal::Journal,
+) -> NativeResult<RepairLineage> {
+    super::super::repair::payload_record::correlate_repair(operation, user, selected, predecessor)
+}
+
+/// Correlates the actual retained task Run result with its strict durable submission. Reading
+/// this string never constructs TaskRunEvidence, a started child, or any native authority.
+#[cfg(all(windows, not(test)))]
+pub(crate) fn repair_submission(
+    io: &super::WindowsNativeIo,
+    proof: &super::SupportProof,
+    operation: [u8; 16],
+    deadline: &super::Deadline,
+) -> NativeResult<String> {
+    proof.check(io, deadline)?;
+    let record = TaskActivationRecord::read(io, proof, deadline)?.ok_or(NativeError::Missing)?;
+    if record.operation != operation || record.phase != Phase::RunObserved {
+        return Err(NativeError::Foreign);
+    }
+    let submission = record
+        .submission
+        .as_ref()
+        .filter(|value| valid_submission(value))
+        .cloned()
+        .ok_or(NativeError::Foreign)?;
+    proof.check(io, deadline)?;
+    Ok(submission)
+}

@@ -233,6 +233,117 @@ mod native {
         value.reverify(deadline)?;
         Ok(value)
     }
+    /// A retained genuine fixed-payload/completion gate on the ORIGINAL source IO. Captured
+    /// StartIntent bytes correlate the selection; they never replace native approval or tree proof.
+    #[derive(Clone)]
+    pub(crate) struct RepairTaskSelection {
+        io: Arc<WindowsNativeIo>,
+        payload: Arc<native_io::RepairFixedPayload>,
+        selected: Vec<u8>,
+        operation: [u8; 16],
+    }
+    impl RepairTaskSelection {
+        fn reverify(&self, deadline: &Deadline) -> NativeResult<()> {
+            let proof = self.io.admit_support(deadline)?;
+            self.payload.reverify(&self.io, &proof, deadline)?;
+            self.payload
+                .reverify_completion(&self.io, &proof, deadline)?;
+            let record = self
+                .io
+                .read_payload_repair(&proof, deadline)?
+                .ok_or(NativeError::Foreign)?;
+            if record.operation() != self.operation
+                || record.phase()
+                    != super::super::super::repair::payload_record::PayloadRepairPhase::StartIntent
+                || record.encode()? != self.selected
+            {
+                return Err(NativeError::Foreign);
+            }
+            deadline.check()
+        }
+        fn matches_task(&self, actual: Option<&Snapshot>) -> NativeResult<()> {
+            let selected =
+                super::super::super::repair::payload_record::PayloadRepairRecord::decode(
+                    &self.selected,
+                )?;
+            match actual {
+                Some(actual)
+                    if actual.definition.enabled && actual.xml == selected.task().xml() =>
+                {
+                    Ok(())
+                }
+                None if selected.task().diagnostic()
+                    == super::super::super::repair::RepairDiagnostic::Missing =>
+                {
+                    Ok(())
+                }
+                _ => Err(NativeError::Foreign),
+            }
+        }
+        fn matches_images(&self, images: &NativeImages, deadline: &Deadline) -> NativeResult<()> {
+            use super::super::super::payload::inventory::PayloadRole;
+            self.reverify(deadline)?;
+            let proof = images.io.admit_support(deadline)?;
+            for (role, pin) in [
+                (PayloadRole::Installer, &images.installer),
+                (PayloadRole::Agent, &images.agent),
+                (PayloadRole::Ui, &images.ui),
+            ] {
+                pin.reverify(&images.io, &proof, deadline)?;
+                if pin.identity() != self.payload.identity(role)
+                    || pin.approved().facts() != self.payload.facts(role)
+                {
+                    return Err(NativeError::Foreign);
+                }
+            }
+            let inventory = super::super::super::payload::inventory::ApprovedInventory::embedded()?;
+            let ctl = images._root.open_approved(
+                &images.io,
+                &proof,
+                PayloadRole::Ctl,
+                inventory.role(PayloadRole::Ctl)?,
+                deadline,
+            )?;
+            if ctl.identity() != self.payload.identity(PayloadRole::Ctl)
+                || ctl.approved().facts() != self.payload.facts(PayloadRole::Ctl)
+            {
+                return Err(NativeError::Foreign);
+            }
+            ctl.reverify(&images.io, &proof, deadline)
+        }
+    }
+    pub(in super::super) fn prepare_repair(
+        io: Arc<WindowsNativeIo>,
+        payload: &native_io::RepairFixedPayload,
+        deadline: &Deadline,
+    ) -> NativeResult<RepairTaskSelection> {
+        if !Arc::ptr_eq(&io, payload.io()) {
+            return Err(NativeError::Foreign);
+        }
+        let proof = io.admit_support(deadline)?;
+        payload.reverify(&io, &proof, deadline)?;
+        payload.reverify_completion(&io, &proof, deadline)?;
+        let record = io
+            .read_payload_repair(&proof, deadline)?
+            .ok_or(NativeError::Foreign)?;
+        if record.operation() != payload.operation()
+            || record.phase()
+                != super::super::super::repair::payload_record::PayloadRepairPhase::StartIntent
+        {
+            return Err(NativeError::Foreign);
+        }
+        let selection = RepairTaskSelection {
+            operation: payload.operation(),
+            selected: record.encode()?,
+            payload: payload.retain_for_start(),
+            io,
+        };
+        selection.reverify(deadline)?;
+        Ok(selection)
+    }
+    // One uncertain repair task call keeps the genuine source completion and fixed-file pins.
+    static UNCERTAIN_REPAIR: OnceLock<Arc<RepairTaskSelection>> = OnceLock::new();
+
     /// Task-submission operation correlation only; the scheduler GUID is durable in activation.
     /// Fresh owner/agent observation must supply health separately.
     pub(crate) struct TaskRunEvidence {
@@ -246,6 +357,7 @@ mod native {
     struct Binding {
         images: Arc<NativeImages>,
         upgrade: Option<UpgradeTaskSelection>,
+        repair: Option<RepairTaskSelection>,
         deadline: Deadline,
     }
     impl Binding {
@@ -256,6 +368,9 @@ mod native {
                 if self.images.agent.identity() != upgrade.agent {
                     return Err(NativeError::Foreign);
                 }
+            }
+            if let Some(repair) = &self.repair {
+                repair.matches_images(&self.images, &self.deadline)?;
             }
             self.deadline.check()
         }
@@ -305,7 +420,11 @@ mod native {
             if self.retired {
                 return Err(NativeError::OutcomeUnknown);
             }
-            self.scheduler.inspect(&|| self.binding.check())
+            let actual = self.scheduler.inspect(&|| self.binding.check())?;
+            if let Some(repair) = &self.binding.repair {
+                repair.matches_task(actual.as_ref())?;
+            }
+            Ok(actual)
         }
         fn record_intent(&mut self, original: Option<&Snapshot>) -> NativeResult<()> {
             self.original = original.cloned();
@@ -361,7 +480,9 @@ mod native {
             if let Some(old) = self.binding.record()? {
                 // A fresh selected upgrade StartIntent may supersede the previous activation;
                 // standalone reopen never replays either registration or Run.
-                if self.binding.upgrade.is_none() || old.operation() == self.operation {
+                if (self.binding.upgrade.is_none() && self.binding.repair.is_none())
+                    || old.operation() == self.operation
+                {
                     return Err(NativeError::OutcomeUnknown);
                 }
                 if old.phase() != Phase::RunObserved || old.claim().is_none() {
@@ -403,6 +524,9 @@ mod native {
             }
             let desired = desired(&self.binding);
             let actual = self.scheduler.inspect(&|| self.binding.check())?;
+            if let Some(repair) = &self.binding.repair {
+                repair.matches_task(actual.as_ref())?;
+            }
             if plan(&desired, actual.as_ref())? != Plan::Keep {
                 return Err(NativeError::Foreign);
             }
@@ -448,11 +572,14 @@ mod native {
     fn start(
         images: Arc<NativeImages>,
         upgrade: Option<UpgradeTaskSelection>,
+        repair: Option<RepairTaskSelection>,
         deadline: &Deadline,
     ) -> NativeResult<TaskRunEvidence> {
-        let operation = match &upgrade {
-            Some(value) => value.operation,
-            None => {
+        let operation = match (&upgrade, &repair) {
+            (Some(_), Some(_)) => return Err(NativeError::Foreign),
+            (None, Some(value)) => value.operation,
+            (Some(value), None) => value.operation,
+            (None, None) => {
                 let mut id = [0; 16];
                 aws_lc_rs::rand::fill(&mut id).map_err(|_| NativeError::Unavailable)?;
                 if id == [0; 16] {
@@ -462,9 +589,11 @@ mod native {
             }
         };
         let retained = images.clone();
+        let retained_repair = repair.clone();
         let binding = Binding {
             images,
             upgrade,
+            repair,
             deadline: deadline.clone(),
         };
         binding.check()?;
@@ -494,13 +623,16 @@ mod native {
         );
         if matches!(result, Err(NativeError::OutcomeUnknown)) {
             let _ = UNCERTAIN.set(retained);
+            if let Some(selection) = retained_repair {
+                let _ = UNCERTAIN_REPAIR.set(Arc::new(selection));
+            }
         }
         result
     }
     pub(super) fn standalone(trusted: &TrustedImages) -> NativeResult<()> {
         let clock: Arc<dyn native_io::Clock> = Arc::new(MonotonicClock::default());
         let deadline = Deadline::new(30_000, clock, Cancellation::default())?;
-        start(trusted._native.clone(), None, &deadline).map(|_| ())
+        start(trusted._native.clone(), None, None, &deadline).map(|_| ())
     }
     pub(in super::super) fn start_upgrade(
         trusted: &TrustedImages,
@@ -514,15 +646,112 @@ mod native {
             agent: selection.agent,
             selected: selection.selected.clone(),
         };
-        start(trusted._native.clone(), Some(selection), deadline)
+        start(trusted._native.clone(), Some(selection), None, deadline)
     }
 
+    pub(in super::super) fn start_repair(
+        trusted: &TrustedImages,
+        selection: &RepairTaskSelection,
+        deadline: &Deadline,
+    ) -> NativeResult<TaskRunEvidence> {
+        selection.matches_images(&trusted._native, deadline)?;
+        start(
+            trusted._native.clone(),
+            None,
+            Some(selection.clone()),
+            deadline,
+        )
+    }
+    /// The new supervisor's independent four-image admission. This is not the source process's
+    /// old tree proof; the genuine task claim and exclusive namespace remain separately required.
+    struct RepairClaim {
+        selected: super::super::super::repair::payload_record::PayloadRepairRecord,
+        ctl: native_io::OpenedPe,
+    }
+    impl RepairClaim {
+        fn admit(
+            images: &NativeImages,
+            operation: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<Option<Self>> {
+            use super::super::super::{
+                payload::inventory::{ApprovedInventory, PayloadRole},
+                repair::payload_record::PayloadRepairPhase,
+            };
+            let proof = images.io.admit_support(deadline)?;
+            let Some(selected) = images.io.read_payload_repair(&proof, deadline)? else {
+                return Ok(None);
+            };
+            if selected.operation() != operation {
+                return Ok(None);
+            }
+            if !matches!(
+                selected.phase(),
+                PayloadRepairPhase::StartIntent | PayloadRepairPhase::StartSubmitted
+            ) {
+                return Err(NativeError::Foreign);
+            }
+            selected.context().matches(images.io.target().identity())?;
+            let inventory = ApprovedInventory::embedded()?;
+            let ctl = images._root.open_approved(
+                &images.io,
+                &proof,
+                PayloadRole::Ctl,
+                inventory.role(PayloadRole::Ctl)?,
+                deadline,
+            )?;
+            let value = Self { selected, ctl };
+            value.reverify(images, deadline)?;
+            Ok(Some(value))
+        }
+        fn reverify(&self, images: &NativeImages, deadline: &Deadline) -> NativeResult<()> {
+            use super::super::super::{
+                payload::inventory::PayloadRole, repair::payload_record::PayloadRepairPhase,
+            };
+            let proof = images.io.admit_support(deadline)?;
+            let actual = images
+                .io
+                .read_payload_repair(&proof, deadline)?
+                .ok_or(NativeError::Foreign)?;
+            if !actual.same_selection(&self.selected)
+                || matches!(
+                    actual.phase(),
+                    PayloadRepairPhase::Unknown | PayloadRepairPhase::Cancelled
+                )
+                || actual.phase().rank() < PayloadRepairPhase::StartIntent.rank()
+            {
+                return Err(NativeError::Foreign);
+            }
+            actual.context().matches(images.io.target().identity())?;
+            for (role, pin) in [
+                (PayloadRole::Installer, &images.installer),
+                (PayloadRole::Agent, &images.agent),
+                (PayloadRole::Ui, &images.ui),
+                (PayloadRole::Ctl, &self.ctl),
+            ] {
+                pin.reverify(&images.io, &proof, deadline)?;
+                let selected = actual.role(role).published().ok_or(NativeError::Foreign)?;
+                if pin.identity()
+                    != (native_io::files::FileIdentity {
+                        volume: selected.identity.volume,
+                        file: selected.identity.file,
+                    })
+                    || pin.approved().facts() != &selected.facts
+                    || pin.approved().facts() != actual.selection().source(role)
+                {
+                    return Err(NativeError::Foreign);
+                }
+            }
+            deadline.check()
+        }
+    }
     /// Fresh own-process/image/context plus a once-published exact activation claim. Never decoded.
     pub(crate) struct TaskRunPermit {
         images: Arc<NativeImages>,
         operation: [u8; 16],
         user: String,
         owner: native_io::process::own::OwnProcessIdentity,
+        repair: Option<RepairClaim>,
     }
     impl TaskRunPermit {
         pub(crate) fn operation(&self) -> [u8; 16] {
@@ -537,6 +766,18 @@ mod native {
         pub(crate) fn owner_identity(&self) -> &native_io::process::own::OwnProcessIdentity {
             &self.owner
         }
+        pub(crate) fn is_repair(&self) -> bool {
+            self.repair.is_some()
+        }
+        pub(crate) fn repair_selection(
+            &self,
+        ) -> NativeResult<&super::super::super::repair::payload_record::PayloadRepairRecord>
+        {
+            self.repair
+                .as_ref()
+                .map(|r| &r.selected)
+                .ok_or(NativeError::Foreign)
+        }
         pub(crate) fn reverify(
             &self,
             io: &WindowsNativeIo,
@@ -549,6 +790,9 @@ mod native {
             }
             proof.check(io, deadline)?;
             self.images.reverify(deadline)?;
+            if let Some(repair) = &self.repair {
+                repair.reverify(&self.images, deadline)?;
+            }
             self.owner.reverify(deadline)?;
             let proof = self.images.io.admit_support(deadline)?;
             let record = TaskActivationRecord::read(&self.images.io, &proof, deadline)?
@@ -588,6 +832,7 @@ mod native {
             .ok_or(NativeError::Foreign)?;
         let user = images.io.target().identity().user.sddl();
         record.bind(record.operation(), &user, images.installer.identity())?;
+        let repair = RepairClaim::admit(&images, record.operation(), deadline)?;
         record.claim_supervisor(SupervisorClaim {
             pid: owner.pid(),
             creation: owner.creation(),
@@ -602,6 +847,7 @@ mod native {
             images,
             user,
             owner,
+            repair,
         };
         let proof = permit.images.io.admit_support(deadline)?;
         permit.reverify(&permit.images.io, &proof, deadline)?;
@@ -611,7 +857,9 @@ mod native {
 #[cfg(all(windows, not(test)))]
 pub(crate) use native::TaskRunPermit;
 #[cfg(all(windows, not(test)))]
-pub(super) use native::{claim_supervisor, prepare_upgrade, start_upgrade};
+pub(super) use native::{
+    TaskRunEvidence, claim_supervisor, prepare_repair, prepare_upgrade, start_repair, start_upgrade,
+};
 
 // A6 repair is separate from activation: registration-only, no TaskActivation claim or Run.
 #[cfg(all(windows, not(test)))]

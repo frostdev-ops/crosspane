@@ -1832,6 +1832,147 @@ pub(crate) mod native {
             }
             Ok(actual)
         }
+        // A6b: same-handle protocol for the separate, closed payload-repair leaves.
+        pub(crate) fn write_payload_repair_publication_intent(
+            &self,
+            previous: Option<(FileIdentity, &[u8])>,
+            bytes: &[u8],
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<FileIdentity> {
+            use std::io::Write;
+            let name = PrivateName::new("repair-payload-publication-intent.json")?;
+            self.revalidate(security, true, deadline)?;
+            check_read_size(bytes.len(), MAX_RECORD_BYTES)?;
+            let mut file = match previous {
+                Some((id, old)) => {
+                    let mut file = open_component(
+                        self.file()?,
+                        &ComponentName::new(name.as_str())?,
+                        ObjectKind::File,
+                        GENERIC_READ | GENERIC_WRITE,
+                        0,
+                        deadline,
+                    )?
+                    .ok_or(NativeError::Foreign)?;
+                    let facts = observe(&file, name.as_str(), security)?;
+                    admit_component(&facts, Admission::PrivateFile)?;
+                    if facts.identity != id || read_repair_bytes(&mut file, deadline)? != old {
+                        return Err(NativeError::Foreign);
+                    }
+                    file
+                }
+                None => self.create_private(&name, security, deadline)?,
+            };
+            let facts = observe(&file, name.as_str(), security)?;
+            admit_component(&facts, Admission::PrivateFile)?;
+            deadline.check()?;
+            // Fixed intent is deliberately not published via a random temporary. A torn write
+            // leaves a strictly malformed/Unknown fixed intent and can never be salvaged as permission.
+            file.set_len(0).map_err(|_| NativeError::OutcomeUnknown)?;
+            std::io::Seek::rewind(&mut file).map_err(|_| NativeError::OutcomeUnknown)?;
+            file.write_all(bytes)
+                .map_err(|_| NativeError::OutcomeUnknown)?;
+            deadline.check()?;
+            // SAFETY: exact retained private writable intent; ordinary flush, no path fallback.
+            if unsafe { FlushFileBuffers(file.as_raw_handle()) } == 0 {
+                return Err(last_error());
+            }
+            let id = facts.identity;
+            drop(file);
+            let (actual, observed) = self
+                .read_private(&name, security, MAX_RECORD_BYTES, deadline)?
+                .ok_or(NativeError::OutcomeUnknown)?;
+            if actual != id || observed != bytes {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            deadline.check()?;
+            Ok(id)
+        }
+        pub(crate) fn create_payload_repair_pending(
+            &self,
+            bytes: &[u8],
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<FileIdentity> {
+            use std::io::Write;
+            check_read_size(bytes.len(), MAX_RECORD_BYTES)?;
+            let name = PrivateName::new("repair-payload-pending.json")?;
+            // This raw fixed pending file contains the selected target envelope, NOT an
+            // independently trusted RepairPayloadPending body. Only the intent's exact target/stamp admits it.
+            let mut file = self.create_private(&name, security, deadline)?;
+            deadline.check()?;
+            file.write_all(bytes)
+                .map_err(|_| NativeError::OutcomeUnknown)?;
+            deadline.check()?;
+            // SAFETY: our one CREATE_NEW complete bounded pending record, retained through flush.
+            if unsafe { FlushFileBuffers(file.as_raw_handle()) } == 0 {
+                return Err(last_error());
+            }
+            let facts = observe(&file, name.as_str(), security)?;
+            admit_component(&facts, Admission::PrivateFile)?;
+            let id = facts.identity;
+            drop(file);
+            let (actual, observed) = self
+                .read_private(&name, security, MAX_RECORD_BYTES, deadline)?
+                .ok_or(NativeError::OutcomeUnknown)?;
+            if actual != id || observed != bytes {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(id)
+        }
+        pub(crate) fn publish_payload_repair_pending(
+            &self,
+            target: &PrivateName,
+            pending_id: FileIdentity,
+            bytes: &[u8],
+            previous: Option<(FileIdentity, &[u8])>,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<FileIdentity> {
+            if !matches!(
+                target.as_str(),
+                "repair-payload.json" | "repair-payload-catalog.json"
+            ) {
+                return Err(NativeError::Foreign);
+            }
+            self.revalidate(security, true, deadline)?;
+            let pending = PrivateName::new("repair-payload-pending.json")?;
+            let mut source = open_component(
+                self.file()?,
+                &ComponentName::new(pending.as_str())?,
+                ObjectKind::File,
+                GENERIC_READ | super::DELETE,
+                0,
+                deadline,
+            )?
+            .ok_or(NativeError::Foreign)?;
+            let facts = observe(&source, pending.as_str(), security)?;
+            admit_component(&facts, Admission::PrivateFile)?;
+            if facts.identity != pending_id || read_repair_bytes(&mut source, deadline)? != bytes {
+                return Err(NativeError::Foreign);
+            }
+            let actual = self.read_private(target, security, MAX_RECORD_BYTES, deadline)?;
+            match (previous, actual) {
+                (None, None) => {}
+                (Some((id, old)), Some((actual, observed))) if id == actual && old == observed => {}
+                _ => return Err(NativeError::Foreign),
+            }
+            self.publish_private(&source, target, security, deadline)?;
+            drop(source);
+            let (actual, observed) = self
+                .read_private(target, security, MAX_RECORD_BYTES, deadline)?
+                .ok_or(NativeError::OutcomeUnknown)?;
+            if actual != pending_id
+                || observed != bytes
+                || self
+                    .read_private(&pending, security, MAX_RECORD_BYTES, deadline)?
+                    .is_some()
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(actual)
+        }
         pub(crate) fn repair_evidence_slot(
             &self,
             slot: u8,

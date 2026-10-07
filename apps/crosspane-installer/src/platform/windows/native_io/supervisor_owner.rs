@@ -1285,6 +1285,16 @@ mod native {
     ) -> NativeResult<()> {
         let io = state.root.io();
         let proof = io.admit_support(deadline)?;
+        if let Some(record) = io.read_payload_repair(&proof, deadline)?
+            && !matches!(
+                record.phase(),
+                super::super::super::repair::payload_record::PayloadRepairPhase::Complete
+                    | super::super::super::repair::payload_record::PayloadRepairPhase::Cancelled
+                    | super::super::super::repair::payload_record::PayloadRepairPhase::Retired
+            )
+        {
+            return repair_owner::serve(state, pipe, &record, deadline).await;
+        }
         if let Some(record) = io.read_removal(&proof, deadline)?
             && record.cursor() != super::super::super::removal::RemovalCursor::Retired
         {
@@ -2996,6 +3006,17 @@ mod native {
         deadline: &Deadline,
     ) -> NativeResult<()> {
         #[cfg(not(test))]
+        if let Some(record) = io.read_payload_repair(proof, deadline)?
+            && !matches!(
+                record.phase(),
+                super::super::super::repair::payload_record::PayloadRepairPhase::Complete
+                    | super::super::super::repair::payload_record::PayloadRepairPhase::Cancelled
+                    | super::super::super::repair::payload_record::PayloadRepairPhase::Retired
+            )
+        {
+            return repair_owner::validate_stop(io, proof, &record, operation, selected, deadline);
+        }
+        #[cfg(not(test))]
         if let Some(record) = io.read_removal(proof, deadline)?
             && record.cursor() != super::super::super::removal::RemovalCursor::Retired
         {
@@ -3901,6 +3922,1300 @@ mod native {
             Ok(pipe)
         }
     }
+    /// Third distinct role shares the original Transfer, server latch and export ledger.
+    #[cfg(not(test))]
+    mod repair_owner {
+        use super::super::super::super::{
+            payload::{
+                inventory::PayloadRole,
+                recovery::{OriginalLeaf, StageCatalog},
+            },
+            repair::payload_record::{PayloadRepairPhase, PayloadRepairRecord},
+            service::journal::{Journal, Phase as JournalPhase},
+        };
+        use super::super::super::{RepairCompletionAdmission, RepairFixedPayload, RepairPeerImage};
+        use super::*;
+
+        #[derive(Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(rename_all = "snake_case")]
+        enum RepairMode {
+            ProbeRepair,
+            CompleteRepair,
+            ProveReady,
+        }
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RepairHello {
+            request: Request,
+            operation: [u8; 16],
+            mode: RepairMode,
+        }
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SupportReply {
+            schema_version: u32,
+            nonce: [u8; 16],
+            operation: [u8; 16],
+            generation: Generation,
+        }
+
+        fn fresh(
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            operation: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<PayloadRepairRecord> {
+            let record = io
+                .read_payload_repair(proof, deadline)?
+                .ok_or(NativeError::Missing)?;
+            if record.operation() != operation {
+                return Err(NativeError::Foreign);
+            }
+            record.context().matches(io.target().identity())?;
+            if let Some(removal) = io.read_removal(proof, deadline)?
+                && removal.cursor() != super::super::super::super::removal::RemovalCursor::Retired
+            {
+                return Err(NativeError::Foreign);
+            }
+            if let Some(outer) =
+                super::super::super::super::payload::recovery::OuterUpgradeRecord::read(
+                    io, proof, deadline,
+                )?
+            {
+                use super::super::super::super::payload::recovery::{OuterCopyCleanup, OuterPhase};
+                if !matches!(outer.phase(), OuterPhase::Complete | OuterPhase::Cancelled)
+                    || outer.copy_cleanup() != OuterCopyCleanup::Absent
+                {
+                    return Err(NativeError::Foreign);
+                }
+            }
+            use super::super::super::records::{RecordName, record_data};
+            if let Some(raw) = io.read_record(
+                proof,
+                RecordName::StageCatalog,
+                super::super::super::files::MAX_RECORD_BYTES,
+                deadline,
+            )? {
+                let catalog: StageCatalog = record_data(&RecordName::StageCatalog, raw.bytes())?;
+                catalog.validate()?;
+                if catalog.active.is_some() {
+                    return Err(NativeError::Foreign);
+                }
+            }
+            Ok(record)
+        }
+        pub(super) fn validate_stop(
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            record: &PayloadRepairRecord,
+            operation: [u8; 16],
+            selected: Generation,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let actual = fresh(io, proof, operation, deadline)?;
+            if !record.same_selection(&actual)
+                || actual.original_generation() != selected
+                || actual.phase() != PayloadRepairPhase::StopIntent
+            {
+                return Err(NativeError::Foreign);
+            }
+            let journal = Journal::read(io, proof, deadline)?.ok_or(NativeError::Missing)?;
+            if journal.phase != JournalPhase::StopIntent
+                || journal.current != Some(selected)
+                || journal.stop_instance != Some(selected.instance)
+            {
+                return Err(NativeError::Foreign);
+            }
+            Ok(())
+        }
+        fn support(record: &PayloadRepairRecord) -> bool {
+            matches!(
+                record.phase(),
+                PayloadRepairPhase::Created
+                    | PayloadRepairPhase::ResumeIntent
+                    | PayloadRepairPhase::Ready
+            )
+        }
+        fn start_ready(record: &PayloadRepairRecord) -> bool {
+            matches!(
+                record.phase(),
+                PayloadRepairPhase::StartIntent
+                    | PayloadRepairPhase::StartSubmitted
+                    | PayloadRepairPhase::ReadyObserved
+            )
+        }
+        /// Matches a freshly admitted observation to the published new Agent. These facts never
+        /// construct an owner, approve an image, or grant terminal/export authority.
+        fn ready_generation(
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            record: &PayloadRepairRecord,
+            agent: &AgentObservation,
+            deadline: &Deadline,
+        ) -> NativeResult<Generation> {
+            if !start_ready(record) || agent.bootstrap().phase != BootstrapPhase::Ready {
+                return Err(NativeError::Foreign);
+            }
+            agent.revalidate(io, proof, deadline)?;
+            let generation = io.agent_generation(agent, proof, deadline)?;
+            let original = record.original_generation();
+            let published = record
+                .role(PayloadRole::Agent)
+                .published()
+                .ok_or(NativeError::Foreign)?;
+            let identity = io.agent_identity(agent, proof, deadline)?;
+            let old_identity = match record.selection().fixed(PayloadRole::Agent) {
+                OriginalLeaf::Present(identity) => identity,
+                _ => return Err(NativeError::Foreign),
+            };
+            if generation == original
+                || generation.instance == original.instance
+                || generation.creation == original.creation
+                || record.phase() == PayloadRepairPhase::ReadyObserved
+                    && record.ready() != Some(generation)
+                || published.identity != identity.into()
+                || published.identity == old_identity
+            {
+                return Err(NativeError::Foreign);
+            }
+            deadline.check()?;
+            Ok(generation)
+        }
+        pub(super) async fn serve(
+            state: &ServerState,
+            pipe: &mut NamedPipeServer,
+            record: &PayloadRepairRecord,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let io = state.root.io();
+            let proof = io.admit_support(deadline)?;
+            // The actual connected kernel process/context is selected before any claimed frame.
+            let peer =
+                KernelOuterPeer::admit(pipe.as_raw_handle(), false, io.clone(), &proof, deadline)?;
+            let image: RepairPeerImage =
+                io.pin_repair_peer(&proof, record.operation(), &peer, deadline)?;
+            peer.reverify(io, &proof, deadline)?;
+            image.reverify(io, &proof, deadline)?;
+            let actual = fresh(io, &proof, record.operation(), deadline)?;
+            let probe = support(&actual);
+            if !probe && !start_ready(&actual) && actual.phase() != PayloadRepairPhase::StopIntent {
+                return Err(NativeError::Foreign);
+            }
+            let hello: RepairHello = read_frame(pipe, deadline).await?;
+            if hello.operation != actual.operation() {
+                return Err(NativeError::Foreign);
+            }
+            if hello.mode == RepairMode::ProveReady {
+                let agent = state
+                    .agent
+                    .lock()
+                    .map_err(|_| NativeError::Unavailable)?
+                    .as_ref()
+                    .cloned()
+                    .ok_or(NativeError::Unavailable)?;
+                let proof = io.admit_support(deadline)?;
+                let generation = ready_generation(io, &proof, &actual, &agent, deadline)?;
+                check_request(&hello.request, generation)?;
+                if hello.request.method != Method::Hello {
+                    return Err(NativeError::Foreign);
+                }
+                // Only the original native owner can supply these exact retained objects. Its
+                // child accessor positively checks the new child's membership in its own job.
+                let process = state.owner.process_for_peer(&proof, deadline)?;
+                let child = state.owner.child_for_peer(&agent, &proof, deadline)?;
+                peer.reverify(io, &proof, deadline)?;
+                image.reverify(io, &proof, deadline)?;
+                let mut reply = Reply {
+                    status: ReplyStatus::Ready,
+                    schema_version: 1,
+                    nonce: hello.request.nonce,
+                    method: Method::Hello,
+                    operation: None,
+                    generation,
+                    process: Some(process.as_raw_handle() as usize as u64),
+                    child: Some(child.as_raw_handle() as usize as u64),
+                    job: None,
+                };
+                write_frame(pipe, &reply, deadline).await?;
+                // This separate mode accepts only ready-only Acks. Arm/Empty cannot enter
+                // the terminal loop, state.export, or job export from this connection.
+                let ack: Request = read_frame(pipe, deadline).await?;
+                check_request(&ack, generation)?;
+                if ack.method != Method::Ack
+                    || ack.nonce != hello.request.nonce
+                    || ack.operation != Some(actual.operation())
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let proof = io.admit_support(deadline)?;
+                let current = fresh(io, &proof, actual.operation(), deadline)?;
+                if !current.same_selection(&actual)
+                    || ready_generation(io, &proof, &current, &agent, deadline)? != generation
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let current_agent = state
+                    .agent
+                    .lock()
+                    .map_err(|_| NativeError::Unavailable)?
+                    .as_ref()
+                    .cloned()
+                    .ok_or(NativeError::Unavailable)?;
+                if ready_generation(io, &proof, &current, &current_agent, deadline)? != generation
+                    || !Arc::ptr_eq(&process, &state.owner.process_for_peer(&proof, deadline)?)
+                    || !Arc::ptr_eq(
+                        &child,
+                        &state
+                            .owner
+                            .child_for_peer(&current_agent, &proof, deadline)?,
+                    )
+                {
+                    return Err(NativeError::Foreign);
+                }
+                peer.reverify(io, &proof, deadline)?;
+                image.reverify(io, &proof, deadline)?;
+                reply.method = Method::Ack;
+                reply.operation = ack.operation;
+                reply.process = None;
+                reply.child = None;
+                write_frame(pipe, &reply, deadline).await?;
+                // Do not Disconnect while that reply may still be queued. The client sends
+                // this final ready-only Ack after consuming it, then positively observes EOF.
+                let close: Request = read_frame(pipe, deadline).await?;
+                check_request(&close, generation)?;
+                if close.method != Method::Ack
+                    || close.nonce != hello.request.nonce
+                    || close.operation != Some(actual.operation())
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let proof = io.admit_support(deadline)?;
+                let current = fresh(io, &proof, actual.operation(), deadline)?;
+                let current_agent = state
+                    .agent
+                    .lock()
+                    .map_err(|_| NativeError::Unavailable)?
+                    .as_ref()
+                    .cloned()
+                    .ok_or(NativeError::Unavailable)?;
+                if !current.same_selection(&actual)
+                    || ready_generation(io, &proof, &current, &agent, deadline)? != generation
+                    || ready_generation(io, &proof, &current, &current_agent, deadline)?
+                        != generation
+                    || !Arc::ptr_eq(&process, &state.owner.process_for_peer(&proof, deadline)?)
+                    || !Arc::ptr_eq(
+                        &child,
+                        &state
+                            .owner
+                            .child_for_peer(&current_agent, &proof, deadline)?,
+                    )
+                {
+                    return Err(NativeError::Foreign);
+                }
+                peer.reverify(io, &proof, deadline)?;
+                image.reverify(io, &proof, deadline)?;
+                // The existing listener disconnects the actual server pipe after this return.
+                return Ok(());
+            }
+            if start_ready(&actual) || (hello.mode == RepairMode::ProbeRepair) != probe {
+                return Err(NativeError::Foreign);
+            }
+            let original = state
+                .agent
+                .lock()
+                .map_err(|_| NativeError::Unavailable)?
+                .as_ref()
+                .cloned()
+                .ok_or(NativeError::Unavailable)?;
+            let selected =
+                io.agent_generation(&original, &io.admit_support(deadline)?, deadline)?;
+            if selected != actual.original_generation() {
+                return Err(NativeError::Foreign);
+            }
+            check_request(&hello.request, selected)?;
+            if hello.request.method != Method::Hello {
+                return Err(NativeError::Foreign);
+            }
+            let process = state.owner.process_for_peer(&proof, deadline)?;
+            let child = state.owner.child_for_peer(&original, &proof, deadline)?;
+            if probe {
+                original.revalidate(io, &io.admit_support(deadline)?, deadline)?;
+                peer.reverify(io, &io.admit_support(deadline)?, deadline)?;
+                image.reverify(io, &io.admit_support(deadline)?, deadline)?;
+                return write_frame(
+                    pipe,
+                    &SupportReply {
+                        schema_version: 1,
+                        nonce: hello.request.nonce,
+                        operation: actual.operation(),
+                        generation: selected,
+                    },
+                    deadline,
+                )
+                .await;
+            }
+            let mut reply = Reply {
+                status: ReplyStatus::Ready,
+                schema_version: 1,
+                nonce: hello.request.nonce,
+                method: Method::Hello,
+                operation: None,
+                generation: selected,
+                process: Some(process.as_raw_handle() as usize as u64),
+                child: Some(child.as_raw_handle() as usize as u64),
+                job: None,
+            };
+            write_frame(pipe, &reply, deadline).await?;
+            loop {
+                let request: Request = read_frame(pipe, deadline).await?;
+                check_request(&request, selected)?;
+                if request.nonce != hello.request.nonce
+                    || request.operation != Some(actual.operation())
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let proof = io.admit_support(deadline)?;
+                peer.reverify(io, &proof, deadline)?;
+                image.reverify(io, &proof, deadline)?;
+                let current = fresh(io, &proof, actual.operation(), deadline)?;
+                validate_stop(io, &proof, &current, actual.operation(), selected, deadline)?;
+                reply.method = request.method;
+                reply.operation = request.operation;
+                reply.process = None;
+                reply.child = None;
+                reply.job = None;
+                match request.method {
+                    Method::Arm => {
+                        state
+                            .owner
+                            .arm_terminal(selected, actual.operation(), &proof, deadline)?;
+                        *state.export.lock().map_err(|_| NativeError::Unavailable)? =
+                            Some((actual.operation(), selected));
+                    }
+                    Method::Empty => {
+                        if state.owner.terminal_operation() != Some(actual.operation()) {
+                            return Err(NativeError::Foreign);
+                        }
+                        if let Some(empty) =
+                            state.owner.settled_for_stop(&proof, &original, deadline)?
+                        {
+                            let job = state.owner.job_for_empty(&empty, &proof, deadline)?;
+                            if active(&job)? != 0 {
+                                return Err(NativeError::Foreign);
+                            }
+                            reply.job = Some(job.as_raw_handle() as usize as u64);
+                            write_frame(pipe, &reply, deadline).await?;
+                            let ack: Request = read_frame(pipe, deadline).await?;
+                            check_request(&ack, selected)?;
+                            if ack.method != Method::Ack
+                                || ack.nonce != hello.request.nonce
+                                || ack.operation != Some(actual.operation())
+                            {
+                                return Err(NativeError::Foreign);
+                            }
+                            peer.reverify(io, &io.admit_support(deadline)?, deadline)?;
+                            image.reverify(io, &io.admit_support(deadline)?, deadline)?;
+                            reply.method = Method::Ack;
+                            reply.job = None;
+                            write_frame(pipe, &reply, deadline).await?;
+                            return Ok(());
+                        }
+                    }
+                    _ => return Err(NativeError::Foreign),
+                }
+                write_frame(pipe, &reply, deadline).await?;
+            }
+        }
+
+        /// Pre-reservation, read-only support admission. The actual live pipe peer must
+        /// run the fixed Installer image freshly measured against THIS build's own module.
+        /// No record, message, terminal latch or effect is needed to refuse an older owner.
+        pub(crate) fn probe_source_repair_support(
+            io: Arc<WindowsNativeIo>,
+            lock: &super::super::super::InstallerLock,
+            module: &super::super::super::SelfImagePin,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            use super::super::super::super::payload::inventory::{ApprovedPe, PayloadRole};
+            let proof = io.admit_support(deadline)?;
+            let expected = ApprovedPe::own_image(module)?;
+            let image = io.payload_root(&proof, lock, deadline)?.open_approved(
+                &io,
+                &proof,
+                PayloadRole::Installer,
+                &expected,
+                deadline,
+            )?;
+            let agent = io.observe_agent(&io.admit_support(deadline)?, deadline)?;
+            if agent.bootstrap().phase != BootstrapPhase::Ready {
+                return Err(NativeError::Unsupported);
+            }
+            let root = io.broker_admission(&io.admit_support(deadline)?, deadline)?;
+            root.bind_runtime(&agent, &io.admit_support(deadline)?, deadline)?;
+            runtime()?.block_on(async {
+                let pipe = loop {
+                    deadline.check()?;
+                    match ClientOptions::new().open(format!("{}.outer", root.endpoint())) {
+                        Ok(pipe) => break pipe,
+                        Err(error) if error.raw_os_error() == Some(231) => {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        Err(_) => return Err(NativeError::Unsupported),
+                    }
+                };
+                let peer = Peer::admit(pipe.as_raw_handle(), true, &root, deadline)?;
+                if image.identity() != root.installer_identity() {
+                    return Err(NativeError::Foreign);
+                }
+                peer.reverify(&root, deadline)?;
+                image.reverify(&io, &io.admit_support(deadline)?, deadline)?;
+                module.reverify(&io, &io.admit_support(deadline)?, deadline)?;
+                agent.revalidate(&io, &io.admit_support(deadline)?, deadline)?;
+                // Connection closes without any request. This helper grants no effect authority.
+                deadline.check()
+            })
+        }
+
+        pub(crate) fn probe_repair_support(
+            io: Arc<WindowsNativeIo>,
+            proof: &SupportProof,
+            operation: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let selected = io.select_repair_keeper(proof, deadline)?;
+            selected.reverify(&io, proof, deadline)?;
+            if selected.operation() != operation || !support(selected.record()) {
+                return Err(NativeError::Foreign);
+            }
+            let original = io.observe_agent(proof, deadline)?;
+            if original.bootstrap().phase != BootstrapPhase::Ready {
+                return Err(NativeError::Unavailable);
+            }
+            let generation = io.agent_generation(&original, proof, deadline)?;
+            if generation != selected.record().original_generation() {
+                return Err(NativeError::Foreign);
+            }
+            let root = io.broker_admission(proof, deadline)?;
+            root.bind_runtime(&original, proof, deadline)?;
+            let nonce = io.bridge_nonce(proof, deadline)?;
+            runtime()?.block_on(async {
+                let mut pipe = loop {
+                    deadline.check()?;
+                    match ClientOptions::new().open(format!("{}.outer", root.endpoint())) {
+                        Ok(pipe) => break pipe,
+                        Err(error) if error.raw_os_error() == Some(231) => {
+                            tokio::time::sleep(Duration::from_millis(5)).await
+                        }
+                        Err(error) if error.raw_os_error() == Some(2) => {
+                            return Err(NativeError::Unsupported);
+                        }
+                        Err(_) => return Err(NativeError::Unavailable),
+                    }
+                };
+                // The original fixed source/kernel peer is authenticated BEFORE reply decoding.
+                let peer = Peer::admit(pipe.as_raw_handle(), true, &root, deadline)?;
+                selected.reverify(&io, &io.admit_support(deadline)?, deadline)?;
+                let hello = RepairHello {
+                    request: Request {
+                        schema_version: 1,
+                        nonce,
+                        method: Method::Hello,
+                        operation: None,
+                        generation,
+                    },
+                    operation,
+                    mode: RepairMode::ProbeRepair,
+                };
+                write_frame(&mut pipe, &hello, deadline).await?;
+                let reply: SupportReply = read_frame(&mut pipe, deadline).await?;
+                if reply.schema_version != 1
+                    || reply.nonce != nonce
+                    || reply.operation != operation
+                    || reply.generation != generation
+                {
+                    return Err(NativeError::Foreign);
+                }
+                peer.reverify(&root, deadline)?;
+                original.revalidate(&io, &io.admit_support(deadline)?, deadline)?;
+                selected.reverify(&io, &io.admit_support(deadline)?, deadline)?;
+                Ok(())
+            })
+        }
+
+        fn ready_handles_match(
+            peer: &Peer,
+            supervisor: &OwnedHandle,
+            child: &OwnedHandle,
+            root: &BrokerAdmission,
+            agent: &AgentObservation,
+            generation: Generation,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            peer.reverify(root, deadline)?;
+            let (supervisor_creation, supervisor_image) = process_facts(supervisor, true)?;
+            let (child_creation, child_image) = process_facts(child, true)?;
+            // SAFETY: this exact query/sync handle was duplicated from the authenticated
+            // native owner's own retained supervisor object, never selected by a recorded PID.
+            let supervisor_pid = unsafe { GetProcessId(supervisor.as_raw_handle()) };
+            // SAFETY: this exact query/sync handle came from owner.child_for_peer, which
+            // proves actual native child lineage and job membership before the reply.
+            let child_pid = unsafe { GetProcessId(child.as_raw_handle()) };
+            if supervisor_pid != peer.pid
+                || supervisor_creation != peer.created
+                || supervisor_image != peer.image
+                || child_pid != generation.pid
+                || child_creation != generation.creation
+                || child_image
+                    != super::super::super::process::literal_path(agent.image_canonical())?
+                || identity::native::observe_process(supervisor)? != *root.token()
+                || identity::native::observe_process(child)? != *root.token()
+            {
+                return Err(NativeError::Foreign);
+            }
+            deadline.check()
+        }
+        /// Ready-only proof of the newly admitted child through its actual native supervisor.
+        /// No terminal latch, job export, Stop request, or completion capability is available.
+        pub(crate) fn prove_repair_ready(
+            io: Arc<WindowsNativeIo>,
+            agent: &AgentObservation,
+            payload: &RepairFixedPayload,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            if !Arc::ptr_eq(&io, payload.io()) {
+                return Err(NativeError::Foreign);
+            }
+            let proof = io.admit_support(deadline)?;
+            let selected = io.select_repair_keeper(&proof, deadline)?;
+            selected.reverify(&io, &proof, deadline)?;
+            payload.reverify(&io, &proof, deadline)?;
+            let record = fresh(&io, &proof, payload.operation(), deadline)?;
+            if selected.operation() != payload.operation()
+                || !selected.record().same_selection(&record)
+            {
+                return Err(NativeError::Foreign);
+            }
+            let generation = ready_generation(&io, &proof, &record, agent, deadline)?;
+            if io.agent_identity(agent, &proof, deadline)? != payload.identity(PayloadRole::Agent) {
+                return Err(NativeError::Foreign);
+            }
+            let root = io.broker_admission(&proof, deadline)?;
+            root.bind_runtime(agent, &proof, deadline)?;
+            let nonce = io.bridge_nonce(&proof, deadline)?;
+            runtime()?.block_on(async {
+                let mut pipe = loop {
+                    deadline.check()?;
+                    match ClientOptions::new().open(format!("{}.outer", root.endpoint())) {
+                        Ok(pipe) => break pipe,
+                        Err(error) if error.raw_os_error() == Some(231) => {
+                            tokio::time::sleep(Duration::from_millis(5)).await
+                        }
+                        Err(error) if error.raw_os_error() == Some(2) => {
+                            return Err(NativeError::Unsupported);
+                        }
+                        Err(_) => return Err(NativeError::Unavailable),
+                    }
+                };
+                // The actual pipe server must be the freshly pinned installed installer role.
+                // The old admitted caller-role factory is unchanged; only this private mode
+                // authenticates the repair keeper at the server's fixed repair-role gate.
+                let peer = Peer::admit(pipe.as_raw_handle(), true, &root, deadline)?;
+                let hello = RepairHello {
+                    request: Request {
+                        schema_version: 1,
+                        nonce,
+                        method: Method::Hello,
+                        operation: None,
+                        generation,
+                    },
+                    operation: payload.operation(),
+                    mode: RepairMode::ProveReady,
+                };
+                write_frame(&mut pipe, &hello, deadline).await?;
+                let reply: Reply = read_frame(&mut pipe, deadline).await?;
+                check_reply(&reply, &hello.request)?;
+                if reply.status != ReplyStatus::Ready {
+                    return Err(NativeError::Unavailable);
+                }
+                peer.reverify(&root, deadline)?;
+                let supervisor = peer.duplicate(
+                    reply.process.ok_or(NativeError::Foreign)?,
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    deadline,
+                )?;
+                let child = peer.duplicate(
+                    reply.child.ok_or(NativeError::Foreign)?,
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    deadline,
+                )?;
+                ready_handles_match(
+                    &peer,
+                    &supervisor,
+                    &child,
+                    &root,
+                    agent,
+                    generation,
+                    deadline,
+                )?;
+                let proof = io.admit_support(deadline)?;
+                selected.reverify(&io, &proof, deadline)?;
+                payload.reverify(&io, &proof, deadline)?;
+                let current = fresh(&io, &proof, payload.operation(), deadline)?;
+                if !current.same_selection(&record)
+                    || ready_generation(&io, &proof, &current, agent, deadline)? != generation
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let ack = Request {
+                    schema_version: 1,
+                    nonce,
+                    method: Method::Ack,
+                    operation: Some(payload.operation()),
+                    generation,
+                };
+                let ack_reply = exchange(&mut pipe, &ack, deadline).await?;
+                if ack_reply.status != ReplyStatus::Ready {
+                    return Err(NativeError::Foreign);
+                }
+                ready_handles_match(
+                    &peer,
+                    &supervisor,
+                    &child,
+                    &root,
+                    agent,
+                    generation,
+                    deadline,
+                )?;
+                write_frame(&mut pipe, &ack, deadline).await?;
+                // An Ack alone is insufficient: positively observe the actual server-side
+                // Disconnect before dropping our endpoint and reporting ready-only success.
+                let mut byte = [0u8; 1];
+                let mut buffer = ReadBuf::new(&mut byte);
+                let closed = tokio::time::timeout(
+                    Duration::from_millis(deadline.remaining_ms()?),
+                    std::future::poll_fn(|cx| {
+                        std::pin::Pin::new(&mut pipe).poll_read(cx, &mut buffer)
+                    }),
+                )
+                .await
+                .map_err(|_| NativeError::OutcomeUnknown)?;
+                match closed {
+                    Ok(()) if buffer.filled().is_empty() => {}
+                    Err(error)
+                        if matches!(error.raw_os_error(),
+                        Some(code) if code == ERROR_BROKEN_PIPE as i32
+                            || code == ERROR_PIPE_NOT_CONNECTED as i32) => {}
+                    _ => return Err(NativeError::OutcomeUnknown),
+                }
+                drop(pipe);
+                ready_handles_match(
+                    &peer,
+                    &supervisor,
+                    &child,
+                    &root,
+                    agent,
+                    generation,
+                    deadline,
+                )?;
+                let proof = io.admit_support(deadline)?;
+                selected.reverify(&io, &proof, deadline)?;
+                payload.reverify(&io, &proof, deadline)?;
+                let current = fresh(&io, &proof, payload.operation(), deadline)?;
+                if !current.same_selection(&record)
+                    || ready_generation(&io, &proof, &current, agent, deadline)? != generation
+                {
+                    return Err(NativeError::Foreign);
+                }
+                // All imported objects are read-only and released locally; no global owner,
+                // lease, terminal bit, or job handle was created by this readiness exchange.
+                drop(child);
+                drop(supervisor);
+                deadline.check()
+            })
+        }
+
+        enum ControlRole {
+            Keeper {
+                process: Arc<OwnedHandle>,
+                identity: super::super::super::files::FileIdentity,
+            },
+            Source {
+                parent: Arc<OwnedHandle>,
+                own: super::super::super::SelfImagePin,
+                selection: Arc<super::super::super::RepairKeeperSelection>,
+            },
+        }
+        /// Authentication of the real preparation/commit endpoint, never a serialized permit.
+        pub(crate) struct RepairControlPeer {
+            io: Arc<WindowsNativeIo>,
+            peer: KernelOuterPeer,
+            image: super::super::super::OuterPeerImage,
+            operation: [u8; 16],
+            role: ControlRole,
+        }
+        impl RepairControlPeer {
+            pub(crate) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                self.peer.reverify(io, proof, deadline)?;
+                self.image.reverify(io, proof, deadline)?;
+                let record = fresh(io, proof, self.operation, deadline)?;
+                // This is control-channel authentication only. Later same-owner Status has no
+                // Arm/Stop/Run or completion authority; every destructive method has its own gate.
+                if record.phase() == PayloadRepairPhase::Retired {
+                    return Err(NativeError::Foreign);
+                }
+                match &self.role {
+                    ControlRole::Keeper { process, identity } => {
+                        let (creation, path) = process_facts(process, true)?;
+                        // SAFETY: originally created child object retained by the actual creator.
+                        let pid = unsafe { GetProcessId(process.as_raw_handle()) };
+                        if self.peer.pid != pid
+                            || self.peer.created != creation
+                            || self.peer.image != path
+                            || self.image.identity() != *identity
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                        let copy = record.keeper().image().ok_or(NativeError::Foreign)?;
+                        let child = record.keeper().child().ok_or(NativeError::Foreign)?;
+                        if copy.identity != stamp(*identity)
+                            || copy.facts != *self.image.facts()
+                            || child.pid() != pid
+                            || child.creation() != creation
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                    }
+                    ControlRole::Source {
+                        parent,
+                        own,
+                        selection,
+                    } => {
+                        own.reverify(io, proof, deadline)?;
+                        selection.reverify(io, proof, deadline)?;
+                        if selection.operation() != self.operation
+                            || selection.module().identity() != own.identity()
+                            || selection.module().facts() != own.facts()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                        let (creation, path) = process_facts(parent, true)?;
+                        // SAFETY: the exact explicitly inherited original parent handle only.
+                        let pid = unsafe { GetProcessId(parent.as_raw_handle()) };
+                        if self.peer.pid != pid
+                            || self.peer.created != creation
+                            || self.peer.image != path
+                            || self.image.facts() != own.facts()
+                            || stamp(self.image.identity())
+                                != record.selection().own_module().identity
+                            || pid != record.selection().source_process().pid()
+                            || creation != record.selection().source_process().creation()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                    }
+                }
+                deadline.check()
+            }
+        }
+        // Signed additive admission keeps original IO, context, actual object and deadline
+        // separate; restructuring would obscure the sealed authority inputs.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn admit_repair_keeper_peer(
+            pipe: std::os::windows::io::RawHandle,
+            is_server: bool,
+            io: Arc<WindowsNativeIo>,
+            proof: &SupportProof,
+            process: &Arc<OwnedHandle>,
+            image: &super::super::super::OpenedPe,
+            operation: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<RepairControlPeer> {
+            image.reverify(&io, proof, deadline)?;
+            let peer = KernelOuterPeer::admit(pipe, is_server, io.clone(), proof, deadline)?;
+            let opened = io.pin_outer_kernel_image(
+                proof,
+                &peer,
+                &image.approved().facts().version,
+                deadline,
+            )?;
+            if opened.identity() != image.identity()
+                || opened.facts() != image.approved().facts()
+                || opened.canonical_dos_path() != image.canonical_dos_path()
+            {
+                return Err(NativeError::Foreign);
+            }
+            let result = RepairControlPeer {
+                io,
+                peer,
+                image: opened,
+                operation,
+                role: ControlRole::Keeper {
+                    process: process.clone(),
+                    identity: image.identity(),
+                },
+            };
+            result.reverify(&result.io, proof, deadline)?;
+            Ok(result)
+        }
+        // Signed additive admission keeps original IO, context, actual object and deadline
+        // separate; restructuring would obscure the sealed authority inputs.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn admit_repair_source_peer(
+            pipe: std::os::windows::io::RawHandle,
+            io: Arc<WindowsNativeIo>,
+            proof: &SupportProof,
+            parent: &super::super::super::super::payload::helper::repair::RepairParent,
+            own: super::super::super::SelfImagePin,
+            selection: Arc<super::super::super::RepairKeeperSelection>,
+            operation: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<RepairControlPeer> {
+            parent.reverify(&io, proof, operation, deadline)?;
+            own.reverify(&io, proof, deadline)?;
+            let peer = KernelOuterPeer::admit(pipe, false, io.clone(), proof, deadline)?;
+            let image = io.pin_outer_kernel_image(proof, &peer, &own.facts().version, deadline)?;
+            let result = RepairControlPeer {
+                io,
+                peer,
+                image,
+                operation,
+                role: ControlRole::Source {
+                    parent: parent.retained_process().clone(),
+                    own,
+                    selection,
+                },
+            };
+            result.reverify(&result.io, proof, deadline)?;
+            Ok(result)
+        }
+
+        struct RepairTransfer {
+            original: Arc<Transfer>,
+            admission: RepairCompletionAdmission,
+            completion: Mutex<Option<Arc<RetainedTreeCompletion>>>,
+            arm_attempted: AtomicBool,
+            complete_attempted: AtomicBool,
+        }
+        static REPAIR_TRANSFER: OnceLock<Mutex<Option<Arc<RepairTransfer>>>> = OnceLock::new();
+        pub(crate) struct AdmittedRepairOwner {
+            inner: Option<AdmittedSupervisorOwner>,
+            sidecar: Option<Arc<RepairTransfer>>,
+        }
+        impl AdmittedRepairOwner {
+            pub(crate) fn admit(
+                io: Arc<WindowsNativeIo>,
+                original: AgentObservation,
+                lease: Arc<super::super::super::StopLockLease>,
+                admission: RepairCompletionAdmission,
+                deadline: &Deadline,
+            ) -> NativeResult<Self> {
+                let proof = io.admit_support(deadline)?;
+                admission.reverify(&io, &proof, deadline)?;
+                lease.reverify(&proof, deadline)?;
+                let root = io.broker_admission(&proof, deadline)?;
+                root.bind_runtime(&original, &proof, deadline)?;
+                let selected = io.agent_generation(&original, &proof, deadline)?;
+                let record = fresh(&io, &proof, admission.operation(), deadline)?;
+                if selected != record.original_generation() {
+                    return Err(NativeError::Foreign);
+                }
+                if original.bootstrap().phase != BootstrapPhase::Ready {
+                    return Err(NativeError::Unavailable);
+                }
+                let nonce = io.bridge_nonce(&proof, deadline)?;
+                let state = Arc::new(Transfer {
+                    root,
+                    original: Mutex::new(Some(Arc::new(original))),
+                    selected,
+                    nonce,
+                    peer: Mutex::new(None),
+                    handles: Mutex::new(Handles::default()),
+                    lease: Mutex::new(Some(lease)),
+                    retired: AtomicBool::new(false),
+                    thread: Mutex::new(None),
+                });
+                let held = Arc::new(RepairTransfer {
+                    original: state.clone(),
+                    admission,
+                    completion: Mutex::new(None),
+                    arm_attempted: AtomicBool::new(false),
+                    complete_attempted: AtomicBool::new(false),
+                });
+                {
+                    let mut current = TRANSFER
+                        .get_or_init(|| Mutex::new(None))
+                        .lock()
+                        .map_err(|_| NativeError::OutcomeUnknown)?;
+                    let mut repair = REPAIR_TRANSFER
+                        .get_or_init(|| Mutex::new(None))
+                        .lock()
+                        .map_err(|_| NativeError::OutcomeUnknown)?;
+                    if current.is_some() || repair.is_some() {
+                        return Err(NativeError::Busy);
+                    }
+                    *current = Some(state.clone());
+                    *repair = Some(held.clone());
+                }
+                let (send, commands) = std::sync::mpsc::sync_channel(1);
+                let (ready, receive) = std::sync::mpsc::sync_channel(1);
+                let captured = held.clone();
+                let initial = deadline.clone();
+                let thread = std::thread::Builder::new()
+                    .name("crosspane-repair-original-owner".into())
+                    .spawn(move || {
+                        let state = &captured.original;
+                        let result = (|| {
+                            let rt = runtime()?;
+                            let pipe =
+                                rt.block_on(connect(state, &captured.admission, &initial))?;
+                            ready
+                                .send(Ok(()))
+                                .map_err(|_| NativeError::OutcomeUnknown)?;
+                            // Shared actual original-handle/job import mechanics; no upgrade selection.
+                            command_loop(state, &rt, pipe, commands)
+                        })();
+                        if result.is_err() {
+                            state.retired.store(true, Ordering::Release);
+                            let _ = ready.try_send(Err(NativeError::OutcomeUnknown));
+                        }
+                    })
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                *state
+                    .thread
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)? = Some(thread);
+                match receive.recv_timeout(Duration::from_millis(deadline.remaining_ms()?)) {
+                    Ok(Ok(())) if deadline.check().is_ok() => Ok(Self {
+                        inner: Some(AdmittedSupervisorOwner { state, send }),
+                        sidecar: Some(held),
+                    }),
+                    _ => {
+                        state.retired.store(true, Ordering::Release);
+                        Err(NativeError::OutcomeUnknown)
+                    }
+                }
+            }
+            pub(crate) fn arm_terminal(
+                &self,
+                operation: [u8; 16],
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                let held = self.sidecar.as_ref().ok_or(NativeError::Foreign)?;
+                if operation != held.admission.operation() {
+                    return Err(NativeError::Foreign);
+                }
+                if held.arm_attempted.swap(true, Ordering::AcqRel) {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                held.admission.reverify(
+                    held.original.root.io(),
+                    &held.original.root.io().admit_support(deadline)?,
+                    deadline,
+                )?;
+                self.inner
+                    .as_ref()
+                    .ok_or(NativeError::Foreign)?
+                    .arm_terminal(operation, deadline)
+            }
+            pub(crate) fn observe_completion(
+                &self,
+                operation: [u8; 16],
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                let held = self.sidecar.as_ref().ok_or(NativeError::Foreign)?;
+                if operation != held.admission.operation() {
+                    return Err(NativeError::Foreign);
+                }
+                if held.complete_attempted.swap(true, Ordering::AcqRel) {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                let inner = self.inner.as_ref().ok_or(NativeError::Foreign)?;
+                let (send, recv) = std::sync::mpsc::sync_channel(1);
+                inner
+                    .send
+                    .try_send(Command::Complete(operation, deadline.clone(), send))
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                let tree = Arc::new(inner.receive(recv, deadline)?);
+                tree.reverify(deadline)?;
+                // Preserve the actual native result BEFORE any later settlement failure.
+                *held
+                    .completion
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)? = Some(tree);
+                inner.settle(deadline)
+            }
+            pub(crate) fn finish_settled(
+                &mut self,
+                deadline: &Deadline,
+            ) -> NativeResult<Option<Arc<RetainedTreeCompletion>>> {
+                let held = self.sidecar.as_ref().ok_or(NativeError::Foreign)?;
+                let state = &held.original;
+                let finished = state
+                    .thread
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                    .as_ref()
+                    .is_some_and(|thread| {
+                        // SAFETY: exact actual owned worker thread; native exit includes TLS cleanup.
+                        (unsafe { WaitForSingleObject(thread.as_raw_handle(), 0) }) == WAIT_OBJECT_0
+                    });
+                if !finished {
+                    deadline.check()?;
+                    return Ok(None);
+                }
+                let existing = held
+                    .completion
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                    .as_ref()
+                    .cloned();
+                let tree = if let Some(tree) = existing {
+                    tree
+                } else {
+                    held.admission.reverify(
+                        state.root.io(),
+                        &state.root.io().admit_support(deadline)?,
+                        deadline,
+                    )?;
+                    let peer = state
+                        .peer
+                        .lock()
+                        .map_err(|_| NativeError::OutcomeUnknown)?
+                        .as_ref()
+                        .cloned()
+                        .ok_or(NativeError::OutcomeUnknown)?;
+                    if !peer.exited()? {
+                        return Ok(None);
+                    }
+                    let original = state
+                        .original
+                        .lock()
+                        .map_err(|_| NativeError::OutcomeUnknown)?
+                        .as_ref()
+                        .cloned()
+                        .ok_or(NativeError::OutcomeUnknown)?;
+                    match original.observe_exit(
+                        state.root.io(),
+                        &state.root.io().admit_support(deadline)?,
+                        deadline,
+                    )? {
+                        ExitObservation::Exited {
+                            creation,
+                            code: 0,
+                            receipt: Some(receipt),
+                        } if creation == state.selected.creation
+                            && receipt.instance_id == state.selected.instance
+                            && receipt.stopped_unix_ms >= original.bootstrap().started_unix_ms
+                            && receipt.clean
+                            && receipt.input_journals_empty
+                            && receipt.audio_stopped => {}
+                        ExitObservation::Running => return Ok(None),
+                        _ => return Err(NativeError::OutcomeUnknown),
+                    }
+                    let handles = state
+                        .handles
+                        .lock()
+                        .map_err(|_| NativeError::OutcomeUnknown)?;
+                    let tree = Arc::new(RetainedTreeCompletion {
+                        operation: held.admission.operation(),
+                        selected: state.selected,
+                        supervisor: handles
+                            .supervisor
+                            .as_ref()
+                            .cloned()
+                            .ok_or(NativeError::OutcomeUnknown)?,
+                        child: handles
+                            .child
+                            .as_ref()
+                            .cloned()
+                            .ok_or(NativeError::OutcomeUnknown)?,
+                        job: handles
+                            .job
+                            .as_ref()
+                            .cloned()
+                            .ok_or(NativeError::OutcomeUnknown)?,
+                    });
+                    tree.reverify(deadline)?;
+                    *held
+                        .completion
+                        .lock()
+                        .map_err(|_| NativeError::OutcomeUnknown)? = Some(tree.clone());
+                    tree
+                };
+                tree.reverify(deadline)?;
+                // The service MUST physically settle its ONE agent transport before calling this.
+                // Acquire every fallible guard and verify the final proof BEFORE irreversible
+                // slot consumption. Errors leave both the worker handle and actual proof retained.
+                let mut slot = TRANSFER
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                if slot
+                    .as_ref()
+                    .is_some_and(|value| !Arc::ptr_eq(value, state))
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let mut side = REPAIR_TRANSFER
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                if !side.as_ref().is_some_and(|value| Arc::ptr_eq(value, held))
+                    || Arc::strong_count(held) != 2
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                let mut peer = state.peer.lock().map_err(|_| NativeError::OutcomeUnknown)?;
+                let mut original = state
+                    .original
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                let mut lease = state
+                    .lease
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                let mut thread = state
+                    .thread
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                state.root.release_image_pin()?;
+                tree.reverify(deadline)?;
+                // No fallible work follows this same-object alias drop barrier.
+                peer.take();
+                original.take();
+                lease.take();
+                thread.take();
+                slot.take();
+                side.take();
+                drop(peer);
+                drop(original);
+                drop(lease);
+                drop(thread);
+                drop(slot);
+                drop(side);
+                self.inner.take();
+                self.sidecar.take();
+                // No Transfer/Broker/image/install anchor is contained in the returned bare proof.
+                Ok(Some(tree))
+            }
+        }
+
+        async fn connect(
+            state: &Transfer,
+            admission: &RepairCompletionAdmission,
+            deadline: &Deadline,
+        ) -> NativeResult<NamedPipeClient> {
+            let mut pipe = loop {
+                deadline.check()?;
+                match ClientOptions::new().open(format!("{}.outer", state.root.endpoint())) {
+                    Ok(pipe) => break pipe,
+                    Err(error) if error.raw_os_error() == Some(231) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await
+                    }
+                    Err(error) if error.raw_os_error() == Some(2) => {
+                        return Err(NativeError::Unsupported);
+                    }
+                    Err(_) => return Err(NativeError::Unavailable),
+                }
+            };
+            let peer = Arc::new(Peer::admit(
+                pipe.as_raw_handle(),
+                true,
+                &state.root,
+                deadline,
+            )?);
+            *state.peer.lock().map_err(|_| NativeError::OutcomeUnknown)? = Some(peer.clone());
+            admission.reverify(
+                state.root.io(),
+                &state.root.io().admit_support(deadline)?,
+                deadline,
+            )?;
+            let request = Request {
+                schema_version: 1,
+                nonce: state.nonce,
+                method: Method::Hello,
+                operation: None,
+                generation: state.selected,
+            };
+            let hello = RepairHello {
+                request,
+                operation: admission.operation(),
+                mode: RepairMode::CompleteRepair,
+            };
+            write_frame(&mut pipe, &hello, deadline).await?;
+            let reply: Reply = read_frame(&mut pipe, deadline).await?;
+            check_reply(&reply, &hello.request)?;
+            if reply.status != ReplyStatus::Ready {
+                return Err(NativeError::Unavailable);
+            }
+            let supervisor = Arc::new(peer.duplicate(
+                reply.process.ok_or(NativeError::Foreign)?,
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                deadline,
+            )?);
+            state
+                .handles
+                .lock()
+                .map_err(|_| NativeError::OutcomeUnknown)?
+                .supervisor = Some(supervisor.clone());
+            let child = Arc::new(peer.duplicate(
+                reply.child.ok_or(NativeError::Foreign)?,
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                deadline,
+            )?);
+            state
+                .handles
+                .lock()
+                .map_err(|_| NativeError::OutcomeUnknown)?
+                .child = Some(child.clone());
+            let (creation, _) = process_facts(&supervisor, true)?;
+            // SAFETY: query only the SAME retained authenticated supervisor kernel object.
+            let supervisor_pid = unsafe { GetProcessId(supervisor.as_raw_handle()) };
+            // SAFETY: query only the SAME exact original child imported from its genuine owner.
+            let child_pid = unsafe { GetProcessId(child.as_raw_handle()) };
+            if supervisor_pid != peer.pid
+                || creation != peer.created
+                || child_pid != state.selected.pid
+            {
+                return Err(NativeError::Foreign);
+            }
+            let (created, image) = process_facts(&child, true)?;
+            let original = state
+                .original
+                .lock()
+                .map_err(|_| NativeError::OutcomeUnknown)?
+                .as_ref()
+                .cloned()
+                .ok_or(NativeError::Foreign)?;
+            if created != state.selected.creation
+                || image != super::super::super::process::literal_path(original.image_canonical())?
+                || identity::native::observe_process(&child)? != *state.root.token()
+            {
+                return Err(NativeError::Foreign);
+            }
+            original.revalidate(
+                state.root.io(),
+                &state.root.io().admit_support(deadline)?,
+                deadline,
+            )?;
+            peer.reverify(&state.root, deadline)?;
+            Ok(pipe)
+        }
+    }
+    #[cfg(not(test))]
+    pub(crate) use repair_owner::{
+        AdmittedRepairOwner, RepairControlPeer, admit_repair_keeper_peer, admit_repair_source_peer,
+        probe_repair_support, probe_source_repair_support, prove_repair_ready,
+    };
+
     #[cfg(not(test))]
     pub(crate) use removal_owner::{
         AdmittedRemovalOwner, RemovalControlPeer, admit_removal_keeper_peer,
@@ -4000,10 +5315,12 @@ mod native {
 }
 #[cfg(all(windows, not(test)))]
 pub(crate) use native::{
-    AdmittedRemovalOwner, KernelOuterPeer, OuterOwnerServer, OuterPeerPin, RemovalControlPeer,
-    admit_keeper_observer_server, admit_keeper_peer, admit_outer_observer_peer,
-    admit_outer_source_peer, admit_removal_keeper_peer, admit_removal_source_peer,
-    probe_outer_support, probe_removal_support,
+    AdmittedRemovalOwner, AdmittedRepairOwner, KernelOuterPeer, OuterOwnerServer, OuterPeerPin,
+    RemovalControlPeer, RepairControlPeer, admit_keeper_observer_server, admit_keeper_peer,
+    admit_outer_observer_peer, admit_outer_source_peer, admit_removal_keeper_peer,
+    admit_removal_source_peer, admit_repair_keeper_peer, admit_repair_source_peer,
+    probe_outer_support, probe_removal_support, probe_repair_support, probe_source_repair_support,
+    prove_repair_ready,
 };
 
 #[cfg(windows)]
