@@ -302,6 +302,15 @@ mod native {
         pub(crate) fn image(&self) -> &str {
             &self.image
         }
+        pub(crate) fn pid(&self) -> u32 {
+            self.pid
+        }
+        pub(crate) fn creation(&self) -> u64 {
+            self.created
+        }
+        pub(crate) fn token(&self) -> &identity::TokenFacts {
+            &self.token
+        }
         pub(crate) fn reverify(
             &self,
             io: &WindowsNativeIo,
@@ -1276,6 +1285,11 @@ mod native {
     ) -> NativeResult<()> {
         let io = state.root.io();
         let proof = io.admit_support(deadline)?;
+        if let Some(record) = io.read_removal(&proof, deadline)?
+            && record.cursor() != super::super::super::removal::RemovalCursor::Retired
+        {
+            return removal_owner::serve(state, pipe, &record, deadline).await;
+        }
         let peer =
             KernelOuterPeer::admit(pipe.as_raw_handle(), false, io.clone(), &proof, deadline)?;
         // Kernel context is authenticated BEFORE any frame or supplied operation is decoded.
@@ -2981,6 +2995,12 @@ mod native {
         selected: Generation,
         deadline: &Deadline,
     ) -> NativeResult<()> {
+        #[cfg(not(test))]
+        if let Some(record) = io.read_removal(proof, deadline)?
+            && record.cursor() != super::super::super::removal::RemovalCursor::Retired
+        {
+            return removal_owner::validate_stop(io, proof, &record, operation, selected, deadline);
+        }
         use super::super::super::payload::recovery::{OperationRecord, Phase, StageCatalog};
         use super::super::records::{RecordName, record_data};
         let catalog = io
@@ -3020,6 +3040,873 @@ mod native {
         }
         Ok(())
     }
+
+    /// Separate removal role and transfer. Old outer admission/sidecar/constructors are untouched.
+    #[cfg(not(test))]
+    mod removal_owner {
+        use super::super::super::super::{
+            payload::recovery::StageCatalog,
+            removal::{RemovalCursor, RemovalHandoffStage, RemovalRecord},
+            service::journal::{Journal, Phase as JournalPhase},
+        };
+        use super::super::super::{RemovalCompletionAdmission, RemovalPeerImage};
+        use super::*;
+
+        #[derive(Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(rename_all = "snake_case")]
+        enum RemovalMode {
+            ProbeRemoval,
+            CompleteRemoval,
+        }
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RemovalHello {
+            request: Request,
+            operation: [u8; 16],
+            mode: RemovalMode,
+        }
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SupportReply {
+            schema_version: u32,
+            nonce: [u8; 16],
+            operation: [u8; 16],
+            generation: Generation,
+        }
+
+        fn fresh(
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            operation: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<RemovalRecord> {
+            let record = io
+                .read_removal(proof, deadline)?
+                .ok_or(NativeError::Missing)?;
+            if record.operation() != operation {
+                return Err(NativeError::Foreign);
+            }
+            record.context().matches(io.target().identity())?;
+            use super::super::super::records::{RecordName, record_data};
+            if let Some(raw) = io.read_record(
+                proof,
+                RecordName::StageCatalog,
+                super::super::super::files::MAX_RECORD_BYTES,
+                deadline,
+            )? {
+                let catalog: StageCatalog = record_data(&RecordName::StageCatalog, raw.bytes())?;
+                catalog.validate()?;
+                if catalog.active.is_some() {
+                    return Err(NativeError::Foreign);
+                }
+            }
+            Ok(record)
+        }
+        pub(super) fn validate_stop(
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            record: &RemovalRecord,
+            operation: [u8; 16],
+            selected: Generation,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let actual = fresh(io, proof, operation, deadline)?;
+            record.same_selection(&actual)?;
+            if actual.cursor() != RemovalCursor::StopIntent
+                || !matches!(
+                    actual.handoff_stage(),
+                    RemovalHandoffStage::Committed { .. }
+                )
+            {
+                return Err(NativeError::Foreign);
+            }
+            let journal = Journal::read(io, proof, deadline)?.ok_or(NativeError::Missing)?;
+            if journal.phase != JournalPhase::StopIntent
+                || journal.current != Some(selected)
+                || journal.stop_instance != Some(selected.instance)
+            {
+                return Err(NativeError::Foreign);
+            }
+            Ok(())
+        }
+        fn support(record: &RemovalRecord) -> bool {
+            record.cursor() == RemovalCursor::Selected
+                && matches!(
+                    record.handoff_stage(),
+                    RemovalHandoffStage::Created { .. }
+                        | RemovalHandoffStage::ResumeIntent { .. }
+                        | RemovalHandoffStage::Ready { .. }
+                )
+        }
+        pub(super) async fn serve(
+            state: &ServerState,
+            pipe: &mut NamedPipeServer,
+            record: &RemovalRecord,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let io = state.root.io();
+            let proof = io.admit_support(deadline)?;
+            // The actual connected kernel process/context is selected before any claimed frame.
+            let peer =
+                KernelOuterPeer::admit(pipe.as_raw_handle(), false, io.clone(), &proof, deadline)?;
+            let image: RemovalPeerImage =
+                io.pin_removal_peer(&proof, record.operation(), &peer, deadline)?;
+            peer.reverify(io, &proof, deadline)?;
+            image.reverify(io, &proof, deadline)?;
+            let actual = fresh(io, &proof, record.operation(), deadline)?;
+            let probe = support(&actual);
+            if !probe && actual.cursor() != RemovalCursor::StopIntent {
+                return Err(NativeError::Foreign);
+            }
+            let hello: RemovalHello = read_frame(pipe, deadline).await?;
+            if hello.operation != actual.operation()
+                || (hello.mode == RemovalMode::ProbeRemoval) != probe
+            {
+                return Err(NativeError::Foreign);
+            }
+            let original = state
+                .agent
+                .lock()
+                .map_err(|_| NativeError::Unavailable)?
+                .as_ref()
+                .cloned()
+                .ok_or(NativeError::Unavailable)?;
+            let selected =
+                io.agent_generation(&original, &io.admit_support(deadline)?, deadline)?;
+            check_request(&hello.request, selected)?;
+            if hello.request.method != Method::Hello {
+                return Err(NativeError::Foreign);
+            }
+            let process = state.owner.process_for_peer(&proof, deadline)?;
+            let child = state.owner.child_for_peer(&original, &proof, deadline)?;
+            if probe {
+                original.revalidate(io, &io.admit_support(deadline)?, deadline)?;
+                peer.reverify(io, &io.admit_support(deadline)?, deadline)?;
+                image.reverify(io, &io.admit_support(deadline)?, deadline)?;
+                return write_frame(
+                    pipe,
+                    &SupportReply {
+                        schema_version: 1,
+                        nonce: hello.request.nonce,
+                        operation: actual.operation(),
+                        generation: selected,
+                    },
+                    deadline,
+                )
+                .await;
+            }
+            let mut reply = Reply {
+                status: ReplyStatus::Ready,
+                schema_version: 1,
+                nonce: hello.request.nonce,
+                method: Method::Hello,
+                operation: None,
+                generation: selected,
+                process: Some(process.as_raw_handle() as usize as u64),
+                child: Some(child.as_raw_handle() as usize as u64),
+                job: None,
+            };
+            write_frame(pipe, &reply, deadline).await?;
+            loop {
+                let request: Request = read_frame(pipe, deadline).await?;
+                check_request(&request, selected)?;
+                if request.nonce != hello.request.nonce
+                    || request.operation != Some(actual.operation())
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let proof = io.admit_support(deadline)?;
+                peer.reverify(io, &proof, deadline)?;
+                image.reverify(io, &proof, deadline)?;
+                let current = fresh(io, &proof, actual.operation(), deadline)?;
+                validate_stop(io, &proof, &current, actual.operation(), selected, deadline)?;
+                reply.method = request.method;
+                reply.operation = request.operation;
+                reply.process = None;
+                reply.child = None;
+                reply.job = None;
+                match request.method {
+                    Method::Arm => {
+                        state
+                            .owner
+                            .arm_terminal(selected, actual.operation(), &proof, deadline)?;
+                        *state.export.lock().map_err(|_| NativeError::Unavailable)? =
+                            Some((actual.operation(), selected));
+                    }
+                    Method::Empty => {
+                        if state.owner.terminal_operation() != Some(actual.operation()) {
+                            return Err(NativeError::Foreign);
+                        }
+                        if let Some(empty) =
+                            state.owner.settled_for_stop(&proof, &original, deadline)?
+                        {
+                            let job = state.owner.job_for_empty(&empty, &proof, deadline)?;
+                            if active(&job)? != 0 {
+                                return Err(NativeError::Foreign);
+                            }
+                            reply.job = Some(job.as_raw_handle() as usize as u64);
+                            write_frame(pipe, &reply, deadline).await?;
+                            let ack: Request = read_frame(pipe, deadline).await?;
+                            check_request(&ack, selected)?;
+                            if ack.method != Method::Ack
+                                || ack.nonce != hello.request.nonce
+                                || ack.operation != Some(actual.operation())
+                            {
+                                return Err(NativeError::Foreign);
+                            }
+                            peer.reverify(io, &io.admit_support(deadline)?, deadline)?;
+                            image.reverify(io, &io.admit_support(deadline)?, deadline)?;
+                            reply.method = Method::Ack;
+                            reply.job = None;
+                            write_frame(pipe, &reply, deadline).await?;
+                            return Ok(());
+                        }
+                    }
+                    _ => return Err(NativeError::Foreign),
+                }
+                write_frame(pipe, &reply, deadline).await?;
+            }
+        }
+
+        pub(crate) fn probe_removal_support(
+            io: Arc<WindowsNativeIo>,
+            proof: &SupportProof,
+            operation: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let selected = io.select_removal_keeper(proof, deadline)?;
+            selected.reverify(&io, proof, deadline)?;
+            if selected.operation() != operation || !support(selected.record()) {
+                return Err(NativeError::Foreign);
+            }
+            let original = io.observe_agent(proof, deadline)?;
+            if original.bootstrap().phase != BootstrapPhase::Ready {
+                return Err(NativeError::Unavailable);
+            }
+            let generation = io.agent_generation(&original, proof, deadline)?;
+            let root = io.broker_admission(proof, deadline)?;
+            root.bind_runtime(&original, proof, deadline)?;
+            let nonce = io.bridge_nonce(proof, deadline)?;
+            runtime()?.block_on(async {
+                let mut pipe = loop {
+                    deadline.check()?;
+                    match ClientOptions::new().open(format!("{}.outer", root.endpoint())) {
+                        Ok(pipe) => break pipe,
+                        Err(error) if error.raw_os_error() == Some(231) => {
+                            tokio::time::sleep(Duration::from_millis(5)).await
+                        }
+                        Err(error) if error.raw_os_error() == Some(2) => {
+                            return Err(NativeError::Unsupported);
+                        }
+                        Err(_) => return Err(NativeError::Unavailable),
+                    }
+                };
+                // The original fixed source/kernel peer is authenticated BEFORE reply decoding.
+                let peer = Peer::admit(pipe.as_raw_handle(), true, &root, deadline)?;
+                selected.reverify(&io, &io.admit_support(deadline)?, deadline)?;
+                let hello = RemovalHello {
+                    request: Request {
+                        schema_version: 1,
+                        nonce,
+                        method: Method::Hello,
+                        operation: None,
+                        generation,
+                    },
+                    operation,
+                    mode: RemovalMode::ProbeRemoval,
+                };
+                write_frame(&mut pipe, &hello, deadline).await?;
+                let reply: SupportReply = read_frame(&mut pipe, deadline).await?;
+                if reply.schema_version != 1
+                    || reply.nonce != nonce
+                    || reply.operation != operation
+                    || reply.generation != generation
+                {
+                    return Err(NativeError::Foreign);
+                }
+                peer.reverify(&root, deadline)?;
+                original.revalidate(&io, &io.admit_support(deadline)?, deadline)?;
+                selected.reverify(&io, &io.admit_support(deadline)?, deadline)?;
+                Ok(())
+            })
+        }
+
+        enum ControlRole {
+            Keeper {
+                process: Arc<OwnedHandle>,
+                identity: super::super::super::files::FileIdentity,
+            },
+            Source {
+                parent: Arc<OwnedHandle>,
+                own: super::super::super::SelfImagePin,
+                selection: Arc<super::super::super::RemovalKeeperSelection>,
+            },
+        }
+        /// Authentication of the real preparation/commit endpoint, never a serialized permit.
+        pub(crate) struct RemovalControlPeer {
+            io: Arc<WindowsNativeIo>,
+            peer: KernelOuterPeer,
+            image: super::super::super::OuterPeerImage,
+            operation: [u8; 16],
+            role: ControlRole,
+        }
+        impl RemovalControlPeer {
+            pub(crate) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                self.peer.reverify(io, proof, deadline)?;
+                self.image.reverify(io, proof, deadline)?;
+                let record = fresh(io, proof, self.operation, deadline)?;
+                // This is control-channel authentication only. Later same-owner Status has no
+                // Arm/Stop/Run or completion authority; every destructive method has its own gate.
+                if record.cursor() == RemovalCursor::Retired {
+                    return Err(NativeError::Foreign);
+                }
+                match &self.role {
+                    ControlRole::Keeper { process, identity } => {
+                        let (creation, path) = process_facts(process, true)?;
+                        // SAFETY: originally created child object retained by the actual creator.
+                        let pid = unsafe { GetProcessId(process.as_raw_handle()) };
+                        if self.peer.pid != pid
+                            || self.peer.created != creation
+                            || self.peer.image != path
+                            || self.image.identity() != *identity
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                        let copy = record
+                            .plan()
+                            .copies()
+                            .iter()
+                            .find(|copy| copy.identity() == Some(stamp(*identity)))
+                            .ok_or(NativeError::Foreign)?;
+                        if copy.pid() != Some(pid)
+                            || copy.creation() != Some(creation)
+                            || copy.image() != Some(self.image.facts())
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                    }
+                    ControlRole::Source {
+                        parent,
+                        own,
+                        selection,
+                    } => {
+                        own.reverify(io, proof, deadline)?;
+                        selection.reverify(io, proof, deadline)?;
+                        if selection.operation() != self.operation
+                            || selection.module().identity() != own.identity()
+                            || selection.module().facts() != own.facts()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                        let (creation, path) = process_facts(parent, true)?;
+                        // SAFETY: the exact explicitly inherited original parent handle only.
+                        let pid = unsafe { GetProcessId(parent.as_raw_handle()) };
+                        if self.peer.pid != pid
+                            || self.peer.created != creation
+                            || self.peer.image != path
+                            || self.image.facts() != own.facts()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                    }
+                }
+                deadline.check()
+            }
+            pub(crate) fn image_identity(&self) -> super::super::super::files::FileIdentity {
+                self.image.identity()
+            }
+        }
+        // Signed additive admission keeps original IO, context, actual object and deadline
+        // separate; restructuring would obscure the sealed authority inputs.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn admit_removal_keeper_peer(
+            pipe: std::os::windows::io::RawHandle,
+            is_server: bool,
+            io: Arc<WindowsNativeIo>,
+            proof: &SupportProof,
+            process: &Arc<OwnedHandle>,
+            image: &super::super::super::OpenedPe,
+            operation: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<RemovalControlPeer> {
+            image.reverify(&io, proof, deadline)?;
+            let peer = KernelOuterPeer::admit(pipe, is_server, io.clone(), proof, deadline)?;
+            let opened = io.pin_outer_kernel_image(
+                proof,
+                &peer,
+                &image.approved().facts().version,
+                deadline,
+            )?;
+            if opened.identity() != image.identity()
+                || opened.facts() != image.approved().facts()
+                || opened.canonical_dos_path() != image.canonical_dos_path()
+            {
+                return Err(NativeError::Foreign);
+            }
+            let result = RemovalControlPeer {
+                io,
+                peer,
+                image: opened,
+                operation,
+                role: ControlRole::Keeper {
+                    process: process.clone(),
+                    identity: image.identity(),
+                },
+            };
+            result.reverify(&result.io, proof, deadline)?;
+            Ok(result)
+        }
+        // Signed additive admission keeps original IO, context, actual object and deadline
+        // separate; restructuring would obscure the sealed authority inputs.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn admit_removal_source_peer(
+            pipe: std::os::windows::io::RawHandle,
+            io: Arc<WindowsNativeIo>,
+            proof: &SupportProof,
+            parent: &super::super::super::super::payload::helper::removal::RemovalParent,
+            own: super::super::super::SelfImagePin,
+            selection: Arc<super::super::super::RemovalKeeperSelection>,
+            operation: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<RemovalControlPeer> {
+            parent.reverify(&io, proof, operation, deadline)?;
+            own.reverify(&io, proof, deadline)?;
+            let peer = KernelOuterPeer::admit(pipe, false, io.clone(), proof, deadline)?;
+            let image = io.pin_outer_kernel_image(proof, &peer, &own.facts().version, deadline)?;
+            let result = RemovalControlPeer {
+                io,
+                peer,
+                image,
+                operation,
+                role: ControlRole::Source {
+                    parent: parent.retained_process().clone(),
+                    own,
+                    selection,
+                },
+            };
+            result.reverify(&result.io, proof, deadline)?;
+            Ok(result)
+        }
+
+        struct RemovalTransfer {
+            original: Arc<Transfer>,
+            admission: RemovalCompletionAdmission,
+            completion: Mutex<Option<Arc<RetainedTreeCompletion>>>,
+            arm_attempted: AtomicBool,
+            complete_attempted: AtomicBool,
+        }
+        static REMOVAL_TRANSFER: OnceLock<Mutex<Option<Arc<RemovalTransfer>>>> = OnceLock::new();
+        pub(crate) struct AdmittedRemovalOwner {
+            inner: Option<AdmittedSupervisorOwner>,
+            sidecar: Option<Arc<RemovalTransfer>>,
+        }
+        impl AdmittedRemovalOwner {
+            pub(crate) fn admit(
+                io: Arc<WindowsNativeIo>,
+                original: AgentObservation,
+                lease: Arc<super::super::super::StopLockLease>,
+                admission: RemovalCompletionAdmission,
+                deadline: &Deadline,
+            ) -> NativeResult<Self> {
+                let proof = io.admit_support(deadline)?;
+                admission.reverify(&io, &proof, deadline)?;
+                lease.reverify(&proof, deadline)?;
+                let root = io.broker_admission(&proof, deadline)?;
+                root.bind_runtime(&original, &proof, deadline)?;
+                let selected = io.agent_generation(&original, &proof, deadline)?;
+                if original.bootstrap().phase != BootstrapPhase::Ready {
+                    return Err(NativeError::Unavailable);
+                }
+                let nonce = io.bridge_nonce(&proof, deadline)?;
+                let state = Arc::new(Transfer {
+                    root,
+                    original: Mutex::new(Some(Arc::new(original))),
+                    selected,
+                    nonce,
+                    peer: Mutex::new(None),
+                    handles: Mutex::new(Handles::default()),
+                    lease: Mutex::new(Some(lease)),
+                    retired: AtomicBool::new(false),
+                    thread: Mutex::new(None),
+                });
+                let held = Arc::new(RemovalTransfer {
+                    original: state.clone(),
+                    admission,
+                    completion: Mutex::new(None),
+                    arm_attempted: AtomicBool::new(false),
+                    complete_attempted: AtomicBool::new(false),
+                });
+                {
+                    let mut current = TRANSFER
+                        .get_or_init(|| Mutex::new(None))
+                        .lock()
+                        .map_err(|_| NativeError::OutcomeUnknown)?;
+                    let mut removal = REMOVAL_TRANSFER
+                        .get_or_init(|| Mutex::new(None))
+                        .lock()
+                        .map_err(|_| NativeError::OutcomeUnknown)?;
+                    if current.is_some() || removal.is_some() {
+                        return Err(NativeError::Busy);
+                    }
+                    *current = Some(state.clone());
+                    *removal = Some(held.clone());
+                }
+                let (send, commands) = std::sync::mpsc::sync_channel(1);
+                let (ready, receive) = std::sync::mpsc::sync_channel(1);
+                let captured = held.clone();
+                let initial = deadline.clone();
+                let thread = std::thread::Builder::new()
+                    .name("crosspane-removal-original-owner".into())
+                    .spawn(move || {
+                        let state = &captured.original;
+                        let result = (|| {
+                            let rt = runtime()?;
+                            let pipe =
+                                rt.block_on(connect(state, &captured.admission, &initial))?;
+                            ready
+                                .send(Ok(()))
+                                .map_err(|_| NativeError::OutcomeUnknown)?;
+                            // Shared actual original-handle/job import mechanics; no upgrade selection.
+                            command_loop(state, &rt, pipe, commands)
+                        })();
+                        if result.is_err() {
+                            state.retired.store(true, Ordering::Release);
+                            let _ = ready.try_send(Err(NativeError::OutcomeUnknown));
+                        }
+                    })
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                *state
+                    .thread
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)? = Some(thread);
+                match receive.recv_timeout(Duration::from_millis(deadline.remaining_ms()?)) {
+                    Ok(Ok(())) if deadline.check().is_ok() => Ok(Self {
+                        inner: Some(AdmittedSupervisorOwner { state, send }),
+                        sidecar: Some(held),
+                    }),
+                    _ => {
+                        state.retired.store(true, Ordering::Release);
+                        Err(NativeError::OutcomeUnknown)
+                    }
+                }
+            }
+            pub(crate) fn arm_terminal(
+                &self,
+                operation: [u8; 16],
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                let held = self.sidecar.as_ref().ok_or(NativeError::Foreign)?;
+                if operation != held.admission.operation() {
+                    return Err(NativeError::Foreign);
+                }
+                if held.arm_attempted.swap(true, Ordering::AcqRel) {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                held.admission.reverify(
+                    held.original.root.io(),
+                    &held.original.root.io().admit_support(deadline)?,
+                    deadline,
+                )?;
+                self.inner
+                    .as_ref()
+                    .ok_or(NativeError::Foreign)?
+                    .arm_terminal(operation, deadline)
+            }
+            pub(crate) fn observe_completion(
+                &self,
+                operation: [u8; 16],
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                let held = self.sidecar.as_ref().ok_or(NativeError::Foreign)?;
+                if operation != held.admission.operation() {
+                    return Err(NativeError::Foreign);
+                }
+                if held.complete_attempted.swap(true, Ordering::AcqRel) {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                let inner = self.inner.as_ref().ok_or(NativeError::Foreign)?;
+                let (send, recv) = std::sync::mpsc::sync_channel(1);
+                inner
+                    .send
+                    .try_send(Command::Complete(operation, deadline.clone(), send))
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                let tree = Arc::new(inner.receive(recv, deadline)?);
+                tree.reverify(deadline)?;
+                // Preserve the actual native result BEFORE any later settlement failure.
+                *held
+                    .completion
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)? = Some(tree);
+                inner.settle(deadline)
+            }
+            pub(crate) fn finish_settled(
+                &mut self,
+                deadline: &Deadline,
+            ) -> NativeResult<Option<Arc<RetainedTreeCompletion>>> {
+                let held = self.sidecar.as_ref().ok_or(NativeError::Foreign)?;
+                let state = &held.original;
+                let finished = state
+                    .thread
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                    .as_ref()
+                    .is_some_and(|thread| {
+                        // SAFETY: exact actual owned worker thread; native exit includes TLS cleanup.
+                        (unsafe { WaitForSingleObject(thread.as_raw_handle(), 0) }) == WAIT_OBJECT_0
+                    });
+                if !finished {
+                    deadline.check()?;
+                    return Ok(None);
+                }
+                let existing = held
+                    .completion
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                    .as_ref()
+                    .cloned();
+                let tree = if let Some(tree) = existing {
+                    tree
+                } else {
+                    held.admission.reverify(
+                        state.root.io(),
+                        &state.root.io().admit_support(deadline)?,
+                        deadline,
+                    )?;
+                    let peer = state
+                        .peer
+                        .lock()
+                        .map_err(|_| NativeError::OutcomeUnknown)?
+                        .as_ref()
+                        .cloned()
+                        .ok_or(NativeError::OutcomeUnknown)?;
+                    if !peer.exited()? {
+                        return Ok(None);
+                    }
+                    let original = state
+                        .original
+                        .lock()
+                        .map_err(|_| NativeError::OutcomeUnknown)?
+                        .as_ref()
+                        .cloned()
+                        .ok_or(NativeError::OutcomeUnknown)?;
+                    match original.observe_exit(
+                        state.root.io(),
+                        &state.root.io().admit_support(deadline)?,
+                        deadline,
+                    )? {
+                        ExitObservation::Exited {
+                            creation,
+                            code: 0,
+                            receipt: Some(receipt),
+                        } if creation == state.selected.creation
+                            && receipt.instance_id == state.selected.instance
+                            && receipt.clean
+                            && receipt.input_journals_empty
+                            && receipt.audio_stopped => {}
+                        ExitObservation::Running => return Ok(None),
+                        _ => return Err(NativeError::OutcomeUnknown),
+                    }
+                    let handles = state
+                        .handles
+                        .lock()
+                        .map_err(|_| NativeError::OutcomeUnknown)?;
+                    let tree = Arc::new(RetainedTreeCompletion {
+                        operation: held.admission.operation(),
+                        selected: state.selected,
+                        supervisor: handles
+                            .supervisor
+                            .as_ref()
+                            .cloned()
+                            .ok_or(NativeError::OutcomeUnknown)?,
+                        child: handles
+                            .child
+                            .as_ref()
+                            .cloned()
+                            .ok_or(NativeError::OutcomeUnknown)?,
+                        job: handles
+                            .job
+                            .as_ref()
+                            .cloned()
+                            .ok_or(NativeError::OutcomeUnknown)?,
+                    });
+                    tree.reverify(deadline)?;
+                    *held
+                        .completion
+                        .lock()
+                        .map_err(|_| NativeError::OutcomeUnknown)? = Some(tree.clone());
+                    tree
+                };
+                tree.reverify(deadline)?;
+                // The service MUST physically settle its ONE agent transport before calling this.
+                // Acquire every fallible guard and verify the final proof BEFORE irreversible
+                // slot consumption. Errors leave both the worker handle and actual proof retained.
+                let mut slot = TRANSFER
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                if slot
+                    .as_ref()
+                    .is_some_and(|value| !Arc::ptr_eq(value, state))
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let mut side = REMOVAL_TRANSFER
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                if !side.as_ref().is_some_and(|value| Arc::ptr_eq(value, held))
+                    || Arc::strong_count(held) != 2
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                let mut peer = state.peer.lock().map_err(|_| NativeError::OutcomeUnknown)?;
+                let mut original = state
+                    .original
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                let mut lease = state
+                    .lease
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                let mut thread = state
+                    .thread
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                state.root.release_image_pin()?;
+                tree.reverify(deadline)?;
+                // No fallible work follows this same-object alias drop barrier.
+                peer.take();
+                original.take();
+                lease.take();
+                thread.take();
+                slot.take();
+                side.take();
+                drop(peer);
+                drop(original);
+                drop(lease);
+                drop(thread);
+                drop(slot);
+                drop(side);
+                self.inner.take();
+                self.sidecar.take();
+                // No Transfer/Broker/image/install anchor is contained in the returned bare proof.
+                Ok(Some(tree))
+            }
+        }
+
+        async fn connect(
+            state: &Transfer,
+            admission: &RemovalCompletionAdmission,
+            deadline: &Deadline,
+        ) -> NativeResult<NamedPipeClient> {
+            let mut pipe = loop {
+                deadline.check()?;
+                match ClientOptions::new().open(format!("{}.outer", state.root.endpoint())) {
+                    Ok(pipe) => break pipe,
+                    Err(error) if error.raw_os_error() == Some(231) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await
+                    }
+                    Err(error) if error.raw_os_error() == Some(2) => {
+                        return Err(NativeError::Unsupported);
+                    }
+                    Err(_) => return Err(NativeError::Unavailable),
+                }
+            };
+            let peer = Arc::new(Peer::admit(
+                pipe.as_raw_handle(),
+                true,
+                &state.root,
+                deadline,
+            )?);
+            *state.peer.lock().map_err(|_| NativeError::OutcomeUnknown)? = Some(peer.clone());
+            admission.reverify(
+                state.root.io(),
+                &state.root.io().admit_support(deadline)?,
+                deadline,
+            )?;
+            let request = Request {
+                schema_version: 1,
+                nonce: state.nonce,
+                method: Method::Hello,
+                operation: None,
+                generation: state.selected,
+            };
+            let hello = RemovalHello {
+                request,
+                operation: admission.operation(),
+                mode: RemovalMode::CompleteRemoval,
+            };
+            write_frame(&mut pipe, &hello, deadline).await?;
+            let reply: Reply = read_frame(&mut pipe, deadline).await?;
+            check_reply(&reply, &hello.request)?;
+            if reply.status != ReplyStatus::Ready {
+                return Err(NativeError::Unavailable);
+            }
+            let supervisor = Arc::new(peer.duplicate(
+                reply.process.ok_or(NativeError::Foreign)?,
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                deadline,
+            )?);
+            state
+                .handles
+                .lock()
+                .map_err(|_| NativeError::OutcomeUnknown)?
+                .supervisor = Some(supervisor.clone());
+            let child = Arc::new(peer.duplicate(
+                reply.child.ok_or(NativeError::Foreign)?,
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                deadline,
+            )?);
+            state
+                .handles
+                .lock()
+                .map_err(|_| NativeError::OutcomeUnknown)?
+                .child = Some(child.clone());
+            let (creation, _) = process_facts(&supervisor, true)?;
+            // SAFETY: query only SAME locally retained authenticated source/child objects.
+            if unsafe{GetProcessId(supervisor.as_raw_handle())}!=peer.pid || creation!=peer.created
+                // SAFETY: SAME actual original child imported from its genuine owning supervisor.
+                || unsafe{GetProcessId(child.as_raw_handle())}!=state.selected.pid
+            {
+                return Err(NativeError::Foreign);
+            }
+            let (created, image) = process_facts(&child, true)?;
+            let original = state
+                .original
+                .lock()
+                .map_err(|_| NativeError::OutcomeUnknown)?
+                .as_ref()
+                .cloned()
+                .ok_or(NativeError::Foreign)?;
+            if created != state.selected.creation
+                || image != super::super::super::process::literal_path(original.image_canonical())?
+                || identity::native::observe_process(&child)? != *state.root.token()
+            {
+                return Err(NativeError::Foreign);
+            }
+            original.revalidate(
+                state.root.io(),
+                &state.root.io().admit_support(deadline)?,
+                deadline,
+            )?;
+            peer.reverify(&state.root, deadline)?;
+            Ok(pipe)
+        }
+    }
+    #[cfg(not(test))]
+    pub(crate) use removal_owner::{
+        AdmittedRemovalOwner, RemovalControlPeer, admit_removal_keeper_peer,
+        admit_removal_source_peer, probe_removal_support,
+    };
+
     #[cfg(test)]
     mod polling_tests {
         use super::*;
@@ -3113,8 +4000,10 @@ mod native {
 }
 #[cfg(all(windows, not(test)))]
 pub(crate) use native::{
-    KernelOuterPeer, OuterOwnerServer, OuterPeerPin, admit_keeper_observer_server,
-    admit_keeper_peer, admit_outer_observer_peer, admit_outer_source_peer, probe_outer_support,
+    AdmittedRemovalOwner, KernelOuterPeer, OuterOwnerServer, OuterPeerPin, RemovalControlPeer,
+    admit_keeper_observer_server, admit_keeper_peer, admit_outer_observer_peer,
+    admit_outer_source_peer, admit_removal_keeper_peer, admit_removal_source_peer,
+    probe_outer_support, probe_removal_support,
 };
 
 #[cfg(windows)]

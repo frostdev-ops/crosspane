@@ -3,6 +3,9 @@
 pub mod detect;
 pub mod native_io;
 pub(crate) mod payload;
+// Native removal consumers are excluded from the library unit-test graph; integration fakes include this new graph.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) mod removal;
 pub mod service;
 pub mod transport;
 

@@ -98,6 +98,12 @@ pub(crate) use adapter::{OuterCompletionAdmission, OuterPeerImage};
 pub(crate) use adapter::{FileRecoveryKeeperAbsent, FileRecoveryRoot, FileRecoverySeal};
 
 #[cfg(all(windows, not(test)))]
+pub(crate) use adapter::{
+    RemovalCompletionAdmission, RemovalKeeperSelection, RemovalMutationPermit, RemovalPeerImage,
+    RemovalRoot,
+};
+
+#[cfg(all(windows, not(test)))]
 pub(crate) use adapter::keeper;
 
 #[cfg(windows)]
@@ -3276,6 +3282,1399 @@ mod adapter {
             self.read(name)
         }
     }
+
+    /// A5 private removal wiring. Serialized observations are never completion or mutation seals.
+    #[cfg(not(test))]
+    mod removal_io {
+        use super::super::super::{
+            removal::{
+                self, RemovalCursor as Cursor, RemovalHandoffStage as Handoff, RemovalOptions,
+                RemovalRecord,
+                executor::NodePresence,
+                inventory::{
+                    RemovalCopy, RemovalCopyKind, RemovalInventory, RemovalNode, RemovalNodeKind,
+                    RemovalTask,
+                },
+                plan::RemovalPlan,
+            },
+            service::{
+                removal_runtime::RemovalCompletion,
+                task::{Definition, Logon, RunLevel, SUPERVISOR_ARGUMENT, TASK_NAME},
+            },
+        };
+        use super::*;
+        use native::RemovalObjectKind as Kind;
+
+        pub(crate) struct RemovalMutationPermit {
+            io: Arc<WindowsNativeIo>,
+            bytes: Vec<u8>,
+            operation: [u8; 16],
+        }
+        impl RemovalMutationPermit {
+            pub(crate) fn operation(&self) -> [u8; 16] {
+                self.operation
+            }
+            pub(crate) fn bytes(&self) -> &[u8] {
+                &self.bytes
+            }
+            fn document(&self) -> NativeResult<RemovalRecord> {
+                RemovalRecord::decode(&self.bytes)
+            }
+            pub(crate) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                io.verify_stop_lock(proof, lock, deadline)?;
+                let current = io
+                    .read_record(
+                        proof,
+                        records::RecordName::Removal,
+                        files::MAX_RECORD_BYTES,
+                        deadline,
+                    )?
+                    .ok_or(NativeError::Missing)?;
+                if current.bytes() != self.bytes {
+                    return Err(NativeError::Foreign);
+                }
+                context_matches(&self.document()?, io.target().identity())?;
+                deadline.check()
+            }
+        }
+        pub(crate) struct RemovalRoot {
+            io: Arc<WindowsNativeIo>,
+            programs: Arc<Anchor>,
+            original: RemovalRecord,
+        }
+        fn definition(context: &Context) -> Definition {
+            let user = context.target.identity.user.sddl();
+            Definition {
+                name: TASK_NAME.into(),
+                principal: user.clone(),
+                trigger_user: user,
+                logon: Logon::InteractiveToken,
+                run_level: RunLevel::Limited,
+                action: format!(
+                    "{}\\crosspane-installer.exe",
+                    context.target.paths.install()
+                ),
+                arguments: SUPERVISOR_ARGUMENT.into(),
+                working_directory: context.target.paths.install().into(),
+                logon_trigger_only: true,
+                ignore_new_instance: true,
+                manager_restart_count: 0,
+                enabled: true,
+            }
+        }
+        fn read(
+            context: &Context,
+            lease: &LockState,
+            budget: &Deadline,
+        ) -> NativeResult<Option<(Vec<u8>, RemovalRecord)>> {
+            validate_payload_lock(context, lease, budget)?;
+            lease
+                .parent
+                .read_private(
+                    &records::RecordName::Removal.file_name()?,
+                    &context.security,
+                    files::MAX_RECORD_BYTES,
+                    budget,
+                )?
+                .map(|(_, bytes)| {
+                    let record = RemovalRecord::decode(&bytes)?;
+                    context_matches(&record, &context.target.identity)?;
+                    Ok((bytes, record))
+                })
+                .transpose()
+        }
+        fn context_matches(record: &RemovalRecord, facts: &TokenFacts) -> NativeResult<()> {
+            if matches!(
+                record.cursor(),
+                Cursor::Complete { .. }
+                    | Cursor::FinalCopyCleanupIntent { .. }
+                    | Cursor::FinalCopyAbsent { .. }
+                    | Cursor::Retired
+            ) {
+                record.context().same_user(facts)
+            } else {
+                record.context().matches(facts)
+            }
+        }
+        fn check(
+            context: &Context,
+            lease: &LockState,
+            bytes: &[u8],
+            budget: &Deadline,
+        ) -> NativeResult<RemovalRecord> {
+            let (fresh, record) = read(context, lease, budget)?.ok_or(NativeError::Missing)?;
+            if fresh != bytes {
+                return Err(NativeError::Foreign);
+            }
+            Ok(record)
+        }
+        fn exclusion(context: &Context, lease: &LockState, budget: &Deadline) -> NativeResult<()> {
+            validate_payload_lock(context, lease, budget)?;
+            let catalog = lease.parent.read_private(
+                &records::RecordName::StageCatalog.file_name()?,
+                &context.security,
+                files::MAX_RECORD_BYTES,
+                budget,
+            )?;
+            let active = if let Some((_, bytes)) = catalog {
+                let catalog: super::super::super::payload::recovery::StageCatalog =
+                    records::record_data(&records::RecordName::StageCatalog, &bytes)?;
+                catalog.validate()?;
+                catalog.active.is_some()
+            } else {
+                false
+            };
+            let outer = lease.parent.read_private(
+                &records::RecordName::OuterUpgrade.file_name()?,
+                &context.security,
+                files::MAX_RECORD_BYTES,
+                budget,
+            )?;
+            let outer_active = if let Some((_, bytes)) = outer {
+                use super::super::super::payload::recovery::{OuterPhase, OuterUpgradeRecord};
+                !matches!(
+                    OuterUpgradeRecord::decode(&bytes)?.phase(),
+                    OuterPhase::Complete | OuterPhase::Cancelled
+                )
+            } else {
+                false
+            };
+            let progress = lease.parent.read_private(
+                &records::RecordName::FileRecovery.file_name()?,
+                &context.security,
+                files::MAX_RECORD_BYTES,
+                budget,
+            )?;
+            let recovery_active = if let Some((_, bytes)) = progress {
+                use super::super::super::payload::recovery::{
+                    FileRecoveryCursor, FileRecoveryJournal,
+                };
+                FileRecoveryJournal::decode(&bytes)?.cursor() != FileRecoveryCursor::Retired
+            } else {
+                false
+            };
+            removal::admit_removal_selection(active || outer_active || recovery_active)
+        }
+        fn plan(
+            context: &Context,
+            lease: &LockState,
+            programs: &Anchor,
+            budget: &Deadline,
+        ) -> NativeResult<RemovalPlan> {
+            exclusion(context, lease, budget)?;
+            let observed = programs.observe_removal_install(&context.security, budget)?;
+            let nodes = observed
+                .nodes
+                .into_iter()
+                .map(|n| {
+                    RemovalNode::new(
+                        n.components,
+                        n.parent.into(),
+                        n.identity.into(),
+                        match n.kind {
+                            Kind::File => RemovalNodeKind::File,
+                            Kind::Directory => RemovalNodeKind::Directory,
+                            Kind::ReparseLink => RemovalNodeKind::Reparse,
+                        },
+                    )
+                })
+                .collect::<NativeResult<Vec<_>>>()?;
+            let scheduler = super::super::task::Scheduler::connect(&|| {
+                validate_payload_lock(context, lease, budget)
+            })?;
+            let (expected, actual) = scheduler.inspect_removal(&definition(context), &|| {
+                validate_payload_lock(context, lease, budget)
+            })?;
+            RemovalPlan::new(RemovalInventory::new(
+                observed.root.map(Into::into),
+                nodes,
+                RemovalTask::new(expected, actual)?,
+                vec![RemovalCopy::planned(RemovalCopyKind::Keeper)],
+            )?)
+        }
+        fn identity(stamp: super::super::super::payload::recovery::FileStamp) -> FileIdentity {
+            FileIdentity {
+                volume: stamp.volume,
+                file: stamp.file,
+            }
+        }
+        fn ancestors(record: &RemovalRecord, index: u16) -> NativeResult<Vec<FileIdentity>> {
+            let node = record.plan().node(index)?;
+            let mut ids = vec![identity(record.plan().root().ok_or(NativeError::Foreign)?)];
+            for depth in 1..node.components().len() {
+                let parent = record
+                    .plan()
+                    .order()
+                    .iter()
+                    .map(|i| record.plan().node(*i))
+                    .collect::<NativeResult<Vec<_>>>()?
+                    .into_iter()
+                    .find(|n| {
+                        n.components() == &node.components()[..depth]
+                            && n.kind() == RemovalNodeKind::Directory
+                    })
+                    .ok_or(NativeError::Foreign)?;
+                ids.push(identity(parent.identity()));
+            }
+            Ok(ids)
+        }
+        fn kind(kind: RemovalNodeKind) -> Kind {
+            match kind {
+                RemovalNodeKind::File => Kind::File,
+                RemovalNodeKind::Directory => Kind::Directory,
+                RemovalNodeKind::Reparse => Kind::ReparseLink,
+            }
+        }
+        impl RemovalRoot {
+            pub(crate) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &RemovalMutationPermit,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                permit.reverify(io, proof, lock, deadline)?;
+                self.original.same_selection(&permit.document()?)?;
+                let root = self.programs.clone();
+                let context = io.context.clone();
+                let budget = proof.budget(io, deadline)?;
+                io.owner.run(Dispatch::Observation, deadline, move || {
+                    root.revalidate(&context.security, false, &budget)
+                })
+            }
+            pub(crate) fn task_absent(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &RemovalMutationPermit,
+                deadline: &Deadline,
+            ) -> NativeResult<bool> {
+                self.reverify(io, proof, lock, permit, deadline)?;
+                let context = io.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes.clone();
+                let budget = proof.budget(io, deadline)?;
+                io.owner.run(Dispatch::Observation, deadline, move || {
+                    let record = check(&context, &lease, &bytes, &budget)?;
+                    let scheduler = super::super::task::Scheduler::connect(&|| {
+                        check(&context, &lease, &bytes, &budget).map(|_| ())
+                    })?;
+                    let (expected, actual) = scheduler
+                        .inspect_removal(&definition(&context), &|| {
+                            check(&context, &lease, &bytes, &budget).map(|_| ())
+                        })?;
+                    if expected != record.plan().task().expected_xml() {
+                        return Err(NativeError::Foreign);
+                    }
+                    Ok(actual.is_none())
+                })
+            }
+            pub(crate) fn delete_task(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &RemovalMutationPermit,
+                completion: &RemovalCompletion,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                self.reverify(io, proof, lock, permit, deadline)?;
+                let record = permit.document()?;
+                if record.cursor() != Cursor::TaskDeleteIntent {
+                    return Err(NativeError::Foreign);
+                }
+                completion.reverify(io, proof, lock, record.operation(), deadline)?;
+                let tree = completion.tree().clone();
+                let context = io.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes.clone();
+                let budget = proof.budget(io, deadline)?;
+                io.owner.run(Dispatch::Mutation, deadline, move || {
+                    let renew = || {
+                        check(&context, &lease, &bytes, &budget)?;
+                        tree.reverify(&budget)
+                    };
+                    renew()?;
+                    let scheduler = super::super::task::Scheduler::connect(&renew)?;
+                    let change = Change::new();
+                    // A shorter support budget can expire after COM touched the task. Preserve
+                    // may-have-mutated through every following check/absence observation; the
+                    // existing CallOwner retires mutations before delivering OutcomeUnknown.
+                    change.finish(scheduler.delete_removal(
+                        &definition(&context),
+                        record.plan().task().expected_xml(),
+                        &renew,
+                        &|| change.reached(),
+                    ))
+                })
+            }
+            pub(crate) fn observe_node(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &RemovalMutationPermit,
+                index: u16,
+                deadline: &Deadline,
+            ) -> NativeResult<NodePresence> {
+                self.reverify(io, proof, lock, permit, deadline)?;
+                let record = permit.document()?;
+                let node = record.plan().node(index)?.clone();
+                let parents = ancestors(&record, index)?;
+                let root = self.programs.clone();
+                let context = io.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes.clone();
+                let budget = proof.budget(io, deadline)?;
+                io.owner.run(Dispatch::Observation, deadline, move || {
+                    check(&context, &lease, &bytes, &budget)?;
+                    Ok(
+                        match root.observe_removal_node(
+                            parents[0],
+                            node.components(),
+                            &parents,
+                            &context.security,
+                            &budget,
+                        )? {
+                            None => NodePresence::Absent,
+                            Some((id, k))
+                                if id == identity(node.identity()) && k == kind(node.kind()) =>
+                            {
+                                NodePresence::Same
+                            }
+                            Some(_) => NodePresence::Changed,
+                        },
+                    )
+                })
+            }
+            // Independent current IO, lock, publication, selected node and retained-tree seals.
+            #[allow(clippy::too_many_arguments)]
+            pub(crate) fn delete_node(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &RemovalMutationPermit,
+                index: u16,
+                completion: &RemovalCompletion,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                self.reverify(io, proof, lock, permit, deadline)?;
+                let record = permit.document()?;
+                if record.cursor() != (Cursor::DeleteIntent { index }) {
+                    return Err(NativeError::Foreign);
+                }
+                completion.reverify(io, proof, lock, record.operation(), deadline)?;
+                let tree = completion.tree().clone();
+                let node = record.plan().node(index)?.clone();
+                let parents = ancestors(&record, index)?;
+                let root = self.programs.clone();
+                let context = io.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes.clone();
+                let budget = proof.budget(io, deadline)?;
+                io.owner.run(Dispatch::Mutation, deadline, move || {
+                    check(&context, &lease, &bytes, &budget)?;
+                    tree.reverify(&budget)?;
+                    let change = Change::new();
+                    change.reached();
+                    change.finish(root.delete_removal_node(
+                        parents[0],
+                        node.components(),
+                        &parents,
+                        identity(node.parent()),
+                        identity(node.identity()),
+                        kind(node.kind()),
+                        &context.security,
+                        &budget,
+                    ))
+                })
+            }
+            pub(crate) fn root_absent(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &RemovalMutationPermit,
+                deadline: &Deadline,
+            ) -> NativeResult<bool> {
+                self.reverify(io, proof, lock, permit, deadline)?;
+                let record = permit.document()?;
+                let context = io.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes.clone();
+                let root = self.programs.clone();
+                let budget = proof.budget(io, deadline)?;
+                io.owner.run(Dispatch::Observation, deadline, move || {
+                    check(&context, &lease, &bytes, &budget)?;
+                    let fresh = root.removal_install_identity(&context.security, &budget)?;
+                    if fresh.is_some() && fresh != record.plan().root().map(identity) {
+                        return Err(NativeError::Foreign);
+                    }
+                    Ok(fresh.is_none())
+                })
+            }
+            pub(crate) fn delete_root(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &RemovalMutationPermit,
+                completion: &RemovalCompletion,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                self.reverify(io, proof, lock, permit, deadline)?;
+                let record = permit.document()?;
+                if record.cursor() != Cursor::RootDeleteIntent {
+                    return Err(NativeError::Foreign);
+                }
+                completion.reverify(io, proof, lock, record.operation(), deadline)?;
+                let tree = completion.tree().clone();
+                let root = self.programs.clone();
+                let context = io.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes.clone();
+                let budget = proof.budget(io, deadline)?;
+                io.owner.run(Dispatch::Mutation, deadline, move || {
+                    check(&context, &lease, &bytes, &budget)?;
+                    tree.reverify(&budget)?;
+                    if let Some(id) = record.plan().root() {
+                        let change = Change::new();
+                        change.reached();
+                        change.finish(root.delete_removal_install_root(
+                            identity(id),
+                            &context.security,
+                            &budget,
+                        ))?;
+                    } else if root
+                        .removal_install_identity(&context.security, &budget)?
+                        .is_some()
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    Ok(())
+                })
+            }
+        }
+        impl WindowsNativeIo {
+            pub(crate) fn read_removal(
+                &self,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<Option<RemovalRecord>> {
+                self.read_record(
+                    proof,
+                    records::RecordName::Removal,
+                    files::MAX_RECORD_BYTES,
+                    deadline,
+                )?
+                .map(|record| {
+                    let document = RemovalRecord::decode(record.bytes())?;
+                    context_matches(&document, self.target().identity())?;
+                    Ok(document)
+                })
+                .transpose()
+            }
+            pub(crate) fn prepare_removal(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                options: RemovalOptions,
+                deadline: &Deadline,
+            ) -> NativeResult<(RemovalRoot, RemovalRecord)> {
+                self.verify_stop_lock(proof, lock, deadline)?;
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let budget = proof.budget(self, deadline)?;
+                let (programs,record)=self.owner.run(Dispatch::Observation,deadline,move||{
+                    exclusion(&context,&lease,&budget)?;
+                    let programs=Arc::new(Anchor::open(context.target.paths.programs(),&context.security,false,&budget)?
+                        .ok_or(NativeError::Missing)?);
+                    let record=if let Some((_,old))=read(&context,&lease,&budget)? {
+                        if old.cursor()!=Cursor::Retired {if old.options()!=options{return Err(NativeError::Foreign)}old}
+                        else{RemovalRecord::new(nonce()?,super::super::super::payload::recovery::OuterContextCorrelation::new(&context.target.identity)?,
+                            options,plan(&context,&lease,&programs,&budget)?)?}
+                    }else{RemovalRecord::new(nonce()?,super::super::super::payload::recovery::OuterContextCorrelation::new(&context.target.identity)?,
+                        options,plan(&context,&lease,&programs,&budget)?)?};
+                    Ok((programs,record))
+                })?;
+                Ok((
+                    RemovalRoot {
+                        io: self.clone(),
+                        programs,
+                        original: record.clone(),
+                    },
+                    record,
+                ))
+            }
+            /// Cold terminal FILE-only selection. No new operation, staging, Stop, erase,
+            /// image approval or tree authority is created from the recorded plan.
+            pub(crate) fn reopen_removal_root(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &RemovalMutationPermit,
+                deadline: &Deadline,
+            ) -> NativeResult<RemovalRoot> {
+                permit.reverify(self, proof, lock, deadline)?;
+                let original = permit.document()?;
+                if !matches!(
+                    original.cursor(),
+                    Cursor::Complete { .. }
+                        | Cursor::FinalCopyCleanupIntent { .. }
+                        | Cursor::FinalCopyAbsent { .. }
+                        | Cursor::Retired
+                ) {
+                    return Err(NativeError::Foreign);
+                }
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes.clone();
+                let budget = proof.budget(self, deadline)?;
+                let programs = self.owner.run(Dispatch::Observation, deadline, move || {
+                    check(&context, &lease, &bytes, &budget)?;
+                    let programs = Anchor::open(
+                        context.target.paths.programs(),
+                        &context.security,
+                        false,
+                        &budget,
+                    )?
+                    .ok_or(NativeError::Missing)?;
+                    budget.check()?;
+                    Ok(Arc::new(programs))
+                })?;
+                Ok(RemovalRoot {
+                    io: self.clone(),
+                    programs,
+                    original,
+                })
+            }
+            pub(crate) fn admit_removal_permit(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<RemovalMutationPermit> {
+                self.verify_stop_lock(proof, lock, deadline)?;
+                let record = self
+                    .read_record(
+                        proof,
+                        records::RecordName::Removal,
+                        files::MAX_RECORD_BYTES,
+                        deadline,
+                    )?
+                    .ok_or(NativeError::Missing)?;
+                let document = RemovalRecord::decode(record.bytes())?;
+                context_matches(&document, self.target().identity())?;
+                Ok(RemovalMutationPermit {
+                    io: self.clone(),
+                    bytes: record.bytes().to_vec(),
+                    operation: document.operation(),
+                })
+            }
+            pub(crate) fn publish_removal(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                record: &RemovalRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<RemovalMutationPermit> {
+                self.verify_stop_lock(proof, lock, deadline)?;
+                record.validate()?;
+                context_matches(record, self.target().identity())?;
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let budget = proof.budget(self, deadline)?;
+                let requested = record.clone();
+                let bytes = record.encode()?;
+                let output = bytes.clone();
+                let owner = self.owner.clone();
+                self.owner.run(Dispatch::Mutation, deadline, move || {
+                    exclusion(&context, &lease, &budget)?;
+                    match read(&context, &lease, &budget)? {
+                        Some((_, old)) if old.cursor() != Cursor::Retired => {
+                            // Shared production matcher covers cursor and handoff stage in this record: a stale preparation
+                            // cannot regress Ready/commit even while cursor remains Selected.
+                            old.publication_successor(&requested)?;
+                        }
+                        _ => {
+                            if requested.cursor() != Cursor::Selected
+                                || requested.handoff_stage() != Handoff::None
+                            {
+                                return Err(NativeError::Foreign);
+                            }
+                            let programs = Anchor::open(
+                                context.target.paths.programs(),
+                                &context.security,
+                                false,
+                                &budget,
+                            )?
+                            .ok_or(NativeError::Missing)?;
+                            plan(&context, &lease, &programs, &budget)?
+                                .same_files(requested.plan())?;
+                        }
+                    }
+                    let mut store = NativeStore {
+                        context,
+                        lease,
+                        budget,
+                        name: records::RecordName::Removal,
+                        change: Change::new(),
+                    };
+                    let budget = store.budget.clone();
+                    let result = records::publish(&mut store, &bytes, &budget);
+                    let result = store.change.finish(result)?;
+                    if result.native_failure.is_some()
+                        || result.state != records::PublicationRecovery::NewPublished
+                    {
+                        owner.retire_mutations();
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    Ok(())
+                })?;
+                Ok(RemovalMutationPermit {
+                    io: self.clone(),
+                    bytes: output,
+                    operation: record.operation(),
+                })
+            }
+        }
+
+        fn copy_parent(
+            context: &Context,
+            operation: [u8; 16],
+            create: bool,
+            budget: &Deadline,
+            change: &Change,
+        ) -> NativeResult<Option<Arc<Anchor>>> {
+            context.validate(budget)?;
+            if operation == [0; 16] {
+                return Err(NativeError::Invalid);
+            }
+            if create {
+                let state =
+                    ensure_payload_child(&context.local, "Crosspane", context, budget, change)?;
+                let runtime = ensure_payload_child(&state, "runtime", context, budget, change)?;
+                let removal = ensure_payload_child(&runtime, "removal", context, budget, change)?;
+                return Ok(Some(Arc::new(ensure_payload_child(
+                    &removal,
+                    &records::hex(&operation),
+                    context,
+                    budget,
+                    change,
+                )?)));
+            }
+            Anchor::open(
+                &format!(
+                    "{}\\Crosspane\\runtime\\removal\\{}",
+                    context.target.paths.local(),
+                    records::hex(&operation)
+                ),
+                &context.security,
+                true,
+                budget,
+            )
+            .map(|root| root.map(Arc::new))
+        }
+        fn copy(record: &RemovalRecord, index: u8) -> NativeResult<&RemovalCopy> {
+            record
+                .plan()
+                .copies()
+                .get(usize::from(index))
+                .ok_or(NativeError::Invalid)
+        }
+        fn peer_phase(record: &RemovalRecord) -> NativeResult<()> {
+            if record.cursor() == Cursor::StopIntent {
+                return Ok(());
+            }
+            if matches!(record.cursor(), Cursor::Selected | Cursor::Committed)
+                && matches!(
+                    record.handoff_stage(),
+                    Handoff::Created { .. }
+                        | Handoff::ResumeIntent { .. }
+                        | Handoff::Ready { .. }
+                        | Handoff::RemovalCommitIntent { .. }
+                        | Handoff::Committed { .. }
+                )
+            {
+                return Ok(());
+            }
+            Err(NativeError::Foreign)
+        }
+        /// A measured fixed copy observation only: it cannot be converted into image approval.
+        pub(crate) struct RemovalPeerImage(Arc<RemovalPeerData>);
+        struct RemovalPeerData {
+            target: [u8; 16],
+            original: RemovalRecord,
+            index: u8,
+            parent: Arc<Anchor>,
+            image: native::ImageData,
+        }
+        impl RemovalPeerImage {
+            pub(crate) fn identity(&self) -> FileIdentity {
+                self.0.image.identity
+            }
+            pub(crate) fn facts(&self) -> &PeFacts {
+                &self.0.image.facts
+            }
+            pub(crate) fn canonical_dos_path(&self) -> &str {
+                &self.0.image.canonical
+            }
+            pub(crate) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if self.0.target != io.context.target.nonce {
+                    return Err(NativeError::Foreign);
+                }
+                let current = io
+                    .read_removal(proof, deadline)?
+                    .ok_or(NativeError::Missing)?;
+                self.0.original.same_selection(&current)?;
+                let expected = copy(&current, self.0.index)?;
+                if expected.identity() != Some(self.identity().into())
+                    || expected.image() != Some(self.facts())
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let pin = self.0.clone();
+                let context = io.context.clone();
+                let budget = proof.budget(io, deadline)?;
+                io.owner.run(Dispatch::Observation, deadline, move || {
+                    context.validate(&budget)?;
+                    pin.parent.revalidate(&context.security, true, &budget)?;
+                    let fresh = pin.parent.open_image(
+                        copy(&pin.original, pin.index)?.kind().leaf(),
+                        true,
+                        &pin.image.facts.version,
+                        &context.security,
+                        &budget,
+                    )?;
+                    if fresh.identity != pin.image.identity || fresh.facts != pin.image.facts {
+                        return Err(NativeError::Foreign);
+                    }
+                    budget.check()
+                })
+            }
+        }
+        pub(crate) struct RemovalKeeperSelection {
+            io: Arc<WindowsNativeIo>,
+            module: SelfImagePin,
+            own: process::own::OwnProcessIdentity,
+            image: RemovalPeerImage,
+            record: RemovalRecord,
+            index: u8,
+        }
+        impl RemovalKeeperSelection {
+            pub(crate) fn operation(&self) -> [u8; 16] {
+                self.record.operation()
+            }
+            pub(crate) fn record(&self) -> &RemovalRecord {
+                &self.record
+            }
+            pub(crate) fn index(&self) -> u8 {
+                self.index
+            }
+            pub(crate) fn module(&self) -> &SelfImagePin {
+                &self.module
+            }
+            pub(crate) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                self.module.reverify(io, proof, deadline)?;
+                self.own.reverify(deadline)?;
+                self.image.reverify(io, proof, deadline)?;
+                let current = io
+                    .read_removal(proof, deadline)?
+                    .ok_or(NativeError::Missing)?;
+                self.record.same_selection(&current)?;
+                let expected = copy(&current, self.index)?;
+                if expected.pid() != Some(self.own.pid())
+                    || expected.creation() != Some(self.own.creation())
+                    || self.module.identity() != self.image.identity()
+                    || self.module.facts() != self.image.facts()
+                    || process::literal_path(self.module.canonical_dos_path())?
+                        != process::literal_path(self.image.canonical_dos_path())?
+                {
+                    return Err(NativeError::Foreign);
+                }
+                deadline.check()
+            }
+        }
+        pub(crate) struct RemovalCompletionAdmission {
+            selection: RemovalKeeperSelection,
+        }
+        impl RemovalCompletionAdmission {
+            pub(crate) fn operation(&self) -> [u8; 16] {
+                self.selection.operation()
+            }
+            pub(crate) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                self.selection.reverify(io, proof, deadline)?;
+                let current = io
+                    .read_removal(proof, deadline)?
+                    .ok_or(NativeError::Missing)?;
+                if current.operation() != self.operation() || current.cursor() != Cursor::StopIntent
+                {
+                    return Err(NativeError::Foreign);
+                }
+                current.context().matches(io.target().identity())?;
+                deadline.check()
+            }
+        }
+        impl WindowsNativeIo {
+            pub(crate) fn prepare_removal_copy(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &RemovalMutationPermit,
+                index: u8,
+                own: &SelfImagePin,
+                deadline: &Deadline,
+            ) -> NativeResult<OpenedPe> {
+                permit.reverify(self, proof, lock, deadline)?;
+                own.reverify(self, proof, deadline)?;
+                let record = permit.document()?;
+                if record.cursor() != Cursor::Selected
+                    || record.handoff_stage() != (Handoff::CopyPrepareIntent { index })
+                    || copy(&record, index)?.identity().is_some()
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let expected = ApprovedPe::own_image(own)?;
+                let input = self.self_image_reader(own, proof, deadline)?;
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Mutation, deadline, move || {
+                    let change = Change::new();
+                    change.finish((|| {
+                        let fresh = check(&context, &lease, &bytes, &budget)?;
+                        let parent =
+                            copy_parent(&context, fresh.operation(), true, &budget, &change)?
+                                .ok_or(NativeError::Missing)?;
+                        let leaf = copy(&fresh, index)?.kind().leaf();
+                        // CREATE_NEW only. An interrupted unknown copy is retained, never adopted.
+                        change.reached();
+                        let image = parent.stage_image(
+                            leaf,
+                            input,
+                            &expected,
+                            &context.security,
+                            &budget,
+                        )?;
+                        Ok(OpenedPe(Arc::new(ApprovedImage {
+                            target: context.target.nonce,
+                            parent,
+                            leaf: leaf.into(),
+                            image,
+                            expected,
+                        })))
+                    })())
+                })
+            }
+            fn pin_removal_index(
+                &self,
+                proof: &SupportProof,
+                record: &RemovalRecord,
+                index: u8,
+                deadline: &Deadline,
+            ) -> NativeResult<RemovalPeerImage> {
+                record.context().matches(self.target().identity())?;
+                let selected = copy(record, index)?;
+                let expected = selected.image().ok_or(NativeError::Missing)?.clone();
+                let expected_id = selected.identity().ok_or(NativeError::Missing)?;
+                let original = record.clone();
+                let context = self.context.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    context.validate(&budget)?;
+                    let parent = copy_parent(
+                        &context,
+                        original.operation(),
+                        false,
+                        &budget,
+                        &Change::new(),
+                    )?
+                    .ok_or(NativeError::Missing)?;
+                    let image = parent.open_image(
+                        copy(&original, index)?.kind().leaf(),
+                        true,
+                        &expected.version,
+                        &context.security,
+                        &budget,
+                    )?;
+                    if image.identity != identity(expected_id) || image.facts != expected {
+                        return Err(NativeError::Foreign);
+                    }
+                    Ok(RemovalPeerImage(Arc::new(RemovalPeerData {
+                        target: context.target.nonce,
+                        original,
+                        index,
+                        parent,
+                        image,
+                    })))
+                })
+            }
+            pub(crate) fn select_removal_keeper(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<RemovalKeeperSelection> {
+                let record = self
+                    .read_removal(proof, deadline)?
+                    .ok_or(NativeError::Missing)?;
+                peer_phase(&record)?;
+                let module = self.self_image(proof, deadline)?;
+                let own = self.own_process_identity(proof, deadline)?;
+                let index = record
+                    .plan()
+                    .copies()
+                    .iter()
+                    .position(|copy| {
+                        copy.pid() == Some(own.pid())
+                            && copy.creation() == Some(own.creation())
+                            && copy.identity() == Some(module.identity().into())
+                            && copy.image() == Some(module.facts())
+                    })
+                    .ok_or(NativeError::Foreign)? as u8;
+                let image = self.pin_removal_index(proof, &record, index, deadline)?;
+                let result = RemovalKeeperSelection {
+                    io: self.clone(),
+                    module,
+                    own,
+                    image,
+                    record,
+                    index,
+                };
+                result.reverify(self, proof, deadline)?;
+                Ok(result)
+            }
+            pub(crate) fn prepare_removal_completion(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lease: &StopLockLease,
+                operation: [u8; 16],
+                deadline: &Deadline,
+            ) -> NativeResult<RemovalCompletionAdmission> {
+                if !std::ptr::eq(self.as_ref(), lease.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                lease.reverify(proof, deadline)?;
+                let selection = self.select_removal_keeper(proof, deadline)?;
+                if selection.operation() != operation {
+                    return Err(NativeError::Foreign);
+                }
+                let result = RemovalCompletionAdmission { selection };
+                result.reverify(self, proof, deadline)?;
+                Ok(result)
+            }
+            pub(crate) fn pin_removal_peer(
+                &self,
+                proof: &SupportProof,
+                operation: [u8; 16],
+                peer: &super::super::supervisor_owner::KernelOuterPeer,
+                deadline: &Deadline,
+            ) -> NativeResult<RemovalPeerImage> {
+                peer.reverify(self, proof, deadline)?;
+                let record = self
+                    .read_removal(proof, deadline)?
+                    .ok_or(NativeError::Missing)?;
+                peer_phase(&record)?;
+                if record.operation() != operation {
+                    return Err(NativeError::Foreign);
+                }
+                record.context().matches(peer.token())?;
+                let index = record
+                    .plan()
+                    .copies()
+                    .iter()
+                    .position(|copy| {
+                        copy.pid() == Some(peer.pid()) && copy.creation() == Some(peer.creation())
+                    })
+                    .ok_or(NativeError::Foreign)? as u8;
+                let image = self.pin_removal_index(proof, &record, index, deadline)?;
+                if process::literal_path(peer.image())?
+                    != process::literal_path(image.canonical_dos_path())?
+                {
+                    return Err(NativeError::Foreign);
+                }
+                peer.reverify(self, proof, deadline)?;
+                image.reverify(self, proof, deadline)?;
+                Ok(image)
+            }
+        }
+
+        fn copy_presence(
+            context: &Context,
+            record: &RemovalRecord,
+            index: u8,
+            budget: &Deadline,
+        ) -> NativeResult<bool> {
+            let selected = copy(record, index)?;
+            let id = selected.identity().ok_or(NativeError::Missing)?;
+            let parent = copy_parent(context, record.operation(), false, budget, &Change::new())?;
+            let Some(parent) = parent else {
+                return Ok(true);
+            };
+            let observed =
+                parent.removal_copy_identity(selected.kind().leaf(), &context.security, budget)?;
+            let Some(observed) = observed else {
+                return Ok(true);
+            };
+            if observed != identity(id) {
+                return Err(NativeError::Foreign);
+            }
+            Ok(false)
+        }
+        fn original_copy_exited(
+            process: &std::os::windows::io::OwnedHandle,
+            record: &RemovalRecord,
+            index: u8,
+            budget: &Deadline,
+        ) -> NativeResult<()> {
+            use windows_sys::Win32::{
+                Foundation::{FILETIME, WAIT_OBJECT_0},
+                System::Threading::*,
+            };
+            let selected = copy(record, index)?;
+            budget.check()?;
+            let mut created = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
+            let mut exit = created;
+            let mut kernel = created;
+            let mut user = created;
+            // SAFETY: actual retained original child/kernel-peer handle from a genuine exit seal;
+            // query/wait only, no OpenProcess, PID/name selection, termination or inherited claims.
+            let ok = unsafe {
+                GetProcessTimes(
+                    process.as_raw_handle(),
+                    &mut created,
+                    &mut exit,
+                    &mut kernel,
+                    &mut user,
+                )
+            };
+            // SAFETY: read-only identity and nonblocking wait on that same retained native object.
+            let (pid, wait) = unsafe {
+                (
+                    GetProcessId(process.as_raw_handle()),
+                    WaitForSingleObject(process.as_raw_handle(), 0),
+                )
+            };
+            let creation =
+                (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+            if ok == 0
+                || wait != WAIT_OBJECT_0
+                || selected.pid() != Some(pid)
+                || selected.creation() != Some(creation)
+            {
+                return Err(NativeError::Foreign);
+            }
+            budget.check()
+        }
+        fn namespace_held(
+            handle: &std::os::windows::io::OwnedHandle,
+            budget: &Deadline,
+        ) -> NativeResult<()> {
+            let mut flags = 0;
+            budget.check()?;
+            // SAFETY: actual exclusively created FIRST_PIPE_INSTANCE namespace handle, retained
+            // from the sealed current lease; this read neither selects nor reconstructs an owner.
+            if unsafe {
+                windows_sys::Win32::Foundation::GetHandleInformation(
+                    handle.as_raw_handle(),
+                    &mut flags,
+                )
+            } == 0
+            {
+                return Err(NativeError::Foreign);
+            }
+            budget.check()
+        }
+        impl WindowsNativeIo {
+            pub(crate) fn read_removal_receipt(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &RemovalMutationPermit,
+                completion: &RemovalCompletion,
+                deadline: &Deadline,
+            ) -> NativeResult<Option<crate::agent_contract::LastExitV1>> {
+                permit.reverify(self, proof, lock, deadline)?;
+                completion.reverify(self, proof, lock, permit.operation(), deadline)?;
+                let generation = completion.generation();
+                let started = completion.started_unix_ms();
+                let tree = completion.tree().clone();
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    check(&context, &lease, &bytes, &budget)?;
+                    tree.reverify(&budget)?;
+                    let receipt =
+                        with_state_exit_receipt(context.target.paths.local(), |state, leaf| {
+                            let Some(parent) =
+                                Anchor::open(state, &context.security, true, &budget)?
+                            else {
+                                return Ok(None);
+                            };
+                            parent.read_private(
+                                &PrivateName::new(leaf)?,
+                                &context.security,
+                                crate::agent_contract::MAX_RESPONSE_BYTES,
+                                &budget,
+                            )
+                        })?;
+                    receipt
+                        .map(|(_, bytes)| {
+                            let parsed = crate::agent_contract::parse_last_exit(&bytes)
+                                .map_err(|_| NativeError::Invalid)?;
+                            if parsed.instance_id != generation.instance
+                                || parsed.stopped_unix_ms < started
+                            {
+                                return Err(NativeError::Foreign);
+                            }
+                            tree.reverify(&budget)?;
+                            budget.check()?;
+                            Ok(parsed)
+                        })
+                        .transpose()
+                })
+            }
+            pub(crate) fn executing_removal_copy(
+                &self,
+                proof: &SupportProof,
+                permit: &RemovalMutationPermit,
+                deadline: &Deadline,
+            ) -> NativeResult<Option<u8>> {
+                if !std::ptr::eq(self, permit.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                let current = self
+                    .read_removal(proof, deadline)?
+                    .ok_or(NativeError::Missing)?;
+                if current.encode()? != permit.bytes {
+                    return Err(NativeError::Foreign);
+                }
+                let module = self.self_image(proof, deadline)?;
+                let own = self.own_process_identity(proof, deadline)?;
+                let found = current
+                    .plan()
+                    .copies()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, copy)| {
+                        copy.identity() == Some(module.identity().into())
+                            && copy.image() == Some(module.facts())
+                            && copy.pid() == Some(own.pid())
+                            && copy.creation() == Some(own.creation())
+                    })
+                    .map(|(i, _)| i as u8);
+                own.reverify(deadline)?;
+                module.reverify(self, proof, deadline)?;
+                Ok(found)
+            }
+            // Original IO, lock, exact journal/index and retained exited process are independent.
+            #[allow(clippy::too_many_arguments)]
+            pub(crate) fn removal_copy_absent(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &RemovalMutationPermit,
+                index: u8,
+                exit: &super::super::super::payload::helper::removal::RemovalCopyExit,
+                deadline: &Deadline,
+            ) -> NativeResult<bool> {
+                permit.reverify(self, proof, lock, deadline)?;
+                let record = permit.document()?;
+                let id = identity(
+                    copy(&record, index)?
+                        .identity()
+                        .ok_or(NativeError::Missing)?,
+                );
+                exit.reverify(self, proof, record.operation(), index, id, deadline)?;
+                let process = exit.retained_process().clone();
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    let record = check(&context, &lease, &bytes, &budget)?;
+                    original_copy_exited(&process, &record, index, &budget)?;
+                    copy_presence(&context, &record, index, &budget)
+                })
+            }
+            #[allow(clippy::too_many_arguments)]
+            pub(crate) fn retire_removal_copy(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &RemovalMutationPermit,
+                index: u8,
+                exit: &super::super::super::payload::helper::removal::RemovalCopyExit,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                permit.reverify(self, proof, lock, deadline)?;
+                let record = permit.document()?;
+                if record.cursor() != (Cursor::CopyDeleteIntent { index }) {
+                    return Err(NativeError::Foreign);
+                }
+                let id = identity(
+                    copy(&record, index)?
+                        .identity()
+                        .ok_or(NativeError::Missing)?,
+                );
+                exit.reverify(self, proof, record.operation(), index, id, deadline)?;
+                let process = exit.retained_process().clone();
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Mutation, deadline, move || {
+                    let record = check(&context, &lease, &bytes, &budget)?;
+                    original_copy_exited(&process, &record, index, &budget)?;
+                    let Some(parent) =
+                        copy_parent(&context, record.operation(), false, &budget, &Change::new())?
+                    else {
+                        return Ok(());
+                    };
+                    let change = Change::new();
+                    change.reached();
+                    change.finish(parent.delete_removal_copy(
+                        copy(&record, index)?.kind().leaf(),
+                        id,
+                        &context.security,
+                        &budget,
+                    ))?;
+                    original_copy_exited(&process, &record, index, &budget)
+                })
+            }
+            #[allow(clippy::too_many_arguments)]
+            pub(crate) fn final_removal_copy_absent(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &RemovalMutationPermit,
+                index: u8,
+                namespace: &super::super::super::payload::helper::removal::RemovalKeeperLease,
+                deadline: &Deadline,
+            ) -> NativeResult<bool> {
+                permit.reverify(self, proof, lock, deadline)?;
+                let record = permit.document()?;
+                // FILE-only terminal observation covers every selected index, including a
+                // previously retired nonfinal copy. It asserts no original process/tree exit.
+                if !matches!(
+                    record.cursor(),
+                    Cursor::Complete { .. }
+                        | Cursor::FinalCopyCleanupIntent { .. }
+                        | Cursor::FinalCopyAbsent { .. }
+                        | Cursor::Retired
+                ) {
+                    return Err(NativeError::Foreign);
+                }
+                copy(&record, index)?;
+                namespace.reverify(self, proof, record.operation(), deadline)?;
+                let actual = namespace.retained_namespace().clone();
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    let record = check(&context, &lease, &bytes, &budget)?;
+                    namespace_held(&actual, &budget)?;
+                    copy_presence(&context, &record, index, &budget)
+                })
+            }
+            #[allow(clippy::too_many_arguments)]
+            pub(crate) fn cleanup_final_removal_copy(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &RemovalMutationPermit,
+                index: u8,
+                namespace: &super::super::super::payload::helper::removal::RemovalKeeperLease,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                permit.reverify(self, proof, lock, deadline)?;
+                let record = permit.document()?;
+                if record.cursor() != (Cursor::FinalCopyCleanupIntent { index }) {
+                    return Err(NativeError::Foreign);
+                }
+                namespace.reverify(self, proof, record.operation(), deadline)?;
+                let id = identity(
+                    copy(&record, index)?
+                        .identity()
+                        .ok_or(NativeError::Missing)?,
+                );
+                let module = self.self_image(proof, deadline)?;
+                if module.identity() == id {
+                    return Err(NativeError::Foreign);
+                }
+                drop(module);
+                let actual = namespace.retained_namespace().clone();
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Mutation, deadline, move || {
+                    let record = check(&context, &lease, &bytes, &budget)?;
+                    namespace_held(&actual, &budget)?;
+                    let Some(parent) =
+                        copy_parent(&context, record.operation(), false, &budget, &Change::new())?
+                    else {
+                        return Ok(());
+                    };
+                    // No mapped image or live copy is force-deleted: exclusive standard DELETE
+                    // must succeed naturally, otherwise this FILE-only cleanup remains retained.
+                    let change = Change::new();
+                    change.reached();
+                    change.finish(parent.delete_removal_copy(
+                        copy(&record, index)?.kind().leaf(),
+                        id,
+                        &context.security,
+                        &budget,
+                    ))?;
+                    namespace_held(&actual, &budget)
+                })
+            }
+        }
+    }
+    #[cfg(not(test))]
+    pub(crate) use removal_io::{
+        RemovalCompletionAdmission, RemovalKeeperSelection, RemovalMutationPermit,
+        RemovalPeerImage, RemovalRoot,
+    };
 
     /// File-only ended-logon authority. None of these private capabilities can be converted to
     /// RetainedTreeCompletion, UpgradeStopProof, image approval, task submission, or Run evidence.

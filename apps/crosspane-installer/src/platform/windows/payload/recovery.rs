@@ -918,6 +918,12 @@ mod native {
         proof: &SupportProof,
         deadline: &Deadline,
     ) -> NativeResult<StageCatalog> {
+        // Removal is a distinct operation: observing its unresolved selection grants no
+        // upgrade authority and cannot be disguised as an empty upgrade catalog.
+        #[cfg(not(test))]
+        super::super::super::removal::admit_upgrade_selection(
+            io.read_removal(proof, deadline)?.as_ref(),
+        )?;
         let catalog = match io.read_record(
             proof,
             RecordName::StageCatalog,

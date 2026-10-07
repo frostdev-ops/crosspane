@@ -1804,6 +1804,534 @@ pub(crate) mod native {
         deadline.check()
     }
 
+    /// Fresh rooted observations only. Neither the relative names nor FileIds are authority;
+    /// the wiring requires the actual removal journal permit and original completion separately.
+    #[cfg(not(test))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum RemovalObjectKind {
+        File,
+        Directory,
+        ReparseLink,
+    }
+    #[cfg(not(test))]
+    pub(crate) struct RemovalEntryObservation {
+        pub(crate) components: Vec<String>,
+        pub(crate) parent: FileIdentity,
+        pub(crate) identity: FileIdentity,
+        pub(crate) kind: RemovalObjectKind,
+    }
+    #[cfg(not(test))]
+    pub(crate) struct RemovalTreeObservation {
+        pub(crate) root: Option<FileIdentity>,
+        pub(crate) nodes: Vec<RemovalEntryObservation>,
+    }
+    #[cfg(not(test))]
+    fn removal_object(
+        parent: &File,
+        component: &str,
+        access: u32,
+        sharing: u32,
+        volume: u64,
+        deadline: &Deadline,
+    ) -> NativeResult<Option<OpaqueData>> {
+        let request = ComponentRequest {
+            name: ComponentName::new(component)?,
+            kind: ObjectKind::Opaque,
+            create: false,
+            dont_reparse: false,
+            open_reparse_point: true,
+        };
+        deadline.check()?;
+        let file = match (NativeComponentIo {
+            access,
+            sharing,
+            descriptor: None,
+        })
+        .submit(Some(parent), &request)
+        {
+            Ok(file) => file,
+            Err(NativeError::Missing) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let identity = raw_identity(&file)?;
+        if identity.volume != volume || name(&file)? != component {
+            return Err(NativeError::Foreign);
+        }
+        // SAFETY: read-only type query of the retained actual disk object; no device/pipe admitted.
+        if unsafe { GetFileType(file.as_raw_handle()) } != FILE_TYPE_DISK {
+            return Err(NativeError::Foreign);
+        }
+        deadline.check()?;
+        Ok(Some(OpaqueData {
+            file,
+            identity,
+            name: component.into(),
+        }))
+    }
+    #[cfg(not(test))]
+    fn removal_kind(file: &File) -> NativeResult<RemovalObjectKind> {
+        let standard: FILE_STANDARD_INFO = info(file, FileStandardInfo)?;
+        let tag: FILE_ATTRIBUTE_TAG_INFO = info(file, FileAttributeTagInfo)?;
+        Ok(if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            RemovalObjectKind::ReparseLink
+        } else if standard.Directory {
+            RemovalObjectKind::Directory
+        } else {
+            RemovalObjectKind::File
+        })
+    }
+    #[cfg(not(test))]
+    fn removal_directory(
+        parent: &File,
+        leaf: &str,
+        expected: FileIdentity,
+        deadline: &Deadline,
+    ) -> NativeResult<OpaqueData> {
+        let object = removal_object(
+            parent,
+            leaf,
+            FILE_LIST_DIRECTORY | FILE_TRAVERSE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            expected.volume,
+            deadline,
+        )?
+        .ok_or(NativeError::Missing)?;
+        if object.identity != expected
+            || removal_kind(&object.file)? != RemovalObjectKind::Directory
+        {
+            return Err(NativeError::Foreign);
+        }
+        // A genuine READ/LIST pin with no delete sharing binds this same directory while descending.
+        Ok(object)
+    }
+    #[cfg(not(test))]
+    fn removal_snapshot(
+        directory: &File,
+        parent_id: FileIdentity,
+        path: &mut Vec<String>,
+        output: &mut Vec<RemovalEntryObservation>,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        if path.len() > 32 {
+            return Err(NativeError::Oversize);
+        }
+        for component in entries(directory, deadline)? {
+            if output.len() >= 1024 {
+                return Err(NativeError::Oversize);
+            }
+            let object = removal_object(
+                directory,
+                &component,
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                parent_id.volume,
+                deadline,
+            )?
+            .ok_or(NativeError::Foreign)?;
+            let identity = object.identity;
+            let kind = removal_kind(&object.file)?;
+            path.push(component.clone());
+            if path.len() > 32 {
+                return Err(NativeError::Oversize);
+            }
+            if kind == RemovalObjectKind::Directory {
+                // Never descend a reparse entry. Reopen this exact ordinary directory with real
+                // LIST access/no delete sharing, then revalidate its FileId before recursion.
+                let pin = removal_directory(directory, &component, identity, deadline)?;
+                removal_snapshot(&pin.file, identity, path, output, deadline)?;
+            }
+            if output.len() >= 1024 {
+                return Err(NativeError::Oversize);
+            }
+            output.push(RemovalEntryObservation {
+                components: path.clone(),
+                parent: parent_id,
+                identity,
+                kind,
+            });
+            path.pop();
+        }
+        deadline.check()
+    }
+    #[cfg(not(test))]
+    impl Anchor {
+        /// Caller supplies only the genuine Shell-admitted Programs anchor. The root leaf is
+        /// literal; observations keep no install-root pin after returning, enabling final removal.
+        pub(crate) fn observe_removal_install(
+            &self,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<RemovalTreeObservation> {
+            self.revalidate(security, false, deadline)?;
+            let root = removal_object(
+                self.file()?,
+                "Crosspane",
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                self.identity()?.volume,
+                deadline,
+            )?;
+            let Some(root) = root else {
+                return Ok(RemovalTreeObservation {
+                    root: None,
+                    nodes: Vec::new(),
+                });
+            };
+            if removal_kind(&root.file)? != RemovalObjectKind::Directory {
+                return Err(NativeError::Foreign);
+            }
+            let pin = removal_directory(self.file()?, "Crosspane", root.identity, deadline)?;
+            let mut nodes = Vec::new();
+            removal_snapshot(
+                &pin.file,
+                pin.identity,
+                &mut Vec::new(),
+                &mut nodes,
+                deadline,
+            )?;
+            self.revalidate(security, false, deadline)?;
+            Ok(RemovalTreeObservation {
+                root: Some(pin.identity),
+                nodes,
+            })
+        }
+        // Independently explicit immutable root/parent/leaf identities and type are all plan facts;
+        // the native wiring supplies the distinct genuine publication/completion capabilities.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn delete_removal_node(
+            &self,
+            root: FileIdentity,
+            components: &[String],
+            ancestors: &[FileIdentity],
+            expected_parent: FileIdentity,
+            expected: FileIdentity,
+            kind: RemovalObjectKind,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.revalidate(security, false, deadline)?;
+            if components.is_empty()
+                || components.len() > 32
+                || ancestors.len() != components.len()
+                || ancestors.first() != Some(&root)
+                || root.volume != self.identity()?.volume
+                || expected.volume != root.volume
+                || expected_parent.volume != root.volume
+            {
+                return Err(NativeError::Foreign);
+            }
+            let mut pins = vec![removal_directory(
+                self.file()?,
+                "Crosspane",
+                root,
+                deadline,
+            )?];
+            for (index, component) in components[..components.len() - 1].iter().enumerate() {
+                let parent = pins.last().ok_or(NativeError::Foreign)?;
+                let child = removal_object(
+                    &parent.file,
+                    component,
+                    FILE_LIST_DIRECTORY | FILE_TRAVERSE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    root.volume,
+                    deadline,
+                )?
+                .ok_or(NativeError::Missing)?;
+                if child.identity != ancestors[index + 1]
+                    || removal_kind(&child.file)? != RemovalObjectKind::Directory
+                {
+                    return Err(NativeError::Foreign);
+                }
+                pins.push(child);
+            }
+            let parent = pins.last().ok_or(NativeError::Foreign)?;
+            if parent.identity != expected_parent {
+                return Err(NativeError::Foreign);
+            }
+            let leaf = components.last().ok_or(NativeError::Invalid)?;
+            let access = super::DELETE
+                | if kind == RemovalObjectKind::Directory {
+                    FILE_LIST_DIRECTORY
+                } else {
+                    0
+                };
+            let object = removal_object(&parent.file, leaf, access, 0, root.volume, deadline)?;
+            let Some(object) = object else { return Ok(()) }; // Only wiring's exact durable delete intent admits absence.
+            if object.identity != expected || removal_kind(&object.file)? != kind {
+                return Err(NativeError::Foreign);
+            }
+            if kind == RemovalObjectKind::Directory && !entries(&object.file, deadline)?.is_empty()
+            {
+                return Err(NativeError::Foreign);
+            }
+            let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            deadline.check()?;
+            // SAFETY: the exclusively opened same planned FileId is marked by normal disposition.
+            // Reparse entries are the link itself and are never enumerated or followed; no force flags.
+            if unsafe {
+                SetFileInformationByHandle(
+                    object.file.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            drop(object);
+            deadline.check()?;
+            if removal_object(
+                &parent.file,
+                leaf,
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                root.volume,
+                deadline,
+            )?
+            .is_some()
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            self.revalidate(security, false, deadline)
+        }
+        /// Metadata only, through the same original parent chain. An absent original ancestor
+        /// implies the selected descendant is absent; a replacement identity never does.
+        pub(crate) fn observe_removal_node(
+            &self,
+            root: FileIdentity,
+            components: &[String],
+            ancestors: &[FileIdentity],
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<Option<(FileIdentity, RemovalObjectKind)>> {
+            self.revalidate(security, false, deadline)?;
+            if components.is_empty()
+                || components.len() > 32
+                || ancestors.len() != components.len()
+                || ancestors.first() != Some(&root)
+            {
+                return Err(NativeError::Invalid);
+            }
+            let original = removal_object(
+                self.file()?,
+                "Crosspane",
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                self.identity()?.volume,
+                deadline,
+            )?;
+            let Some(original) = original else {
+                return Ok(None);
+            };
+            if original.identity != root
+                || removal_kind(&original.file)? != RemovalObjectKind::Directory
+            {
+                return Err(NativeError::Foreign);
+            }
+            let mut pins = vec![removal_directory(
+                self.file()?,
+                "Crosspane",
+                root,
+                deadline,
+            )?];
+            for (index, component) in components[..components.len() - 1].iter().enumerate() {
+                let parent = pins.last().ok_or(NativeError::Foreign)?;
+                let child = removal_object(
+                    &parent.file,
+                    component,
+                    FILE_LIST_DIRECTORY | FILE_TRAVERSE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    root.volume,
+                    deadline,
+                )?;
+                let Some(child) = child else { return Ok(None) };
+                if child.identity != ancestors[index + 1]
+                    || removal_kind(&child.file)? != RemovalObjectKind::Directory
+                {
+                    return Err(NativeError::Foreign);
+                }
+                pins.push(child);
+            }
+            let parent = pins.last().ok_or(NativeError::Foreign)?;
+            removal_object(
+                &parent.file,
+                components.last().ok_or(NativeError::Invalid)?,
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                root.volume,
+                deadline,
+            )?
+            .map(|object| Ok((object.identity, removal_kind(&object.file)?)))
+            .transpose()
+        }
+        pub(crate) fn removal_install_identity(
+            &self,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<Option<FileIdentity>> {
+            self.revalidate(security, false, deadline)?;
+            let root = removal_object(
+                self.file()?,
+                "Crosspane",
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                self.identity()?.volume,
+                deadline,
+            )?;
+            root.map(|object| {
+                if removal_kind(&object.file)? != RemovalObjectKind::Directory {
+                    return Err(NativeError::Foreign);
+                }
+                Ok(object.identity)
+            })
+            .transpose()
+        }
+        /// Exact fixed regular copy metadata; READ_CONTROL is explicit for same-handle ACL facts.
+        pub(crate) fn removal_copy_identity(
+            &self,
+            leaf: &str,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<Option<FileIdentity>> {
+            if !matches!(leaf, "helper-copy.exe" | "keeper-copy.exe") {
+                return Err(NativeError::Invalid);
+            }
+            self.revalidate(security, true, deadline)?;
+            let object = removal_object(
+                self.file()?,
+                leaf,
+                READ_CONTROL_ACCESS,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                self.identity()?.volume,
+                deadline,
+            )?;
+            object
+                .map(|object| {
+                    let facts = observe(&object.file, leaf, security)?;
+                    admit_component(&facts, Admission::PrivateFile)?;
+                    deadline.check()?;
+                    Ok(object.identity)
+                })
+                .transpose()
+        }
+        /// The caller separately proves original process exit or genuine exclusive cold namespace
+        /// absence. This primitive only deletes the literal selected regular copy FileId.
+        pub(crate) fn delete_removal_copy(
+            &self,
+            leaf: &str,
+            expected: FileIdentity,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            if !matches!(leaf, "helper-copy.exe" | "keeper-copy.exe") {
+                return Err(NativeError::Invalid);
+            }
+            self.revalidate(security, true, deadline)?;
+            // Opaque opens intentionally add no implicit READ_CONTROL. This exact copy needs
+            // owner/DACL admission on the SAME handle before normal disposition.
+            let object = removal_object(
+                self.file()?,
+                leaf,
+                super::DELETE | READ_CONTROL_ACCESS,
+                0,
+                self.identity()?.volume,
+                deadline,
+            )?;
+            let Some(object) = object else { return Ok(()) };
+            let facts = observe(&object.file, leaf, security)?;
+            admit_component(&facts, Admission::PrivateFile)?;
+            if object.identity != expected {
+                return Err(NativeError::Foreign);
+            }
+            let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            deadline.check()?;
+            // SAFETY: normal disposition on the exact exclusively opened regular copy handle;
+            // the independent caller seal prohibits executing-image cleanup and grants no bypass.
+            if unsafe {
+                SetFileInformationByHandle(
+                    object.file.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            drop(object);
+            deadline.check()?;
+            if removal_object(
+                self.file()?,
+                leaf,
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                self.identity()?.volume,
+                deadline,
+            )?
+            .is_some()
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            self.revalidate(security, true, deadline)
+        }
+        /// Requires every planned child result first. This method cannot prune the root and owns
+        /// no install-root aliases itself; it deletes only an actually empty exact root object.
+        pub(crate) fn delete_removal_install_root(
+            &self,
+            expected: FileIdentity,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.revalidate(security, false, deadline)?;
+            let root = removal_object(
+                self.file()?,
+                "Crosspane",
+                super::DELETE | FILE_LIST_DIRECTORY,
+                0,
+                self.identity()?.volume,
+                deadline,
+            )?;
+            let Some(root) = root else { return Ok(()) };
+            if root.identity != expected
+                || removal_kind(&root.file)? != RemovalObjectKind::Directory
+                || !entries(&root.file, deadline)?.is_empty()
+            {
+                return Err(NativeError::Foreign);
+            }
+            let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            deadline.check()?;
+            // SAFETY: exact empty original install-root handle, exclusive DELETE; no recursive,
+            // ADS, POSIX, reboot-pending or executing-image workaround is used.
+            if unsafe {
+                SetFileInformationByHandle(
+                    root.file.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            drop(root);
+            deadline.check()?;
+            if removal_object(
+                self.file()?,
+                "Crosspane",
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                self.identity()?.volume,
+                deadline,
+            )?
+            .is_some()
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            self.revalidate(security, false, deadline)
+        }
+    }
+
     /// Fixture-only creator ledger, not reconstructed from disk or deserialized bytes.
     #[cfg(test)]
     #[derive(Clone)]

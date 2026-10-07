@@ -354,6 +354,132 @@ mod native {
             journal(RegistrationStep::DefinitionRegistered)?;
             Ok(())
         }
+        /// Generated expectation only. SDK roundtripping does not promise that registration's
+        /// automatic author/date fields match this template. Any discrepancy is retained, never
+        /// copied from the observed task or normalized away. Native equivalence remains unproven.
+        pub(crate) fn removal_template(
+            &self,
+            desired: &Definition,
+            check: &dyn Fn() -> NativeResult<()>,
+        ) -> NativeResult<String> {
+            let definition = call!(check, self.service.NewTask(0))?;
+            let principal = call!(check, definition.Principal())?;
+            call!(
+                check,
+                principal.SetUserId(&BSTR::from(desired.principal.as_str()))
+            )?;
+            call!(check, principal.SetLogonType(TASK_LOGON_INTERACTIVE_TOKEN))?;
+            call!(check, principal.SetRunLevel(TASK_RUNLEVEL_LUA))?;
+            let triggers = call!(check, definition.Triggers())?;
+            let trigger = call!(check, triggers.Create(TASK_TRIGGER_LOGON))?;
+            let trigger: ILogonTrigger = trigger.cast().map_err(|_| NativeError::Unavailable)?;
+            call!(
+                check,
+                trigger.SetUserId(&BSTR::from(desired.trigger_user.as_str()))
+            )?;
+            let actions = call!(check, definition.Actions())?;
+            let action = call!(check, actions.Create(TASK_ACTION_EXEC))?;
+            let action: IExecAction = action.cast().map_err(|_| NativeError::Unavailable)?;
+            call!(check, action.SetPath(&BSTR::from(desired.action.as_str())))?;
+            call!(check, action.SetArguments(&BSTR::from(SUPERVISOR_ARGUMENT)))?;
+            call!(
+                check,
+                action.SetWorkingDirectory(&BSTR::from(desired.working_directory.as_str()))
+            )?;
+            let settings = call!(check, definition.Settings())?;
+            call!(
+                check,
+                settings.SetMultipleInstances(TASK_INSTANCES_IGNORE_NEW)
+            )?;
+            call!(check, settings.SetRestartCount(0))?;
+            call!(check, settings.SetAllowDemandStart(VARIANT_BOOL(-1)))?;
+            call!(check, settings.SetExecutionTimeLimit(&BSTR::from("PT0S")))?;
+            call!(check, settings.SetStopIfGoingOnBatteries(VARIANT_BOOL(0)))?;
+            call!(
+                check,
+                settings.SetDisallowStartIfOnBatteries(VARIANT_BOOL(0))
+            )?;
+            call!(check, settings.SetAllowHardTerminate(VARIANT_BOOL(0)))?;
+            call!(check, settings.SetRunOnlyIfIdle(VARIANT_BOOL(0)))?;
+            call!(
+                check,
+                settings.SetRunOnlyIfNetworkAvailable(VARIANT_BOOL(0))
+            )?;
+            call!(check, settings.SetWakeToRun(VARIANT_BOOL(0)))?;
+            call!(check, settings.SetEnabled(VARIANT_BOOL(-1)))?;
+            let information = call!(check, definition.RegistrationInfo())?;
+            call!(check, information.SetURI(&BSTR::from(TASK_NAME)))?;
+            let mut xml = BSTR::new();
+            call!(check, definition.XmlText(&mut xml))?;
+            bounded_bstr(&xml, MAX_XML_BYTES)
+        }
+        fn removal_canonical(
+            &self,
+            xml: &str,
+            check: &dyn Fn() -> NativeResult<()>,
+        ) -> NativeResult<String> {
+            if xml.is_empty() || xml.len() > MAX_XML_BYTES || xml.contains('\0') {
+                return Err(NativeError::Invalid);
+            }
+            let definition = call!(check, self.service.NewTask(0))?;
+            call!(check, definition.SetXmlText(&BSTR::from(xml)))?;
+            let mut xml = BSTR::new();
+            call!(check, definition.XmlText(&mut xml))?;
+            bounded_bstr(&xml, MAX_XML_BYTES)
+        }
+        /// Exact fixed task only. Read-only admission compares the WHOLE bounded SDK XML form;
+        /// no property subset, observed author/date copying, enumeration or path alias is accepted.
+        pub(crate) fn inspect_removal(
+            &self,
+            desired: &Definition,
+            check: &dyn Fn() -> NativeResult<()>,
+        ) -> NativeResult<(String, Option<String>)> {
+            let expected =
+                self.removal_canonical(&self.removal_template(desired, check)?, check)?;
+            let observed = self
+                .inspect(check)?
+                .map(|snapshot| self.removal_canonical(&snapshot.xml, check))
+                .transpose()?;
+            if observed.as_deref().is_some_and(|xml| xml != expected) {
+                return Err(NativeError::Foreign);
+            }
+            check()?;
+            Ok((expected, observed))
+        }
+        /// Intent and genuine completed-tree admission precede entry. The public SDK has no
+        /// compare-and-delete: fresh whole XML equality is adjacent to DeleteTask, then fixed
+        /// absence is checked. Concurrent task edits/unknown outcomes are conservatively retained.
+        pub(crate) fn delete_removal(
+            &self,
+            desired: &Definition,
+            expected: &str,
+            check: &dyn Fn() -> NativeResult<()>,
+            effect: &dyn Fn(),
+        ) -> NativeResult<()> {
+            let (fresh, observed) = self.inspect_removal(desired, check)?;
+            if fresh != expected {
+                return Err(NativeError::Foreign);
+            }
+            if observed.is_none() {
+                return Ok(());
+            }
+            let folder = self.folder.as_ref().ok_or(NativeError::Foreign)?;
+            check()?;
+            // Record may-have-mutated immediately before the actual COM deletion dispatch.
+            effect();
+            // SAFETY: exact fixed task name after fresh whole-XML admission on this owned MTA.
+            // DeleteTask offers no atomic expected-XML argument; flags 0 never widen the target.
+            unsafe { folder.DeleteTask(&BSTR::from("Agent"), 0) }
+                .map_err(|_| NativeError::OutcomeUnknown)?;
+            check()?;
+            // SAFETY: read-only fixed leaf absence check on the same MTA, no folder enumeration.
+            let observed = unsafe { folder.GetTask(&BSTR::from("Agent")) };
+            check()?;
+            match observed {
+                Err(error) if missing(&error) => Ok(()),
+                _ => Err(NativeError::OutcomeUnknown),
+            }
+        }
         pub(crate) fn run(
             &self,
             check: &dyn Fn() -> NativeResult<()>,
