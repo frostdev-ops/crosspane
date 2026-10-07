@@ -110,7 +110,14 @@ pub fn run(payload: Option<PathBuf>) -> anyhow::Result<()> {
     crate::platform::linux::integration::diagnose(payload.as_deref(), &mut report);
     #[cfg(target_os = "macos")]
     crate::platform::macos::integration::diagnose(payload.as_deref(), &mut report);
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(all(windows, not(test)))]
+    crate::platform::windows::integration::diagnose::run(payload.as_deref(), &mut report);
+    #[cfg(all(windows, test))]
+    {
+        let _ = payload;
+        report.unavailable_target();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = payload;
         report.unavailable_target();

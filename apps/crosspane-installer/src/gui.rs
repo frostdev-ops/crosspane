@@ -89,7 +89,7 @@ pub struct ReviewOptions {
     /// Demo only: close our window after 1–8000 ms; a stalled close exits nonzero within 9 s.
     #[arg(long, value_name = "MS")]
     pub exit_after_ms: Option<u64>,
-    /// Linux production: directory holding `payload.tar` and `payload.sha256`.
+    /// Explicit payload folder: Linux archive/checksum, or Windows Agent/UI/Ctl readers.
     #[arg(long, value_name = "DIR")]
     pub payload: Option<PathBuf>,
 }
@@ -410,8 +410,7 @@ fn production_controller(
     }
     #[cfg(windows)]
     {
-        ensure!(payload.is_none(), "--payload is only supported on Linux");
-        crate::platform::windows::open()
+        crate::platform::windows::integration::open(payload)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
@@ -662,6 +661,13 @@ impl eframe::App for InstallerGui {
         }
         if let Some(deadline) = self.demo_deadline {
             ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
+        }
+        #[cfg(windows)]
+        if crate::platform::windows::integration::take_parent_exit() {
+            // Only the worker's actual committed handoff admits an automatic own-viewport exit.
+            self.controller.close();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
         }
         // A window-manager close during a running change is refused, so the change is never cut
         // short by the process exiting; the view explains why.

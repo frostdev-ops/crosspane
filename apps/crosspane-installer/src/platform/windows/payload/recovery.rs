@@ -1041,6 +1041,27 @@ mod native {
         }
         absence.reverify(io, proof, lock, deadline)
     }
+    /// Archive only the exact terminal outer selection after positive copy absence.
+    /// The existing a6 port owns the lock, intent, metadata move and bounded evidence.
+    #[cfg(not(test))]
+    pub(crate) fn settle_completed_outer_history(
+        io: &Arc<WindowsNativeIo>,
+        proof: &SupportProof,
+        lock: InstallerLock,
+        absence: &super::super::super::native_io::keeper::KeeperCopyAbsent,
+        deadline: &Deadline,
+    ) -> NativeResult<bool> {
+        retire_outer_terminal(io, proof, &lock, absence, deadline)?;
+        let current = io
+            .read_record(
+                proof,
+                RecordName::OuterUpgrade,
+                super::super::super::native_io::files::MAX_RECORD_BYTES,
+                deadline,
+            )?
+            .ok_or(NativeError::Foreign)?;
+        io.archive_settled_outer_history(proof, lock, absence, current.bytes().to_vec(), deadline)
+    }
     pub(crate) fn save_operation(
         io: Arc<WindowsNativeIo>,
         proof: &SupportProof,
@@ -1154,12 +1175,12 @@ mod native {
         })
     }
 }
-#[cfg(all(windows, not(test)))]
-pub(crate) use native::retire_outer_terminal;
 #[cfg(windows)]
 pub(crate) use native::{
     MutationPermit, active_helper_operation, catalog, save_operation, selected_operation,
 };
+#[cfg(all(windows, not(test)))]
+pub(crate) use native::{retire_outer_terminal, settle_completed_outer_history};
 
 #[cfg(windows)]
 #[allow(dead_code)] // The frozen borrowed helper API stays available but cannot release a caller's lock.

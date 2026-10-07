@@ -1,6 +1,9 @@
 //! Limited-token Windows foundation and an unavailable wizard port. The shell port owns no
 //! install, agent, task or payload capability.
 pub mod detect;
+#[cfg(windows)]
+#[cfg_attr(test, allow(dead_code, unused_imports))]
+pub(crate) mod integration;
 pub mod native_io;
 pub(crate) mod payload;
 // Native removal consumers are excluded from the library unit-test graph; integration fakes include this new graph.
@@ -106,15 +109,5 @@ pub fn open() -> anyhow::Result<(
     eframe::egui::FontDefinitions,
     Box<dyn crate::gui::InstallerController>,
 )> {
-    use anyhow::Context;
-    let root =
-        std::env::var_os("SystemRoot").context("Windows system font location is unavailable")?;
-    let font = std::path::PathBuf::from(root)
-        .join("Fonts")
-        .join("segoeui.ttf");
-    let fonts = crate::gui::load_review_font(&font)?;
-    let started = std::time::Instant::now();
-    let clock =
-        std::sync::Arc::new(move || started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
-    Ok((fonts, unavailable(clock)?))
+    integration::open(None)
 }

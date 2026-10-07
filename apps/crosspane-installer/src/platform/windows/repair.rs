@@ -226,6 +226,20 @@ pub(crate) struct RepairPlan {
     archives: Vec<SourceSnapshot>,
 }
 impl RepairPlan {
+    /// Metadata correlation only. Native settlement must separately admit the actual
+    /// terminal source, lock and keeper-copy absence before this plan can be used.
+    #[cfg(all(windows, not(test)))]
+    pub(crate) fn outer_history(source: SourceSnapshot) -> NativeResult<Self> {
+        if source.kind() != SourceKind::OuterUpgrade {
+            return Err(NativeError::Foreign);
+        }
+        let plan = Self {
+            task_xml: None,
+            archives: vec![source],
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
     pub(crate) fn task_xml(&self) -> Option<&str> {
         self.task_xml.as_deref()
     }

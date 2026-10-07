@@ -4588,6 +4588,14 @@ mod adapter {
                 result
             }
             fn namespace(&mut self, source: &SourceSnapshot) -> NativeResult<Arc<Namespace>> {
+                if let Some(namespace) = self.selection.archive_namespace() {
+                    if source.kind() != SourceKind::OuterUpgrade {
+                        return Err(NativeError::Foreign);
+                    }
+                    let proof = self.io.admit_support(&self.deadline)?;
+                    namespace.reverify(&self.io, &proof, &self.deadline)?;
+                    return Ok(Arc::new(Namespace::Keeper(namespace)));
+                }
                 let cell = if source.kind() == SourceKind::Removal {
                     &mut self.removal
                 } else {
@@ -4981,6 +4989,156 @@ mod adapter {
                 NativeRepairPort::new(io, lock, selection, record, deadline)?.run(deadline)
             }
         }
+        impl WindowsNativeIo {
+            /// Read-only correlation for integration's capacity deferral. The old a6
+            /// classifier stays unchanged; these facts authorize no native effect.
+            pub(crate) fn repair_capacity_only(
+                &self,
+                proof: &SupportProof,
+                observed: &[JournalObservation],
+                deadline: &Deadline,
+            ) -> NativeResult<bool> {
+                let ctx = self.context.clone();
+                let budget = proof.budget(self, deadline)?;
+                let observed = observed.to_vec();
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    ctx.validate(&budget)?;
+                    let parent =
+                        Anchor::open(ctx.target.paths.installer(), &ctx.security, true, &budget)?
+                            .ok_or(NativeError::Missing)?;
+                    clean_publication(&parent, &ctx, &budget)?;
+                    let evidence = index(&parent, &ctx, &budget)?;
+                    verify_evidence(&parent, &ctx, &evidence, &budget)?;
+                    let (_, bytes) = read(&parent, &ctx, records::RecordName::Repair, &budget)?
+                        .ok_or(NativeError::Foreign)?;
+                    let record = RepairRecord::decode(&bytes)?;
+                    record.context().same_user(&ctx.target.identity)?;
+                    if record.cursor() != RepairCursor::Complete {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    if record.slot().is_some() {
+                        check_slot(&parent, &ctx, &record, &budget)?;
+                    }
+                    if (0..3).any(|slot| evidence.get(slot).is_none()) {
+                        return Ok(false);
+                    }
+                    let mut terminal = false;
+                    for kind in [
+                        SourceKind::OuterUpgrade,
+                        SourceKind::FileRecovery,
+                        SourceKind::Removal,
+                    ] {
+                        let current = match read(&parent, &ctx, source_name(kind), &budget)? {
+                            None => JournalObservation::Absent(kind),
+                            Some((id, bytes)) => {
+                                let document =
+                                    terminal_document(&parent, &ctx, kind, &bytes, &budget)?;
+                                terminal = true;
+                                JournalObservation::Terminal(snapshot(
+                                    kind,
+                                    source_operation(&document),
+                                    id,
+                                    &bytes,
+                                )?)
+                            }
+                        };
+                        if observed.iter().find(|j| j.kind() == kind) != Some(&current) {
+                            return Err(NativeError::Foreign);
+                        }
+                    }
+                    budget.check()?;
+                    Ok(terminal)
+                })
+            }
+            /// Explicit settlement only: consume the real lock and retain the original
+            /// vacant namespace. No payload health, image pin or task authority is minted.
+            pub(crate) fn archive_settled_outer_history(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: InstallerLock,
+                absence: &keeper::KeeperCopyAbsent,
+                expected: Vec<u8>,
+                deadline: &Deadline,
+            ) -> NativeResult<bool> {
+                self.lock_binding(proof, &lock, deadline)?;
+                self.refuse_unsettled_repair(proof, &lock, deadline)?;
+                self.refuse_unsettled_payload_repair(proof, &lock, deadline)?;
+                let namespace = absence.archive_namespace(self, proof, &lock, deadline)?;
+                let ctx = self.context.clone();
+                let lease = lock.0.clone();
+                let budget = proof.budget(self, deadline)?;
+                let archive_operation = nonce()?;
+                let source_operation_id = absence.operation();
+                let (source, capacity) =
+                    self.owner.run(Dispatch::Observation, deadline, move || {
+                        validate_payload_lock(&ctx, &lease, &budget)?;
+                        clean_publication(&lease.parent, &ctx, &budget)?;
+                        let mut evidence = index(&lease.parent, &ctx, &budget)?;
+                        verify_evidence(&lease.parent, &ctx, &evidence, &budget)?;
+                        let (id, bytes) = read(
+                            &lease.parent,
+                            &ctx,
+                            records::RecordName::OuterUpgrade,
+                            &budget,
+                        )?
+                        .ok_or(NativeError::Foreign)?;
+                        if bytes != expected {
+                            return Err(NativeError::Foreign);
+                        }
+                        let document = terminal_document(
+                            &lease.parent,
+                            &ctx,
+                            SourceKind::OuterUpgrade,
+                            &bytes,
+                            &budget,
+                        )?;
+                        if source_operation(&document) != source_operation_id {
+                            return Err(NativeError::Foreign);
+                        }
+                        // An unrelated active or uncertain selection cannot be bypassed even
+                        // when capacity is exhausted. Terminal evidence is never evicted.
+                        for kind in [SourceKind::FileRecovery, SourceKind::Removal] {
+                            if let Some((_, bytes)) =
+                                read(&lease.parent, &ctx, source_name(kind), &budget)?
+                            {
+                                terminal_document(&lease.parent, &ctx, kind, &bytes, &budget)?;
+                            }
+                        }
+                        let source =
+                            snapshot(SourceKind::OuterUpgrade, source_operation_id, id, &bytes)?;
+                        let capacity = match evidence
+                            .reserve(archive_operation, std::slice::from_ref(&source))
+                        {
+                            Ok(_) => true,
+                            // Only this pure, positively observed capacity refusal is deferred.
+                            // No selection, intent, index or archive write has occurred.
+                            Err(NativeError::Busy) => false,
+                            Err(error) => return Err(error),
+                        };
+                        budget.check()?;
+                        Ok((source, capacity))
+                    })?;
+                if !capacity {
+                    return Ok(false);
+                }
+                let plan = repair::RepairPlan::outer_history(source)?;
+                let selection =
+                    RepairSelection::outer_history(self.clone(), plan.clone(), namespace)?;
+                let record = RepairRecord::new(
+                    archive_operation,
+                    recovery::OuterContextCorrelation::new(self.target().identity())?,
+                    plan,
+                    None,
+                )?;
+                let outcome =
+                    NativeRepairPort::new(self.clone(), lock, selection, record, deadline)?
+                        .run(deadline)?;
+                if outcome != RepairOutcome::Repaired {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                Ok(true)
+            }
+        }
     }
     // A6 diagnostic/task-only region. No old constructor, Stop, keeper or payload mutation.
     #[cfg(not(test))]
@@ -5354,10 +5512,49 @@ mod adapter {
         pub(crate) struct RepairSelection {
             io: Arc<WindowsNativeIo>,
             plan: RepairPlan,
-            images: Arc<RepairImages>,
-            agent: Arc<RepairAgent>,
+            authority: RepairAuthority,
+        }
+        enum RepairAuthority {
+            Full {
+                images: Arc<RepairImages>,
+                agent: Arc<RepairAgent>,
+            },
+            OuterHistory(Arc<keeper::RepairNamespaceHold>),
         }
         impl RepairSelection {
+            // Sole caller is the lock-owning settlement bridge after genuine absence
+            // admission and exact terminal-byte selection. Never deserialized.
+            pub(super) fn outer_history(
+                io: Arc<WindowsNativeIo>,
+                plan: RepairPlan,
+                namespace: Arc<keeper::RepairNamespaceHold>,
+            ) -> NativeResult<Arc<Self>> {
+                plan.validate()?;
+                if plan.task_xml().is_some()
+                    || plan.archives().len() != 1
+                    || plan.archives()[0].kind()
+                        != super::super::super::repair::SourceKind::OuterUpgrade
+                {
+                    return Err(NativeError::Foreign);
+                }
+                Ok(Arc::new(Self {
+                    io,
+                    plan,
+                    authority: RepairAuthority::OuterHistory(namespace),
+                }))
+            }
+            fn full_images(&self) -> NativeResult<&Arc<RepairImages>> {
+                match &self.authority {
+                    RepairAuthority::Full { images, .. } => Ok(images),
+                    RepairAuthority::OuterHistory(_) => Err(NativeError::Foreign),
+                }
+            }
+            pub(super) fn archive_namespace(&self) -> Option<Arc<keeper::RepairNamespaceHold>> {
+                match &self.authority {
+                    RepairAuthority::OuterHistory(namespace) => Some(namespace.clone()),
+                    RepairAuthority::Full { .. } => None,
+                }
+            }
             pub(crate) fn plan(&self) -> &RepairPlan {
                 &self.plan
             }
@@ -5378,14 +5575,25 @@ mod adapter {
                 io.owner.run(Dispatch::Observation, deadline, move || {
                     validate_payload_lock(&context, &lease, &budget)
                 })?;
-                self.images.check(io, deadline)?;
-                self.agent.check(&self.io, &self.images, deadline)
+                match &self.authority {
+                    RepairAuthority::Full { images, agent } => {
+                        images.check(io, deadline)?;
+                        agent.check(&self.io, images, deadline)
+                    }
+                    // Source renewals now belong to the unchanged archive permit and
+                    // terminal driver, including after the source has moved. Retain the
+                    // original kernel namespace rather than reacquiring it by name.
+                    RepairAuthority::OuterHistory(namespace) => {
+                        namespace.reverify(io, proof, deadline)
+                    }
+                }
             }
         }
         /// Retains the actual current lock/pins/record before the separate MTA mutation dispatch.
         /// This is not Clone/Deserialize, nor a capability constructible from diagnostic facts.
         pub(crate) struct RepairTaskBinding {
             selection: Arc<RepairSelection>,
+            images: Arc<RepairImages>,
             lease: Arc<LockState>,
             permit: Arc<super::repair_archive::RepairMutationPermit>,
             change: Change,
@@ -5393,6 +5601,7 @@ mod adapter {
         impl RepairTaskBinding {
             pub(crate) fn check(&self, deadline: &Deadline) -> NativeResult<()> {
                 let io = &self.selection.io;
+                self.selection.full_images()?;
                 let proof = io.admit_support(deadline)?;
                 let lock = InstallerLock(self.lease.clone());
                 self.selection.reverify(io, &proof, &lock, deadline)?;
@@ -5407,7 +5616,7 @@ mod adapter {
                 deadline.check()
             }
             pub(crate) fn desired(&self) -> &Definition {
-                &self.selection.images.definition
+                &self.images.definition
             }
             pub(crate) fn task_xml(&self) -> NativeResult<&str> {
                 self.selection.plan.task_xml().ok_or(NativeError::Foreign)
@@ -5487,8 +5696,10 @@ mod adapter {
                 let selected = Arc::new(RepairSelection {
                     io: self.clone(),
                     plan: plan.clone(),
-                    images: actual.images.ok_or(NativeError::Foreign)?,
-                    agent: actual.agent.ok_or(NativeError::Foreign)?,
+                    authority: RepairAuthority::Full {
+                        images: actual.images.ok_or(NativeError::Foreign)?,
+                        agent: actual.agent.ok_or(NativeError::Foreign)?,
+                    },
                 });
                 let proof = self.admit_support(deadline)?;
                 selected.reverify(self, &proof, lock, deadline)?;
@@ -5504,7 +5715,7 @@ mod adapter {
                 selection.reverify(self, proof, lock, deadline)?;
                 super::super::super::service::task::repair_probe(
                     selection.io.clone(),
-                    selection.images.definition.clone(),
+                    selection.full_images()?.definition.clone(),
                     deadline,
                 )
             }
@@ -5520,6 +5731,7 @@ mod adapter {
                 permit.reverify(self, proof, lock, selection, deadline)?;
                 let binding = Arc::new(RepairTaskBinding {
                     selection: selection.clone(),
+                    images: selection.full_images()?.clone(),
                     lease: lock.0.clone(),
                     permit: permit.clone(),
                     change: Change::new(),
@@ -6758,6 +6970,8 @@ mod adapter {
                 resume_attempted: bool,
                 ready_attempted: bool,
                 commit_attempted: bool,
+                // Positive reply to this child's exact authenticated Commit, not an attempt bit.
+                commit_confirmed: bool,
                 workers: Vec<std::thread::JoinHandle<()>>,
             }
             struct LaunchOwner {
@@ -7323,7 +7537,20 @@ mod adapter {
                     if self.exchange(Method::Commit, None, budget)? != State::Committed {
                         return Err(NativeError::OutcomeUnknown);
                     }
+                    self.owner
+                        .state
+                        .lock()
+                        .map_err(|_| NativeError::OutcomeUnknown)?
+                        .commit_confirmed = true;
                     Ok(())
+                }
+                pub(crate) fn committed_here(&self) -> NativeResult<bool> {
+                    Ok(self
+                        .owner
+                        .state
+                        .lock()
+                        .map_err(|_| NativeError::OutcomeUnknown)?
+                        .commit_confirmed)
                 }
                 pub(crate) fn status(&self, budget: &Deadline) -> NativeResult<State> {
                     self.exchange(Method::Status, None, budget)
@@ -14782,6 +15009,18 @@ mod adapter {
             identity: Option<FileIdentity>,
         }
         impl KeeperCopyAbsent {
+            // Transfer only a hold on the already-owned first-instance object. The
+            // archive terminal/permit renews the exact metadata after selection.
+            pub(super) fn archive_namespace(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<Arc<RepairNamespaceHold>> {
+                self.reverify(io, proof, lock, deadline)?;
+                Ok(Arc::new(RepairNamespaceHold(self.namespace.clone())))
+            }
             pub(crate) fn operation(&self) -> [u8; 16] {
                 self.operation
             }
@@ -15303,6 +15542,8 @@ mod adapter {
         pub struct KeeperContinuation {
             io: Arc<WindowsNativeIo>,
             operation: [u8; 16],
+            // Set only by the existing authenticated Commit exchange, never by admit/records.
+            committed_here: bool,
         }
         impl std::fmt::Debug for KeeperContinuation {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -15421,10 +15662,30 @@ mod adapter {
                 Ok(KeeperContinuation {
                     io: self.child.0.io.clone(),
                     operation: op,
+                    committed_here: true,
                 })
             }
         }
         impl KeeperContinuation {
+            pub(crate) fn integration_handoff(
+                &self,
+                deadline: &Deadline,
+            ) -> NativeResult<super::super::super::service::IntegrationHandoff> {
+                use super::super::super::integration::domains::CommitObservation;
+                Ok(super::super::super::service::integration_observe_handoff(
+                    self.committed_here,
+                    deadline,
+                    |slice| {
+                        self.observe(slice).map(|observed| match observed.stage {
+                            KeeperStage::Committed => CommitObservation::Committed,
+                            KeeperStage::Complete => CommitObservation::Complete,
+                            KeeperStage::Retained => CommitObservation::Retained,
+                            KeeperStage::Ready | KeeperStage::Preparing => CommitObservation::Ready,
+                            _ => CommitObservation::Refused,
+                        })
+                    },
+                ))
+            }
             /// Read-only authenticated observation of the retained keeper. No replay or native
             /// authority is returned; caller loss never cancels a committed operation.
             pub fn status(&self) -> NativeResult<&'static str> {
@@ -15454,6 +15715,7 @@ mod adapter {
                 let value = Self {
                     io,
                     operation: selected.operation(),
+                    committed_here: false,
                 };
                 value.observe(deadline)?;
                 Ok(value)

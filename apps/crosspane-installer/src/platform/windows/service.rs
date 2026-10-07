@@ -1371,6 +1371,156 @@ mod keeper_runtime {
     }
 }
 
+/// Private integration observations; no wire/schema or native authority is added.
+#[cfg(all(windows, not(test)))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IntegrationHandoff {
+    NotCommitted,
+    Committed,
+    Complete,
+    Unknown,
+}
+
+#[cfg(all(windows, not(test)))]
+pub(crate) fn integration_observe_handoff(
+    local_commit: bool,
+    deadline: &super::native_io::Deadline,
+    mut observe: impl FnMut(
+        &super::native_io::Deadline,
+    ) -> NativeResult<super::integration::domains::CommitObservation>,
+) -> IntegrationHandoff {
+    use super::integration::domains::{CommitObservation, Handoff, await_committed_handoff};
+    let result = await_committed_handoff(
+        local_commit,
+        || {
+            let slice = match deadline.shorten(5_000) {
+                Ok(slice) => slice,
+                Err(_) => return CommitObservation::Refused,
+            };
+            match observe(&slice) {
+                Ok(observed) => observed,
+                Err(NativeError::Timeout) => CommitObservation::NoAnswer,
+                Err(_) => CommitObservation::Refused,
+            }
+        },
+        || deadline.check().is_ok(),
+        || std::thread::sleep(std::time::Duration::from_millis(20)),
+    );
+    match result {
+        Handoff::NotCommitted => IntegrationHandoff::NotCommitted,
+        Handoff::Committed => IntegrationHandoff::Committed,
+        Handoff::Complete => IntegrationHandoff::Complete,
+        Handoff::Unknown => IntegrationHandoff::Unknown,
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+pub(crate) fn settle_operation_artifacts(
+    _kind: super::integration::domains::Operation,
+    deadline: &super::native_io::Deadline,
+) -> NativeResult<bool> {
+    use super::integration::domains::{ArtifactSettlement, RepairArtifact, settle_artifacts};
+    use super::native_io::{InstallerLock, WindowsNativeIo};
+    use super::payload::recovery::{OuterPhase, OuterUpgradeRecord};
+    use super::repair::payload_record::PayloadRepairPhase;
+    use std::sync::Arc;
+    let io = Arc::new(WindowsNativeIo::current(
+        Arc::new(super::native_io::MonotonicClock::default()),
+        deadline,
+    )?);
+    let proof = io.admit_support(deadline)?;
+    let outer = OuterUpgradeRecord::read(&io, &proof, deadline)?;
+    let repair = io.read_payload_repair(&proof, deadline)?;
+    let outer_work = outer
+        .as_ref()
+        .is_some_and(|r| matches!(r.phase(), OuterPhase::Complete | OuterPhase::Cancelled));
+    let repair_work = if repair
+        .as_ref()
+        .is_some_and(|r| r.phase() == PayloadRepairPhase::Complete)
+    {
+        RepairArtifact::Complete
+    } else {
+        RepairArtifact::RetiredOrAbsent
+    };
+    struct Settlement<'a> {
+        io: Arc<WindowsNativeIo>,
+        lock: Option<InstallerLock>,
+        deadline: &'a super::native_io::Deadline,
+    }
+    impl Settlement<'_> {
+        fn lock(&mut self) -> NativeResult<&InstallerLock> {
+            if self.lock.is_none() {
+                let proof = self.io.admit_support(self.deadline)?;
+                self.lock = Some(self.io.acquire_installer_lock(&proof, self.deadline)?);
+            }
+            self.lock.as_ref().ok_or(NativeError::Foreign)
+        }
+    }
+    impl ArtifactSettlement for Settlement<'_> {
+        type Error = NativeError;
+        fn retire_repair_copy(&mut self) -> NativeResult<()> {
+            self.lock()?;
+            let proof = self.io.admit_support(self.deadline)?;
+            self.io.retire_settled_repair_copy(
+                &proof,
+                self.lock.as_ref().ok_or(NativeError::Foreign)?,
+                self.deadline,
+            )
+        }
+        fn settle_outer_history(&mut self) -> NativeResult<()> {
+            self.lock()?;
+            let proof = self.io.admit_support(self.deadline)?;
+            let absent = self.io.cleanup_cold_keeper(
+                &proof,
+                self.lock.as_ref().ok_or(NativeError::Foreign)?,
+                self.deadline,
+            )?;
+            let proof = self.io.admit_support(self.deadline)?;
+            let _archived = super::payload::recovery::settle_completed_outer_history(
+                &self.io,
+                &proof,
+                self.lock.take().ok_or(NativeError::Foreign)?,
+                &absent,
+                self.deadline,
+            )?;
+            // A full evidence index deferred archival before writes; the copy is
+            // settled and the next begin_* must still perform its own admission.
+            Ok(())
+        }
+    }
+    // Classifier Report about current payload/agent/task health cannot block this
+    // archive-only bridge. The next begin_* retains all its original admission.
+    settle_artifacts(
+        outer_work,
+        repair_work,
+        &mut Settlement {
+            io,
+            lock: None,
+            deadline,
+        },
+    )
+}
+
+#[cfg(all(windows, not(test)))]
+pub(crate) fn integration_metadata_repair(
+    deadline: &super::native_io::Deadline,
+) -> NativeResult<bool> {
+    use super::native_io::WindowsNativeIo;
+    use super::repair::{RepairDecision, RepairOutcome};
+    let probe = WindowsNativeIo::probe_repair(
+        std::sync::Arc::new(super::native_io::MonotonicClock::default()),
+        deadline,
+    )?;
+    match super::repair::classify(probe.observation())? {
+        RepairDecision::Healthy => Ok(true),
+        RepairDecision::Report(_) => Err(NativeError::Unsupported),
+        RepairDecision::Apply(plan) => match probe.apply(&plan, deadline)? {
+            RepairOutcome::Healthy | RepairOutcome::Repaired => Ok(true),
+            _ => Err(NativeError::OutcomeUnknown),
+        },
+    }
+}
+
 /// An opaque actual keeper observer; it confers no native/image approval.
 #[cfg(all(windows, not(test)))]
 #[doc(hidden)]
@@ -1467,6 +1617,13 @@ impl std::fmt::Debug for RemovalContinuation {
     }
 }
 impl RemovalContinuation {
+    #[cfg(all(windows, not(test)))]
+    pub(crate) fn integration_handoff(
+        &self,
+        deadline: &super::native_io::Deadline,
+    ) -> NativeResult<IntegrationHandoff> {
+        self.state.integration_handoff(deadline)
+    }
     /// Bounded genuine same-owner observation; this method never submits Stop, erase or deletion.
     pub fn status(&self) -> NativeResult<&'static str> {
         #[cfg(all(windows, not(test)))]
@@ -1509,6 +1666,30 @@ impl std::fmt::Debug for RepairContinuation {
     }
 }
 impl RepairContinuation {
+    #[cfg(all(windows, not(test)))]
+    pub(crate) fn integration_handoff(
+        &self,
+        deadline: &super::native_io::Deadline,
+    ) -> NativeResult<IntegrationHandoff> {
+        use super::native_io::payload_repair_keeper::State;
+        let Some(child) = &self.child else {
+            return Ok(IntegrationHandoff::NotCommitted);
+        };
+        use super::integration::domains::CommitObservation;
+        Ok(integration_observe_handoff(
+            child.committed_here()?,
+            deadline,
+            |slice| {
+                child.status(slice).map(|state| match state {
+                    State::Committed => CommitObservation::Committed,
+                    State::Complete => CommitObservation::Complete,
+                    State::Retained => CommitObservation::Retained,
+                    State::Ready => CommitObservation::Ready,
+                    _ => CommitObservation::Refused,
+                })
+            },
+        ))
+    }
     pub fn status(&self) -> NativeResult<&'static str> {
         #[cfg(all(windows, not(test)))]
         if let Some(child) = &self.child {
@@ -2975,6 +3156,29 @@ mod removal_native {
         terminal: &'static str,
     }
     impl ContinuationState {
+        pub(super) fn integration_handoff(
+            &self,
+            deadline: &Deadline,
+        ) -> NativeResult<super::IntegrationHandoff> {
+            let Some(live) = &self.live else {
+                return Ok(super::IntegrationHandoff::NotCommitted);
+            };
+            let live = live.try_lock().map_err(|_| NativeError::OutcomeUnknown)?;
+            let (control, _) = &*live;
+            if !control.committed() {
+                return Ok(super::IntegrationHandoff::NotCommitted);
+            }
+            let state = control.child()?.exchange(ControlMethod::Status, deadline)?;
+            Ok(match state {
+                // A fresh Status before atomic transfer is Ready. Retained Status is
+                // served only by poll_status, whose server checks its actual committed cap.
+                ControlState::Committed | ControlState::Retained => {
+                    super::IntegrationHandoff::Committed
+                }
+                ControlState::Complete => super::IntegrationHandoff::Complete,
+                _ => super::IntegrationHandoff::Unknown,
+            })
+        }
         pub(super) fn status(&self) -> NativeResult<&'static str> {
             let Some(live) = &self.live else {
                 return Ok(self.terminal);
