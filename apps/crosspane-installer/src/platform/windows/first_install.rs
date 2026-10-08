@@ -204,3 +204,23 @@ pub(crate) fn retry_busy<T>(
         }
     }
 }
+
+/// Routing of decoded observations only; all native absence is independently renewed.
+pub(crate) fn recovery_mode_allowed(
+    source: &record::FirstInstallRecord,
+    mode: record::FirstRecoveryMode,
+) -> super::native_io::NativeResult<()> {
+    use record::{FirstRecoveryMode as M, Phase as P};
+    source.validate()?;
+    match mode {
+        M::Rollback | M::Remove if source.phase().rank() < P::RunIntent.rank() => Ok(()),
+        M::Supersede | M::RetireStale
+            if source.phase().rank() >= P::RunIntent.rank()
+                && source.phase().rank() < P::Complete.rank()
+                && source.phase() != P::Unknown =>
+        {
+            Ok(())
+        }
+        _ => Err(super::native_io::NativeError::OutcomeUnknown),
+    }
+}

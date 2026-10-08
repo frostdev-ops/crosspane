@@ -683,3 +683,880 @@ fn installer_lock_busy_retries_only_within_the_original_deadline() {
     );
     assert_eq!(attempts, 1);
 }
+
+#[derive(Clone)]
+struct HistoryFake {
+    source: Vec<Option<HistoryObservation>>,
+    destination: Vec<Option<HistoryObservation>>,
+    saved: Option<FirstHistoryIntent>,
+    index: FirstHistoryIndex,
+    effects: usize,
+    cut: Option<usize>,
+}
+impl FirstHistoryPort for HistoryFake {
+    fn renew(&mut self, intent: &FirstHistoryIntent) -> NativeResult<()> {
+        intent.validate()
+    }
+    fn persist_intent(&mut self, intent: &FirstHistoryIntent) -> NativeResult<()> {
+        self.saved = Some(intent.clone());
+        Ok(())
+    }
+    fn observe_pair(
+        &mut self,
+        intent: &FirstHistoryIntent,
+        leaf: &HistoryLeaf,
+    ) -> NativeResult<(Option<HistoryObservation>, Option<HistoryObservation>)> {
+        let n = intent
+            .selected
+            .leaves
+            .iter()
+            .position(|old| old.leaf == leaf.leaf)
+            .ok_or(NativeError::Foreign)?;
+        Ok((self.source[n].clone(), self.destination[n].clone()))
+    }
+    fn move_exact(&mut self, intent: &FirstHistoryIntent, leaf: &HistoryLeaf) -> NativeResult<()> {
+        let n = intent
+            .selected
+            .leaves
+            .iter()
+            .position(|old| old.leaf == leaf.leaf)
+            .ok_or(NativeError::Foreign)?;
+        self.destination[n] = self.source[n].take();
+        self.effects += 1;
+        if self.cut == Some(self.effects) {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        Ok(())
+    }
+    fn persist_index(&mut self, index: &FirstHistoryIndex) -> NativeResult<()> {
+        self.index = index.clone();
+        Ok(())
+    }
+}
+fn history_fixture() -> (HistoryFake, FirstHistoryIntent) {
+    let source = [
+        "supervisor.json",
+        "task-activation.json",
+        "supervisor-logon.json",
+        "removal.json",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(n, name)| {
+        let id = FileStamp {
+            volume: 1,
+            file: [n as u8 + 10; 16],
+        };
+        let bytes = name.as_bytes().to_vec();
+        (
+            HistoryLeaf::observe(name.into(), id, &bytes).unwrap(),
+            (id, bytes),
+        )
+    })
+    .collect::<Vec<_>>();
+    let index = FirstHistoryIndex::default();
+    let intent = index
+        .select(FirstHistorySlot {
+            source: FirstHistorySource::Removal,
+            operation: [1; 16],
+            next_operation: [2; 16],
+            context: vec![1],
+            leaves: source.iter().map(|(leaf, _)| leaf.clone()).collect(),
+        })
+        .unwrap();
+    (
+        HistoryFake {
+            destination: vec![None; source.len()],
+            source: source.into_iter().map(|(_, bytes)| Some(bytes)).collect(),
+            saved: None,
+            index,
+            effects: 0,
+            cut: None,
+        },
+        intent,
+    )
+}
+#[test]
+fn a8b_history_each_move_interruption_observes_without_replay() {
+    for cut in 1..=4 {
+        let (mut port, mut intent) = history_fixture();
+        let original = port.source.clone();
+        let mut index = port.index.clone();
+        port.cut = Some(cut);
+        assert_eq!(
+            archive_history(&mut port, &mut intent, &mut index),
+            Err(NativeError::OutcomeUnknown)
+        );
+        let mut reopened = port.saved.clone().unwrap();
+        port.cut = None;
+        archive_history(&mut port, &mut reopened, &mut index).unwrap();
+        assert!(reopened.complete);
+        assert_eq!(port.effects, 4);
+        assert!(port.source.iter().all(Option::is_none));
+        assert_eq!(port.destination, original); // Exact bytes and FileIds, no old claim edit.
+        let effects = port.effects;
+        archive_history(&mut port, &mut reopened, &mut index).unwrap();
+        assert_eq!(port.effects, effects);
+    }
+}
+#[test]
+fn a8b_history_drift_and_ambiguous_pairs_refuse_before_a_move() {
+    for both in [false, true] {
+        let (mut port, mut intent) = history_fixture();
+        let mut index = port.index.clone();
+        if both {
+            port.destination[0] = port.source[0].clone();
+        } else {
+            port.source[0].as_mut().unwrap().1.push(0);
+        }
+        assert_eq!(
+            archive_history(&mut port, &mut intent, &mut index),
+            Err(NativeError::OutcomeUnknown)
+        );
+        assert_eq!(port.effects, 0);
+        assert!(index.slots.iter().all(Option::is_none));
+    }
+}
+#[test]
+fn a8b_full_archive_has_no_eviction_or_effect() {
+    let (mut port, intent) = history_fixture();
+    let mut index = port.index.clone();
+    for slot in 0..3 {
+        let mut selected = intent.selected.clone();
+        selected.operation = [slot + 1; 16];
+        selected.next_operation = [slot + 11; 16];
+        index.slots[usize::from(slot)] = Some(selected);
+    }
+    let original = index.clone();
+    assert_eq!(
+        index.select(intent.selected.clone()),
+        Err(NativeError::Busy)
+    );
+    assert_eq!(index, original);
+    assert_eq!(port.effects, 0);
+    let mut rejected = intent.clone();
+    rejected.slot = 0;
+    assert_eq!(
+        archive_history(&mut port, &mut rejected, &mut index),
+        Err(NativeError::Foreign)
+    );
+    assert_eq!(port.effects, 0);
+}
+#[test]
+fn a8b_archive_claim_bytes_stay_immutable_and_gate_new_epoch() {
+    let (mut port, mut intent) = history_fixture();
+    let mut index = port.index.clone();
+    assert!(index.slots[0].is_none());
+    archive_history(&mut port, &mut intent, &mut index).unwrap();
+    assert_eq!(index.slots[0], Some(intent.selected.clone()));
+    let mut events = vec!["archive-complete"];
+    struct Epoch<'a>(&'a mut Vec<&'static str>);
+    impl service::supervisor::InitialEpochPort for Epoch<'_> {
+        type Child = ();
+        type Ready = ();
+        fn prepare_epoch(&mut self) -> NativeResult<()> {
+            self.0.push("fresh-claim-and-owner");
+            Ok(())
+        }
+        fn create(&mut self) -> NativeResult<()> {
+            self.0.push("create");
+            Ok(())
+        }
+        fn await_ready(&mut self, _: &()) -> NativeResult<()> {
+            self.0.push("ready");
+            Ok(())
+        }
+        fn publish_running(&mut self, _: &()) -> NativeResult<()> {
+            self.0.push("running");
+            Ok(())
+        }
+    }
+    service::supervisor::initialize_epoch(&mut Epoch(&mut events)).unwrap();
+    assert_eq!(
+        events,
+        [
+            "archive-complete",
+            "fresh-claim-and-owner",
+            "create",
+            "ready",
+            "running"
+        ]
+    );
+    let bytes = intent.encode().unwrap();
+    assert_eq!(FirstHistoryIntent::decode(&bytes).unwrap(), intent);
+}
+
+#[derive(Clone)]
+struct RecoveryFake {
+    saved: Option<FirstRecoveryRecord>,
+    triads: [RoleTriad; 4],
+    task: bool,
+    task_delete: usize,
+    moves: [usize; 4],
+    restores: [usize; 4],
+    deletes: [usize; 4],
+    retired: bool,
+    events: Vec<&'static str>,
+    cut: Option<usize>,
+    effects: usize,
+    scaffold: bool,
+    refuse_delete: Option<PayloadRole>,
+}
+impl RecoveryFake {
+    fn new(mode: FirstRecoveryMode) -> (Self, FirstRecoveryRecord) {
+        let mut source = record();
+        for role in PayloadRole::ALL {
+            source.role_mut(role).unwrap().staged = Some(image(role));
+        }
+        for role in PayloadRole::ALL {
+            let original = FileStamp {
+                volume: 1,
+                file: [40 + role as u8; 16],
+            };
+            let r = source.role_mut(role).unwrap();
+            r.original = OriginalLeaf::Present(original);
+            r.backup = Some(original);
+            r.published = Some(image(role));
+        }
+        source.advance(Phase::FilesVerified).unwrap();
+        source.advance(Phase::TaskRegistered).unwrap();
+        let bytes = source.encode().unwrap();
+        let selected = HistoryLeaf::observe(
+            "first-install.json".into(),
+            FileStamp {
+                volume: 1,
+                file: [70; 16],
+            },
+            &bytes,
+        )
+        .unwrap();
+        let recovery = FirstRecoveryRecord::new(selected, source, mode).unwrap();
+        let triads = PayloadRole::ALL.map(|role| RoleTriad {
+            stage: None,
+            fixed: Some(image(role).identity),
+            backup: Some(FileStamp {
+                volume: 1,
+                file: [40 + role as u8; 16],
+            }),
+        });
+        (
+            Self {
+                saved: None,
+                triads,
+                task: true,
+                task_delete: 0,
+                moves: [0; 4],
+                restores: [0; 4],
+                deletes: [0; 4],
+                retired: false,
+                events: vec![],
+                cut: None,
+                effects: 0,
+                scaffold: true,
+                refuse_delete: None,
+            },
+            recovery,
+        )
+    }
+    /// A first install cut at `StageIntent(role)`: earlier roles are staged, `role` has no
+    /// persisted staged identity, `recorded` is the stray stamp selection observed, and `leaf` is
+    /// what currently sits at that role's stage name.
+    fn stage_intent(
+        mode: FirstRecoveryMode,
+        role: PayloadRole,
+        recorded: Option<FileStamp>,
+        leaf: Option<FileStamp>,
+    ) -> (Self, FirstRecoveryRecord) {
+        let mut source = record();
+        for earlier in PayloadRole::ALL {
+            if (earlier as usize) < (role as usize) {
+                source.role_mut(earlier).unwrap().staged = Some(image(earlier));
+            }
+        }
+        source.advance(Phase::StageIntent(role)).unwrap();
+        let bytes = source.encode().unwrap();
+        let selected = HistoryLeaf::observe(
+            "first-install.json".into(),
+            FileStamp {
+                volume: 1,
+                file: [70; 16],
+            },
+            &bytes,
+        )
+        .unwrap();
+        let mut recovery = FirstRecoveryRecord::new(selected, source, mode).unwrap();
+        recovery.stray_stage = recorded.map(|id| (role, id));
+        recovery.validate().unwrap();
+        let triads = PayloadRole::ALL.map(|r| RoleTriad {
+            stage: if r == role {
+                leaf
+            } else if (r as usize) < (role as usize) {
+                Some(image(r).identity)
+            } else {
+                None
+            },
+            fixed: None,
+            backup: None,
+        });
+        (
+            Self {
+                saved: None,
+                triads,
+                task: true,
+                task_delete: 0,
+                moves: [0; 4],
+                restores: [0; 4],
+                deletes: [0; 4],
+                retired: false,
+                events: vec![],
+                cut: None,
+                effects: 0,
+                scaffold: true,
+                refuse_delete: None,
+            },
+            recovery,
+        )
+    }
+    fn cut(&mut self) -> NativeResult<()> {
+        self.effects += 1;
+        if self.cut == Some(self.effects) {
+            Err(NativeError::OutcomeUnknown)
+        } else {
+            Ok(())
+        }
+    }
+    fn persist(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+        r.validate()?;
+        if let Some(old) = &self.saved {
+            r.follows(old)?;
+        }
+        self.saved = Some(r.clone());
+        self.cut()
+    }
+    fn delete(
+        &mut self,
+        r: &FirstRecoveryRecord,
+        role: PayloadRole,
+        location: removal::inventory::PartialFirstLocation,
+        id: FileStamp,
+    ) -> NativeResult<bool> {
+        use removal::inventory::PartialFirstLocation as L;
+        assert!(!self.task);
+        assert!(matches!(r.cursor, FirstRecoveryCursor::Role { .. }));
+        if self.refuse_delete == Some(role) {
+            return Ok(false);
+        }
+        let triad = &mut self.triads[role as usize];
+        let value = match location {
+            L::Fixed => &mut triad.fixed,
+            L::Stage => &mut triad.stage,
+            L::Backup => &mut triad.backup,
+        };
+        if value.is_some() {
+            assert_eq!(*value, Some(id));
+            *value = None;
+            self.deletes[role as usize] += 1;
+            self.events.push("delete");
+            self.cut()?;
+        }
+        Ok(true)
+    }
+    fn retire(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+        assert_eq!(r.cursor, FirstRecoveryCursor::RetireIntent);
+        if !self.retired {
+            self.retired = true;
+            self.events.push("retire");
+            self.cut()?;
+        }
+        Ok(())
+    }
+}
+impl FirstRecoveryPort for RecoveryFake {
+    fn renew_recovery(&mut self, _: &FirstRecoveryRecord) -> NativeResult<()> {
+        Ok(())
+    }
+    fn persist_recovery(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+        self.persist(r)
+    }
+    fn task_absent(&mut self, _: &FirstRecoveryRecord) -> NativeResult<bool> {
+        Ok(!self.task)
+    }
+    fn delete_task(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+        assert_eq!(r.cursor, FirstRecoveryCursor::TaskDeleteIntent);
+        assert!(self.task);
+        self.task = false;
+        self.task_delete += 1;
+        self.events.push("task-delete");
+        self.cut()
+    }
+    fn triad(&mut self, _: &FirstRecoveryRecord, role: PayloadRole) -> NativeResult<RoleTriad> {
+        Ok(self.triads[role as usize])
+    }
+    fn unpublish(&mut self, _: &FirstRecoveryRecord, role: PayloadRole) -> NativeResult<()> {
+        assert!(!self.task);
+        let t = &mut self.triads[role as usize];
+        assert!(t.stage.is_none());
+        t.stage = t.fixed.take();
+        self.moves[role as usize] += 1;
+        self.events.push("unpublish");
+        self.cut()
+    }
+    fn restore_original(&mut self, _: &FirstRecoveryRecord, role: PayloadRole) -> NativeResult<()> {
+        assert!(!self.task);
+        let t = &mut self.triads[role as usize];
+        assert!(t.fixed.is_none());
+        t.fixed = t.backup.take();
+        self.restores[role as usize] += 1;
+        self.events.push("restore");
+        self.cut()
+    }
+    fn delete_stage(&mut self, r: &FirstRecoveryRecord, role: PayloadRole) -> NativeResult<()> {
+        let id = r.stage_identity(role)?.unwrap();
+        if self.delete(r, role, removal::inventory::PartialFirstLocation::Stage, id)? {
+            Ok(())
+        } else {
+            Err(NativeError::Unavailable)
+        }
+    }
+    fn settle_scaffold(&mut self, _: &FirstRecoveryRecord) -> NativeResult<bool> {
+        Ok(self.scaffold)
+    }
+    fn retire_first(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+        self.retire(r)
+    }
+}
+impl removal::executor::PartialFirstRemovalPort for RecoveryFake {
+    fn renew_partial(&mut self, _: &FirstRecoveryRecord) -> NativeResult<()> {
+        Ok(())
+    }
+    fn persist_partial(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+        self.persist(r)
+    }
+    fn task_absent_partial(&mut self, r: &FirstRecoveryRecord) -> NativeResult<bool> {
+        FirstRecoveryPort::task_absent(self, r)
+    }
+    fn delete_task_partial(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+        FirstRecoveryPort::delete_task(self, r)
+    }
+    fn observe_partial(
+        &mut self,
+        _: &FirstRecoveryRecord,
+        role: PayloadRole,
+        location: removal::inventory::PartialFirstLocation,
+    ) -> NativeResult<Option<FileStamp>> {
+        use removal::inventory::PartialFirstLocation as L;
+        let t = self.triads[role as usize];
+        Ok(match location {
+            L::Fixed => t.fixed,
+            L::Stage => t.stage,
+            L::Backup => t.backup,
+        })
+    }
+    fn delete_partial(
+        &mut self,
+        r: &FirstRecoveryRecord,
+        role: PayloadRole,
+        location: removal::inventory::PartialFirstLocation,
+        id: FileStamp,
+    ) -> NativeResult<bool> {
+        self.delete(r, role, location, id)
+    }
+    fn settle_scaffold(&mut self, _: &FirstRecoveryRecord) -> NativeResult<bool> {
+        Ok(self.scaffold)
+    }
+    fn retire_partial(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+        self.retire(r)
+    }
+}
+#[test]
+fn a8b_partial_rollback_every_cut_restores_originals_without_replay() {
+    let (mut baseline, mut r) = RecoveryFake::new(FirstRecoveryMode::Rollback);
+    assert_eq!(
+        recover_first(&mut baseline, &mut r).unwrap(),
+        FirstRecoveryOutcome::RolledBack
+    );
+    let boundaries = baseline.effects;
+    for cut in 1..=boundaries {
+        let (mut fake, mut r) = RecoveryFake::new(FirstRecoveryMode::Rollback);
+        fake.cut = Some(cut);
+        assert!(recover_first(&mut fake, &mut r).is_err(), "cut {cut}");
+        fake.cut = None;
+        r = fake.saved.clone().unwrap();
+        assert_eq!(
+            recover_first(&mut fake, &mut r).unwrap(),
+            FirstRecoveryOutcome::RolledBack,
+            "cut {cut}"
+        );
+        assert_eq!(fake.task_delete, 1);
+        assert_eq!(fake.moves, [1; 4]);
+        assert_eq!(fake.restores, [1; 4]);
+        assert_eq!(fake.deletes, [1; 4]);
+        for role in PayloadRole::ALL {
+            assert_eq!(
+                fake.triads[role as usize].fixed,
+                Some(FileStamp {
+                    volume: 1,
+                    file: [40 + role as u8; 16]
+                })
+            );
+            assert!(fake.triads[role as usize].stage.is_none());
+            assert!(fake.triads[role as usize].backup.is_none());
+        }
+        assert_eq!(fake.events.first(), Some(&"task-delete"));
+        assert_eq!(fake.events.last(), Some(&"retire"));
+    }
+}
+#[test]
+fn a8b_partial_removal_is_independent_retains_foreign_and_refuses_erase() {
+    let (mut fake, mut r) = RecoveryFake::new(FirstRecoveryMode::Rollback);
+    let foreign = FileStamp {
+        volume: 1,
+        file: [99; 16],
+    };
+    fake.triads[3].fixed = Some(foreign);
+    assert!(recover_first(&mut fake, &mut r).is_err());
+    let mut removal = r.select_removal().unwrap();
+    assert_eq!(
+        removal::executor::remove_partial_first(&mut fake, &mut removal).unwrap(),
+        FirstRecoveryOutcome::Retained { pending: 1 }
+    );
+    assert_eq!(fake.triads[3].fixed, Some(foreign));
+    assert!(!fake.retired);
+    assert!(fake.deletes[..3].iter().all(|c| *c == 2));
+    assert_eq!(
+        removal::partial_first_removal_allowed(true),
+        Err(NativeError::Unsupported)
+    );
+    assert!(removal::partial_first_removal_allowed(false).is_ok());
+    let mut retry = removal.retry_retained().unwrap();
+    fake.triads[3].fixed = None;
+    assert_eq!(
+        removal::executor::remove_partial_first(&mut fake, &mut retry).unwrap(),
+        FirstRecoveryOutcome::Removed
+    );
+    assert_eq!(fake.task_delete, 1);
+    assert!(fake.retired);
+}
+#[test]
+fn a8b_partial_removal_each_cut_and_mapped_object_are_not_replayed() {
+    let (mut baseline, mut r) = RecoveryFake::new(FirstRecoveryMode::Remove);
+    removal::executor::remove_partial_first(&mut baseline, &mut r).unwrap();
+    for cut in 1..=baseline.effects {
+        let (mut fake, mut r) = RecoveryFake::new(FirstRecoveryMode::Remove);
+        fake.cut = Some(cut);
+        assert!(removal::executor::remove_partial_first(&mut fake, &mut r).is_err());
+        fake.cut = None;
+        r = fake.saved.clone().unwrap();
+        assert_eq!(
+            removal::executor::remove_partial_first(&mut fake, &mut r).unwrap(),
+            FirstRecoveryOutcome::Removed
+        );
+        assert_eq!(fake.task_delete, 1);
+        assert_eq!(fake.deletes, [2; 4]);
+    }
+    let (mut fake, mut r) = RecoveryFake::new(FirstRecoveryMode::Remove);
+    fake.refuse_delete = Some(PayloadRole::Installer);
+    assert_eq!(
+        removal::executor::remove_partial_first(&mut fake, &mut r).unwrap(),
+        FirstRecoveryOutcome::Retained { pending: 1 }
+    );
+    assert!(!fake.retired);
+    assert_eq!(fake.deletes[PayloadRole::Installer as usize], 0);
+    assert!(fake.triads[PayloadRole::Installer as usize].fixed.is_some());
+}
+/// Earlier roles delete their staged leaves; the cut role deletes only its recorded stray leaf.
+fn stage_intent_deletes(role: PayloadRole, leaf_present: bool) -> [usize; 4] {
+    PayloadRole::ALL
+        .map(|r| usize::from((r as usize) < (role as usize) || (r == role && leaf_present)))
+}
+fn stray_stamp(role: PayloadRole) -> FileStamp {
+    FileStamp {
+        volume: 1,
+        file: [90 + role as u8; 16],
+    }
+}
+#[test]
+fn a8b_stage_intent_cut_with_stray_leaf_rolls_back_and_removes() {
+    for role in PayloadRole::ALL {
+        let stray = stray_stamp(role);
+        let (mut baseline, mut r) =
+            RecoveryFake::stage_intent(FirstRecoveryMode::Rollback, role, Some(stray), Some(stray));
+        assert_eq!(
+            recover_first(&mut baseline, &mut r).unwrap(),
+            FirstRecoveryOutcome::RolledBack,
+            "role {role:?}"
+        );
+        assert_eq!(baseline.deletes, stage_intent_deletes(role, true));
+        assert_eq!(baseline.moves, [0; 4]);
+        assert_eq!(baseline.restores, [0; 4]);
+        assert_eq!(baseline.task_delete, 1);
+        assert!(baseline.retired);
+        assert!(
+            baseline
+                .triads
+                .iter()
+                .all(|t| t.stage.is_none() && t.fixed.is_none())
+        );
+        for cut in 1..=baseline.effects {
+            let (mut fake, mut r) = RecoveryFake::stage_intent(
+                FirstRecoveryMode::Rollback,
+                role,
+                Some(stray),
+                Some(stray),
+            );
+            fake.cut = Some(cut);
+            assert!(
+                recover_first(&mut fake, &mut r).is_err(),
+                "role {role:?} cut {cut}"
+            );
+            fake.cut = None;
+            r = fake.saved.clone().unwrap();
+            assert_eq!(
+                recover_first(&mut fake, &mut r).unwrap(),
+                FirstRecoveryOutcome::RolledBack,
+                "role {role:?} cut {cut}"
+            );
+            assert_eq!(fake.deletes, stage_intent_deletes(role, true), "cut {cut}");
+            assert_eq!(fake.task_delete, 1, "cut {cut}");
+            assert!(fake.retired, "cut {cut}");
+        }
+        let (mut baseline, mut r) =
+            RecoveryFake::stage_intent(FirstRecoveryMode::Remove, role, Some(stray), Some(stray));
+        assert_eq!(
+            removal::executor::remove_partial_first(&mut baseline, &mut r).unwrap(),
+            FirstRecoveryOutcome::Removed,
+            "role {role:?}"
+        );
+        assert_eq!(baseline.deletes, stage_intent_deletes(role, true));
+        assert_eq!(baseline.task_delete, 1);
+        for cut in 1..=baseline.effects {
+            let (mut fake, mut r) = RecoveryFake::stage_intent(
+                FirstRecoveryMode::Remove,
+                role,
+                Some(stray),
+                Some(stray),
+            );
+            fake.cut = Some(cut);
+            assert!(
+                removal::executor::remove_partial_first(&mut fake, &mut r).is_err(),
+                "role {role:?} cut {cut}"
+            );
+            fake.cut = None;
+            r = fake.saved.clone().unwrap();
+            assert_eq!(
+                removal::executor::remove_partial_first(&mut fake, &mut r).unwrap(),
+                FirstRecoveryOutcome::Removed,
+                "role {role:?} cut {cut}"
+            );
+            assert_eq!(fake.deletes, stage_intent_deletes(role, true), "cut {cut}");
+            assert_eq!(fake.task_delete, 1, "cut {cut}");
+            assert!(fake.retired, "cut {cut}");
+        }
+        // A leaf that vanished before its effect is already settled, never a deletion.
+        let (mut fake, mut r) =
+            RecoveryFake::stage_intent(FirstRecoveryMode::Rollback, role, Some(stray), None);
+        assert_eq!(
+            recover_first(&mut fake, &mut r).unwrap(),
+            FirstRecoveryOutcome::RolledBack,
+            "role {role:?}"
+        );
+        assert_eq!(fake.deletes, stage_intent_deletes(role, false));
+        let (mut fake, mut r) =
+            RecoveryFake::stage_intent(FirstRecoveryMode::Remove, role, Some(stray), None);
+        assert_eq!(
+            removal::executor::remove_partial_first(&mut fake, &mut r).unwrap(),
+            FirstRecoveryOutcome::Removed,
+            "role {role:?}"
+        );
+        assert_eq!(fake.deletes, stage_intent_deletes(role, false));
+    }
+}
+#[test]
+fn a8b_stage_intent_stray_leaf_replaced_is_retained_not_deleted() {
+    for role in PayloadRole::ALL {
+        let stray = stray_stamp(role);
+        let other = FileStamp {
+            volume: 1,
+            file: [120 + role as u8; 16],
+        };
+        let (mut fake, mut r) =
+            RecoveryFake::stage_intent(FirstRecoveryMode::Rollback, role, Some(stray), Some(other));
+        assert_eq!(
+            recover_first(&mut fake, &mut r),
+            Err(NativeError::OutcomeUnknown),
+            "role {role:?}"
+        );
+        assert_eq!(fake.triads[role as usize].stage, Some(other));
+        assert_eq!(fake.deletes[role as usize], 0);
+        assert!(!fake.retired);
+        let (mut fake, mut r) =
+            RecoveryFake::stage_intent(FirstRecoveryMode::Remove, role, Some(stray), Some(other));
+        assert_eq!(
+            removal::executor::remove_partial_first(&mut fake, &mut r).unwrap(),
+            FirstRecoveryOutcome::Retained { pending: 1 },
+            "role {role:?}"
+        );
+        assert_eq!(fake.triads[role as usize].stage, Some(other));
+        assert_eq!(fake.deletes[role as usize], 0);
+        assert!(!fake.retired);
+    }
+}
+#[test]
+fn a8b_recovery_never_replays_register_or_run_or_erases_unknown_scaffolds() {
+    let (mut fake, mut r) = RecoveryFake::new(FirstRecoveryMode::Remove);
+    fake.scaffold = false;
+    assert_eq!(
+        removal::executor::remove_partial_first(&mut fake, &mut r).unwrap(),
+        FirstRecoveryOutcome::Retained { pending: 1 }
+    );
+    assert!(!fake.retired);
+    let mut run = r.document.clone();
+    run.advance(Phase::RunIntent).unwrap();
+    assert_eq!(
+        recovery_mode_allowed(&run, FirstRecoveryMode::Remove),
+        Err(NativeError::OutcomeUnknown)
+    );
+    assert_eq!(
+        recovery_mode_allowed(&run, FirstRecoveryMode::Rollback),
+        Err(NativeError::OutcomeUnknown)
+    );
+    assert!(recovery_mode_allowed(&run, FirstRecoveryMode::RetireStale).is_ok());
+}
+
+struct StaleFake {
+    saved: Option<FirstRecoveryRecord>,
+    live: Option<u64>,
+    exclusive: bool,
+    claim: Vec<u8>,
+    retired: usize,
+    effects: usize,
+    cut: Option<usize>,
+}
+impl FirstStalePort for StaleFake {
+    fn renew_stale(&mut self, _: &FirstRecoveryRecord) -> NativeResult<()> {
+        Ok(())
+    }
+    fn observe_supersession(&mut self, _: &FirstRecoveryRecord) -> NativeResult<Option<u64>> {
+        Ok(self.live)
+    }
+    fn reserve_absent(&mut self, _: &FirstRecoveryRecord) -> NativeResult<()> {
+        if self.exclusive {
+            Ok(())
+        } else {
+            Err(NativeError::Busy)
+        }
+    }
+    fn persist_stale(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+        if let Some(old) = &self.saved {
+            r.follows(old)?;
+        }
+        self.saved = Some(r.clone());
+        self.effects += 1;
+        if self.cut == Some(self.effects) {
+            Err(NativeError::OutcomeUnknown)
+        } else {
+            Ok(())
+        }
+    }
+    fn retire_stale(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+        assert_eq!(r.cursor, FirstRecoveryCursor::RetireIntent);
+        assert!(self.exclusive);
+        if self.retired == 0 {
+            self.retired = 1;
+            self.effects += 1;
+            if self.cut == Some(self.effects) {
+                return Err(NativeError::OutcomeUnknown);
+            }
+        }
+        Ok(())
+    }
+}
+fn stale_fixture(mode: FirstRecoveryMode) -> (StaleFake, FirstRecoveryRecord) {
+    use native_io::activation::{SupervisorClaim, TaskActivationRecord};
+    let (_, first) = RecoveryFake::new(FirstRecoveryMode::Rollback);
+    let mut document = first.document;
+    document.advance(Phase::RunObserved).unwrap();
+    let bytes = document.encode().unwrap();
+    let source =
+        HistoryLeaf::observe("first-install.json".into(), first.source.identity, &bytes).unwrap();
+    let mut task = TaskActivationRecord::new(
+        document.operation(),
+        "S-1-5-21-1".into(),
+        native_io::files::FileIdentity {
+            volume: 1,
+            file: [1; 16],
+        },
+        None,
+    )
+    .unwrap();
+    task.registered().unwrap();
+    task.run_intent().unwrap();
+    task.claim_supervisor(SupervisorClaim {
+        pid: 1,
+        creation: 1,
+    })
+    .unwrap();
+    (
+        StaleFake {
+            saved: None,
+            live: Some(2),
+            exclusive: true,
+            claim: task.encode().unwrap(),
+            retired: 0,
+            effects: 0,
+            cut: None,
+        },
+        FirstRecoveryRecord::new(source, document, mode).unwrap(),
+    )
+}
+#[test]
+fn a8b_stale_new_logon_settles_metadata_and_preserves_the_consumed_claim() {
+    let (mut fake, mut r) = stale_fixture(FirstRecoveryMode::Supersede);
+    let before = fake.claim.clone();
+    assert_eq!(
+        settle_stale_first(&mut fake, &mut r).unwrap(),
+        FirstRecoveryOutcome::Superseded
+    );
+    assert_eq!(r.cursor, FirstRecoveryCursor::Superseded);
+    assert_eq!(r.document.phase(), Phase::RunObserved);
+    assert_eq!(fake.claim, before);
+    assert_eq!(fake.retired, 0);
+    let count = fake.effects;
+    assert_eq!(
+        settle_stale_first(&mut fake, &mut r).unwrap(),
+        FirstRecoveryOutcome::Superseded
+    );
+    assert_eq!(fake.effects, count);
+    fake.live = None;
+    assert_eq!(
+        settle_stale_first(&mut fake, &mut r),
+        Err(NativeError::OutcomeUnknown)
+    );
+    assert_eq!(fake.claim, before);
+}
+#[test]
+fn a8b_stale_absence_retirement_each_cut_never_resets_or_runs_claim() {
+    for cut in 1..=4 {
+        let (mut fake, mut r) = stale_fixture(FirstRecoveryMode::RetireStale);
+        fake.live = None;
+        let before = fake.claim.clone();
+        fake.cut = Some(cut);
+        assert!(settle_stale_first(&mut fake, &mut r).is_err());
+        fake.cut = None;
+        r = fake.saved.clone().unwrap();
+        assert_eq!(
+            settle_stale_first(&mut fake, &mut r).unwrap(),
+            FirstRecoveryOutcome::Retired
+        );
+        assert_eq!(fake.retired, 1);
+        assert_eq!(fake.claim, before);
+    }
+    let (mut fake, mut r) = stale_fixture(FirstRecoveryMode::RetireStale);
+    fake.exclusive = false;
+    assert_eq!(
+        settle_stale_first(&mut fake, &mut r),
+        Err(NativeError::Busy)
+    );
+    assert_eq!(fake.effects, 0);
+    assert_eq!(fake.retired, 0);
+}

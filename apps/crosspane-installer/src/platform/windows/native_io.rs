@@ -92,8 +92,8 @@ pub(crate) use adapter::{OpenedPe, PayloadRoot, PruneOutcome, SelfImagePin, Stag
 
 #[cfg(all(windows, not(test)))]
 pub(crate) use adapter::{
-    LogonArchiveResult, LogonReservation, OwnedArchiveResult, PriorLogonDisposition,
-    RepairArchiveResult,
+    ArchivedFirstHistory, FirstInstallArchiveResult, FirstRecoveryReservation, LogonArchiveResult,
+    LogonReservation, OwnedArchiveResult, PriorLogonDisposition, RepairArchiveResult,
 };
 
 #[cfg(all(windows, not(test)))]
@@ -12136,12 +12136,17 @@ mod adapter {
             agent_identity: FileIdentity,
             agent: Mutex<Option<Arc<File>>>,
             namespace: Mutex<Option<super::super::supervisor_owner::FirstInstallNamespace>>,
+            removed_namespace: Mutex<Option<super::first_history_io::RemovedNamespace>>,
             active: AtomicBool,
         }
         #[derive(Clone)]
         pub(crate) struct FirstInstallReservation(Arc<ReservationData>);
         impl FirstInstallReservation {
-            fn renew_native(&self, context: &Context, deadline: &Deadline) -> NativeResult<()> {
+            pub(super) fn renew_native(
+                &self,
+                context: &Context,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
                 if !std::ptr::eq(context, self.0.io.context.as_ref())
                     || context.target.nonce != self.0.io.context.target.nonce
                     || !self.0.active.load(Ordering::Acquire)
@@ -12207,7 +12212,35 @@ mod adapter {
                     .as_ref()
                     .ok_or(NativeError::Foreign)?
                     .reverify(proof, deadline)?;
+                if let Some(removed) = self
+                    .0
+                    .removed_namespace
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                    .as_ref()
+                {
+                    removed.reverify(io, proof, deadline)?;
+                }
                 deadline.check()
+            }
+            pub(super) fn retain_removed_namespace(
+                &self,
+                namespace: super::first_history_io::RemovedNamespace,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                self.reverify(&self.0.io, proof, deadline)?;
+                namespace.reverify(&self.0.io, proof, deadline)?;
+                let mut held = self
+                    .0
+                    .removed_namespace
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                if held.is_some() {
+                    return Err(NativeError::Foreign);
+                }
+                *held = Some(namespace);
+                Ok(())
             }
             /// Called only by the prepared task's actual lock-release boundary. An in-flight
             /// original worker keeps the reservation; neither elapsed time nor a record releases it.
@@ -12220,7 +12253,21 @@ mod adapter {
                 if !self.0.io.native_idle() {
                     return Err(NativeError::OutcomeUnknown);
                 }
+                if let Some(removed) = self
+                    .0
+                    .removed_namespace
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                    .as_ref()
+                {
+                    removed.reverify(&self.0.io, proof, deadline)?;
+                }
                 self.0.active.store(false, Ordering::Release);
+                self.0
+                    .removed_namespace
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                    .take();
                 self.0
                     .namespace
                     .lock()
@@ -12349,8 +12396,18 @@ mod adapter {
                     first_install::{DecodedHistory, classify_history},
                     service::journal::Journal,
                 };
+                let history = self.read_first_history_intent(proof, deadline)?;
+                if let Some(history) = &history {
+                    if !history.complete {
+                        return Ok(Disposition::CompletedRemoval);
+                    }
+                    self.verify_first_history(proof, history, deadline)?;
+                }
                 let removal = self.read_removal(proof, deadline)?;
                 let first = self.read_first_install(proof, deadline)?;
+                if history.is_some() && first.is_none() {
+                    return Ok(Disposition::CompletedRemoval);
+                }
                 if let Some(removal) = removal.as_ref() {
                     return Ok(classify_history(DecodedHistory {
                         removal: Some(removal.cursor()),
@@ -12361,9 +12418,9 @@ mod adapter {
                         names: &[],
                     }));
                 }
-                if first
-                    .as_ref()
-                    .is_some_and(|r| r.phase() == FirstPhase::Complete)
+                if let Some(first) = &first
+                    && (first.phase() == FirstPhase::Complete
+                        || self.first_source_settled(proof, first, deadline)?)
                 {
                     return Ok(Disposition::Existing);
                 }
@@ -12407,6 +12464,22 @@ mod adapter {
                         None => Ok(Vec::new()),
                     }
                 })?;
+                let names = if history.is_some() {
+                    names
+                        .into_iter()
+                        .filter(|name| {
+                            !matches!(
+                                name.as_str(),
+                                "first-install-history"
+                                    | "first-install-history-index.json"
+                                    | "first-install-history-intent.json"
+                                    | "first-install-recovery.json"
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    names
+                };
                 Ok(classify_history(DecodedHistory {
                     removal: removal.as_ref().map(|r| r.cursor()),
                     first: first.as_ref().map(|r| r.phase()),
@@ -12421,9 +12494,9 @@ mod adapter {
                 proof: &SupportProof,
                 deadline: &Deadline,
             ) -> NativeResult<()> {
-                if self
-                    .read_first_install(proof, deadline)?
-                    .is_some_and(|r| r.phase() != FirstPhase::Complete)
+                if let Some(record) = self.read_first_install(proof, deadline)?
+                    && record.phase() != FirstPhase::Complete
+                    && !self.first_source_settled(proof, &record, deadline)?
                 {
                     return Err(NativeError::Busy);
                 }
@@ -12475,6 +12548,26 @@ mod adapter {
                 ) {
                     return Err(NativeError::Unsupported);
                 }
+                self.reserve_first_namespace(proof, lock, deadline)
+            }
+            // Shared mechanical acquisition only. Callers have distinct policy/proof factories;
+            // the existing cold entry still requires its original Eligible/Resume gate above.
+            pub(super) fn reserve_first_namespace(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<FirstInstallReservation> {
+                self.acquire_first_reservation(proof, lock, true, deadline)
+            }
+            pub(super) fn acquire_first_reservation(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                require_task_absence: bool,
+                deadline: &Deadline,
+            ) -> NativeResult<FirstInstallReservation> {
+                self.verify_stop_lock(proof, lock, deadline)?;
                 let context = self.context.clone();
                 let lease = lock.0.clone();
                 let budget = proof.budget(self, deadline)?;
@@ -12486,10 +12579,11 @@ mod adapter {
                             let check = || context.validate(&budget);
                             let scheduler = super::super::task::Scheduler::connect_repair(&check)
                                 .map_err(|_| NativeError::Unavailable)?;
-                            if scheduler
-                                .repair_snapshot(&check)
-                                .map_err(|_| NativeError::Unavailable)?
-                                .is_some()
+                            if require_task_absence
+                                && scheduler
+                                    .repair_snapshot(&check)
+                                    .map_err(|_| NativeError::Unavailable)?
+                                    .is_some()
                             {
                                 return Err(NativeError::Foreign);
                             }
@@ -12543,6 +12637,7 @@ mod adapter {
                     agent_identity,
                     agent: Mutex::new(Some(agent)),
                     namespace: Mutex::new(Some(namespace)),
+                    removed_namespace: Mutex::new(None),
                     active: AtomicBool::new(true),
                 }));
                 reservation.reverify(self, proof, deadline)?;
@@ -17131,4 +17226,2770 @@ mod adapter {
             }
         }
     }
+
+    #[cfg(not(test))]
+    mod first_history_io {
+        use super::super::super::first_install::record::Phase as FirstPhase;
+        use super::super::super::{
+            first_install::{
+                driver::{self, FirstHistoryPort, HistoryObservation},
+                record::*,
+            },
+            payload::{helper::removal::RemovalKeeperLease, recovery::FileStamp},
+            removal::{RemovalCursor, RemovalRecord},
+            service::{
+                journal::{Journal, Phase as JournalPhase},
+                task::TaskRunPermit,
+            },
+        };
+        use super::super::{
+            activation::{Phase as TaskPhase, SupervisorLogonRecord, TaskActivationRecord},
+            jobs::SupervisorOwner,
+            supervisor_owner::ExclusiveSupervisorLease,
+        };
+        use super::*;
+
+        pub(super) struct RemovedNamespace {
+            // Drop the server and lease before its runtime. No request or worker is started here.
+            server: tokio::net::windows::named_pipe::NamedPipeServer,
+            lease: Arc<RemovalKeeperLease>,
+            runtime: tokio::runtime::Runtime,
+            operation: [u8; 16],
+        }
+        impl RemovedNamespace {
+            pub(super) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                let _ = (&self.server, &self.runtime);
+                self.lease.reverify(io, proof, self.operation, deadline)
+            }
+        }
+        pub(crate) struct CompletedRemovalHistory {
+            io: Arc<WindowsNativeIo>,
+            reservation: FirstInstallReservation,
+            leaves: Vec<(HistoryLeaf, Vec<u8>)>,
+            operation: [u8; 16],
+            context: Vec<u8>,
+            resume: Option<FirstHistoryIntent>,
+        }
+        pub(crate) struct ArchivedFirstHistory {
+            io: Arc<WindowsNativeIo>,
+            reservation: FirstInstallReservation,
+            intent: FirstHistoryIntent,
+        }
+        impl ArchivedFirstHistory {
+            pub(crate) fn reservation(&self) -> &FirstInstallReservation {
+                &self.reservation
+            }
+            // reason: a reinstall runs under next_operation, not the removed operation.
+            #[allow(clippy::misnamed_getters)]
+            pub(crate) fn operation(&self) -> [u8; 16] {
+                self.intent.selected.next_operation
+            }
+            pub(crate) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                self.reservation.reverify(io, proof, deadline)?;
+                io.verify_first_history(proof, &self.intent, deadline)
+            }
+        }
+        pub(crate) struct FirstInstallArchiveResult {
+            io: Arc<WindowsNativeIo>,
+            namespace: Arc<ExclusiveSupervisorLease>,
+            permit: Arc<TaskRunPermit>,
+            intent: FirstHistoryIntent,
+        }
+        impl FirstInstallArchiveResult {
+            pub(crate) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &Arc<TaskRunPermit>,
+                owner: &Arc<SupervisorOwner>,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.io.as_ref())
+                    || !Arc::ptr_eq(permit, &self.permit)
+                    || !Arc::ptr_eq(&self.namespace, &owner.exclusive_lease(proof, deadline)?)
+                    || permit.operation() != self.intent.selected.next_operation
+                {
+                    return Err(NativeError::Foreign);
+                }
+                io.verify_stop_lock(proof, lock, deadline)?;
+                self.namespace.reverify(io, proof, deadline)?;
+                permit.reverify(io, proof, deadline)?;
+                io.verify_first_history(proof, &self.intent, deadline)?;
+                preparing_matches(io, proof, &EpochClaim::Task(permit).epoch(io)?, deadline)?;
+                if io
+                    .read_record(
+                        proof,
+                        records::RecordName::Supervisor,
+                        files::MAX_RECORD_BYTES,
+                        deadline,
+                    )?
+                    .is_some()
+                {
+                    return Err(NativeError::Foreign);
+                }
+                Ok(())
+            }
+            pub(crate) fn publish_bound(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &Arc<TaskRunPermit>,
+                owner: &Arc<SupervisorOwner>,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.io.as_ref())
+                    || !Arc::ptr_eq(permit, &self.permit)
+                    || !Arc::ptr_eq(&self.namespace, &owner.exclusive_lease(proof, deadline)?)
+                {
+                    return Err(NativeError::Foreign);
+                }
+                io.verify_first_history(proof, &self.intent, deadline)?;
+                publish_epoch_bound(
+                    io,
+                    proof,
+                    lock,
+                    &self.namespace,
+                    EpochClaim::Task(permit),
+                    owner,
+                    deadline,
+                )
+            }
+        }
+        fn validate_slot_document(
+            slot: &FirstHistorySlot,
+            leaves: &[(HistoryLeaf, Vec<u8>)],
+            user: &TokenFacts,
+        ) -> NativeResult<()> {
+            match slot.source {
+                FirstHistorySource::Removal => {
+                    let (r, _) = decode_removal_history(leaves, user)?;
+                    if r.operation() != slot.operation {
+                        return Err(NativeError::Foreign);
+                    }
+                }
+                FirstHistorySource::Partial | FirstHistorySource::Stale => {
+                    let source = leaves
+                        .iter()
+                        .find(|(l, _)| l.leaf == "first-install.json")
+                        .ok_or(NativeError::Foreign)?;
+                    let first = FirstInstallRecord::decode(&source.1)?;
+                    let old: super::super::super::payload::recovery::OuterContextCorrelation =
+                        serde_json::from_slice(first.context())
+                            .map_err(|_| NativeError::Invalid)?;
+                    old.same_user(user)?;
+                    if first.operation() != slot.operation
+                        || leaves.iter().any(|(l, _)| {
+                            !matches!(
+                                l.leaf.as_str(),
+                                "first-install.json" | "task-activation.json"
+                            )
+                        })
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    if let Some((_, bytes)) = leaves
+                        .iter()
+                        .find(|(l, _)| l.leaf == "task-activation.json")
+                    {
+                        let activation = TaskActivationRecord::decode(bytes)?;
+                        if slot.source != FirstHistorySource::Partial
+                            || activation.operation() != first.operation()
+                            || activation.claim().is_some()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn core_names() -> Vec<records::RecordName> {
+            use records::RecordName as N;
+            vec![
+                N::Supervisor,
+                N::SupervisorLogon,
+                N::TaskActivation,
+                N::SupervisorEpoch(0),
+                N::SupervisorEpoch(1),
+                N::SupervisorEpoch(2),
+                N::SupervisorArchiveIntent,
+                N::Removal,
+                N::FirstInstall,
+                N::FirstInstallRecovery,
+            ]
+        }
+        fn decode_removal_history(
+            leaves: &[(HistoryLeaf, Vec<u8>)],
+            user: &TokenFacts,
+        ) -> NativeResult<(RemovalRecord, super::super::activation::EpochProvenance)> {
+            let bytes = |name: &str| -> NativeResult<&[u8]> {
+                leaves
+                    .iter()
+                    .find(|(leaf, _)| leaf.leaf == name)
+                    .map(|(_, bytes)| bytes.as_slice())
+                    .ok_or(NativeError::Foreign)
+            };
+            let removal = RemovalRecord::decode(bytes("removal.json")?)?;
+            removal.context().same_user(user)?;
+            if !matches!(
+                removal.cursor(),
+                RemovalCursor::Retired
+                    | RemovalCursor::Complete {
+                        retained_copy: None
+                    }
+            ) {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            let journal = Journal::decode(bytes("supervisor.json")?)?;
+            let provenance = SupervisorLogonRecord::decode(bytes("supervisor-logon.json")?)?;
+            let epoch = provenance.matches_current(&journal)?.clone();
+            if journal.phase != JournalPhase::Finished
+                || journal.user != user.user.sddl()
+                || removal
+                    .stopped()
+                    .is_none_or(|stopped| journal.current != Some(stopped.generation))
+            {
+                return Err(NativeError::Foreign);
+            }
+            let task = TaskActivationRecord::decode(bytes("task-activation.json")?)?;
+            if task.phase() != TaskPhase::RunObserved || task.claim().is_none() {
+                return Err(NativeError::Foreign);
+            }
+            // Correlation only: compare the exact decoded historical claim to matched provenance.
+            // No saved PID is opened, and no image is approved here.
+            let claim = task.claim().ok_or(NativeError::Foreign)?;
+            if task.user() != epoch.user() {
+                return Err(NativeError::Foreign);
+            }
+            let mut history = Vec::new();
+            for slot in 0..3 {
+                if let Some((leaf, data)) = leaves
+                    .iter()
+                    .find(|(leaf, _)| leaf.leaf == format!("supervisor-epoch-{slot}.json"))
+                {
+                    let prior = Journal::decode(data)?;
+                    history.push(
+                        provenance
+                            .matches_history(slot, &prior, leaf.identity, leaf.digest)?
+                            .clone(),
+                    );
+                }
+            }
+            // The archive keeps three slots and, once full, evicts the lowest clock epoch. That
+            // clock epoch equals owner_creation (EpochProvenance::new and validate). A claim must
+            // match a retained epoch unless three entries are retained and the claim is older than
+            // all of them; then it may have been evicted legitimately. Only the epoch match is
+            // waived in that case. Each archived leaf above was still verified byte-exact.
+            let may_be_retained = history.len() < 3
+                || history
+                    .iter()
+                    .map(|entry| entry.owner_creation())
+                    .min()
+                    .is_none_or(|oldest| claim.creation >= oldest);
+            let mut epochs = vec![epoch.clone()];
+            epochs.extend(history);
+            if may_be_retained
+                && !epochs.iter().any(|epoch| {
+                    serde_json::to_value(epoch).ok().is_some_and(|facts| {
+                        epoch.operation() == task.operation()
+                            && facts.get("owner_pid").and_then(serde_json::Value::as_u64)
+                                == Some(u64::from(claim.pid))
+                            && epoch.owner_creation() == claim.creation
+                    })
+                })
+            {
+                return Err(NativeError::Foreign);
+            }
+            for (leaf, data) in leaves {
+                match leaf.leaf.as_str() {
+                    "first-install.json" => {
+                        let first = FirstInstallRecord::decode(data)?;
+                        if first.phase() != FirstPhase::Complete {
+                            let (source, recovery) = leaves
+                                .iter()
+                                .find(|(l, _)| l.leaf == "first-install-recovery.json")
+                                .ok_or(NativeError::OutcomeUnknown)?;
+                            source.validate()?;
+                            let recovery = FirstRecoveryRecord::decode(recovery)?;
+                            if recovery.mode != FirstRecoveryMode::Supersede
+                                || recovery.cursor != FirstRecoveryCursor::Superseded
+                                || recovery.document != first
+                                || !recovery.source.matches(leaf.identity, data)
+                            {
+                                return Err(NativeError::OutcomeUnknown);
+                            }
+                        }
+                    }
+                    "first-install-recovery.json" => {
+                        let recovery = FirstRecoveryRecord::decode(data)?;
+                        if !matches!(
+                            recovery.cursor,
+                            FirstRecoveryCursor::Superseded | FirstRecoveryCursor::Retired
+                        ) {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                    }
+                    "supervisor-archive-intent.json" => {
+                        let value: super::super::epoch_archive::ArchiveIntent =
+                            records::record_data(
+                                &records::RecordName::SupervisorArchiveIntent,
+                                data,
+                            )?;
+                        value.require_complete()?;
+                    }
+                    _ => {}
+                }
+            }
+            validate_history_dependencies(leaves, user)?;
+            Ok((removal, epoch))
+        }
+        fn validate_history_dependencies(
+            leaves: &[(HistoryLeaf, Vec<u8>)],
+            user: &TokenFacts,
+        ) -> NativeResult<()> {
+            use super::super::super::{
+                payload::recovery as R,
+                repair::{payload_record as P, record as M},
+            };
+            let find = |name: &str| leaves.iter().find(|(leaf, _)| leaf.leaf == name);
+            for (leaf, bytes) in leaves {
+                match leaf.leaf.as_str() {
+                    "stage-catalog.json" => {
+                        let catalog: R::StageCatalog =
+                            records::record_data(&records::RecordName::StageCatalog, bytes)?;
+                        catalog.validate()?;
+                        for id in catalog
+                            .generations
+                            .iter()
+                            .map(|g| g.operation)
+                            .chain(catalog.active)
+                        {
+                            let name = records::RecordName::Operation(id);
+                            let (_, observed) = find(name.file_name()?.as_str())
+                                .ok_or(NativeError::OutcomeUnknown)?;
+                            let operation: R::OperationRecord =
+                                records::record_data(&name, observed)?;
+                            operation.validate()?;
+                            if operation.operation() != id
+                                || !matches!(
+                                    operation.phase(),
+                                    R::Phase::Complete | R::Phase::RolledBack
+                                )
+                            {
+                                return Err(NativeError::OutcomeUnknown);
+                            }
+                        }
+                    }
+                    "outer-upgrade.json" => {
+                        let outer = R::OuterUpgradeRecord::decode(bytes)?;
+                        outer.context().same_user(user)?;
+                        if !matches!(
+                            outer.phase(),
+                            R::OuterPhase::Complete | R::OuterPhase::Cancelled
+                        ) || outer.copy_cleanup() != R::OuterCopyCleanup::Absent
+                        {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                    }
+                    "file-recovery.json" => {
+                        if R::FileRecoveryJournal::decode(bytes)?.cursor()
+                            != R::FileRecoveryCursor::Retired
+                        {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                    }
+                    "repair.json" => {
+                        let record = M::RepairRecord::decode(bytes)?;
+                        record.context().same_user(user)?;
+                        if record.cursor() != M::RepairCursor::Complete {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                    }
+                    "repair-evidence-index.json" => {
+                        let index = M::EvidenceIndex::decode(bytes)?;
+                        if (0..3).any(|slot| {
+                            index
+                                .get(slot)
+                                .is_some_and(|s| s.phase() != M::EvidencePhase::Complete)
+                        }) {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                    }
+                    "repair-publication-intent.json" => {
+                        let intent: records::RepairPublicationIntent = records::record_data(
+                            &records::RecordName::RepairPublicationIntent,
+                            bytes,
+                        )?;
+                        intent.validate()?;
+                        let current = find(intent.target().name().file_name()?.as_str())
+                            .map(|(leaf, bytes)| {
+                                records::RepairPublicationStamp::new(
+                                    epoch_identity(leaf.identity),
+                                    bytes,
+                                )
+                            })
+                            .transpose()?;
+                        if intent.phase() != records::RepairPublicationPhase::Published
+                            || records::recover_repair_publication(&intent, current, None)
+                                != records::RepairPublicationObservation::Published
+                        {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                    }
+                    "repair-payload.json" => {
+                        let record = P::PayloadRepairRecord::decode(bytes)?;
+                        let (_, bytes) = find("repair-payload-catalog.json")
+                            .ok_or(NativeError::OutcomeUnknown)?;
+                        let catalog = P::PayloadRepairCatalog::decode(bytes)?;
+                        let intent = find("repair-payload-publication-intent.json")
+                            .map(|(_, bytes)| P::PayloadRepairPublicationIntent::decode(bytes))
+                            .transpose()?;
+                        let state = if let Some(intent) = &intent {
+                            let current = find(intent.target().name().file_name()?.as_str())
+                                .map(|(leaf, bytes)| {
+                                    P::PayloadRepairPublicationStamp::new(leaf.identity, bytes)
+                                })
+                                .transpose()?;
+                            P::recover_payload_repair_publication(intent, current, None)
+                        } else {
+                            P::PayloadRepairPublicationObservation::Published
+                        };
+                        if !P::retired_cleanup_settled(&record, &catalog, intent.as_ref(), state)? {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                    }
+                    "repair-payload-catalog.json" => {
+                        P::PayloadRepairCatalog::decode(bytes)?.validate()?;
+                    }
+                    "repair-payload-publication-intent.json" => {
+                        P::PayloadRepairPublicationIntent::decode(bytes)?.validate()?;
+                    }
+                    "repair-pending.json" | "repair-payload-pending.json" => {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        impl WindowsNativeIo {
+            pub(crate) fn read_first_history_intent(
+                &self,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<Option<FirstHistoryIntent>> {
+                self.read_record(
+                    proof,
+                    records::RecordName::FirstInstallHistoryIntent,
+                    files::MAX_RECORD_BYTES,
+                    deadline,
+                )?
+                .map(|record| FirstHistoryIntent::decode(record.bytes()))
+                .transpose()
+            }
+            pub(super) fn read_first_history_index(
+                &self,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<FirstHistoryIndex> {
+                self.read_record(
+                    proof,
+                    records::RecordName::FirstInstallHistoryIndex,
+                    files::MAX_RECORD_BYTES,
+                    deadline,
+                )?
+                .map(|record| FirstHistoryIndex::decode(record.bytes()))
+                .transpose()
+                .map(|r| r.unwrap_or_default())
+            }
+            fn first_history_parent(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<Arc<Anchor>> {
+                self.verify_stop_lock(proof, lock, deadline)?;
+                Ok(lock.0.parent.clone())
+            }
+            pub(super) fn validate_first_history_slots(
+                &self,
+                proof: &SupportProof,
+                index: &FirstHistoryIndex,
+                active: Option<&FirstHistoryIntent>,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                index.validate()?;
+                let context = self.context.clone();
+                let index = index.clone();
+                let active = active.cloned();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    let Some(parent) = Anchor::open(
+                        context.target.paths.installer(),
+                        &context.security,
+                        true,
+                        &budget,
+                    )?
+                    else {
+                        if index.slots.iter().any(Option::is_some) || active.is_some() {
+                            return Err(NativeError::Foreign);
+                        }
+                        return Ok(());
+                    };
+                    for slot in 0..3 {
+                        let archive =
+                            parent.first_history_slot(slot, false, &context.security, &budget)?;
+                        match (&index.slots[usize::from(slot)], archive) {
+                            (Some(manifest), Some(archive)) => {
+                                let names = archive.entry_names(&context.security, &budget)?;
+                                if names.len() != manifest.leaves.len()
+                                    || names.iter().any(|n| {
+                                        !manifest.leaves.iter().any(|leaf| &leaf.leaf == n)
+                                    })
+                                {
+                                    return Err(NativeError::Foreign);
+                                }
+                                let mut leaves = Vec::new();
+                                for leaf in &manifest.leaves {
+                                    let (id, bytes) = archive
+                                        .read_private(
+                                            &PrivateName::new(&leaf.leaf)?,
+                                            &context.security,
+                                            files::MAX_RECORD_BYTES,
+                                            &budget,
+                                        )?
+                                        .ok_or(NativeError::Foreign)?;
+                                    if !leaf.matches(id.into(), &bytes) {
+                                        return Err(NativeError::Foreign);
+                                    }
+                                    leaves.push((leaf.clone(), bytes));
+                                }
+                                validate_slot_document(
+                                    manifest,
+                                    &leaves,
+                                    &context.target.identity,
+                                )?;
+                            }
+                            (None, None) => {}
+                            (None, Some(archive))
+                                if active.as_ref().is_some_and(|intent| {
+                                    intent.slot == slot && !intent.complete
+                                }) =>
+                            {
+                                let intent = active.as_ref().ok_or(NativeError::Foreign)?;
+                                let names = archive.entry_names(&context.security, &budget)?;
+                                if names.iter().any(|n| {
+                                    !intent.selected.leaves.iter().any(|leaf| &leaf.leaf == n)
+                                }) {
+                                    return Err(NativeError::Foreign);
+                                }
+                            }
+                            _ => return Err(NativeError::OutcomeUnknown),
+                        }
+                    }
+                    budget.check()
+                })
+            }
+            pub(crate) fn first_history_capacity_available(
+                &self,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<bool> {
+                if let Some(intent) = self.read_first_history_intent(proof, deadline)?
+                    && (!intent.complete || self.read_removal(proof, deadline)?.is_none())
+                {
+                    return Ok(true);
+                }
+                let index = self.read_first_history_index(proof, deadline)?;
+                let active = self.read_first_history_intent(proof, deadline)?;
+                self.validate_first_history_slots(proof, &index, active.as_ref(), deadline)?;
+                Ok(index.vacant().is_ok())
+            }
+            pub(crate) fn admit_completed_removal_history(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<CompletedRemovalHistory> {
+                self.verify_stop_lock(proof, lock, deadline)?;
+                let index = self.read_first_history_index(proof, deadline)?;
+                let old = self.read_first_history_intent(proof, deadline)?;
+                self.validate_first_history_slots(proof, &index, old.as_ref(), deadline)?;
+                let resume = old.filter(|intent| {
+                    !intent.complete
+                        || self
+                            .read_removal(proof, deadline)
+                            .is_ok_and(|r| r.is_none())
+                });
+                let mut leaves = Vec::new();
+                if let Some(intent) = &resume {
+                    intent.validate()?;
+                    // Resuming in a later logon compares only the same user. A different logon
+                    // needs the same ended-logon disposition as first-install recovery.
+                    let stored: super::super::super::payload::recovery::OuterContextCorrelation =
+                        serde_json::from_slice(&intent.selected.context)
+                            .map_err(|_| NativeError::Invalid)?;
+                    stored.same_user(&self.context.target.identity)?;
+                    super::first_recovery_io::renew_prior_correlation(
+                        self, proof, &stored, deadline,
+                    )?;
+                    if index.slots[usize::from(intent.slot)]
+                        .as_ref()
+                        .is_some_and(|slot| slot != &intent.selected)
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    let parent = self.first_history_parent(proof, lock, deadline)?;
+                    let context = self.context.clone();
+                    let intent = intent.clone();
+                    let budget = proof.budget(self, deadline)?;
+                    leaves = self.owner.run(Dispatch::Observation, deadline, move || {
+                        let archive = parent.first_history_slot(
+                            intent.slot,
+                            false,
+                            &context.security,
+                            &budget,
+                        )?;
+                        let mut observed = Vec::new();
+                        for leaf in intent.selected.leaves {
+                            let name = PrivateName::new(&leaf.leaf)?;
+                            let source = parent.read_private(
+                                &name,
+                                &context.security,
+                                files::MAX_RECORD_BYTES,
+                                &budget,
+                            )?;
+                            let destination = archive
+                                .as_ref()
+                                .map(|a| {
+                                    a.read_private(
+                                        &name,
+                                        &context.security,
+                                        files::MAX_RECORD_BYTES,
+                                        &budget,
+                                    )
+                                })
+                                .transpose()?
+                                .flatten();
+                            let (id, bytes) = match (source, destination) {
+                                (Some(actual), None) | (None, Some(actual)) => actual,
+                                _ => return Err(NativeError::OutcomeUnknown),
+                            };
+                            if !leaf.matches(id.into(), &bytes) {
+                                return Err(NativeError::Foreign);
+                            }
+                            observed.push((leaf, bytes));
+                        }
+                        Ok(observed)
+                    })?;
+                } else {
+                    index.vacant()?;
+                    for name in core_names() {
+                        if let Some(record) = self.read_record(
+                            proof,
+                            name.clone(),
+                            files::MAX_RECORD_BYTES,
+                            deadline,
+                        )? {
+                            leaves.push((
+                                HistoryLeaf::observe(
+                                    name.file_name()?.as_str().into(),
+                                    record.identity.into(),
+                                    record.bytes(),
+                                )?,
+                                record.bytes().to_vec(),
+                            ));
+                        }
+                    }
+                }
+                let (removal, epoch) =
+                    decode_removal_history(&leaves, &self.context.target.identity)?;
+                if epoch.authentication_id() != self.context.target.identity.authentication_id {
+                    self.query_prior_logon(
+                        proof,
+                        &MatchedLogonProvenance {
+                            io: self.clone(),
+                            epoch,
+                        },
+                        deadline,
+                    )?;
+                }
+                if resume.is_none() {
+                    self.collect_terminal_first_dependencies(proof, &mut leaves, deadline)?;
+                }
+                let reservation = self.reserve_first_namespace(proof, lock, deadline)?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| NativeError::Unavailable)?;
+                let (server, lease) = runtime.block_on(async {
+                    RemovalKeeperLease::reserve(self.clone(), proof, removal.operation(), deadline)
+                })?;
+                reservation.retain_removed_namespace(
+                    RemovedNamespace {
+                        server,
+                        lease,
+                        runtime,
+                        operation: removal.operation(),
+                    },
+                    proof,
+                    deadline,
+                )?;
+                let parent = self.first_history_parent(proof, lock, deadline)?;
+                let context = self.context.clone();
+                let root = self.payload_root(proof, lock, deadline)?.0;
+                let operation = removal.operation();
+                let repair_operation = leaves
+                    .iter()
+                    .find(|(leaf, _)| leaf.leaf == "repair-payload.json")
+                    .map(|(_, bytes)| {
+                        super::super::super::repair::payload_record::PayloadRepairRecord::decode(
+                            bytes,
+                        )
+                        .map(|r| r.operation())
+                    })
+                    .transpose()?;
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    if PayloadRoot(root).check(&context, &budget)?.is_some() {
+                        return Err(NativeError::Foreign);
+                    }
+                    let state = Anchor::open(
+                        &format!("{}\\Crosspane", context.target.paths.local()),
+                        &context.security,
+                        true,
+                        &budget,
+                    )?
+                    .ok_or(NativeError::Missing)?;
+                    if let Some(runtime) = state.child("runtime", &context.security, &budget)?
+                        && let Some(copies) =
+                            runtime.child("removal", &context.security, &budget)?
+                        && let Some(op) =
+                            copies.child(&records::hex(&operation), &context.security, &budget)?
+                    {
+                        for leaf in ["keeper-copy.exe", "helper-copy.exe"] {
+                            if op
+                                .opaque(leaf, false, &context.security, &budget)?
+                                .is_some()
+                            {
+                                return Err(NativeError::OutcomeUnknown);
+                            }
+                        }
+                    }
+                    if let Some(operation) = repair_operation
+                        && let Some(runtime) = state.child("runtime", &context.security, &budget)?
+                        && let Some(repairs) =
+                            runtime.child("repair", &context.security, &budget)?
+                        && let Some(op) =
+                            repairs.child(&records::hex(&operation), &context.security, &budget)?
+                        && op
+                            .opaque("keeper-copy.exe", false, &context.security, &budget)?
+                            .is_some()
+                    {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    parent.revalidate(&context.security, true, &budget)
+                })?;
+                Ok(CompletedRemovalHistory {
+                    io: self.clone(),
+                    reservation,
+                    leaves,
+                    operation: removal.operation(),
+                    context: self.first_install_context()?,
+                    resume,
+                })
+            }
+
+            fn collect_terminal_first_dependencies(
+                &self,
+                proof: &SupportProof,
+                leaves: &mut Vec<(HistoryLeaf, Vec<u8>)>,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                use super::super::super::{
+                    payload::recovery as R,
+                    repair::{payload_record as P, record as M},
+                };
+                let mut add = |name: records::RecordName,
+                               bytes: &[u8],
+                               id: FileIdentity|
+                 -> NativeResult<()> {
+                    if leaves.len() >= MAX_HISTORY_LEAVES {
+                        return Err(NativeError::Oversize);
+                    }
+                    let leaf =
+                        HistoryLeaf::observe(name.file_name()?.as_str().into(), id.into(), bytes)?;
+                    if leaves.iter().any(|(old, _)| old.leaf == leaf.leaf) {
+                        return Err(NativeError::Foreign);
+                    }
+                    leaves.push((leaf, bytes.to_vec()));
+                    Ok(())
+                };
+                let read = |name| self.read_record(proof, name, files::MAX_RECORD_BYTES, deadline);
+                if let Some(catalog) = read(records::RecordName::StageCatalog)? {
+                    let value: R::StageCatalog =
+                        records::record_data(&records::RecordName::StageCatalog, catalog.bytes())?;
+                    value.validate()?;
+                    let mut operations = value
+                        .generations
+                        .iter()
+                        .map(|g| g.operation)
+                        .collect::<Vec<_>>();
+                    if let Some(active) = value.active
+                        && !operations.contains(&active)
+                    {
+                        operations.push(active);
+                    }
+                    if operations.len() > MAX_HISTORY_LEAVES - 1 {
+                        return Err(NativeError::Oversize);
+                    }
+                    for id in operations {
+                        let name = records::RecordName::Operation(id);
+                        let observed = read(name.clone())?.ok_or(NativeError::OutcomeUnknown)?;
+                        let operation: R::OperationRecord =
+                            records::record_data(&name, observed.bytes())?;
+                        operation.validate()?;
+                        if operation.operation() != id
+                            || !matches!(
+                                operation.phase(),
+                                R::Phase::Complete | R::Phase::RolledBack
+                            )
+                        {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                        add(name, observed.bytes(), observed.identity)?;
+                    }
+                    add(
+                        records::RecordName::StageCatalog,
+                        catalog.bytes(),
+                        catalog.identity,
+                    )?;
+                }
+                if let Some(record) = read(records::RecordName::OuterUpgrade)? {
+                    let outer = R::OuterUpgradeRecord::decode(record.bytes())?;
+                    outer.context().same_user(&self.context.target.identity)?;
+                    if !matches!(
+                        outer.phase(),
+                        R::OuterPhase::Complete | R::OuterPhase::Cancelled
+                    ) || outer.copy_cleanup() != R::OuterCopyCleanup::Absent
+                    {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    add(
+                        records::RecordName::OuterUpgrade,
+                        record.bytes(),
+                        record.identity,
+                    )?;
+                }
+                if let Some(record) = read(records::RecordName::FileRecovery)? {
+                    let recovery = R::FileRecoveryJournal::decode(record.bytes())?;
+                    if recovery.cursor() != R::FileRecoveryCursor::Retired {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    add(
+                        records::RecordName::FileRecovery,
+                        record.bytes(),
+                        record.identity,
+                    )?;
+                }
+                if read(records::RecordName::RepairPending)?.is_some()
+                    || read(records::RecordName::RepairPayloadPending)?.is_some()
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                if let Some(record) = read(records::RecordName::Repair)? {
+                    let repair = M::RepairRecord::decode(record.bytes())?;
+                    repair.context().same_user(&self.context.target.identity)?;
+                    if repair.cursor() != M::RepairCursor::Complete {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    add(records::RecordName::Repair, record.bytes(), record.identity)?;
+                }
+                if let Some(record) = read(records::RecordName::RepairEvidence)? {
+                    let index = M::EvidenceIndex::decode(record.bytes())?;
+                    for slot in 0..3 {
+                        if index
+                            .get(slot)
+                            .is_some_and(|s| s.phase() != M::EvidencePhase::Complete)
+                        {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                    }
+                    add(
+                        records::RecordName::RepairEvidence,
+                        record.bytes(),
+                        record.identity,
+                    )?;
+                }
+                if let Some(record) = read(records::RecordName::RepairPublicationIntent)? {
+                    let intent: records::RepairPublicationIntent = records::record_data(
+                        &records::RecordName::RepairPublicationIntent,
+                        record.bytes(),
+                    )?;
+                    intent.validate()?;
+                    let current = read(intent.target().name())?
+                        .map(|r| records::RepairPublicationStamp::new(r.identity, r.bytes()))
+                        .transpose()?;
+                    if intent.phase() != records::RepairPublicationPhase::Published
+                        || records::recover_repair_publication(&intent, current, None)
+                            != records::RepairPublicationObservation::Published
+                    {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    add(
+                        records::RecordName::RepairPublicationIntent,
+                        record.bytes(),
+                        record.identity,
+                    )?;
+                }
+                if let Some(record) = read(records::RecordName::RepairPayload)? {
+                    let repair = P::PayloadRepairRecord::decode(record.bytes())?;
+                    if repair.phase() != P::PayloadRepairPhase::Retired {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    let catalog = read(records::RecordName::RepairPayloadCatalog)?
+                        .ok_or(NativeError::OutcomeUnknown)?;
+                    let history = P::PayloadRepairCatalog::decode(catalog.bytes())?;
+                    let intent = read(records::RecordName::RepairPayloadPublicationIntent)?
+                        .map(|r| P::PayloadRepairPublicationIntent::decode(r.bytes()))
+                        .transpose()?;
+                    let state = if let Some(intent) = &intent {
+                        let current = read(intent.target().name())?
+                            .map(|r| {
+                                P::PayloadRepairPublicationStamp::new(r.identity.into(), r.bytes())
+                            })
+                            .transpose()?;
+                        P::recover_payload_repair_publication(intent, current, None)
+                    } else {
+                        P::PayloadRepairPublicationObservation::Published
+                    };
+                    if !P::retired_cleanup_settled(&repair, &history, intent.as_ref(), state)? {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    add(
+                        records::RecordName::RepairPayload,
+                        record.bytes(),
+                        record.identity,
+                    )?;
+                    add(
+                        records::RecordName::RepairPayloadCatalog,
+                        catalog.bytes(),
+                        catalog.identity,
+                    )?;
+                } else if read(records::RecordName::RepairPayloadCatalog)?.is_some()
+                    || read(records::RecordName::RepairPayloadPublicationIntent)?.is_some()
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                if let Some(record) = read(records::RecordName::RepairPayloadPublicationIntent)? {
+                    let intent = P::PayloadRepairPublicationIntent::decode(record.bytes())?;
+                    if intent.phase() != P::PayloadRepairPublicationPhase::Published {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    add(
+                        records::RecordName::RepairPayloadPublicationIntent,
+                        record.bytes(),
+                        record.identity,
+                    )?;
+                }
+                Ok(())
+            }
+            pub(crate) fn archive_completed_removal(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                history: CompletedRemovalHistory,
+                next_operation: [u8; 16],
+                deadline: &Deadline,
+            ) -> NativeResult<ArchivedFirstHistory> {
+                if !Arc::ptr_eq(self, &history.io) {
+                    return Err(NativeError::Foreign);
+                }
+                history.reservation.reverify(self, proof, deadline)?;
+                let mut index = self.read_first_history_index(proof, deadline)?;
+                let mut intent = match history.resume {
+                    Some(intent) => intent,
+                    None => index.select(FirstHistorySlot {
+                        source: FirstHistorySource::Removal,
+                        operation: history.operation,
+                        next_operation,
+                        context: history.context,
+                        leaves: history
+                            .leaves
+                            .iter()
+                            .map(|(leaf, _)| leaf.clone())
+                            .collect(),
+                    })?,
+                };
+                let mut port = NativeHistoryPort {
+                    io: self,
+                    lock,
+                    reservation: &history.reservation,
+                    deadline,
+                };
+                driver::archive_history(&mut port, &mut intent, &mut index)?;
+                Ok(ArchivedFirstHistory {
+                    io: self.clone(),
+                    reservation: history.reservation,
+                    intent,
+                })
+            }
+            pub(crate) fn verify_first_history(
+                &self,
+                proof: &SupportProof,
+                intent: &FirstHistoryIntent,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                intent.validate()?;
+                if !intent.complete
+                    || self.read_first_history_intent(proof, deadline)?.as_ref() != Some(intent)
+                    || self.read_first_history_index(proof, deadline)?.slots
+                        [usize::from(intent.slot)]
+                    .as_ref()
+                        != Some(&intent.selected)
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let context = self.context.clone();
+                let selected = intent.clone();
+                let budget = proof.budget(self, deadline)?;
+                let leaves = self.owner.run(Dispatch::Observation, deadline, move || {
+                    let parent = Anchor::open(
+                        context.target.paths.installer(),
+                        &context.security,
+                        true,
+                        &budget,
+                    )?
+                    .ok_or(NativeError::Missing)?;
+                    let archive = parent
+                        .first_history_slot(selected.slot, false, &context.security, &budget)?
+                        .ok_or(NativeError::Foreign)?;
+                    let mut leaves = Vec::new();
+                    for leaf in selected.selected.leaves {
+                        let (id, bytes) = archive
+                            .read_private(
+                                &PrivateName::new(&leaf.leaf)?,
+                                &context.security,
+                                files::MAX_RECORD_BYTES,
+                                &budget,
+                            )?
+                            .ok_or(NativeError::Foreign)?;
+                        if !leaf.matches(id.into(), &bytes) {
+                            return Err(NativeError::Foreign);
+                        }
+                        leaves.push((leaf, bytes));
+                    }
+                    Ok(leaves)
+                })?;
+                validate_slot_document(&intent.selected, &leaves, &self.context.target.identity)?;
+                Ok(())
+            }
+            pub(crate) fn is_first_reinstall_epoch(
+                &self,
+                proof: &SupportProof,
+                operation: [u8; 16],
+                deadline: &Deadline,
+            ) -> NativeResult<bool> {
+                let Some(intent) = self.read_first_history_intent(proof, deadline)? else {
+                    return Ok(false);
+                };
+                if !intent.complete {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                Ok(intent.selected.next_operation == operation)
+            }
+            pub(crate) fn prepare_first_reinstall_epoch(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &Arc<TaskRunPermit>,
+                owner: &Arc<SupervisorOwner>,
+                deadline: &Deadline,
+            ) -> NativeResult<FirstInstallArchiveResult> {
+                self.verify_stop_lock(proof, lock, deadline)?;
+                permit.reverify(self, proof, deadline)?;
+                let namespace = owner.exclusive_lease(proof, deadline)?;
+                namespace.reverify(self, proof, deadline)?;
+                let intent = self
+                    .read_first_history_intent(proof, deadline)?
+                    .ok_or(NativeError::Foreign)?;
+                self.verify_first_history(proof, &intent, deadline)?;
+                let first = self
+                    .read_first_install(proof, deadline)?
+                    .ok_or(NativeError::Foreign)?;
+                if first.operation() != permit.operation()
+                    || intent.selected.next_operation != permit.operation()
+                    || !matches!(
+                        first.phase(),
+                        FirstPhase::RunIntent | FirstPhase::RunObserved
+                    )
+                    || self
+                        .read_record(
+                            proof,
+                            records::RecordName::Supervisor,
+                            files::MAX_RECORD_BYTES,
+                            deadline,
+                        )?
+                        .is_some()
+                    || SupervisorLogonRecord::read(self, proof, deadline)?.is_some()
+                {
+                    return Err(NativeError::Foreign);
+                }
+                publish_epoch_preparing(
+                    self,
+                    proof,
+                    lock,
+                    EpochClaim::Task(permit).epoch(self)?,
+                    None,
+                    deadline,
+                )?;
+                let value = FirstInstallArchiveResult {
+                    io: self.clone(),
+                    namespace,
+                    permit: permit.clone(),
+                    intent,
+                };
+                value.reverify(self, proof, lock, permit, owner, deadline)?;
+                Ok(value)
+            }
+            pub(super) fn read_archived_first_source(
+                &self,
+                proof: &SupportProof,
+                expected: &HistoryLeaf,
+                operation: [u8; 16],
+                deadline: &Deadline,
+            ) -> NativeResult<(FileStamp, Vec<u8>)> {
+                let index = self.read_first_history_index(proof, deadline)?;
+                let active = self.read_first_history_intent(proof, deadline)?;
+                let slot = index
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, slot)| {
+                        slot.as_ref()
+                            .filter(|s| {
+                                s.operation == operation
+                                    && s.source != FirstHistorySource::Removal
+                                    && s.leaves.contains(expected)
+                            })
+                            .map(|_| i as u8)
+                    })
+                    .or_else(|| {
+                        active
+                            .as_ref()
+                            .filter(|i| {
+                                i.selected.operation == operation
+                                    && i.selected.source != FirstHistorySource::Removal
+                                    && i.selected.leaves.contains(expected)
+                            })
+                            .map(|i| i.slot)
+                    })
+                    .ok_or(NativeError::Foreign)?;
+                let context = self.context.clone();
+                let budget = proof.budget(self, deadline)?;
+                let expected = expected.clone();
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    let parent = Anchor::open(
+                        context.target.paths.installer(),
+                        &context.security,
+                        true,
+                        &budget,
+                    )?
+                    .ok_or(NativeError::Missing)?;
+                    let archive = parent
+                        .first_history_slot(slot, false, &context.security, &budget)?
+                        .ok_or(NativeError::Foreign)?;
+                    let (id, bytes) = archive
+                        .read_private(
+                            &PrivateName::new(&expected.leaf)?,
+                            &context.security,
+                            files::MAX_RECORD_BYTES,
+                            &budget,
+                        )?
+                        .ok_or(NativeError::Foreign)?;
+                    if !expected.matches(id.into(), &bytes) {
+                        return Err(NativeError::Foreign);
+                    }
+                    Ok((id.into(), bytes))
+                })
+            }
+            pub(super) fn archive_first_recovery_history(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                reservation: &FirstInstallReservation,
+                recovery: &FirstRecoveryRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                use super::super::super::first_install::record::{
+                    FirstRecoveryCursor as C, FirstRecoveryMode as M,
+                };
+                self.verify_stop_lock(proof, lock, deadline)?;
+                reservation.reverify(self, proof, deadline)?;
+                if recovery.cursor != C::RetireIntent
+                    || recovery.pending_scaffold
+                    || recovery.pending.iter().any(|p| *p)
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let mut index = self.read_first_history_index(proof, deadline)?;
+                let old = self.read_first_history_intent(proof, deadline)?;
+                self.validate_first_history_slots(proof, &index, old.as_ref(), deadline)?;
+                let mut intent = if let Some(old) = old.filter(|i| {
+                    i.selected.operation == recovery.document.operation()
+                        && i.selected.source != FirstHistorySource::Removal
+                }) {
+                    if !old.selected.leaves.contains(&recovery.source) {
+                        return Err(NativeError::Foreign);
+                    }
+                    old
+                } else {
+                    let selected = self
+                        .read_record(
+                            proof,
+                            records::RecordName::FirstInstall,
+                            files::MAX_RECORD_BYTES,
+                            deadline,
+                        )?
+                        .ok_or(NativeError::Foreign)?;
+                    if !recovery
+                        .source
+                        .matches(selected.identity.into(), selected.bytes())
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    let mut leaves = vec![recovery.source.clone()];
+                    let source = if matches!(recovery.mode, M::Rollback | M::Remove) {
+                        FirstHistorySource::Partial
+                    } else {
+                        FirstHistorySource::Stale
+                    };
+                    if source == FirstHistorySource::Partial {
+                        if let Some(record) = self.read_record(
+                            proof,
+                            records::RecordName::TaskActivation,
+                            files::MAX_RECORD_BYTES,
+                            deadline,
+                        )? {
+                            let task = TaskActivationRecord::decode(record.bytes())?;
+                            if task.operation() != recovery.document.operation()
+                                || task.claim().is_some()
+                            {
+                                return Err(NativeError::Foreign);
+                            }
+                            leaves.push(HistoryLeaf::observe(
+                                "task-activation.json".into(),
+                                record.identity.into(),
+                                record.bytes(),
+                            )?);
+                        }
+                        if self
+                            .read_record(
+                                proof,
+                                records::RecordName::Supervisor,
+                                files::MAX_RECORD_BYTES,
+                                deadline,
+                            )?
+                            .is_some()
+                            || SupervisorLogonRecord::read(self, proof, deadline)?.is_some()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                    }
+                    let mut next_operation = [0; 16];
+                    aws_lc_rs::rand::fill(&mut next_operation)
+                        .map_err(|_| NativeError::Unavailable)?;
+                    index.select(FirstHistorySlot {
+                        source,
+                        operation: recovery.document.operation(),
+                        next_operation,
+                        context: self.first_install_context()?,
+                        leaves,
+                    })?
+                };
+                let mut port = NativeHistoryPort {
+                    io: self,
+                    lock,
+                    reservation,
+                    deadline,
+                };
+                driver::archive_history(&mut port, &mut intent, &mut index)?;
+                self.verify_first_history(proof, &intent, deadline)
+            }
+            pub(crate) fn admit_recovered_first_history(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<ArchivedFirstHistory> {
+                use super::super::super::first_install::record::{
+                    FirstRecoveryCursor as C, FirstRecoveryMode as M,
+                };
+                self.verify_stop_lock(proof, lock, deadline)?;
+                // A stale recovery record must never hijack a reinstall: recovered history is
+                // admitted only when no removal or first-install record is live.
+                if self.read_removal(proof, deadline)?.is_some()
+                    || self.read_first_install(proof, deadline)?.is_some()
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let recovery = self
+                    .read_first_recovery(proof, deadline)?
+                    .ok_or(NativeError::Foreign)?;
+                if recovery.cursor != C::Retired
+                    || !matches!(recovery.mode, M::Rollback | M::Remove)
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let intent = self
+                    .read_first_history_intent(proof, deadline)?
+                    .ok_or(NativeError::Foreign)?;
+                self.verify_first_history(proof, &intent, deadline)?;
+                if intent.selected.source != FirstHistorySource::Partial
+                    || !intent.selected.leaves.contains(&recovery.source)
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let reservation = self.acquire_first_reservation(proof, lock, true, deadline)?;
+                // Archive metadata cannot prove file completion: independently renew each actual triad.
+                self.verify_recovered_first_files(proof, lock, &reservation, &recovery, deadline)?;
+                Ok(ArchivedFirstHistory {
+                    io: self.clone(),
+                    reservation,
+                    intent,
+                })
+            }
+        }
+        pub(super) struct NativeHistoryPort<'a> {
+            pub(super) io: &'a Arc<WindowsNativeIo>,
+            pub(super) lock: &'a InstallerLock,
+            pub(super) reservation: &'a FirstInstallReservation,
+            pub(super) deadline: &'a Deadline,
+        }
+        impl FirstHistoryPort for NativeHistoryPort<'_> {
+            fn renew(&mut self, intent: &FirstHistoryIntent) -> NativeResult<()> {
+                let proof = self.io.admit_support(self.deadline)?;
+                self.io.verify_stop_lock(&proof, self.lock, self.deadline)?;
+                self.reservation.reverify(self.io, &proof, self.deadline)?;
+                intent.validate()?;
+                if let Some(old) = self.io.read_first_history_intent(&proof, self.deadline)?
+                    && old.selected.next_operation == intent.selected.next_operation
+                    && (old.slot != intent.slot
+                        || old.selected != intent.selected
+                        || old.moved > intent.moved
+                        || old.complete && !intent.complete)
+                {
+                    return Err(NativeError::Foreign);
+                }
+                Ok(())
+            }
+            fn persist_intent(&mut self, intent: &FirstHistoryIntent) -> NativeResult<()> {
+                let proof = self.io.admit_support(self.deadline)?;
+                self.renew(intent)?;
+                let state = self.io.publish_record(
+                    &proof,
+                    self.lock,
+                    records::RecordName::FirstInstallHistoryIntent,
+                    &intent.encode()?,
+                    self.deadline,
+                )?;
+                if state.native_failure.is_some()
+                    || state.state != records::PublicationRecovery::NewPublished
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                Ok(())
+            }
+            fn observe_pair(
+                &mut self,
+                intent: &FirstHistoryIntent,
+                leaf: &HistoryLeaf,
+            ) -> NativeResult<(Option<HistoryObservation>, Option<HistoryObservation>)>
+            {
+                let proof = self.io.admit_support(self.deadline)?;
+                self.renew(intent)?;
+                let parent = self
+                    .io
+                    .first_history_parent(&proof, self.lock, self.deadline)?;
+                let context = self.io.context.clone();
+                let leaf = leaf.clone();
+                let slot = intent.slot;
+                let budget = proof.budget(self.io, self.deadline)?;
+                self.io
+                    .owner
+                    .run(Dispatch::Observation, self.deadline, move || {
+                        let name = PrivateName::new(&leaf.leaf)?;
+                        let source = parent
+                            .read_private(
+                                &name,
+                                &context.security,
+                                files::MAX_RECORD_BYTES,
+                                &budget,
+                            )?
+                            .map(|(id, bytes)| (id.into(), bytes));
+                        let destination = parent
+                            .first_history_slot(slot, false, &context.security, &budget)?
+                            .map(|archive| {
+                                archive.read_private(
+                                    &name,
+                                    &context.security,
+                                    files::MAX_RECORD_BYTES,
+                                    &budget,
+                                )
+                            })
+                            .transpose()?
+                            .flatten()
+                            .map(|(id, bytes)| (id.into(), bytes));
+                        Ok((source, destination))
+                    })
+            }
+            fn move_exact(
+                &mut self,
+                intent: &FirstHistoryIntent,
+                leaf: &HistoryLeaf,
+            ) -> NativeResult<()> {
+                let proof = self.io.admit_support(self.deadline)?;
+                self.renew(intent)?;
+                if self
+                    .io
+                    .read_first_history_intent(&proof, self.deadline)?
+                    .as_ref()
+                    != Some(intent)
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let parent = self
+                    .io
+                    .first_history_parent(&proof, self.lock, self.deadline)?;
+                let context = self.io.context.clone();
+                let leaf = leaf.clone();
+                let slot = intent.slot;
+                let reservation = self.reservation.clone();
+                let lease = self.lock.0.clone();
+                let budget = proof.budget(self.io, self.deadline)?;
+                self.io
+                    .owner
+                    .run(Dispatch::Mutation, self.deadline, move || {
+                        let change = Change::new();
+                        change.finish((|| {
+                            validate_payload_lock(&context, &lease, &budget)?;
+                            reservation.renew_native(&context, &budget)?;
+                            let (id, bytes) = parent
+                                .read_private(
+                                    &PrivateName::new(&leaf.leaf)?,
+                                    &context.security,
+                                    files::MAX_RECORD_BYTES,
+                                    &budget,
+                                )?
+                                .ok_or(NativeError::Foreign)?;
+                            if !leaf.matches(id.into(), &bytes) {
+                                return Err(NativeError::Foreign);
+                            }
+                            change.reached();
+                            let archive = parent
+                                .first_history_slot(slot, true, &context.security, &budget)?
+                                .ok_or(NativeError::Foreign)?;
+                            parent.archive_first_history_metadata(
+                                &leaf.leaf,
+                                id,
+                                &bytes,
+                                &archive,
+                                &context.security,
+                                &budget,
+                            )?;
+                            reservation.renew_native(&context, &budget)
+                        })())
+                    })
+            }
+            fn persist_index(&mut self, index: &FirstHistoryIndex) -> NativeResult<()> {
+                let proof = self.io.admit_support(self.deadline)?;
+                self.io.verify_stop_lock(&proof, self.lock, self.deadline)?;
+                self.reservation.reverify(self.io, &proof, self.deadline)?;
+                let result = self.io.publish_record(
+                    &proof,
+                    self.lock,
+                    records::RecordName::FirstInstallHistoryIndex,
+                    &index.encode()?,
+                    self.deadline,
+                )?;
+                if result.native_failure.is_some()
+                    || result.state != records::PublicationRecovery::NewPublished
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                Ok(())
+            }
+        }
+    }
+    #[cfg(not(test))]
+    pub(crate) use first_history_io::{ArchivedFirstHistory, FirstInstallArchiveResult};
+
+    #[cfg(not(test))]
+    mod first_recovery_io {
+        use super::super::super::{
+            first_install::record::{
+                FirstInstallRecord, FirstRecoveryCursor, FirstRecoveryMode, FirstRecoveryRecord,
+                HistoryLeaf, RoleTriad,
+            },
+            payload::{
+                inventory::PayloadRole,
+                recovery::{FileStamp, OriginalLeaf, OuterContextCorrelation},
+            },
+            removal::inventory::PartialFirstLocation as Location,
+            service::task::{Definition, Logon, RunLevel, SUPERVISOR_ARGUMENT, TASK_NAME},
+        };
+        use super::*;
+        struct FirstPriorSessionDisposed {
+            io: Arc<WindowsNativeIo>,
+            document: FirstInstallRecord,
+        }
+        impl FirstPriorSessionDisposed {
+            fn reverify(&self, proof: &SupportProof, deadline: &Deadline) -> NativeResult<()> {
+                renew_prior_context(&self.io, proof, &self.document, deadline)
+            }
+        }
+        pub(crate) struct FirstRecoveryReservation {
+            io: Arc<WindowsNativeIo>,
+            reservation: FirstInstallReservation,
+            source: HistoryLeaf,
+            document: FirstInstallRecord,
+            prior: Option<FirstPriorSessionDisposed>,
+        }
+        impl FirstRecoveryReservation {
+            fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                io.verify_stop_lock(proof, lock, deadline)?;
+                self.reservation.reverify(io, proof, deadline)?;
+                let source = io.first_recovery_source(
+                    proof,
+                    &self.source,
+                    self.document.operation(),
+                    deadline,
+                )?;
+                if !self.source.matches(source.0, &source.1)
+                    || FirstInstallRecord::decode(&source.1)? != self.document
+                {
+                    return Err(NativeError::Foreign);
+                }
+                match &self.prior {
+                    Some(prior) => prior.reverify(proof, deadline),
+                    None => renew_prior_context(io, proof, &self.document, deadline),
+                }
+            }
+        }
+        /// Keeps the native cause; a denied Task Scheduler connection is never proof of absence.
+        fn repair_connect_failure(failure: super::super::task::RepairTaskFailure) -> NativeError {
+            match failure {
+                super::super::task::RepairTaskFailure::Native(error) => error,
+                super::super::task::RepairTaskFailure::AccessDenied => NativeError::Foreign,
+            }
+        }
+        fn renew_prior_context(
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            source: &FirstInstallRecord,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let old: OuterContextCorrelation =
+                serde_json::from_slice(source.context()).map_err(|_| NativeError::Invalid)?;
+            renew_prior_correlation(io, proof, &old, deadline)
+        }
+        /// Shared F2 disposition for a stored correlation: the same user is required, and a
+        /// different logon must have ended (`query_ended_logon`). First-install and history
+        /// resumes both use it.
+        pub(super) fn renew_prior_correlation(
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            old: &OuterContextCorrelation,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            old.same_user(&io.context.target.identity)?;
+            if old.matches(&io.context.target.identity).is_ok() {
+                return Ok(());
+            }
+            if old.authentication_id() == io.context.target.identity.authentication_id
+                || old.logon_sid() == io.context.target.identity.logon.bytes()
+                || LOGON_QUERY_QUARANTINE.get().is_some()
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            let context = io.context.clone();
+            let owner = io.owner.clone();
+            let authentication_id = old.authentication_id();
+            let budget = proof.budget(io, deadline)?;
+            // Existing bounded worker returns success ONLY for NO_SUCH_LOGON_SESSION; this
+            // observation grants file/history recovery, never job zero or a process capability.
+            io.owner
+                .run(Dispatch::Observation, deadline, move || {
+                    query_ended_logon(&context, &owner, authentication_id, &budget)
+                })
+                .map_err(|_| NativeError::OutcomeUnknown)
+        }
+        fn definition(context: &Context) -> Definition {
+            let user = context.target.identity.user.sddl();
+            Definition {
+                name: TASK_NAME.into(),
+                principal: user.clone(),
+                trigger_user: user,
+                logon: Logon::InteractiveToken,
+                run_level: RunLevel::Limited,
+                action: format!(
+                    "{}\\crosspane-installer.exe",
+                    context.target.paths.install()
+                ),
+                arguments: SUPERVISOR_ARGUMENT.into(),
+                working_directory: context.target.paths.install().into(),
+                logon_trigger_only: true,
+                ignore_new_instance: true,
+                manager_restart_count: 0,
+                enabled: true,
+            }
+        }
+        fn root(context: &Context, budget: &Deadline) -> NativeResult<Option<Anchor>> {
+            Anchor::open(
+                context.target.paths.install(),
+                &context.security,
+                true,
+                budget,
+            )
+        }
+        fn parent(
+            context: &Context,
+            operation: [u8; 16],
+            location: Location,
+            budget: &Deadline,
+        ) -> NativeResult<Option<Anchor>> {
+            let Some(root) = root(context, budget)? else {
+                return Ok(None);
+            };
+            if location == Location::Fixed {
+                return Ok(Some(root));
+            }
+            let name = match location {
+                Location::Stage => "first-install-stage",
+                Location::Backup => "first-install-backups",
+                Location::Fixed => return Err(NativeError::Invalid),
+            };
+            let Some(group) = root.child(name, &context.security, budget)? else {
+                return Ok(None);
+            };
+            group.child(&records::hex(&operation), &context.security, budget)
+        }
+        fn validate_scaffold(
+            context: &Context,
+            record: &FirstRecoveryRecord,
+            budget: &Deadline,
+        ) -> NativeResult<()> {
+            let Some(root) = root(context, budget)? else {
+                return if record.scaffold[0].is_none() {
+                    Ok(())
+                } else {
+                    Err(NativeError::Foreign)
+                };
+            };
+            if Some(root.identity()?.into()) != record.scaffold[0] {
+                return Err(NativeError::Foreign);
+            }
+            for (base, name) in [(1, "first-install-stage"), (3, "first-install-backups")] {
+                let group = root.child(name, &context.security, budget)?;
+                if group
+                    .as_ref()
+                    .map(Anchor::identity)
+                    .transpose()?
+                    .map(Into::into)
+                    != record.scaffold[base]
+                {
+                    return Err(NativeError::Foreign);
+                }
+                if let Some(group) = group {
+                    let op = group.child(
+                        &records::hex(&record.document.operation()),
+                        &context.security,
+                        budget,
+                    )?;
+                    if op
+                        .as_ref()
+                        .map(Anchor::identity)
+                        .transpose()?
+                        .map(Into::into)
+                        != record.scaffold[base + 1]
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn check(
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            reservation: &FirstRecoveryReservation,
+            record: &FirstRecoveryRecord,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            record.validate()?;
+            reservation.reverify(io, proof, lock, deadline)?;
+            if record.source != reservation.source || record.document != reservation.document {
+                return Err(NativeError::Foreign);
+            }
+            if io.read_first_recovery(proof, deadline)?.as_ref() != Some(record) {
+                return Err(NativeError::Foreign);
+            }
+            Ok(())
+        }
+        impl WindowsNativeIo {
+            fn first_recovery_source(
+                &self,
+                proof: &SupportProof,
+                expected: &HistoryLeaf,
+                operation: [u8; 16],
+                deadline: &Deadline,
+            ) -> NativeResult<(FileStamp, Vec<u8>)> {
+                if let Some(source) = self.read_record(
+                    proof,
+                    records::RecordName::FirstInstall,
+                    files::MAX_RECORD_BYTES,
+                    deadline,
+                )? {
+                    if !expected.matches(source.identity.into(), source.bytes()) {
+                        return Err(NativeError::Foreign);
+                    }
+                    return Ok((source.identity.into(), source.bytes().to_vec()));
+                }
+                let recovery = self
+                    .read_first_recovery(proof, deadline)?
+                    .ok_or(NativeError::Foreign)?;
+                if recovery.source != *expected
+                    || recovery.document.operation() != operation
+                    || !matches!(
+                        recovery.cursor,
+                        FirstRecoveryCursor::RetireIntent | FirstRecoveryCursor::Retired
+                    )
+                {
+                    return Err(NativeError::Foreign);
+                }
+                self.read_archived_first_source(proof, expected, operation, deadline)
+            }
+            pub(crate) fn renew_first_recovery(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                reservation: &FirstRecoveryReservation,
+                record: &FirstRecoveryRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                reservation.reverify(self, proof, lock, deadline)?;
+                if record.source != reservation.source || record.document != reservation.document {
+                    return Err(NativeError::Foreign);
+                }
+                record.validate()
+            }
+            pub(crate) fn read_first_recovery(
+                &self,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<Option<FirstRecoveryRecord>> {
+                self.read_record(
+                    proof,
+                    records::RecordName::FirstInstallRecovery,
+                    files::MAX_RECORD_BYTES,
+                    deadline,
+                )?
+                .map(|r| FirstRecoveryRecord::decode(r.bytes()))
+                .transpose()
+            }
+            fn exclude_other_first_recovery(
+                &self,
+                proof: &SupportProof,
+                source: &FirstInstallRecord,
+                mode: FirstRecoveryMode,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                let context = self.context.clone();
+                let budget = proof.budget(self, deadline)?;
+                let names = self.owner.run(Dispatch::Observation, deadline, move || {
+                    let parent = Anchor::open(
+                        context.target.paths.installer(),
+                        &context.security,
+                        true,
+                        &budget,
+                    )?
+                    .ok_or(NativeError::Missing)?;
+                    parent.entry_names(&context.security, &budget)
+                })?;
+                let stale = matches!(
+                    mode,
+                    FirstRecoveryMode::Supersede | FirstRecoveryMode::RetireStale
+                );
+                for name in names {
+                    if matches!(
+                        name.as_str(),
+                        "install.lock"
+                            | "first-install.json"
+                            | "first-install-recovery.json"
+                            | "first-install-history"
+                            | "first-install-history-index.json"
+                            | "first-install-history-intent.json"
+                            | "task-activation.json"
+                    ) {
+                        continue;
+                    }
+                    if stale
+                        && matches!(
+                            name.as_str(),
+                            "supervisor.json"
+                                | "supervisor-logon.json"
+                                | "supervisor-epoch-0.json"
+                                | "supervisor-epoch-1.json"
+                                | "supervisor-epoch-2.json"
+                                | "supervisor-archive-intent.json"
+                        )
+                    {
+                        continue;
+                    }
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                if let Some(task) =
+                    super::super::activation::TaskActivationRecord::read(self, proof, deadline)?
+                    && (task.operation() != source.operation()
+                        || (!stale && task.claim().is_some()))
+                {
+                    return Err(NativeError::Foreign);
+                }
+                if let Some(intent) = self.read_first_history_intent(proof, deadline)? {
+                    if intent.complete{self.verify_first_history(proof,&intent,deadline)?;}else if intent.selected.operation!=source.operation() || intent.selected.source==super::super::super::first_install::record::FirstHistorySource::Removal {return Err(NativeError::OutcomeUnknown);}
+                }
+                if stale {
+                    use super::super::super::service::journal::Journal;
+                    for name in [
+                        records::RecordName::Supervisor,
+                        records::RecordName::SupervisorEpoch(0),
+                        records::RecordName::SupervisorEpoch(1),
+                        records::RecordName::SupervisorEpoch(2),
+                    ] {
+                        if let Some(r) =
+                            self.read_record(proof, name, files::MAX_RECORD_BYTES, deadline)?
+                        {
+                            Journal::decode(r.bytes())?;
+                        }
+                    }
+                    super::super::activation::SupervisorLogonRecord::read(self, proof, deadline)?;
+                    if let Some(r) = self.read_record(
+                        proof,
+                        records::RecordName::SupervisorArchiveIntent,
+                        files::MAX_RECORD_BYTES,
+                        deadline,
+                    )? {
+                        let intent: super::super::epoch_archive::ArchiveIntent =
+                            records::record_data(
+                                &records::RecordName::SupervisorArchiveIntent,
+                                r.bytes(),
+                            )?;
+                        intent.require_complete()?;
+                    }
+                }
+                Ok(())
+            }
+            pub(crate) fn reserve_first_recovery(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                source: &FirstInstallRecord,
+                mode: FirstRecoveryMode,
+                deadline: &Deadline,
+            ) -> NativeResult<FirstRecoveryReservation> {
+                self.verify_stop_lock(proof, lock, deadline)?;
+                source.validate()?;
+                self.exclude_other_first_recovery(proof, source, mode, deadline)?;
+                let (identity, bytes) = match self.read_record(
+                    proof,
+                    records::RecordName::FirstInstall,
+                    files::MAX_RECORD_BYTES,
+                    deadline,
+                )? {
+                    Some(selected) => (selected.identity.into(), selected.bytes().to_vec()),
+                    None => {
+                        let old = self
+                            .read_first_recovery(proof, deadline)?
+                            .ok_or(NativeError::Foreign)?;
+                        if old.document != *source {
+                            return Err(NativeError::Foreign);
+                        }
+                        self.first_recovery_source(
+                            proof,
+                            &old.source,
+                            source.operation(),
+                            deadline,
+                        )?
+                    }
+                };
+                if FirstInstallRecord::decode(&bytes)? != *source {
+                    return Err(NativeError::Foreign);
+                }
+                renew_prior_context(self, proof, source, deadline)?;
+                let reservation = self.acquire_first_reservation(proof, lock, false, deadline)?;
+                let value = FirstRecoveryReservation {
+                    io: self.clone(),
+                    reservation,
+                    source: HistoryLeaf::observe("first-install.json".into(), identity, &bytes)?,
+                    document: source.clone(),
+                    prior: {
+                        let old: OuterContextCorrelation = serde_json::from_slice(source.context())
+                            .map_err(|_| NativeError::Invalid)?;
+                        if old.matches(&self.context.target.identity).is_ok() {
+                            None
+                        } else {
+                            Some(FirstPriorSessionDisposed {
+                                io: self.clone(),
+                                document: source.clone(),
+                            })
+                        }
+                    },
+                };
+                value.reverify(self, proof, lock, deadline)?;
+                Ok(value)
+            }
+            fn previous_first_recovery_settled(
+                &self,
+                proof: &SupportProof,
+                old: &FirstRecoveryRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if old.cursor != FirstRecoveryCursor::Retired {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                let source = self.read_archived_first_source(
+                    proof,
+                    &old.source,
+                    old.document.operation(),
+                    deadline,
+                )?;
+                if !old.source.matches(source.0, &source.1)
+                    || FirstInstallRecord::decode(&source.1)? != old.document
+                {
+                    return Err(NativeError::Foreign);
+                }
+                Ok(())
+            }
+            pub(crate) fn select_first_recovery(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                reservation: &FirstRecoveryReservation,
+                mode: FirstRecoveryMode,
+                deadline: &Deadline,
+            ) -> NativeResult<FirstRecoveryRecord> {
+                reservation.reverify(self, proof, lock, deadline)?;
+                if let Some(old) = self.read_first_recovery(proof, deadline)? {
+                    if old.source != reservation.source || old.document != reservation.document {
+                        self.previous_first_recovery_settled(proof, &old, deadline)?;
+                    } else {
+                        if old.mode != mode {
+                            if mode == FirstRecoveryMode::RetireStale {
+                                return old.select_retirement();
+                            }
+                            if mode == FirstRecoveryMode::Remove {
+                                return old.select_removal();
+                            }
+                            return Err(NativeError::Foreign);
+                        }
+                        if old.pending_scaffold || old.pending.iter().any(|p| *p) {
+                            return old.retry_retained();
+                        }
+                        return Ok(old);
+                    }
+                }
+                // A new archive-bound recovery needs a vacant history slot before any effect. An
+                // active intent for this same operation already owns its slot.
+                if matches!(
+                    mode,
+                    FirstRecoveryMode::Rollback
+                        | FirstRecoveryMode::Remove
+                        | FirstRecoveryMode::RetireStale
+                ) {
+                    let index = self.read_first_history_index(proof, deadline)?;
+                    let active = self.read_first_history_intent(proof, deadline)?;
+                    self.validate_first_history_slots(proof, &index, active.as_ref(), deadline)?;
+                    let owned = active.as_ref().is_some_and(|intent| {
+                        intent.selected.operation == reservation.document.operation()
+                    });
+                    if !owned {
+                        index.vacant()?;
+                    }
+                }
+                let mut record = FirstRecoveryRecord::new(
+                    reservation.source.clone(),
+                    reservation.document.clone(),
+                    mode,
+                )?;
+                let context = self.context.clone();
+                let operation = record.document.operation();
+                let budget = proof.budget(self, deadline)?;
+                // Only Rollback and Remove record a stray stage leaf, and only for a first install
+                // cut at StageIntent(role) before that role's staged identity was persisted.
+                let stray_role = match mode {
+                    FirstRecoveryMode::Rollback | FirstRecoveryMode::Remove => {
+                        record.document.stray_stage_role()
+                    }
+                    _ => None,
+                };
+                let (scaffold, stray) =
+                    self.owner.run(Dispatch::Observation, deadline, move || {
+                        let mut ids: [Option<FileStamp>; 5] = [None; 5];
+                        if let Some(root) = root(&context, &budget)? {
+                            ids[0] = Some(root.identity()?.into());
+                            for (base, name) in
+                                [(1, "first-install-stage"), (3, "first-install-backups")]
+                            {
+                                if let Some(group) = root.child(name, &context.security, &budget)? {
+                                    ids[base] = Some(group.identity()?.into());
+                                    if let Some(op) = group.child(
+                                        &records::hex(&operation),
+                                        &context.security,
+                                        &budget,
+                                    )? {
+                                        ids[base + 1] = Some(op.identity()?.into());
+                                    }
+                                }
+                            }
+                        }
+                        // The leaf must sit in the operation's own stage directory, whose FileId is
+                        // scaffold[2]. It must be a regular private file; anything else fails closed.
+                        let stray = match stray_role {
+                            None => None,
+                            Some(role) => {
+                                match parent(&context, operation, Location::Stage, &budget)? {
+                                    None => None,
+                                    Some(stage) => {
+                                        if Some(FileStamp::from(stage.identity()?)) != ids[2] {
+                                            return Err(NativeError::Foreign);
+                                        }
+                                        match stage.open_file_metadata(
+                                            &files::PrivateName::new(role.leaf())?,
+                                            &context.security,
+                                            &budget,
+                                        ) {
+                                            Ok((_, identity)) => {
+                                                Some((role, FileStamp::from(identity)))
+                                            }
+                                            Err(NativeError::Missing) => None,
+                                            Err(error) => return Err(error),
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        Ok((ids, stray))
+                    })?;
+                record.scaffold = scaffold;
+                record.stray_stage = stray;
+                record.validate()?;
+                Ok(record)
+            }
+            pub(crate) fn publish_first_recovery(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                reservation: &FirstRecoveryReservation,
+                record: &FirstRecoveryRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                record.validate()?;
+                reservation.reverify(self, proof, lock, deadline)?;
+                if record.source != reservation.source || record.document != reservation.document {
+                    return Err(NativeError::Foreign);
+                }
+                if let Some(old) = self.read_first_recovery(proof, deadline)? {
+                    if old.source == record.source && old.document == record.document {
+                        record.follows(&old)?;
+                    } else {
+                        self.previous_first_recovery_settled(proof, &old, deadline)?;
+                        if record.cursor != FirstRecoveryCursor::Selected || record.pass != 0 {
+                            return Err(NativeError::Foreign);
+                        }
+                    }
+                }
+                let published = self.publish_record(
+                    proof,
+                    lock,
+                    records::RecordName::FirstInstallRecovery,
+                    &record.encode()?,
+                    deadline,
+                )?;
+                if published.native_failure.is_some()
+                    || published.state != records::PublicationRecovery::NewPublished
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                Ok(())
+            }
+            pub(crate) fn first_recovery_task_absent(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                reservation: &FirstRecoveryReservation,
+                record: &FirstRecoveryRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<bool> {
+                check(self, proof, lock, reservation, record, deadline)?;
+                let context = self.context.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    let validate = || context.validate(&budget);
+                    let scheduler = super::super::task::Scheduler::connect_repair(&validate)
+                        .map_err(repair_connect_failure)?;
+                    let (_, current) =
+                        scheduler.inspect_removal(&definition(&context), &validate)?;
+                    Ok(current.is_none())
+                })
+            }
+            pub(crate) fn delete_first_recovery_task(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                reservation: &FirstRecoveryReservation,
+                record: &FirstRecoveryRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                check(self, proof, lock, reservation, record, deadline)?;
+                if record.cursor != FirstRecoveryCursor::TaskDeleteIntent {
+                    return Err(NativeError::Foreign);
+                }
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let held = reservation.reservation.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Mutation, deadline, move || {
+                    let change = Change::new();
+                    change.finish((|| {
+                        validate_payload_lock(&context, &lease, &budget)?;
+                        held.renew_native(&context, &budget)?;
+                        let validate = || {
+                            context.validate(&budget)?;
+                            held.renew_native(&context, &budget)
+                        };
+                        let scheduler = super::super::task::Scheduler::connect_repair(&validate)
+                            .map_err(repair_connect_failure)?;
+                        let desired = definition(&context);
+                        let (xml, _) = scheduler.inspect_removal(&desired, &validate)?;
+                        scheduler.delete_first_partial(&desired, &xml, &validate, &|| {
+                            change.reached()
+                        })?;
+                        held.renew_native(&context, &budget)
+                    })())
+                })
+            }
+            #[allow(clippy::too_many_arguments)]
+            pub(crate) fn observe_first_recovery_role(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                reservation: &FirstRecoveryReservation,
+                record: &FirstRecoveryRecord,
+                role: PayloadRole,
+                location: Location,
+                deadline: &Deadline,
+            ) -> NativeResult<Option<FileStamp>> {
+                check(self, proof, lock, reservation, record, deadline)?;
+                let context = self.context.clone();
+                let operation = record.document.operation();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    let Some(parent) = parent(&context, operation, location, &budget)? else {
+                        return Ok(None);
+                    };
+                    Ok(parent
+                        .opaque(role.leaf(), false, &context.security, &budget)?
+                        .map(|leaf| leaf.identity.into()))
+                })
+            }
+            pub(crate) fn first_recovery_triad(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                reservation: &FirstRecoveryReservation,
+                record: &FirstRecoveryRecord,
+                role: PayloadRole,
+                deadline: &Deadline,
+            ) -> NativeResult<RoleTriad> {
+                Ok(RoleTriad {
+                    fixed: self.observe_first_recovery_role(
+                        proof,
+                        lock,
+                        reservation,
+                        record,
+                        role,
+                        Location::Fixed,
+                        deadline,
+                    )?,
+                    stage: self.observe_first_recovery_role(
+                        proof,
+                        lock,
+                        reservation,
+                        record,
+                        role,
+                        Location::Stage,
+                        deadline,
+                    )?,
+                    backup: self.observe_first_recovery_role(
+                        proof,
+                        lock,
+                        reservation,
+                        record,
+                        role,
+                        Location::Backup,
+                        deadline,
+                    )?,
+                })
+            }
+            #[allow(clippy::too_many_arguments)]
+            pub(crate) fn move_first_recovery_role(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                reservation: &FirstRecoveryReservation,
+                record: &FirstRecoveryRecord,
+                role: PayloadRole,
+                restore: bool,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                check(self, proof, lock, reservation, record, deadline)?;
+                let index = 3 - role as u8;
+                if record.mode != FirstRecoveryMode::Rollback
+                    || record.cursor
+                        != (FirstRecoveryCursor::Role {
+                            index,
+                            step: if restore { 2 } else { 0 },
+                        })
+                    || !self.first_recovery_task_absent(
+                        proof,
+                        lock,
+                        reservation,
+                        record,
+                        deadline,
+                    )?
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let from = if restore {
+                    Location::Backup
+                } else {
+                    Location::Fixed
+                };
+                let to = if restore {
+                    Location::Fixed
+                } else {
+                    Location::Stage
+                };
+                let selected = record.document.role(role)?;
+                let expected = if restore {
+                    match selected.original {
+                        OriginalLeaf::Present(id) => id,
+                        _ => return Err(NativeError::Foreign),
+                    }
+                } else {
+                    selected
+                        .staged
+                        .as_ref()
+                        .ok_or(NativeError::Foreign)?
+                        .identity
+                };
+                if self.self_image(proof, deadline)?.identity() == epoch_identity(expected) {
+                    return Err(NativeError::Unavailable);
+                }
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let held = reservation.reservation.clone();
+                let record = record.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Mutation, deadline, move || {
+                    let change = Change::new();
+                    change.finish((|| {
+                        validate_payload_lock(&context, &lease, &budget)?;
+                        held.renew_native(&context, &budget)?;
+                        validate_scaffold(&context, &record, &budget)?;
+                        let source = parent(&context, record.document.operation(), from, &budget)?
+                            .ok_or(NativeError::Foreign)?;
+                        let destination =
+                            parent(&context, record.document.operation(), to, &budget)?
+                                .ok_or(NativeError::Foreign)?;
+                        if destination
+                            .opaque(role.leaf(), false, &context.security, &budget)?
+                            .is_some()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                        let object = source
+                            .opaque(role.leaf(), false, &context.security, &budget)?
+                            .ok_or(NativeError::Foreign)?;
+                        if object.identity != epoch_identity(expected) {
+                            return Err(NativeError::Foreign);
+                        }
+                        budget.check()?;
+                        change.reached();
+                        source.move_opaque(
+                            object,
+                            &destination,
+                            role.leaf(),
+                            &context.security,
+                            &budget,
+                        )?;
+                        if source
+                            .opaque(role.leaf(), false, &context.security, &budget)?
+                            .is_some()
+                            || destination
+                                .opaque(role.leaf(), false, &context.security, &budget)?
+                                .is_none_or(|o| o.identity != epoch_identity(expected))
+                        {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                        held.renew_native(&context, &budget)
+                    })())
+                })
+            }
+            #[allow(clippy::too_many_arguments)]
+            pub(crate) fn delete_first_recovery_role(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                reservation: &FirstRecoveryReservation,
+                record: &FirstRecoveryRecord,
+                role: PayloadRole,
+                location: Location,
+                expected: FileStamp,
+                deadline: &Deadline,
+            ) -> NativeResult<bool> {
+                check(self, proof, lock, reservation, record, deadline)?;
+                let selected = record.document.role(role)?;
+                let identity = match location {
+                    Location::Fixed => selected
+                        .published
+                        .as_ref()
+                        .or(selected.staged.as_ref())
+                        .map(|i| i.identity),
+                    // The persisted staged identity, or the recorded stray leaf for this role only.
+                    Location::Stage => record.stage_identity(role)?,
+                    Location::Backup => match selected.original {
+                        OriginalLeaf::Present(id) => Some(id),
+                        _ => None,
+                    },
+                };
+                let step = match location {
+                    Location::Fixed => 0,
+                    Location::Stage => 2,
+                    Location::Backup => 4,
+                };
+                let admitted = match record.mode {
+                    FirstRecoveryMode::Remove => {
+                        record.cursor
+                            == FirstRecoveryCursor::Role {
+                                index: 3 - role as u8,
+                                step,
+                            }
+                    }
+                    FirstRecoveryMode::Rollback => {
+                        location == Location::Stage
+                            && record.cursor
+                                == FirstRecoveryCursor::Role {
+                                    index: 3 - role as u8,
+                                    step: 4,
+                                }
+                    }
+                    _ => false,
+                };
+                if !admitted
+                    || identity != Some(expected)
+                    || !self.first_recovery_task_absent(
+                        proof,
+                        lock,
+                        reservation,
+                        record,
+                        deadline,
+                    )?
+                {
+                    return Err(NativeError::Foreign);
+                }
+                if self.self_image(proof, deadline)?.identity() == epoch_identity(expected) {
+                    return Ok(false);
+                }
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let held = reservation.reservation.clone();
+                let record = record.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Mutation, deadline, move || {
+                    let change = Change::new();
+                    change.finish((|| {
+                        validate_payload_lock(&context, &lease, &budget)?;
+                        held.renew_native(&context, &budget)?;
+                        validate_scaffold(&context, &record, &budget)?;
+                        let Some(parent) =
+                            parent(&context, record.document.operation(), location, &budget)?
+                        else {
+                            return Ok(true);
+                        };
+                        let result = parent.delete_first_recovery_leaf(
+                            role.leaf(),
+                            epoch_identity(expected),
+                            &context.security,
+                            &budget,
+                            &|| change.reached(),
+                        )?;
+                        held.renew_native(&context, &budget)?;
+                        Ok(result)
+                    })())
+                })
+            }
+            pub(crate) fn settle_first_recovery_scaffold(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                reservation: &FirstRecoveryReservation,
+                record: &FirstRecoveryRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<bool> {
+                check(self, proof, lock, reservation, record, deadline)?;
+                if record.cursor != FirstRecoveryCursor::CleanupIntent
+                    || !matches!(
+                        record.mode,
+                        FirstRecoveryMode::Rollback | FirstRecoveryMode::Remove
+                    )
+                    || !self.first_recovery_task_absent(
+                        proof,
+                        lock,
+                        reservation,
+                        record,
+                        deadline,
+                    )?
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let held = reservation.reservation.clone();
+                let record = record.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Mutation, deadline, move || {
+                    let change = Change::new();
+                    change.finish((|| {
+                        validate_payload_lock(&context, &lease, &budget)?;
+                        held.renew_native(&context, &budget)?;
+                        // Each retained directory is closed before its exact parent performs ordinary deletion.
+                        let Some(root) = root(&context, &budget)? else {
+                            return Ok(record.mode == FirstRecoveryMode::Remove
+                                || record.scaffold[0].is_none());
+                        };
+                        if Some(root.identity()?.into()) != record.scaffold[0] {
+                            return Err(NativeError::Foreign);
+                        }
+                        let mut complete = true;
+                        for (base, name) in
+                            [(1, "first-install-stage"), (3, "first-install-backups")]
+                        {
+                            if let Some(group) = root.child(name, &context.security, &budget)? {
+                                if Some(group.identity()?.into()) != record.scaffold[base] {
+                                    complete = false;
+                                    continue;
+                                }
+                                let op = records::hex(&record.document.operation());
+                                if let Some(child) = group.child(&op, &context.security, &budget)? {
+                                    let id = child.identity()?;
+                                    drop(child);
+                                    if Some(id.into()) != record.scaffold[base + 1] {
+                                        complete = false;
+                                        continue;
+                                    }
+                                    complete &= group.delete_first_recovery_leaf(
+                                        &op,
+                                        id,
+                                        &context.security,
+                                        &budget,
+                                        &|| change.reached(),
+                                    )?;
+                                }
+                                let id = group.identity()?;
+                                drop(group);
+                                complete &= root.delete_first_recovery_leaf(
+                                    name,
+                                    id,
+                                    &context.security,
+                                    &budget,
+                                    &|| change.reached(),
+                                )?;
+                            }
+                        }
+                        if record.mode == FirstRecoveryMode::Remove {
+                            let id = root.identity()?;
+                            drop(root);
+                            let programs = Anchor::open(
+                                &format!("{}\\Programs", context.target.paths.local()),
+                                &context.security,
+                                false,
+                                &budget,
+                            )?
+                            .ok_or(NativeError::Missing)?;
+                            complete &= programs.delete_first_recovery_leaf(
+                                "Crosspane",
+                                id,
+                                &context.security,
+                                &budget,
+                                &|| change.reached(),
+                            )?;
+                        }
+                        held.renew_native(&context, &budget)?;
+                        Ok(complete)
+                    })())
+                })
+            }
+            pub(crate) fn retire_first_recovery(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                reservation: &FirstRecoveryReservation,
+                record: &FirstRecoveryRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                check(self, proof, lock, reservation, record, deadline)?;
+                self.archive_first_recovery_history(
+                    proof,
+                    lock,
+                    &reservation.reservation,
+                    record,
+                    deadline,
+                )
+            }
+            pub(super) fn verify_recovered_first_files(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                reservation: &FirstInstallReservation,
+                record: &FirstRecoveryRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                self.verify_stop_lock(proof, lock, deadline)?;
+                reservation.reverify(self, proof, deadline)?;
+                let context = self.context.clone();
+                let budget = proof.budget(self, deadline)?;
+                let record = record.clone();
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    if record.mode == FirstRecoveryMode::Remove {
+                        return if root(&context, &budget)?.is_none() {
+                            Ok(())
+                        } else {
+                            Err(NativeError::Foreign)
+                        };
+                    }
+                    for role in PayloadRole::ALL {
+                        for location in [Location::Stage, Location::Backup] {
+                            if let Some(parent) =
+                                parent(&context, record.document.operation(), location, &budget)?
+                                && parent
+                                    .opaque(role.leaf(), false, &context.security, &budget)?
+                                    .is_some()
+                            {
+                                return Err(NativeError::Foreign);
+                            }
+                        }
+                        let observed = parent(
+                            &context,
+                            record.document.operation(),
+                            Location::Fixed,
+                            &budget,
+                        )?
+                        .map(|p| p.opaque(role.leaf(), false, &context.security, &budget))
+                        .transpose()?
+                        .flatten()
+                        .map(|o| o.identity.into());
+                        match record.document.role(role)?.original {
+                            OriginalLeaf::Present(id) if observed == Some(id) => {}
+                            OriginalLeaf::Missing if observed.is_none() => {}
+                            OriginalLeaf::Unobserved => {}
+                            _ => return Err(NativeError::Foreign),
+                        }
+                    }
+                    Ok(())
+                })
+            }
+            pub(crate) fn verify_first_supersession_files(
+                &self,
+                proof: &SupportProof,
+                source: &FirstInstallRecord,
+                agent: &AgentObservation,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                source.validate()?;
+                agent.revalidate(self, proof, deadline)?;
+                let context = self.context.clone();
+                let budget = proof.budget(self, deadline)?;
+                let source = source.clone();
+                let agent_id = self.agent_identity(agent, proof, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    let root = root(&context, &budget)?.ok_or(NativeError::Missing)?;
+                    for role in PayloadRole::ALL {
+                        let selected = source.role(role)?;
+                        let expected = selected.published.as_ref().ok_or(NativeError::Foreign)?;
+                        let image = root.open_image(
+                            role.leaf(),
+                            true,
+                            &expected.facts.version,
+                            &context.security,
+                            &budget,
+                        )?;
+                        if image.identity != epoch_identity(expected.identity)
+                            || image.facts != selected.approved
+                            || (role == PayloadRole::Agent && image.identity != agent_id)
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                    }
+                    Ok(())
+                })
+            }
+            pub(crate) fn select_live_first_recovery(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                source: &FirstInstallRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<FirstRecoveryRecord> {
+                self.verify_stop_lock(proof, lock, deadline)?;
+                self.exclude_other_first_recovery(
+                    proof,
+                    source,
+                    FirstRecoveryMode::Supersede,
+                    deadline,
+                )?;
+                let actual = self
+                    .read_record(
+                        proof,
+                        records::RecordName::FirstInstall,
+                        files::MAX_RECORD_BYTES,
+                        deadline,
+                    )?
+                    .ok_or(NativeError::Foreign)?;
+                if FirstInstallRecord::decode(actual.bytes())? != *source {
+                    return Err(NativeError::Foreign);
+                }
+                let selected = HistoryLeaf::observe(
+                    "first-install.json".into(),
+                    actual.identity.into(),
+                    actual.bytes(),
+                )?;
+                if let Some(old) = self.read_first_recovery(proof, deadline)? {
+                    if old.source != selected
+                        || old.document != *source
+                        || old.mode != FirstRecoveryMode::Supersede
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    return Ok(old);
+                }
+                FirstRecoveryRecord::new(selected, source.clone(), FirstRecoveryMode::Supersede)
+            }
+            pub(crate) fn publish_live_first_recovery(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                record: &FirstRecoveryRecord,
+                live: &super::super::supervisor_owner::LiveFirstSupersession,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                self.verify_stop_lock(proof, lock, deadline)?;
+                record.validate()?;
+                if record.mode != FirstRecoveryMode::Supersede
+                    || record.cursor != FirstRecoveryCursor::Superseded
+                {
+                    return Err(NativeError::Foreign);
+                }
+                live.reverify(self, deadline)?;
+                let actual = self
+                    .read_record(
+                        proof,
+                        records::RecordName::FirstInstall,
+                        files::MAX_RECORD_BYTES,
+                        deadline,
+                    )?
+                    .ok_or(NativeError::Foreign)?;
+                if !record
+                    .source
+                    .matches(actual.identity.into(), actual.bytes())
+                    || FirstInstallRecord::decode(actual.bytes())? != record.document
+                {
+                    return Err(NativeError::Foreign);
+                }
+                if let Some(old) = self.read_first_recovery(proof, deadline)? {
+                    record.follows(&old)?;
+                    if old == *record {
+                        return Ok(());
+                    }
+                }
+                let published = self.publish_record(
+                    proof,
+                    lock,
+                    records::RecordName::FirstInstallRecovery,
+                    &record.encode()?,
+                    deadline,
+                )?;
+                if published.native_failure.is_some()
+                    || published.state != records::PublicationRecovery::NewPublished
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                live.reverify(self, deadline)
+            }
+            pub(crate) fn first_source_settled(
+                &self,
+                proof: &SupportProof,
+                source: &FirstInstallRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<bool> {
+                let Some(recovery) = self.read_first_recovery(proof, deadline)? else {
+                    return Ok(false);
+                };
+                if recovery.mode != FirstRecoveryMode::Supersede
+                    || recovery.cursor != FirstRecoveryCursor::Superseded
+                    || recovery.document != *source
+                {
+                    return Ok(false);
+                }
+                let actual = self
+                    .read_record(
+                        proof,
+                        records::RecordName::FirstInstall,
+                        files::MAX_RECORD_BYTES,
+                        deadline,
+                    )?
+                    .ok_or(NativeError::Foreign)?;
+                Ok(recovery
+                    .source
+                    .matches(actual.identity.into(), actual.bytes()))
+            }
+        }
+    }
+    #[cfg(not(test))]
+    pub(crate) use first_recovery_io::FirstRecoveryReservation;
 }

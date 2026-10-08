@@ -57,6 +57,7 @@ mod first_native {
         lock: Option<InstallerLock>,
         root: PayloadRoot,
         reservation: Option<FirstInstallReservation>,
+        history: Option<native_io::ArchivedFirstHistory>,
         permit: Option<FirstInstallMutationPermit>,
         inventory: ApprovedInventory,
         installer: ApprovedPe,
@@ -316,12 +317,16 @@ mod first_native {
                 .as_ref()
                 .cloned()
                 .ok_or(NativeError::Foreign)?;
-            let selection = task::prepare_first_install(
-                self.io.clone(),
-                payload,
-                self.reservation()?.clone(),
-                &self.deadline,
-            )?;
+            let selection = if let Some(history) = self.history.take() {
+                task::prepare_first_reinstall(self.io.clone(), payload, history, &self.deadline)?
+            } else {
+                task::prepare_first_install(
+                    self.io.clone(),
+                    payload,
+                    self.reservation()?.clone(),
+                    &self.deadline,
+                )?
+            };
             if !self.io.native_idle() {
                 return Err(NativeError::OutcomeUnknown);
             }
@@ -428,45 +433,61 @@ mod first_native {
             let proof = io.admit_support(deadline)?;
             let disposition = io.preview_first_install(&proof, deadline)?;
             // This production gate precedes every lock-foundation call below.
-            first_install::before_foundation(disposition, || {
-                let reopened = io.read_first_install(&proof, deadline)?;
-                let observing = match &reopened {
-                    Some(record) => matches!(
-                        first_install::reopen(record, io.target().identity())?,
-                        first_install::Reopen::Observe(_)
-                    ),
-                    None => false,
-                };
-                if !observing
-                    && (probe.observation().task().diagnostic() != Diagnostic::Missing
-                        || probe.observation().agent() != Diagnostic::Missing)
-                {
-                    return Err(NativeError::Foreign);
-                }
-                let module = io.self_image(&proof, deadline)?;
-                let installer = ApprovedPe::own_image(&module)?;
-                // An observation-only reopen consumes no staging source and cannot dispatch Run.
-                let inputs = if observing {
-                    Vec::new()
+            let reinstalling =
+                disposition == first_install::FirstInstallDisposition::CompletedRemoval;
+            if reinstalling && !io.first_history_capacity_available(&proof, deadline)? {
+                return Ok(Err(
+                    "first-install history archive is full; retained history was not evicted",
+                ));
+            }
+            first_install::before_foundation(
+                if reinstalling {
+                    first_install::FirstInstallDisposition::Eligible
                 } else {
-                    let inputs = [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl]
-                        .into_iter()
-                        .zip(sources)
-                        .map(|(role, content)| PayloadInput { role, content })
-                        .collect();
-                    let buffered =
-                        payload::buffer_outer_sources(inputs, &inventory, &installer, deadline)?;
-                    let mut inputs = buffered.inputs();
-                    inputs.push(PayloadInput {
-                        role: PayloadRole::Installer,
-                        content: io.self_image_reader(&module, &proof, deadline)?,
-                    });
-                    inputs
-                };
-                Ok((io, inventory, installer, inputs, reopened))
-            })
+                    disposition
+                },
+                || {
+                    let reopened = io.read_first_install(&proof, deadline)?;
+                    let observing = match &reopened {
+                        _ if reinstalling => false,
+                        Some(record) => matches!(
+                            first_install::reopen(record, io.target().identity())?,
+                            first_install::Reopen::Observe(_)
+                        ),
+                        None => false,
+                    };
+                    if !observing
+                        && (probe.observation().task().diagnostic() != Diagnostic::Missing
+                            || probe.observation().agent() != Diagnostic::Missing)
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    let module = io.self_image(&proof, deadline)?;
+                    let installer = ApprovedPe::own_image(&module)?;
+                    // An observation-only reopen consumes no staging source and cannot dispatch Run.
+                    let inputs = if observing {
+                        Vec::new()
+                    } else {
+                        let inputs = [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl]
+                            .into_iter()
+                            .zip(sources)
+                            .map(|(role, content)| PayloadInput { role, content })
+                            .collect();
+                        let buffered = payload::buffer_outer_sources(
+                            inputs, &inventory, &installer, deadline,
+                        )?;
+                        let mut inputs = buffered.inputs();
+                        inputs.push(PayloadInput {
+                            role: PayloadRole::Installer,
+                            content: io.self_image_reader(&module, &proof, deadline)?,
+                        });
+                        inputs
+                    };
+                    Ok((io, inventory, installer, inputs, reopened, reinstalling))
+                },
+            )
         })();
-        let (io, inventory, installer, inputs, reopened) = match prepared {
+        let (io, inventory, installer, inputs, reopened, reinstalling) = match prepared {
             Ok(Ok(values)) => values,
             Ok(Err(reason)) => return Ok(FirstInstallOutcome::NotSubmitted(reason)),
             Err(NativeError::OutcomeUnknown) => return Ok(FirstInstallOutcome::Unknown),
@@ -478,6 +499,13 @@ mod first_native {
         };
         // From here the lock foundation may have changed. No failure refunds submission.
         let effect = (|| {
+            if reinstalling
+                && io
+                    .read_removal(&io.admit_support(deadline)?, deadline)?
+                    .is_some()
+            {
+                super::removal_native::settle_first_reinstall_copies(&io, deadline)?;
+            }
             let lock = first_install::retry_busy(
                 deadline,
                 || {
@@ -492,17 +520,48 @@ mod first_native {
             }
             let reopen = reopened
                 .as_ref()
+                .filter(|_| !reinstalling)
                 .map(|r| first_install::reopen(r, io.target().identity()))
                 .transpose()?;
             let observing = matches!(reopen, Some(first_install::Reopen::Observe(_)));
+            let mut operation = [0; 16];
+            aws_lc_rs::rand::fill(&mut operation).map_err(|_| NativeError::Unavailable)?;
+            let history = if reinstalling {
+                let recovered = io.read_first_recovery(&proof, deadline)?.is_some_and(|r| {
+                    r.cursor == first_install::record::FirstRecoveryCursor::Retired
+                        && matches!(
+                            r.mode,
+                            first_install::record::FirstRecoveryMode::Rollback
+                                | first_install::record::FirstRecoveryMode::Remove
+                        )
+                });
+                // A stale recovery record must not hijack a reinstall while a removal or a
+                // first-install record exists; such a reinstall takes the completed-removal path.
+                if recovered
+                    && io.read_removal(&proof, deadline)?.is_none()
+                    && io.read_first_install(&proof, deadline)?.is_none()
+                {
+                    Some(io.admit_recovered_first_history(&proof, &lock, deadline)?)
+                } else {
+                    let selected = io.admit_completed_removal_history(&proof, &lock, deadline)?;
+                    Some(
+                        io.archive_completed_removal(&proof, &lock, selected, operation, deadline)?,
+                    )
+                }
+            } else {
+                None
+            };
+            if let Some(history) = &history {
+                operation = history.operation();
+            }
             let reservation = if observing {
                 None
+            } else if let Some(history) = &history {
+                Some(history.reservation().clone())
             } else {
                 Some(io.reserve_first_install(&proof, &lock, deadline)?)
             };
             let root = io.payload_root(&proof, &lock, deadline)?;
-            let mut operation = [0; 16];
-            aws_lc_rs::rand::fill(&mut operation).map_err(|_| NativeError::Unavailable)?;
             let pins = PayloadRole::ALL.map(|role| {
                 if role == PayloadRole::Installer {
                     Ok(installer.facts().clone())
@@ -535,6 +594,7 @@ mod first_native {
                 lock: Some(lock),
                 root,
                 reservation,
+                history,
                 permit: None,
                 inventory,
                 installer,
@@ -3773,6 +3833,59 @@ mod removal_native {
             }
         }
     }
+    /// Strict terminal FILE-only sibling. It has no fallback to Stop, staging or keeper launch.
+    pub(super) fn settle_first_reinstall_copies(
+        io: &Arc<WindowsNativeIo>,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        let proof = io.admit_support(deadline)?;
+        let Some(record) = io.read_removal(&proof, deadline)? else {
+            return Ok(());
+        };
+        if !matches!(
+            record.cursor(),
+            RemovalCursor::Complete { .. }
+                | RemovalCursor::FinalCopyCleanupIntent { .. }
+                | RemovalCursor::FinalCopyAbsent { .. }
+                | RemovalCursor::Retired
+        ) {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        if matches!(
+            record.cursor(),
+            RemovalCursor::Retired
+                | RemovalCursor::Complete {
+                    retained_copy: None
+                }
+        ) {
+            return Ok(());
+        }
+        let lock = io.acquire_installer_lock(&proof, deadline)?;
+        let rt = copy::runtime()?;
+        let (server, namespace) = rt.block_on(async {
+            copy::RemovalKeeperLease::reserve(io.clone(), &proof, record.operation(), deadline)
+        })?;
+        let permit = io.admit_removal_permit(&proof, &lock, deadline)?;
+        let root = io.reopen_removal_root(&proof, &lock, &permit, deadline)?;
+        let mut resident = super::removal_port::Resident::reopen_terminal(
+            io.clone(),
+            root,
+            lock,
+            record,
+            namespace,
+        )?;
+        let result = resident.run(deadline)?;
+        if !io.native_idle() {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        drop(resident);
+        drop(server);
+        drop(rt);
+        match result {
+            RemovalResult::Removed => Ok(()),
+            _ => Err(NativeError::OutcomeUnknown),
+        }
+    }
     pub(super) fn begin(erase_identity: bool) -> NativeResult<ContinuationState> {
         payload::inventory::ApprovedInventory::embedded()?;
         let clock: Arc<dyn native_io::Clock> = Arc::new(MonotonicClock::default());
@@ -5115,5 +5228,397 @@ mod repair_payload_native {
             // One bounded owner survives unresolved post-Commit work; no wall-time abandonment.
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+}
+
+/// Where a first-recovery refusal happened. `Pre` is raised before the first record persist and
+/// before the first driver call, so no recovery effect ran. `Post` may follow an effect, so its
+/// outcome is unresolved.
+#[cfg(all(windows, not(test)))]
+// The payloads are diagnostic only; the coordinator maps refusals by variant alone.
+#[allow(dead_code)]
+pub(crate) enum RecoveryError {
+    Pre(NativeError),
+    Post(NativeError),
+}
+/// Explicit, file-only first-operation recovery. The native path renews all facts under its
+/// genuine reservation; this facade has no Stop, keeper, activation or identity-erase input.
+/// The split between `Pre` and `Post` is documented in `first_recovery_native::begin`.
+#[cfg(all(windows, not(test)))]
+pub(crate) fn recover_first_install(
+    mode: super::first_install::record::FirstRecoveryMode,
+    deadline: &super::native_io::Deadline,
+) -> Result<super::first_install::record::FirstRecoveryOutcome, RecoveryError> {
+    first_recovery_native::begin(mode, deadline)
+}
+#[cfg(all(windows, not(test)))]
+mod first_recovery_native {
+    use super::super::{
+        first_install::{
+            driver::{self, FirstRecoveryPort, FirstStalePort},
+            record::{FirstRecoveryMode, FirstRecoveryOutcome, FirstRecoveryRecord},
+        },
+        native_io::{
+            Deadline, FirstRecoveryReservation, InstallerLock, MonotonicClock, WindowsNativeIo,
+        },
+        payload::{inventory::PayloadRole, recovery::FileStamp},
+        removal::{
+            executor::{self, PartialFirstRemovalPort},
+            inventory::PartialFirstLocation,
+        },
+    };
+    use super::*;
+    use std::sync::{Arc, Mutex, OnceLock};
+    // Opaque owners whose native call may still be in flight; they are only held or forgotten.
+    static UNKNOWN: OnceLock<Mutex<Option<Box<dyn Send>>>> = OnceLock::new();
+    /// Holds an unresolved owner. A second owner is forgotten, never dropped, so the first
+    /// owner's handles and lease stay alive.
+    fn retain_unknown(owner: Box<dyn Send>) -> NativeResult<()> {
+        let held = UNKNOWN.get_or_init(|| Mutex::new(None));
+        let mut held = held.lock().map_err(|_| NativeError::OutcomeUnknown)?;
+        if held.is_some() {
+            std::mem::forget(owner);
+        } else {
+            *held = Some(owner);
+        }
+        Ok(())
+    }
+    /// After the first recovery effect a Busy is an unresolved outcome, never a refusal.
+    fn post_effect(
+        result: NativeResult<FirstRecoveryOutcome>,
+    ) -> NativeResult<FirstRecoveryOutcome> {
+        match result {
+            Err(NativeError::Busy) => Err(NativeError::OutcomeUnknown),
+            other => other,
+        }
+    }
+    struct Port {
+        io: Arc<WindowsNativeIo>,
+        lock: InstallerLock,
+        reservation: FirstRecoveryReservation,
+        deadline: Deadline,
+    }
+    impl Port {
+        fn persist(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            let p = self.io.admit_support(&self.deadline)?;
+            self.io
+                .publish_first_recovery(&p, &self.lock, &self.reservation, r, &self.deadline)
+        }
+        fn renew(&self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            let p = self.io.admit_support(&self.deadline)?;
+            self.io
+                .renew_first_recovery(&p, &self.lock, &self.reservation, r, &self.deadline)
+        }
+        fn absent(&self, r: &FirstRecoveryRecord) -> NativeResult<bool> {
+            let p = self.io.admit_support(&self.deadline)?;
+            self.io
+                .first_recovery_task_absent(&p, &self.lock, &self.reservation, r, &self.deadline)
+        }
+        fn task_delete(&self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            let p = self.io.admit_support(&self.deadline)?;
+            self.io
+                .delete_first_recovery_task(&p, &self.lock, &self.reservation, r, &self.deadline)
+        }
+        fn scaffold(&self, r: &FirstRecoveryRecord) -> NativeResult<bool> {
+            let p = self.io.admit_support(&self.deadline)?;
+            self.io.settle_first_recovery_scaffold(
+                &p,
+                &self.lock,
+                &self.reservation,
+                r,
+                &self.deadline,
+            )
+        }
+        fn retire(&self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            let p = self.io.admit_support(&self.deadline)?;
+            self.io
+                .retire_first_recovery(&p, &self.lock, &self.reservation, r, &self.deadline)
+        }
+    }
+    impl FirstRecoveryPort for Port {
+        fn renew_recovery(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            self.renew(r)
+        }
+        fn persist_recovery(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            self.persist(r)
+        }
+        fn task_absent(&mut self, r: &FirstRecoveryRecord) -> NativeResult<bool> {
+            self.absent(r)
+        }
+        fn delete_task(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            self.task_delete(r)
+        }
+        fn triad(
+            &mut self,
+            r: &FirstRecoveryRecord,
+            role: PayloadRole,
+        ) -> NativeResult<super::super::first_install::record::RoleTriad> {
+            let p = self.io.admit_support(&self.deadline)?;
+            self.io
+                .first_recovery_triad(&p, &self.lock, &self.reservation, r, role, &self.deadline)
+        }
+        fn unpublish(&mut self, r: &FirstRecoveryRecord, role: PayloadRole) -> NativeResult<()> {
+            let p = self.io.admit_support(&self.deadline)?;
+            self.io.move_first_recovery_role(
+                &p,
+                &self.lock,
+                &self.reservation,
+                r,
+                role,
+                false,
+                &self.deadline,
+            )
+        }
+        fn restore_original(
+            &mut self,
+            r: &FirstRecoveryRecord,
+            role: PayloadRole,
+        ) -> NativeResult<()> {
+            let p = self.io.admit_support(&self.deadline)?;
+            self.io.move_first_recovery_role(
+                &p,
+                &self.lock,
+                &self.reservation,
+                r,
+                role,
+                true,
+                &self.deadline,
+            )
+        }
+        fn delete_stage(&mut self, r: &FirstRecoveryRecord, role: PayloadRole) -> NativeResult<()> {
+            let id = r.stage_identity(role)?.ok_or(NativeError::Foreign)?;
+            let p = self.io.admit_support(&self.deadline)?;
+            if self.io.delete_first_recovery_role(
+                &p,
+                &self.lock,
+                &self.reservation,
+                r,
+                role,
+                PartialFirstLocation::Stage,
+                id,
+                &self.deadline,
+            )? {
+                Ok(())
+            } else {
+                Err(NativeError::OutcomeUnknown)
+            }
+        }
+        fn settle_scaffold(&mut self, r: &FirstRecoveryRecord) -> NativeResult<bool> {
+            self.scaffold(r)
+        }
+        fn retire_first(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            self.retire(r)
+        }
+    }
+    impl PartialFirstRemovalPort for Port {
+        fn renew_partial(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            self.renew(r)
+        }
+        fn persist_partial(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            self.persist(r)
+        }
+        fn task_absent_partial(&mut self, r: &FirstRecoveryRecord) -> NativeResult<bool> {
+            self.absent(r)
+        }
+        fn delete_task_partial(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            self.task_delete(r)
+        }
+        fn observe_partial(
+            &mut self,
+            r: &FirstRecoveryRecord,
+            role: PayloadRole,
+            location: PartialFirstLocation,
+        ) -> NativeResult<Option<FileStamp>> {
+            let p = self.io.admit_support(&self.deadline)?;
+            self.io.observe_first_recovery_role(
+                &p,
+                &self.lock,
+                &self.reservation,
+                r,
+                role,
+                location,
+                &self.deadline,
+            )
+        }
+        fn delete_partial(
+            &mut self,
+            r: &FirstRecoveryRecord,
+            role: PayloadRole,
+            location: PartialFirstLocation,
+            id: FileStamp,
+        ) -> NativeResult<bool> {
+            let p = self.io.admit_support(&self.deadline)?;
+            self.io.delete_first_recovery_role(
+                &p,
+                &self.lock,
+                &self.reservation,
+                r,
+                role,
+                location,
+                id,
+                &self.deadline,
+            )
+        }
+        fn settle_scaffold(&mut self, r: &FirstRecoveryRecord) -> NativeResult<bool> {
+            self.scaffold(r)
+        }
+        fn retire_partial(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            self.retire(r)
+        }
+    }
+    impl FirstStalePort for Port {
+        fn renew_stale(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            self.renew(r)
+        }
+        fn observe_supersession(&mut self, _: &FirstRecoveryRecord) -> NativeResult<Option<u64>> {
+            Err(NativeError::Foreign)
+        }
+        fn reserve_absent(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            self.renew(r)
+        }
+        fn persist_stale(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            self.persist(r)
+        }
+        fn retire_stale(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            self.retire(r)
+        }
+    }
+    struct LivePort {
+        io: Arc<WindowsNativeIo>,
+        lock: InstallerLock,
+        live: super::super::native_io::supervisor_owner::LiveFirstSupersession,
+        deadline: Deadline,
+    }
+    impl FirstStalePort for LivePort {
+        fn renew_stale(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            self.live.reverify_source(&r.document)?;
+            self.live.reverify(&self.io, &self.deadline)?;
+            let p = self.io.admit_support(&self.deadline)?;
+            // The public stop-lock bridge runs the same verification as the private check.
+            self.io.lease_stop_lock(&p, &self.lock, &self.deadline)?;
+            let actual =
+                self.io
+                    .select_live_first_recovery(&p, &self.lock, &r.document, &self.deadline)?;
+            if actual.source != r.source {
+                return Err(NativeError::Foreign);
+            }
+            Ok(())
+        }
+        fn observe_supersession(&mut self, r: &FirstRecoveryRecord) -> NativeResult<Option<u64>> {
+            self.renew_stale(r)?;
+            Ok(Some(self.live.instance()))
+        }
+        fn reserve_absent(&mut self, _: &FirstRecoveryRecord) -> NativeResult<()> {
+            Err(NativeError::Foreign)
+        }
+        fn persist_stale(&mut self, r: &FirstRecoveryRecord) -> NativeResult<()> {
+            let p = self.io.admit_support(&self.deadline)?;
+            self.io
+                .publish_live_first_recovery(&p, &self.lock, r, &self.live, &self.deadline)
+        }
+        fn retire_stale(&mut self, _: &FirstRecoveryRecord) -> NativeResult<()> {
+            Err(NativeError::Foreign)
+        }
+    }
+    /// `Pre` covers every refusal before the first record persist or driver call: probing, the
+    /// admitted reads, the Supersede observations, lock and reservation acquisition, and selection
+    /// (including the R5 vacancy `Busy`). `Post` covers the driver call and everything after it.
+    pub(super) fn begin(
+        mut mode: FirstRecoveryMode,
+        deadline: &Deadline,
+    ) -> Result<FirstRecoveryOutcome, RecoveryError> {
+        if UNKNOWN
+            .get()
+            .is_some_and(|v| v.lock().map_or(true, |v| v.is_some()))
+        {
+            return Err(RecoveryError::Post(NativeError::OutcomeUnknown));
+        }
+        let probe = WindowsNativeIo::probe_repair(Arc::new(MonotonicClock::default()), deadline)
+            .map_err(RecoveryError::Pre)?;
+        let io = probe
+            .io()
+            .cloned()
+            .ok_or(RecoveryError::Pre(NativeError::Unsupported))?;
+        let p = io.admit_support(deadline).map_err(RecoveryError::Pre)?;
+        let source = match io
+            .read_first_install(&p, deadline)
+            .map_err(RecoveryError::Pre)?
+        {
+            Some(source) => source,
+            None => {
+                io.read_first_recovery(&p, deadline)
+                    .map_err(RecoveryError::Pre)?
+                    .ok_or(RecoveryError::Pre(NativeError::Missing))?
+                    .document
+            }
+        };
+        if mode == FirstRecoveryMode::Supersede {
+            if let Ok(agent) = io.observe_agent(&p, deadline) {
+                super::upgrade::first_ready_status(&io, &agent, deadline)
+                    .map_err(RecoveryError::Pre)?;
+                let proof = io.admit_support(deadline).map_err(RecoveryError::Pre)?;
+                let agent = io
+                    .clone_agent(&agent, &proof, deadline)
+                    .map_err(RecoveryError::Pre)?;
+                let live = super::super::native_io::supervisor_owner::observe_first_supersession(
+                    io.clone(),
+                    &source,
+                    Arc::new(agent),
+                    deadline,
+                )
+                .map_err(RecoveryError::Pre)?;
+                let p = io.admit_support(deadline).map_err(RecoveryError::Pre)?;
+                let lock = io
+                    .acquire_installer_lock(&p, deadline)
+                    .map_err(RecoveryError::Pre)?;
+                let mut record = io
+                    .select_live_first_recovery(&p, &lock, &source, deadline)
+                    .map_err(RecoveryError::Pre)?;
+                let mut port = LivePort {
+                    io,
+                    lock,
+                    live,
+                    deadline: deadline.clone(),
+                };
+                // Post: the settlement driver is the first effect. Its errors are unresolved.
+                let result = driver::settle_stale_first(&mut port, &mut record);
+                if result.is_err() && !port.io.native_idle() {
+                    retain_unknown(Box::new(port)).map_err(RecoveryError::Post)?;
+                }
+                return post_effect(result).map_err(RecoveryError::Post);
+            }
+            // Failed observation grants nothing; the genuine reservation below must prove absence.
+            mode = FirstRecoveryMode::RetireStale;
+        }
+        // A possibly consumed Run is observation/retirement only, never task/file rollback.
+        super::super::first_install::recovery_mode_allowed(&source, mode)
+            .map_err(RecoveryError::Pre)?;
+        let lock = io
+            .acquire_installer_lock(&p, deadline)
+            .map_err(RecoveryError::Pre)?;
+        let reservation = io
+            .reserve_first_recovery(&p, &lock, &source, mode, deadline)
+            .map_err(RecoveryError::Pre)?;
+        let mut r = io
+            .select_first_recovery(&p, &lock, &reservation, mode, deadline)
+            .map_err(RecoveryError::Pre)?;
+        let mut port = Port {
+            io,
+            lock,
+            reservation,
+            deadline: deadline.clone(),
+        };
+        // Post: the first recovery driver is the first effect. Its errors are unresolved. The `_`
+        // arm is unreachable (Supersede returned or became RetireStale above); if reached, Post.
+        let result = match mode {
+            FirstRecoveryMode::Rollback => driver::recover_first(&mut port, &mut r),
+            FirstRecoveryMode::Remove => executor::remove_partial_first(&mut port, &mut r),
+            FirstRecoveryMode::RetireStale => driver::settle_stale_first(&mut port, &mut r),
+            _ => Err(NativeError::Unsupported),
+        };
+        if result.is_err() && !port.io.native_idle() {
+            retain_unknown(Box::new(port)).map_err(RecoveryError::Post)?;
+        }
+        post_effect(result).map_err(RecoveryError::Post)
     }
 }

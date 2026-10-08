@@ -341,3 +341,12 @@ impl RemovalInventory {
         Ok(())
     }
 }
+
+/// Observe only the four fixed first-install roles and their own operation stage/backup leaves.
+/// An exact renewed FileId is still required by the native effect adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PartialFirstLocation {
+    Fixed,
+    Stage,
+    Backup,
+}

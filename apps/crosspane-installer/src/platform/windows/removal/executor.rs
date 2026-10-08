@@ -276,3 +276,195 @@ impl<T> RemovalController<T> {
         Ok(RemovalResult::Removed)
     }
 }
+
+/// Separate file-only port. There is deliberately no Stop/erase/tree/Run/keeper method.
+pub(crate) trait PartialFirstRemovalPort {
+    fn renew_partial(
+        &mut self,
+        record: &super::super::first_install::record::FirstRecoveryRecord,
+    ) -> NativeResult<()>;
+    fn persist_partial(
+        &mut self,
+        record: &super::super::first_install::record::FirstRecoveryRecord,
+    ) -> NativeResult<()>;
+    fn task_absent_partial(
+        &mut self,
+        record: &super::super::first_install::record::FirstRecoveryRecord,
+    ) -> NativeResult<bool>;
+    fn delete_task_partial(
+        &mut self,
+        record: &super::super::first_install::record::FirstRecoveryRecord,
+    ) -> NativeResult<()>;
+    fn observe_partial(
+        &mut self,
+        record: &super::super::first_install::record::FirstRecoveryRecord,
+        role: super::super::payload::inventory::PayloadRole,
+        location: super::inventory::PartialFirstLocation,
+    ) -> NativeResult<Option<super::super::payload::recovery::FileStamp>>;
+    fn delete_partial(
+        &mut self,
+        record: &super::super::first_install::record::FirstRecoveryRecord,
+        role: super::super::payload::inventory::PayloadRole,
+        location: super::inventory::PartialFirstLocation,
+        identity: super::super::payload::recovery::FileStamp,
+    ) -> NativeResult<bool>;
+    fn settle_scaffold(
+        &mut self,
+        record: &super::super::first_install::record::FirstRecoveryRecord,
+    ) -> NativeResult<bool>;
+    fn retire_partial(
+        &mut self,
+        record: &super::super::first_install::record::FirstRecoveryRecord,
+    ) -> NativeResult<()>;
+}
+pub(crate) fn remove_partial_first<P: PartialFirstRemovalPort>(
+    port: &mut P,
+    record: &mut super::super::first_install::record::FirstRecoveryRecord,
+) -> NativeResult<super::super::first_install::record::FirstRecoveryOutcome> {
+    use super::super::{
+        first_install::record::{
+            FirstRecoveryCursor as C, FirstRecoveryMode as M, FirstRecoveryOutcome as O,
+        },
+        payload::{inventory::PayloadRole, recovery::OriginalLeaf},
+    };
+    use super::inventory::PartialFirstLocation as L;
+    record.validate()?;
+    if record.mode != M::Remove {
+        return Err(NativeError::Foreign);
+    }
+    port.renew_partial(record)?;
+    if record.cursor == C::Retired {
+        return Ok(O::Removed);
+    }
+    if record.cursor == C::Selected {
+        port.persist_partial(record)?;
+        let mut next = record.clone();
+        next.advance(C::TaskDeleteIntent)?;
+        port.persist_partial(&next)?;
+        *record = next;
+    }
+    if record.cursor == C::TaskDeleteIntent {
+        if !port.task_absent_partial(record)? {
+            port.delete_task_partial(record)?;
+        }
+        if !port.task_absent_partial(record)? {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        let mut next = record.clone();
+        next.advance(C::TaskAbsent)?;
+        port.persist_partial(&next)?;
+        *record = next;
+    }
+    if !port.task_absent_partial(record)? {
+        return Err(NativeError::OutcomeUnknown);
+    }
+    for (index, role) in PayloadRole::ALL.into_iter().rev().enumerate() {
+        let index = index as u8;
+        let start = match record.cursor {
+            C::TaskAbsent => 0,
+            C::Role { index: old, step } if old == index => step,
+            C::Role { index: old, .. } if old > index => continue,
+            C::Role {
+                index: old,
+                step: 5,
+            } if old + 1 == index => 0,
+            C::FilesRemoved | C::CleanupIntent | C::CleanupDone | C::RetireIntent => break,
+            _ => return Err(NativeError::OutcomeUnknown),
+        };
+        for (n, location) in [L::Fixed, L::Stage, L::Backup].into_iter().enumerate() {
+            let step = n as u8 * 2;
+            if start > step {
+                continue;
+            }
+            let mut next = record.clone();
+            next.advance(C::Role { index, step })?;
+            port.renew_partial(record)?;
+            port.persist_partial(&next)?;
+            *record = next;
+            let source = record.document.role(role)?;
+            let expected = match location {
+                L::Fixed => source
+                    .published
+                    .as_ref()
+                    .or(source.staged.as_ref())
+                    .map(|i| i.identity),
+                // The persisted staged identity, or the recorded stray leaf for this role only.
+                L::Stage => record.stage_identity(role)?,
+                L::Backup => match source.original {
+                    OriginalLeaf::Present(id) => Some(id),
+                    _ => None,
+                },
+            };
+            let mut pending = false;
+            match port.observe_partial(record, role, location) {
+                Ok(Some(actual)) if Some(actual) == expected => {
+                    if port.delete_partial(record, role, location, actual)? {
+                        if port.observe_partial(record, role, location)?.is_some() {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                    } else {
+                        pending = true;
+                    }
+                }
+                Ok(None) => {}
+                Ok(Some(_)) | Err(NativeError::Foreign | NativeError::Unavailable) => {
+                    pending = true
+                }
+                Err(error) => return Err(error),
+            }
+            let mut next = record.clone();
+            next.pending[usize::from(index)] |= pending;
+            next.advance(C::Role {
+                index,
+                step: step + 1,
+            })?;
+            port.persist_partial(&next)?;
+            *record = next;
+        }
+    }
+    let pending = record.pending.iter().filter(|v| **v).count();
+    if pending != 0 {
+        return Ok(O::Retained { pending });
+    }
+    if !matches!(
+        record.cursor,
+        C::FilesRemoved | C::CleanupIntent | C::CleanupDone | C::RetireIntent
+    ) {
+        let mut next = record.clone();
+        next.advance(C::FilesRemoved)?;
+        port.persist_partial(&next)?;
+        *record = next;
+    }
+    if record.cursor == C::FilesRemoved {
+        let mut next = record.clone();
+        next.advance(C::CleanupIntent)?;
+        port.persist_partial(&next)?;
+        *record = next;
+    }
+    if record.cursor == C::CleanupIntent {
+        if !port.settle_scaffold(record)? {
+            let mut next = record.clone();
+            next.pending_scaffold = true;
+            port.persist_partial(&next)?;
+            *record = next;
+            return Ok(O::Retained { pending: 1 });
+        }
+        let mut next = record.clone();
+        next.pending_scaffold = false;
+        next.advance(C::CleanupDone)?;
+        port.persist_partial(&next)?;
+        *record = next;
+    }
+    if record.cursor == C::CleanupDone {
+        let mut next = record.clone();
+        next.advance(C::RetireIntent)?;
+        port.persist_partial(&next)?;
+        *record = next;
+    }
+    port.retire_partial(record)?;
+    let mut next = record.clone();
+    next.advance(C::Retired)?;
+    port.persist_partial(&next)?;
+    *record = next;
+    Ok(O::Removed)
+}

@@ -655,6 +655,39 @@ mod native {
                 _ => Err(NativeError::OutcomeUnknown),
             }
         }
+        /// F1 cold partial cleanup only: callers hold the real first-recovery reservation and
+        /// durable TaskDeleteIntent. This cannot consume a completed-tree removal capability.
+        pub(crate) fn delete_first_partial(
+            &self,
+            desired: &Definition,
+            expected: &str,
+            check: &dyn Fn() -> NativeResult<()>,
+            effect: &dyn Fn(),
+        ) -> NativeResult<()> {
+            let (fresh, observed) = self.inspect_removal(desired, check)?;
+            if fresh != expected {
+                return Err(NativeError::Foreign);
+            }
+            if observed.is_none() {
+                return Ok(());
+            }
+            let folder = self.folder.as_ref().ok_or(NativeError::Foreign)?;
+            check()?;
+            // Record may-have-mutated immediately before the actual COM deletion dispatch.
+            effect();
+            // SAFETY: exact fixed task name after fresh whole-XML admission on this owned MTA.
+            // DeleteTask offers no atomic expected-XML argument; flags 0 never widen the target.
+            unsafe { folder.DeleteTask(&BSTR::from("Agent"), 0) }
+                .map_err(|_| NativeError::OutcomeUnknown)?;
+            check()?;
+            // SAFETY: read-only fixed leaf absence check on the same MTA, no folder enumeration.
+            let observed = unsafe { folder.GetTask(&BSTR::from("Agent")) };
+            check()?;
+            match observed {
+                Err(error) if missing(&error) => Ok(()),
+                _ => Err(NativeError::OutcomeUnknown),
+            }
+        }
         pub(crate) fn run(
             &self,
             check: &dyn Fn() -> NativeResult<()>,

@@ -366,7 +366,7 @@ pub(crate) fn run<D: Domains>(
                                         preview: if v.operation == Operation::Install {
                                             install_preview(v.snapshot.cold).into()
                                         } else {
-                                            preview(v.operation)
+                                            preview(v.operation, v.snapshot.cold)
                                         },
                                     },
                                     Err(_) => NativeOutcome::Unsupported,
@@ -415,6 +415,7 @@ pub(crate) fn run<D: Domains>(
                     }
                     NativeJob::Maintenance(req) => {
                         let id = maintenance_id(&req);
+                        let resume_first = matches!(&req, MaintenanceRequest::ResumeRepair { .. });
                         let report = match req {
                             MaintenanceRequest::Inspect { .. } => {
                                 let snapshot = coordinator.detect();
@@ -444,7 +445,7 @@ pub(crate) fn run<D: Domains>(
                                         role: crate::view::ToggleRole::DeleteIdentity,
                                         label: "Erase the Crosspane identity and trust".into(),
                                         checked: false,
-                                        enabled: true,
+                                        enabled: !matches!(&snapshot,Ok(s) if s.cold==domains::Cold::Partial),
                                     }],
                                 }
                             }
@@ -461,7 +462,7 @@ pub(crate) fn run<D: Domains>(
                                 ) {
                                     Ok(p) => MaintenanceReport::Planned {
                                         id,
-                                        preview: preview(p.operation),
+                                        preview: preview(p.operation, p.snapshot.cold),
                                     },
                                     Err(_) => MaintenanceReport::Refused {
                                         id,
@@ -477,7 +478,7 @@ pub(crate) fn run<D: Domains>(
                                     Ok(p) => MaintenanceReport::RepairPlanned {
                                         id,
                                         plan: p.ticket,
-                                        preview: preview(p.operation),
+                                        preview: preview(p.operation, p.snapshot.cold),
                                     },
                                     Err(_) => MaintenanceReport::Refused {
                                         id,
@@ -508,6 +509,7 @@ pub(crate) fn run<D: Domains>(
                                 }
                             }
                             MaintenanceRequest::ConfirmRepair { plan, revision, .. } => {
+                                let first_recovery = matches!(coordinator.detect(),Ok(s) if matches!(s.cold,domains::Cold::Partial|domains::Cold::Stale));
                                 let applied = coordinator.apply(102, id.0, plan, revision, &fence);
                                 if applied.handoff.permits_exit() {
                                     close.handed_off.store(true, Ordering::Release);
@@ -530,25 +532,47 @@ pub(crate) fn run<D: Domains>(
                                                 == Outcome::Verified
                                         {
                                             RepairOutcome::Verified
-                                        } else if applied.outcome == Outcome::Unknown {
+                                        } else if applied.outcome == Outcome::Unknown
+                                            // A completed recovery that can't be re-checked is unknown, not retained.
+                                            || (first_recovery && applied.complete)
+                                        {
                                             RepairOutcome::OutcomeUnknown
                                         } else {
                                             RepairOutcome::RecoveryRetained
                                         },
-                                        lines: vec![format!(
-                                            "Repair submission: {:?}",
-                                            applied.outcome
-                                        )],
+                                        lines: if first_recovery && applied.complete {
+                                            vec!["First-install recovery completed. Review the current facts; a new install requires a new Apply.".into()]
+                                        } else {
+                                            vec![format!(
+                                                "Repair submission: {:?}",
+                                                applied.outcome
+                                            )]
+                                        },
                                         resumable: !applied.complete,
                                     }
                                 }
                             }
                             MaintenanceRequest::ResumeRepair { .. }
                             | MaintenanceRequest::DiscardRepair { .. } => {
+                                let mut recovery_resume = false;
                                 let verified = if fence.admits(id.0) {
                                     coordinator.detect().and_then(|v| {
                                         if !fence.admits(id.0) {
                                             return Err(Failure::NotSubmitted);
+                                        }
+                                        if resume_first
+                                            && matches!(
+                                                v.cold,
+                                                domains::Cold::Partial | domains::Cold::Stale
+                                            )
+                                        {
+                                            recovery_resume = true;
+                                            let outcome =
+                                                coordinator.domains.apply(v.repair_operation())?;
+                                            if !fence.admits(id.0) {
+                                                return Err(Failure::Unknown);
+                                            }
+                                            return Ok(outcome.complete);
                                         }
                                         let settled =
                                             coordinator.domains.settle(v.repair_operation())?;
@@ -571,8 +595,20 @@ pub(crate) fn run<D: Domains>(
                                         reason: "No settlement was started".into(),
                                     }
                                 } else {
-                                    MaintenanceReport::RepairFinished { id, outcome: if matches!(verified,Ok(true)) { RepairOutcome::CheckedAfterEarlierRepair } else { RepairOutcome::OutcomeUnknown },
-                                    lines: vec!["Only existing artifact settlement and fresh observation were requested; no Stop or Run was replayed".into()], resumable: !matches!(verified,Ok(true)) }
+                                    MaintenanceReport::RepairFinished {
+                                        id,
+                                        outcome: if matches!(verified, Ok(true)) {
+                                            RepairOutcome::CheckedAfterEarlierRepair
+                                        } else {
+                                            RepairOutcome::OutcomeUnknown
+                                        },
+                                        lines: vec![if recovery_resume {
+                                            "First-install recovery was requested through its explicit recovery path; no Stop or Run was replayed".to_owned()
+                                        } else {
+                                            "Only existing artifact settlement and fresh observation were requested; no Stop or Run was replayed".to_owned()
+                                        }],
+                                        resumable: !matches!(verified, Ok(true)),
+                                    }
                                 }
                             }
                             MaintenanceRequest::VerifyRepair { .. } => {
@@ -621,7 +657,12 @@ fn native_outcome(outcome: Outcome, now: u64) -> NativeOutcome {
         Outcome::NotSubmitted => NativeOutcome::NotSubmitted,
     }
 }
-fn preview(operation: Operation) -> String {
+fn preview(operation: Operation, cold: domains::Cold) -> String {
+    match cold {
+        domains::Cold::Partial => return "Roll back / remove the partial first install".into(),
+        domains::Cold::Stale => return "Settle the stale first-install record".into(),
+        _ => {}
+    }
     match operation {
         Operation::Install => install_preview(domains::Cold::Eligible).into(),
         Operation::Upgrade => "Verify the supplied release, settle completed artifacts, and transfer this update to an owned keeper".into(),
@@ -639,9 +680,14 @@ pub(crate) fn install_preview(cold: domains::Cold) -> &'static str {
         domains::Cold::Observe => {
             "Observe the earlier first install; no registration or launch will be replayed"
         }
-        domains::Cold::CompletedRemoval => "reinstall after removal: WP-W4.1a8b",
+        domains::Cold::CompletedRemoval => {
+            "Preserve completed removal history, verify the supplied release and reinstall Crosspane"
+        }
+        domains::Cold::Stale => {
+            "Observe or retire the previous first-install operation; no activation will be replayed"
+        }
         domains::Cold::Partial => {
-            "Partial first install: reinstall required; no operation will be replayed"
+            "Roll back the partial first install, or remove proven files; uncertain objects are retained"
         }
         domains::Cold::Unknown => "First-install admission is unknown; nothing will be submitted",
         domains::Cold::AccessDenied => "First install access denied; nothing will be submitted",

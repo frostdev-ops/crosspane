@@ -207,3 +207,314 @@ fn drive<P: FirstInstallPort>(
     next.advance(Phase::Complete)?;
     save(port, record, next)
 }
+
+/// One pair observation; content is bounded admitted metadata, never executable approval.
+pub(crate) type HistoryObservation = (FileStamp, Vec<u8>);
+pub(crate) trait FirstHistoryPort {
+    fn renew(&mut self, intent: &super::record::FirstHistoryIntent) -> NativeResult<()>;
+    fn persist_intent(&mut self, intent: &super::record::FirstHistoryIntent) -> NativeResult<()>;
+    fn observe_pair(
+        &mut self,
+        intent: &super::record::FirstHistoryIntent,
+        leaf: &super::record::HistoryLeaf,
+    ) -> NativeResult<(Option<HistoryObservation>, Option<HistoryObservation>)>;
+    fn move_exact(
+        &mut self,
+        intent: &super::record::FirstHistoryIntent,
+        leaf: &super::record::HistoryLeaf,
+    ) -> NativeResult<()>;
+    fn persist_index(&mut self, index: &super::record::FirstHistoryIndex) -> NativeResult<()>;
+}
+/// On reopen, settled moves are observed, never repeated. An ambiguous pair never admits launch.
+pub(crate) fn archive_history<P: FirstHistoryPort>(
+    port: &mut P,
+    intent: &mut super::record::FirstHistoryIntent,
+    index: &mut super::record::FirstHistoryIndex,
+) -> NativeResult<()> {
+    intent.validate()?;
+    index.validate()?;
+    let slot = index.slots[usize::from(intent.slot)].as_ref();
+    if slot.is_some_and(|slot| slot != &intent.selected) {
+        return Err(NativeError::Foreign);
+    }
+    if intent.complete && slot != Some(&intent.selected) {
+        return Err(NativeError::OutcomeUnknown);
+    }
+    port.renew(intent)?;
+    port.persist_intent(intent)?;
+    for (position, leaf) in intent.selected.leaves.clone().iter().enumerate() {
+        port.renew(intent)?;
+        let (source, destination) = port.observe_pair(intent, leaf)?;
+        match (source, destination) {
+            (Some((id, bytes)), None)
+                if leaf.matches(id, &bytes) && position >= intent.moved && !intent.complete =>
+            {
+                port.move_exact(intent, leaf)?;
+                let (source, destination) = port.observe_pair(intent, leaf)?;
+                if source.is_some()
+                    || destination
+                        .as_ref()
+                        .is_none_or(|(id, bytes)| !leaf.matches(*id, bytes))
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+            }
+            (None, Some((id, bytes))) if leaf.matches(id, &bytes) => {}
+            _ => return Err(NativeError::OutcomeUnknown),
+        }
+        if position >= intent.moved {
+            let mut next = intent.clone();
+            next.moved = position + 1;
+            port.persist_intent(&next)?;
+            *intent = next;
+        }
+    }
+    let mut next = index.clone();
+    next.commit(intent)?;
+    port.persist_index(&next)?;
+    *index = next;
+    let mut complete = intent.clone();
+    complete.complete = true;
+    port.persist_intent(&complete)?;
+    *intent = complete;
+    port.renew(intent)
+}
+
+pub(crate) trait FirstRecoveryPort {
+    fn renew_recovery(&mut self, recovery: &super::record::FirstRecoveryRecord)
+    -> NativeResult<()>;
+    fn persist_recovery(
+        &mut self,
+        recovery: &super::record::FirstRecoveryRecord,
+    ) -> NativeResult<()>;
+    fn task_absent(&mut self, recovery: &super::record::FirstRecoveryRecord) -> NativeResult<bool>;
+    fn delete_task(&mut self, recovery: &super::record::FirstRecoveryRecord) -> NativeResult<()>;
+    fn triad(
+        &mut self,
+        recovery: &super::record::FirstRecoveryRecord,
+        role: PayloadRole,
+    ) -> NativeResult<super::record::RoleTriad>;
+    fn unpublish(
+        &mut self,
+        recovery: &super::record::FirstRecoveryRecord,
+        role: PayloadRole,
+    ) -> NativeResult<()>;
+    fn restore_original(
+        &mut self,
+        recovery: &super::record::FirstRecoveryRecord,
+        role: PayloadRole,
+    ) -> NativeResult<()>;
+    fn delete_stage(
+        &mut self,
+        recovery: &super::record::FirstRecoveryRecord,
+        role: PayloadRole,
+    ) -> NativeResult<()>;
+    fn settle_scaffold(
+        &mut self,
+        recovery: &super::record::FirstRecoveryRecord,
+    ) -> NativeResult<bool>;
+    fn retire_first(&mut self, recovery: &super::record::FirstRecoveryRecord) -> NativeResult<()>;
+}
+fn recovery_save<P: FirstRecoveryPort>(
+    port: &mut P,
+    record: &mut super::record::FirstRecoveryRecord,
+    cursor: super::record::FirstRecoveryCursor,
+) -> NativeResult<()> {
+    let mut next = record.clone();
+    next.advance(cursor)?;
+    port.renew_recovery(record)?;
+    port.persist_recovery(&next)?;
+    *record = next;
+    Ok(())
+}
+/// File-only rollback. An already completed NO_REPLACE move is observed rather than repeated.
+pub(crate) fn recover_first<P: FirstRecoveryPort>(
+    port: &mut P,
+    record: &mut super::record::FirstRecoveryRecord,
+) -> NativeResult<super::record::FirstRecoveryOutcome> {
+    use super::record::{
+        FirstRecoveryCursor as C, FirstRecoveryMode as M, FirstRecoveryOutcome as O,
+    };
+    record.validate()?;
+    if record.mode != M::Rollback {
+        return Err(NativeError::Foreign);
+    }
+    port.renew_recovery(record)?;
+    if record.cursor == C::Retired {
+        return Ok(O::RolledBack);
+    }
+    if record.cursor == C::Selected {
+        port.persist_recovery(record)?;
+        recovery_save(port, record, C::TaskDeleteIntent)?;
+    }
+    if record.cursor == C::TaskDeleteIntent {
+        if !port.task_absent(record)? {
+            port.delete_task(record)?;
+        }
+        if !port.task_absent(record)? {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        recovery_save(port, record, C::TaskAbsent)?;
+    }
+    if !port.task_absent(record)? {
+        return Err(NativeError::OutcomeUnknown);
+    }
+    for (index, role) in PayloadRole::ALL.into_iter().rev().enumerate() {
+        let index = index as u8;
+        let source = record.document.role(role)?.clone();
+        // The persisted staged identity, or the recorded stray leaf for this role only.
+        let identity = record.stage_identity(role)?;
+        let point = |step| C::Role { index, step };
+        let mut stage = 0;
+        match record.cursor {
+            C::TaskAbsent => {}
+            C::Role { index: old, step } if old == index => stage = step,
+            C::Role { index: old, .. } if old > index => continue,
+            C::Role {
+                index: old,
+                step: 5,
+            } if old + 1 == index => {}
+            C::RolledBack | C::CleanupIntent | C::CleanupDone | C::RetireIntent | C::Retired => {
+                break;
+            }
+            _ => return Err(NativeError::OutcomeUnknown),
+        }
+        if stage == 0 {
+            recovery_save(port, record, point(0))?;
+            let observed = port.triad(record, role)?;
+            if observed.fixed.is_some() && observed.fixed == identity {
+                if observed.stage.is_some() {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                port.unpublish(record, role)?;
+                let after = port.triad(record, role)?;
+                if after.fixed.is_some() || after.stage != identity {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+            } else if observed.stage.is_some() && observed.stage != identity {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            recovery_save(port, record, point(1))?;
+            stage = 1;
+        }
+        if stage <= 2 {
+            recovery_save(port, record, point(2))?;
+            let observed = port.triad(record, role)?;
+            match source.original {
+                OriginalLeaf::Present(id)
+                    if observed.fixed.is_none() && observed.backup == Some(id) =>
+                {
+                    port.restore_original(record, role)?;
+                    let after = port.triad(record, role)?;
+                    if after.fixed != Some(id) || after.backup.is_some() {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                }
+                OriginalLeaf::Present(id)
+                    if observed.fixed == Some(id) && observed.backup.is_none() => {}
+                OriginalLeaf::Missing if observed.fixed.is_none() && observed.backup.is_none() => {}
+                OriginalLeaf::Unobserved
+                    if observed.backup.is_none()
+                        && (observed.fixed.is_none() || observed.fixed != identity) => {}
+                _ => return Err(NativeError::OutcomeUnknown),
+            }
+            recovery_save(port, record, point(3))?;
+            stage = 3;
+        }
+        if stage <= 4 {
+            recovery_save(port, record, point(4))?;
+            let observed = port.triad(record, role)?;
+            match observed.stage {
+                Some(id) if Some(id) == identity => {
+                    port.delete_stage(record, role)?;
+                }
+                None => {}
+                _ => return Err(NativeError::OutcomeUnknown),
+            }
+            if port.triad(record, role)?.stage.is_some() {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            recovery_save(port, record, point(5))?;
+        }
+    }
+    if !matches!(
+        record.cursor,
+        C::RolledBack | C::CleanupIntent | C::CleanupDone | C::RetireIntent
+    ) {
+        recovery_save(port, record, C::RolledBack)?;
+    }
+    if record.cursor == C::RolledBack {
+        recovery_save(port, record, C::CleanupIntent)?;
+    }
+    if record.cursor == C::CleanupIntent {
+        if !port.settle_scaffold(record)? {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        recovery_save(port, record, C::CleanupDone)?;
+    }
+    if record.cursor == C::CleanupDone {
+        recovery_save(port, record, C::RetireIntent)?;
+    }
+    port.retire_first(record)?;
+    recovery_save(port, record, C::Retired)?;
+    Ok(O::RolledBack)
+}
+
+/// A read-only live observation is supplied by the native sealed sibling. Absence must be
+/// independently admitted; this port has no file/task/launch/Stop operations.
+pub(crate) trait FirstStalePort {
+    fn renew_stale(&mut self, record: &super::record::FirstRecoveryRecord) -> NativeResult<()>;
+    fn observe_supersession(
+        &mut self,
+        record: &super::record::FirstRecoveryRecord,
+    ) -> NativeResult<Option<u64>>;
+    fn reserve_absent(&mut self, record: &super::record::FirstRecoveryRecord) -> NativeResult<()>;
+    fn persist_stale(&mut self, record: &super::record::FirstRecoveryRecord) -> NativeResult<()>;
+    fn retire_stale(&mut self, record: &super::record::FirstRecoveryRecord) -> NativeResult<()>;
+}
+pub(crate) fn settle_stale_first<P: FirstStalePort>(
+    port: &mut P,
+    record: &mut super::record::FirstRecoveryRecord,
+) -> NativeResult<super::record::FirstRecoveryOutcome> {
+    use super::record::{
+        FirstRecoveryCursor as C, FirstRecoveryMode as M, FirstRecoveryOutcome as O,
+    };
+    record.validate()?;
+    super::recovery_mode_allowed(&record.document, record.mode)?;
+    if !matches!(record.mode, M::Supersede | M::RetireStale) {
+        return Err(NativeError::Foreign);
+    }
+    port.renew_stale(record)?;
+    if record.mode == M::Supersede {
+        if port.observe_supersession(record)?.is_none_or(|i| i == 0) {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        if record.cursor != C::Superseded {
+            let mut next = record.clone();
+            next.advance(C::Superseded)?;
+            port.persist_stale(&next)?;
+            *record = next;
+        }
+        return Ok(O::Superseded);
+    }
+    port.reserve_absent(record)?;
+    if record.cursor == C::Retired {
+        return Ok(O::Retired);
+    }
+    if record.cursor == C::Selected {
+        port.persist_stale(record)?;
+        let mut next = record.clone();
+        next.advance(C::RetireIntent)?;
+        port.persist_stale(&next)?;
+        *record = next;
+    }
+    if record.cursor != C::RetireIntent {
+        return Err(NativeError::Foreign);
+    }
+    port.retire_stale(record)?;
+    let mut next = record.clone();
+    next.advance(C::Retired)?;
+    port.persist_stale(&next)?;
+    *record = next;
+    Ok(O::Retired)
+}

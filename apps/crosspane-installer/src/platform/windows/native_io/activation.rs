@@ -84,6 +84,9 @@ impl TaskActivationRecord {
     pub(crate) fn claim(&self) -> Option<SupervisorClaim> {
         self.claim
     }
+    pub(crate) fn user(&self) -> &str {
+        &self.user
+    }
     pub(crate) fn bind(
         &self,
         operation: [u8; 16],

@@ -463,3 +463,16 @@ pub(crate) fn admit_upgrade_selection(removal: Option<&RemovalRecord>) -> Native
     }
     Ok(())
 }
+
+/// Partial first installs use a separate file-only route; this fact cannot grant Stop or erase.
+/// Test-only: the product route (`executor::remove_partial_first`) has no Stop or erase method.
+#[cfg(test)]
+pub(crate) fn partial_first_removal_allowed(
+    erase_identity: bool,
+) -> super::native_io::NativeResult<()> {
+    if erase_identity {
+        Err(super::native_io::NativeError::Unsupported)
+    } else {
+        Ok(())
+    }
+}

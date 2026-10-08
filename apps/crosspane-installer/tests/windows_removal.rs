@@ -3,6 +3,8 @@
 use crosspane_installer::agent_contract;
 #[path = "../src/platform/windows/detect.rs"]
 mod detect;
+#[path = "../src/platform/windows/first_install.rs"]
+mod first_install;
 #[path = "../src/platform/windows/native_io.rs"]
 mod native_io;
 #[path = "../src/platform/windows/payload.rs"]

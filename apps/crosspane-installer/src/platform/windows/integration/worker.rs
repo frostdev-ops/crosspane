@@ -1,5 +1,5 @@
 //! One bounded background owner; no GUI method waits for an operation or thread settlement.
-use super::domains::{Dispatch, Domains, Failure, Handoff, Operation, Snapshot};
+use super::domains::{Cold, Dispatch, Domains, Failure, Handoff, Operation, Snapshot};
 use std::collections::BTreeMap;
 use std::sync::{
     Arc,
@@ -137,10 +137,16 @@ impl<D: Domains> Coordinator<D> {
         let result = self.domains.apply(plan.operation);
         match result {
             Ok(Dispatch { handoff, complete }) => {
+                // A first-install recovery removal completes in place: there is no keeper to hand off.
+                let recovery_removal = matches!(plan.operation, Operation::Removal { .. })
+                    && matches!(plan.snapshot.cold, Cold::Partial | Cold::Stale)
+                    && complete
+                    && handoff == Handoff::NotCommitted;
                 if matches!(
                     plan.operation,
                     Operation::Upgrade | Operation::PayloadRepair | Operation::Removal { .. }
                 ) && !handoff.permits_exit()
+                    && !recovery_removal
                 {
                     return Applied::failure(Outcome::Unknown);
                 }

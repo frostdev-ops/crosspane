@@ -175,7 +175,7 @@ impl live::Platform for QuietPlatform {
     fn shutdown(&mut self) {}
 }
 #[allow(clippy::unwrap_used)] // Test-only plan setup; failure should fail the fixture.
-fn apply(coordinator: &mut Coordinator<Fake>, op: Operation) -> Applied {
+fn apply<D: Domains>(coordinator: &mut Coordinator<D>, op: Operation) -> Applied {
     coordinator.plan(1, 1, op).unwrap();
     let fence = Fence::default();
     fence.select(2);
@@ -764,12 +764,8 @@ fn first_install_apply_uses_worker_consent_fresh_verify_and_keeps_parent_open() 
 }
 #[test]
 fn first_install_partial_and_removal_history_refuse_before_effects() {
+    // Partial routes to recovery and CompletedRemoval admits a reinstall; see the a8b tests below.
     for (cold, reason) in [
-        (Cold::Partial, "Partial first install"),
-        (
-            Cold::CompletedRemoval,
-            "reinstall after removal: WP-W4.1a8b",
-        ),
         (Cold::Unknown, "admission is unknown"),
         (Cold::AccessDenied, "access denied"),
     ] {
@@ -800,6 +796,65 @@ fn first_install_partial_and_removal_history_refuse_before_effects() {
             (0, 0, 0, 0)
         );
     }
+}
+#[test]
+fn a8b_completed_removal_admits_install_only_with_missing_task_and_agent() {
+    let mut fake = Fake::new();
+    fake.observed.payload = State::Missing;
+    fake.observed.task = State::Missing;
+    fake.observed.agent = State::Missing;
+    fake.observed.cold = Cold::CompletedRemoval;
+    assert_eq!(fake.observed.install_operation(), Operation::Install);
+    assert!(fake.observed.allowed(Operation::Install));
+    assert!(
+        integration::install_preview(Cold::CompletedRemoval)
+            .contains("Preserve completed removal history")
+    );
+    let mut coordinator = Coordinator::new(fake);
+    assert_eq!(
+        apply(&mut coordinator, Operation::Install).outcome,
+        Outcome::Submitted
+    );
+    assert_eq!(coordinator.domains.applications, 1);
+
+    let mut task_present = Fake::new();
+    task_present.observed.payload = State::Missing;
+    task_present.observed.task = State::Healthy;
+    task_present.observed.agent = State::Missing;
+    task_present.observed.cold = Cold::CompletedRemoval;
+    assert!(!task_present.observed.allowed(Operation::Install));
+    let mut coordinator = Coordinator::new(task_present);
+    assert_eq!(
+        apply(&mut coordinator, Operation::Install).outcome,
+        Outcome::NotSubmitted
+    );
+    assert_eq!(
+        (
+            coordinator.domains.applications,
+            coordinator.domains.mutations
+        ),
+        (0, 0)
+    );
+
+    let mut no_sources = Fake::new();
+    no_sources.observed.payload = State::Missing;
+    no_sources.observed.task = State::Missing;
+    no_sources.observed.agent = State::Missing;
+    no_sources.observed.cold = Cold::CompletedRemoval;
+    no_sources.observed.sources = false;
+    assert!(!no_sources.observed.allowed(Operation::Install));
+    let mut coordinator = Coordinator::new(no_sources);
+    assert_eq!(
+        apply(&mut coordinator, Operation::Install).outcome,
+        Outcome::NotSubmitted
+    );
+    assert_eq!(
+        (
+            coordinator.domains.applications,
+            coordinator.domains.mutations
+        ),
+        (0, 0)
+    );
 }
 #[test]
 fn first_install_stale_cold_revision_cancel_and_live_task_have_no_dispatch() {
@@ -921,4 +976,248 @@ fn first_install_not_submitted_reason_survives_the_production_report_path() {
     stop.store(true, Ordering::Release);
     drop(tx);
     thread.join().unwrap();
+}
+
+/// Recovery model mirroring `NativeDomains`. A Partial/Stale snapshot is a real recovery effect
+/// and sets `recovered`, which selects `first_recovery_settled` for MetadataRepair verification.
+/// A healthy MetadataRepair is a zero-effect no-op; a fresh Install is a real effect.
+struct RecoveryDomains {
+    observed: Snapshot,
+    applications: usize,
+    mutations: usize,
+    failure: bool,
+    recovered: bool,
+}
+impl RecoveryDomains {
+    fn new(observed: Snapshot, failure: bool) -> Self {
+        Self {
+            observed,
+            applications: 0,
+            mutations: 0,
+            failure,
+            recovered: false,
+        }
+    }
+}
+impl Domains for RecoveryDomains {
+    fn observe(&mut self) -> Result<Snapshot, Failure> {
+        Ok(self.observed.clone())
+    }
+    fn settle(&mut self, _: Operation) -> Result<bool, Failure> {
+        Ok(false)
+    }
+    fn apply(&mut self, op: Operation) -> Result<Dispatch, Failure> {
+        assert!(self.observed.allowed(op));
+        self.applications += 1;
+        self.recovered = false;
+        let recovering = matches!(self.observed.cold, Cold::Partial | Cold::Stale);
+        if recovering {
+            self.recovered = true;
+            self.mutations += 1; // The recovery effect may land even when its reply is lost.
+        } else if op == Operation::Install {
+            self.mutations += 1;
+        }
+        if self.failure {
+            return Err(Failure::Unknown);
+        }
+        if recovering {
+            if self.observed.cold == Cold::Stale {
+                self.observed = snapshot();
+            } else {
+                self.observed.cold = Cold::Eligible;
+                self.observed.payload = State::Missing;
+                self.observed.agent = State::Missing;
+                self.observed.task = State::Missing;
+                self.observed.unsettled = false;
+            }
+        } else if op == Operation::Install {
+            self.observed = snapshot();
+        }
+        Ok(Dispatch {
+            handoff: Handoff::NotCommitted,
+            complete: true,
+        })
+    }
+    fn verify(&mut self, op: Operation) -> Result<bool, Failure> {
+        if self.recovered && op == Operation::MetadataRepair {
+            return Ok(self.observed.first_recovery_settled());
+        }
+        Ok(self.observed.verified(op))
+    }
+}
+fn partial_snapshot() -> Snapshot {
+    let mut s = snapshot();
+    s.cold = Cold::Partial;
+    s.payload = State::Unknown;
+    s.agent = State::Missing;
+    s.task = State::Mismatch;
+    s.inventory = false;
+    s.sources = false;
+    s.unsettled = true;
+    s
+}
+#[test]
+fn a8b_partial_routes_without_payload_readers_but_never_admits_erase_or_activation() {
+    let s = partial_snapshot();
+    assert_eq!(s.install_operation(), Operation::MetadataRepair);
+    assert_eq!(s.repair_operation(), Operation::MetadataRepair);
+    assert!(s.allowed(Operation::MetadataRepair));
+    assert!(s.allowed(Operation::Removal {
+        erase_identity: false
+    }));
+    for op in [
+        Operation::Install,
+        Operation::Upgrade,
+        Operation::PayloadRepair,
+        Operation::Removal {
+            erase_identity: true,
+        },
+    ] {
+        assert!(!s.allowed(op));
+    }
+    let mut c = Coordinator::new(RecoveryDomains::new(s, false));
+    c.detect().unwrap();
+    assert_eq!(c.domains.mutations, 0);
+    let result = apply(&mut c, Operation::MetadataRepair);
+    assert_eq!(result.outcome, Outcome::Submitted);
+    assert!(result.complete);
+    assert_eq!(result.handoff, Handoff::NotCommitted);
+    assert_eq!((c.domains.applications, c.domains.mutations), (1, 1));
+    // The settled rollback verifies through first_recovery_settled, not the healthy predicate.
+    assert_eq!(c.verify(Operation::MetadataRepair), Outcome::Verified);
+    assert_eq!(c.domains.observed.cold, Cold::Eligible);
+    assert_eq!(c.domains.observed.task, State::Missing);
+    assert_eq!(c.domains.observed.agent, State::Missing);
+    assert!(!c.domains.observed.unsettled);
+}
+#[test]
+fn a8b_recovery_unknown_never_refunds_or_replays_and_healthy_stays_zero_effects() {
+    let mut c = Coordinator::new(RecoveryDomains::new(partial_snapshot(), true));
+    let result = apply(&mut c, Operation::MetadataRepair);
+    assert_eq!(result.outcome, Outcome::Unknown);
+    assert!(!result.outcome.refunds_consent());
+    assert_eq!((c.domains.applications, c.domains.mutations), (1, 1));
+    // Coordinator::apply never reports Verified; a healthy repair submits with zero effects.
+    let mut healthy = Coordinator::new(RecoveryDomains::new(snapshot(), false));
+    let result = apply(&mut healthy, Operation::MetadataRepair);
+    assert_eq!(result.outcome, Outcome::Submitted);
+    assert!(result.complete);
+    assert_eq!(
+        (healthy.domains.applications, healthy.domains.mutations),
+        (1, 0)
+    );
+    assert_eq!(healthy.verify(Operation::MetadataRepair), Outcome::Verified);
+}
+#[test]
+fn a8b_recovery_complete_clears_uncertainty_and_allows_a_new_install() {
+    let mut s = partial_snapshot();
+    // A fresh install needs release sources and inventory, which the routing case leaves false.
+    s.inventory = true;
+    s.sources = true;
+    let mut c = Coordinator::new(RecoveryDomains::new(s, false));
+    let repair = apply(&mut c, Operation::MetadataRepair);
+    assert_eq!(repair.outcome, Outcome::Submitted);
+    assert!(repair.complete);
+    // A dispatch reservation is per slot, so the new install is planned on its own slot.
+    c.plan(2, 3, Operation::Install).unwrap();
+    let fence = Fence::default();
+    fence.select(4);
+    let install = c.apply(2, 4, 3, 4, &fence);
+    assert_eq!(install.outcome, Outcome::Submitted);
+    assert!(install.complete);
+    assert_eq!(c.domains.applications, 2);
+}
+#[test]
+fn a8b_partial_removal_through_coordinator_is_submitted_not_unknown() {
+    let mut c = Coordinator::new(RecoveryDomains::new(partial_snapshot(), false));
+    let removal = apply(
+        &mut c,
+        Operation::Removal {
+            erase_identity: false,
+        },
+    );
+    assert_eq!(removal.outcome, Outcome::Submitted);
+    assert!(removal.complete);
+    assert_eq!(removal.handoff, Handoff::NotCommitted);
+    assert!(!removal.handoff.permits_exit());
+    assert_eq!((c.domains.applications, c.domains.mutations), (1, 1));
+}
+/// Plans through the production report path and returns the preview the operator sees.
+#[allow(clippy::unwrap_used)] // Test-only fixture; a failed send or join should fail the test.
+fn plan_preview(fake: Fake) -> String {
+    use crosspane_installer_core::{JobIntent, JobStage, OperationId, StepId};
+    let (tx, commands) = mpsc::sync_channel(32);
+    let (reports, rx) = mpsc::sync_channel(32);
+    let (agents, _agent_rx) = mpsc::sync_channel(32);
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let thread = std::thread::spawn(move || {
+        integration::run(
+            fake,
+            commands,
+            reports,
+            agents,
+            thread_stop,
+            Arc::new(ports::CloseState::default()),
+            Arc::new(|| 1),
+        )
+    });
+    let fence = Fence::default();
+    fence.select(1);
+    tx.send(ports::Command::Job {
+        fence,
+        job: live::NativeJob::Step {
+            job: JobIntent {
+                step: StepId(20),
+                operation: OperationId(1),
+                stage: JobStage::Plan,
+            },
+            consent: None,
+            status: None,
+        },
+    })
+    .unwrap();
+    let report = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    stop.store(true, Ordering::Release);
+    drop(tx);
+    thread.join().unwrap();
+    match report {
+        live::NativeReport::Step(report) => match report.outcome {
+            live::NativeOutcome::Planned { preview } => preview,
+            _ => panic!("planned outcome expected"),
+        },
+        _ => panic!("step report expected"),
+    }
+}
+#[test]
+fn a8b_partial_and_stale_previews_name_recovery_not_install() {
+    for (cold, expected) in [
+        (
+            Cold::Partial,
+            "Roll back / remove the partial first install",
+        ),
+        (Cold::Stale, "Settle the stale first-install record"),
+    ] {
+        let mut fake = Fake::new();
+        fake.observed.cold = cold;
+        let preview = plan_preview(fake);
+        assert_eq!(preview, expected);
+        assert!(!preview.contains("Verify the supplied release"));
+    }
+}
+#[test]
+fn a8b_stale_routing_is_observation_only_and_completion_reprobes_fresh_facts() {
+    let mut s = snapshot();
+    s.cold = Cold::Stale;
+    s.unsettled = true;
+    assert!(s.allowed(Operation::MetadataRepair));
+    assert!(!s.allowed(Operation::Install));
+    assert!(!s.allowed(Operation::Removal {
+        erase_identity: false
+    }));
+    let mut c = Coordinator::new(RecoveryDomains::new(s, false));
+    let result = apply(&mut c, Operation::MetadataRepair);
+    assert_eq!(result.outcome, Outcome::Submitted);
+    assert_eq!(result.handoff, Handoff::NotCommitted);
+    assert_eq!(c.verify(Operation::MetadataRepair), Outcome::Verified);
 }

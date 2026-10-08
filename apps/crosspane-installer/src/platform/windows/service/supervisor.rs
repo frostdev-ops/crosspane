@@ -602,6 +602,7 @@ mod native {
     }
     enum InitialArchive {
         Installer(OwnedArchiveResult),
+        FirstReinstall(super::super::super::native_io::FirstInstallArchiveResult),
         Repair(RepairArchiveResult),
         Logon(LogonArchiveResult),
     }
@@ -626,6 +627,16 @@ mod native {
         ) -> NativeResult<()> {
             match (&self.archive, &self.permit) {
                 (Some(InitialArchive::Installer(archive)), EntryPermit::Installer(permit)) => {
+                    archive.reverify(
+                        self.owner.io(),
+                        support,
+                        lock,
+                        permit,
+                        &self.owner,
+                        deadline,
+                    )
+                }
+                (Some(InitialArchive::FirstReinstall(archive)), EntryPermit::Installer(permit)) => {
                     archive.reverify(
                         self.owner.io(),
                         support,
@@ -673,6 +684,16 @@ mod native {
                         deadline,
                     )
                 }
+                (Some(InitialArchive::FirstReinstall(archive)), EntryPermit::Installer(permit)) => {
+                    archive.publish_bound(
+                        self.owner.io(),
+                        support,
+                        lock,
+                        permit,
+                        &self.owner,
+                        deadline,
+                    )
+                }
                 (Some(InitialArchive::Repair(archive)), EntryPermit::Installer(permit)) => archive
                     .publish_bound(
                         self.owner.io(),
@@ -710,6 +731,21 @@ mod native {
             self.archive = Some(match &self.permit {
                 EntryPermit::Installer(permit) if permit.is_repair() => {
                     InitialArchive::Repair(self.owner.io().prepare_repair_epoch(
+                        &support,
+                        &lock,
+                        permit,
+                        &self.owner,
+                        self.deadline,
+                    )?)
+                }
+                EntryPermit::Installer(permit)
+                    if self.owner.io().is_first_reinstall_epoch(
+                        &support,
+                        permit.operation(),
+                        self.deadline,
+                    )? =>
+                {
+                    InitialArchive::FirstReinstall(self.owner.io().prepare_first_reinstall_epoch(
                         &support,
                         &lock,
                         permit,

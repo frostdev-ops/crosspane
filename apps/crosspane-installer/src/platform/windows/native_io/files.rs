@@ -2173,6 +2173,165 @@ pub(crate) mod native {
             }
             deadline.check()
         }
+        /// Exact owned first-recovery leaf only. Normal exclusive DELETE can never force a
+        /// mapped image; a reparse entry is deleted as its link, never followed.
+        pub(crate) fn delete_first_recovery_leaf(
+            &self,
+            leaf: &str,
+            expected: FileIdentity,
+            security: &Security,
+            deadline: &Deadline,
+            effect: &dyn Fn(),
+        ) -> NativeResult<bool> {
+            let allowed = super::super::super::payload::inventory::PayloadRole::ALL
+                .iter()
+                .any(|r| r.leaf() == leaf)
+                || matches!(
+                    leaf,
+                    "first-install-stage" | "first-install-backups" | "Crosspane"
+                )
+                || leaf.len() == 32
+                    && leaf
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if !allowed {
+                return Err(NativeError::Foreign);
+            }
+            self.revalidate(security, false, deadline)?;
+            let object = match removal_object(
+                self.file()?,
+                leaf,
+                super::DELETE | FILE_LIST_DIRECTORY,
+                0,
+                self.identity()?.volume,
+                deadline,
+            ) {
+                Ok(None) => return Ok(true),
+                Ok(Some(object)) => object,
+                Err(NativeError::Unavailable) => return Ok(false), // Positive no-dispatch; retain.
+                Err(error) => return Err(error),
+            };
+            if object.identity != expected {
+                return Err(NativeError::Foreign);
+            }
+            let attrs: FILE_ATTRIBUTE_TAG_INFO = info(&object.file, FileAttributeTagInfo)?;
+            if attrs.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
+                && attrs.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                && !entries(&object.file, deadline)?.is_empty()
+            {
+                return Ok(false);
+            }
+            deadline.check()?;
+            effect();
+            let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            // SAFETY: ordinary disposition on the retained no-follow, exclusive DELETE handle
+            // with the exact admitted FileId; directories were positively empty on this handle.
+            if unsafe {
+                SetFileInformationByHandle(
+                    object.file.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            drop(object);
+            if self.opaque(leaf, false, security, deadline)?.is_some() {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            deadline.check()?;
+            Ok(true)
+        }
+        pub(crate) fn first_history_slot(
+            &self,
+            slot: u8,
+            create: bool,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<Option<Anchor>> {
+            let leaf = match slot {
+                0 => "slot-0",
+                1 => "slot-1",
+                2 => "slot-2",
+                _ => return Err(NativeError::Invalid),
+            };
+            self.revalidate(security, true, deadline)?;
+            let evidence = match self.child("first-install-history", security, deadline)? {
+                Some(root) => root,
+                None if create => {
+                    self.create_child_directory("first-install-history", security, deadline)?
+                }
+                None => return Ok(None),
+            };
+            match evidence.child(leaf, security, deadline)? {
+                Some(root) => Ok(Some(root)),
+                None if create => evidence
+                    .create_child_directory(leaf, security, deadline)
+                    .map(Some),
+                None => Ok(None),
+            }
+        }
+        pub(crate) fn archive_first_history_metadata(
+            &self,
+            leaf: &str,
+            expected: FileIdentity,
+            bytes: &[u8],
+            destination: &Anchor,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            if !super::super::super::first_install::record::history_leaf_allowed(leaf) {
+                return Err(NativeError::Foreign);
+            }
+            self.revalidate(security, true, deadline)?;
+            destination.revalidate(security, true, deadline)?;
+            if self.identity()?.volume != destination.identity()?.volume {
+                return Err(NativeError::Foreign);
+            }
+            let name = PrivateName::new(leaf)?;
+            if destination
+                .read_private(&name, security, MAX_RECORD_BYTES, deadline)?
+                .is_some()
+            {
+                return Err(NativeError::Foreign);
+            }
+            // Strict no-follow File adds READ_CONTROL for actual owner/DACL, unlike opaque opens.
+            let mut source = open_component(
+                self.file()?,
+                &ComponentName::new(leaf)?,
+                ObjectKind::File,
+                GENERIC_READ | super::DELETE,
+                0,
+                deadline,
+            )?
+            .ok_or(NativeError::Foreign)?;
+            let facts = observe(&source, leaf, security)?;
+            admit_component(&facts, Admission::PrivateFile)?;
+            if facts.identity != expected || read_repair_bytes(&mut source, deadline)? != bytes {
+                return Err(NativeError::Foreign);
+            }
+            rename_no_replace(&source, destination, leaf, deadline)?;
+            if raw_identity(&source)? != expected || name_of_repair_file(&source)? != leaf {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            drop(source);
+            // Neither DeletePending nor rename return is settlement. Reobserve both exact names.
+            if self
+                .read_private(&name, security, MAX_RECORD_BYTES, deadline)?
+                .is_some()
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            let (id, archived) = destination
+                .read_private(&name, security, MAX_RECORD_BYTES, deadline)?
+                .ok_or(NativeError::OutcomeUnknown)?;
+            if id != expected || archived != bytes {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            deadline.check()
+        }
     }
     #[cfg(not(test))]
     fn name_of_repair_file(file: &File) -> NativeResult<String> {

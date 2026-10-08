@@ -196,6 +196,7 @@ mod native {
         io: Arc<WindowsNativeIo>,
         payload: Arc<VerifiedPayload>,
         reservation: native_io::FirstInstallReservation,
+        history: Option<Arc<native_io::ArchivedFirstHistory>>,
         selected: super::super::super::first_install::record::FirstInstallRecord,
         released: Arc<std::sync::atomic::AtomicBool>,
     }
@@ -206,6 +207,18 @@ mod native {
             self.payload.reverify(&self.io, &proof, deadline)?;
             if !self.released.load(std::sync::atomic::Ordering::Acquire) {
                 self.reservation.reverify(&self.io, &proof, deadline)?;
+                if let Some(history) = &self.history {
+                    history.reverify(&self.io, &proof, deadline)?;
+                }
+            } else if self.history.is_some() {
+                let history = self
+                    .io
+                    .read_first_history_intent(&proof, deadline)?
+                    .ok_or(NativeError::Foreign)?;
+                self.io.verify_first_history(&proof, &history, deadline)?;
+                if history.selected.next_operation != self.selected.operation() {
+                    return Err(NativeError::Foreign);
+                }
             }
             let actual = self
                 .io
@@ -274,6 +287,23 @@ mod native {
             Ok(())
         }
     }
+    pub(in super::super) fn prepare_first_reinstall(
+        io: Arc<WindowsNativeIo>,
+        payload: Arc<VerifiedPayload>,
+        history: native_io::ArchivedFirstHistory,
+        deadline: &Deadline,
+    ) -> NativeResult<FirstInstallTaskSelection> {
+        let proof = io.admit_support(deadline)?;
+        history.reverify(&io, &proof, deadline)?;
+        if history.operation() != payload.operation() {
+            return Err(NativeError::Foreign);
+        }
+        let reservation = history.reservation().clone();
+        let mut selection = prepare_first_install(io, payload, reservation, deadline)?;
+        selection.history = Some(Arc::new(history));
+        selection.reverify(deadline)?;
+        Ok(selection)
+    }
     pub(in super::super) fn prepare_first_install(
         io: Arc<WindowsNativeIo>,
         payload: Arc<VerifiedPayload>,
@@ -295,6 +325,7 @@ mod native {
             io,
             payload,
             reservation,
+            history: None,
             selected,
             released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -1064,8 +1095,8 @@ mod native {
 pub(crate) use native::TaskRunPermit;
 #[cfg(all(windows, not(test)))]
 pub(super) use native::{
-    TaskRunEvidence, claim_supervisor, prepare_first_install, prepare_repair, prepare_upgrade,
-    start_first_install, start_repair, start_upgrade,
+    TaskRunEvidence, claim_supervisor, prepare_first_install, prepare_first_reinstall,
+    prepare_repair, prepare_upgrade, start_first_install, start_repair, start_upgrade,
 };
 
 // A6 repair is separate from activation: registration-only, no TaskActivation claim or Run.

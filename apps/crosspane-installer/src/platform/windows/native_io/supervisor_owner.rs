@@ -134,7 +134,9 @@ mod first_namespace {
 #[cfg(all(windows, not(test)))]
 pub(crate) use first_namespace::FirstInstallNamespace;
 #[cfg(all(windows, not(test)))]
-pub(crate) use native::{FirstInstallReady, observe_first_ready};
+pub(crate) use native::{
+    FirstInstallReady, LiveFirstSupersession, observe_first_ready, observe_first_supersession,
+};
 
 pub(crate) const MAX_OWNER_FRAME: usize = 2048;
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -5453,6 +5455,124 @@ mod native {
         Ok(ready)
     }
 
+    /// Genuine retained kernel peer and current bound logon evidence; no request or handle export.
+    #[cfg(not(test))]
+    pub(crate) struct LiveFirstSupersession {
+        root: Arc<BrokerAdmission>,
+        peer: Peer,
+        agent: Arc<AgentObservation>,
+        source: super::super::super::first_install::record::FirstInstallRecord,
+        activation_identity: super::super::files::FileIdentity,
+        activation_bytes: Vec<u8>,
+    }
+    #[cfg(not(test))]
+    impl LiveFirstSupersession {
+        pub(crate) fn reverify_source(
+            &self,
+            source: &super::super::super::first_install::record::FirstInstallRecord,
+        ) -> NativeResult<()> {
+            if &self.source != source {
+                Err(NativeError::Foreign)
+            } else {
+                Ok(())
+            }
+        }
+        pub(crate) fn instance(&self) -> u64 {
+            self.agent.bootstrap().instance_id
+        }
+        pub(crate) fn reverify(
+            &self,
+            io: &WindowsNativeIo,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            use super::super::super::service::journal::{Journal, Phase};
+            use super::super::{
+                activation::{EpochProvenance, SupervisorLogonRecord},
+                files::MAX_RECORD_BYTES,
+                records::RecordName,
+            };
+            if !std::ptr::eq(io, self.root.io().as_ref()) {
+                return Err(NativeError::Foreign);
+            }
+            let p = io.admit_support(deadline)?;
+            self.peer.reverify(&self.root, deadline)?;
+            self.agent.revalidate(io, &p, deadline)?;
+            let journal = Journal::read(io, &p, deadline)?.ok_or(NativeError::Missing)?;
+            let bound =
+                SupervisorLogonRecord::read(io, &p, deadline)?.ok_or(NativeError::Foreign)?;
+            let epoch = EpochProvenance::new(
+                journal.registration,
+                journal.operation,
+                &self.peer.token,
+                self.peer.pid,
+                self.peer.created,
+            )?;
+            if journal.phase != Phase::Running
+                || bound.matches_current(&journal)? != &epoch
+                || journal.current != Some(io.agent_generation(&self.agent, &p, deadline)?)
+                || self.instance() == 0
+            {
+                return Err(NativeError::Foreign);
+            }
+            let task = io
+                .read_record(&p, RecordName::TaskActivation, MAX_RECORD_BYTES, deadline)?
+                .ok_or(NativeError::Foreign)?;
+            if task.identity != self.activation_identity || task.bytes() != self.activation_bytes {
+                return Err(NativeError::Foreign);
+            }
+            io.verify_first_supersession_files(&p, &self.source, &self.agent, deadline)?;
+            deadline.check()
+        }
+    }
+    #[cfg(not(test))]
+    pub(crate) fn observe_first_supersession(
+        io: Arc<WindowsNativeIo>,
+        source: &super::super::super::first_install::record::FirstInstallRecord,
+        agent: Arc<AgentObservation>,
+        deadline: &Deadline,
+    ) -> NativeResult<LiveFirstSupersession> {
+        use super::super::super::payload::recovery::OuterContextCorrelation;
+        use super::super::{
+            activation::TaskActivationRecord, files::MAX_RECORD_BYTES, records::RecordName,
+        };
+        let old: OuterContextCorrelation =
+            serde_json::from_slice(source.context()).map_err(|_| NativeError::Invalid)?;
+        old.same_user(io.target().identity())?;
+        if old.authentication_id() == io.target().identity().authentication_id {
+            return Err(NativeError::Foreign);
+        }
+        let p = io.admit_support(deadline)?;
+        let root = io.broker_admission(&p, deadline)?;
+        let activation = io
+            .read_record(&p, RecordName::TaskActivation, MAX_RECORD_BYTES, deadline)?
+            .ok_or(NativeError::Foreign)?;
+        let task = TaskActivationRecord::decode(activation.bytes())?;
+        if task.operation() != source.operation() || task.claim().is_none() {
+            return Err(NativeError::Foreign);
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| NativeError::Unavailable)?;
+        let peer = runtime.block_on(async {
+            let pipe = ClientOptions::new()
+                .open(root.endpoint())
+                .map_err(|_| NativeError::Busy)?;
+            let peer = Peer::admit(pipe.as_raw_handle(), true, &root, deadline)?;
+            drop(pipe);
+            Ok::<_, NativeError>(peer)
+        })?;
+        let value = LiveFirstSupersession {
+            root,
+            peer,
+            agent,
+            source: source.clone(),
+            activation_identity: activation.identity,
+            activation_bytes: activation.bytes().to_vec(),
+        };
+        value.reverify(&io, deadline)?;
+        Ok(value)
+    }
     #[cfg(test)]
     mod polling_tests {
         use super::*;

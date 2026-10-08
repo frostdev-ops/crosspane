@@ -72,6 +72,9 @@ pub fn recover(
 #[serde(rename_all = "kebab-case")]
 pub enum RecordKind {
     FirstInstall,
+    FirstInstallHistoryIntent,
+    FirstInstallHistoryIndex,
+    FirstInstallRecovery,
     Receipt,
     StageCatalog,
     OuterUpgrade,
@@ -94,6 +97,9 @@ pub enum RecordKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordName {
     FirstInstall,
+    FirstInstallHistoryIntent,
+    FirstInstallHistoryIndex,
+    FirstInstallRecovery,
     Receipt,
     StageCatalog,
     OuterUpgrade,
@@ -118,6 +124,15 @@ impl RecordName {
     pub fn file_name(&self) -> NativeResult<super::files::PrivateName> {
         match self {
             Self::FirstInstall => super::files::PrivateName::new("first-install.json"),
+            Self::FirstInstallHistoryIntent => {
+                super::files::PrivateName::new("first-install-history-intent.json")
+            }
+            Self::FirstInstallHistoryIndex => {
+                super::files::PrivateName::new("first-install-history-index.json")
+            }
+            Self::FirstInstallRecovery => {
+                super::files::PrivateName::new("first-install-recovery.json")
+            }
             Self::Receipt => super::files::PrivateName::new("receipt.json"),
             Self::StageCatalog => super::files::PrivateName::new("stage-catalog.json"),
             Self::OuterUpgrade => super::files::PrivateName::new("outer-upgrade.json"),
@@ -157,6 +172,9 @@ impl RecordName {
     fn kind(&self) -> RecordKind {
         match self {
             Self::FirstInstall => RecordKind::FirstInstall,
+            Self::FirstInstallHistoryIntent => RecordKind::FirstInstallHistoryIntent,
+            Self::FirstInstallHistoryIndex => RecordKind::FirstInstallHistoryIndex,
+            Self::FirstInstallRecovery => RecordKind::FirstInstallRecovery,
             Self::Receipt => RecordKind::Receipt,
             Self::StageCatalog => RecordKind::StageCatalog,
             Self::OuterUpgrade => RecordKind::OuterUpgrade,

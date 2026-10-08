@@ -24,6 +24,7 @@ pub(crate) enum Cold {
     Eligible,
     Observe,
     Partial,
+    Stale,
     CompletedRemoval,
     Existing,
     AccessDenied,
@@ -76,7 +77,16 @@ impl Snapshot {
             _ => self.healthy(),
         }
     }
+    /// A completed first-install recovery leaves no partial or stale cold state behind.
+    pub fn first_recovery_settled(&self) -> bool {
+        self.source == ObservationSource::Live
+            && !matches!(self.cold, Cold::Partial | Cold::Stale)
+            && !self.unsettled
+    }
     pub fn install_operation(&self) -> Operation {
+        if matches!(self.cold, Cold::Partial | Cold::Stale) {
+            return Operation::MetadataRepair;
+        }
         if self.cold != Cold::Existing || self.payload == State::Missing {
             Operation::Install
         } else {
@@ -84,6 +94,9 @@ impl Snapshot {
         }
     }
     pub fn repair_operation(&self) -> Operation {
+        if matches!(self.cold, Cold::Partial | Cold::Stale) {
+            return Operation::MetadataRepair;
+        }
         if self.payload == State::Healthy {
             Operation::MetadataRepair
         } else {
@@ -91,13 +104,24 @@ impl Snapshot {
         }
     }
     pub fn allowed(&self, op: Operation) -> bool {
+        if self.supported && matches!(self.cold, Cold::Partial | Cold::Stale) {
+            return match op {
+                Operation::MetadataRepair => true,
+                Operation::Removal {
+                    erase_identity: false,
+                } => self.cold == Cold::Partial,
+                _ => false,
+            };
+        }
         if !self.supported || !self.inventory || self.unsettled {
             return false;
         }
         if matches!(op, Operation::Install) {
             return self.sources
                 && match self.cold {
-                    Cold::Eligible => self.task == State::Missing && self.agent == State::Missing,
+                    Cold::Eligible | Cold::CompletedRemoval => {
+                        self.task == State::Missing && self.agent == State::Missing
+                    }
                     Cold::Observe => self.task == State::Healthy && self.agent == State::Healthy,
                     _ => false,
                 };
@@ -259,6 +283,8 @@ pub(crate) mod native {
         version: u64,
         held: Option<Continuation>,
         first_refusal: Option<&'static str>,
+        /// Set by an explicit first-install recovery; verification then uses its settled predicate.
+        recovered: bool,
     }
     enum Continuation {
         Upgrade(service::KeeperContinuation),
@@ -293,6 +319,7 @@ pub(crate) mod native {
                 version: 0,
                 held: None,
                 first_refusal: None,
+                recovered: false,
             }
         }
         fn inputs(&self) -> Result<[Box<dyn std::io::Read + Send>; 3], Failure> {
@@ -377,6 +404,7 @@ pub(crate) mod native {
             let active_first = first.as_ref().map_or(true, |r| {
                 r.as_ref().is_some_and(|r| {
                     r.phase() != super::super::super::first_install::record::Phase::Complete
+                        && !io.first_source_settled(&proof, r, &budget).unwrap_or(false)
                 })
             });
             let history = match observed {
@@ -422,6 +450,32 @@ pub(crate) mod native {
                 Disposition::AccessDenied => Cold::AccessDenied,
                 _ => Cold::Unknown,
             };
+            if let Ok(Some(record)) = &first {
+                use super::super::super::first_install::record::Phase;
+                let context: super::super::super::payload::recovery::OuterContextCorrelation =
+                    serde_json::from_slice(record.context()).map_err(|_| Failure::NotSubmitted)?;
+                let current = io.target().identity();
+                if context.same_user(current).is_ok()
+                    && record.phase() != Phase::Complete
+                    && !io
+                        .first_source_settled(&proof, record, &budget)
+                        .unwrap_or(false)
+                {
+                    let rank = record.phase().rank();
+                    if rank > Phase::Intent.rank() && rank < Phase::RunIntent.rank() {
+                        // StageIntent through TaskRegistered: only a rollback or removal applies.
+                        cold = Cold::Partial;
+                    } else if rank >= Phase::RunIntent.rank()
+                        && record.phase() != Phase::Unknown
+                        && context.authentication_id() != current.authentication_id
+                    {
+                        // Stale only across a logon change; the same logon keeps the reopen mapping.
+                        cold = Cold::Stale;
+                    }
+                    // Otherwise keep the a8 mapping: a pristine Intent restarts, and same-logon
+                    // RunIntent and later observe.
+                }
+            }
             if !active_first
                 && (actual.task().diagnostic() != Diagnostic::Missing
                     || actual.agent() != Diagnostic::Missing)
@@ -438,6 +492,23 @@ pub(crate) mod native {
                     cold = Cold::AccessDenied;
                 } else {
                     cold = Cold::Unknown;
+                }
+            }
+            if matches!(first, Ok(None)) {
+                use super::super::super::first_install::record::{
+                    FirstRecoveryCursor as Cursor, FirstRecoveryMode as Mode,
+                };
+                // A recovery record that outlived first-install.json still owns the partial or stale state.
+                match io.read_first_recovery(&proof, &budget) {
+                    Ok(Some(recovery)) if recovery.cursor != Cursor::Retired => {
+                        cold = match recovery.mode {
+                            Mode::Rollback | Mode::Remove => Cold::Partial,
+                            Mode::Supersede | Mode::RetireStale => Cold::Stale,
+                        };
+                    }
+                    Ok(_) => {}
+                    // An unreadable recovery record fails closed.
+                    Err(_) => cold = Cold::Unknown,
                 }
             }
             if let Ok(Some(record)) = first {
@@ -489,7 +560,9 @@ pub(crate) mod native {
             Ok(snapshot)
         }
         fn settle(&mut self, op: Operation) -> Result<bool, Failure> {
-            if op == Operation::Install {
+            if op == Operation::Install
+                || matches!(read_observation()?.0.cold, Cold::Partial | Cold::Stale)
+            {
                 return Ok(false);
             }
             service::settle_operation_artifacts(op, &deadline(30_000)?)
@@ -497,6 +570,7 @@ pub(crate) mod native {
         }
         fn apply(&mut self, op: Operation) -> Result<Dispatch, Failure> {
             self.first_refusal = None;
+            self.recovered = false;
             if op == Operation::Install {
                 return match service::begin_first_install(self.inputs()?, &deadline(120_000)?)
                     .map_err(|_| Failure::Unknown)?
@@ -511,6 +585,42 @@ pub(crate) mod native {
                     }
                     service::FirstInstallOutcome::Unknown => Err(Failure::Unknown),
                 };
+            }
+            let cold = read_observation()?.0.cold;
+            if matches!(cold, Cold::Partial | Cold::Stale) {
+                use super::super::super::first_install::record::{
+                    FirstRecoveryMode as M, FirstRecoveryOutcome as O,
+                };
+                let mode = match op {
+                    Operation::MetadataRepair => {
+                        if cold == Cold::Stale {
+                            M::Supersede
+                        } else {
+                            M::Rollback
+                        }
+                    }
+                    Operation::Removal {
+                        erase_identity: false,
+                    } if cold == Cold::Partial => M::Remove,
+                    _ => return Err(Failure::NotSubmitted),
+                };
+                let budget = deadline(120_000)?;
+                self.recovered = true;
+                let outcome = match service::recover_first_install(mode, &budget) {
+                    Ok(outcome) => outcome,
+                    // Pre: refused before any recovery effect, so nothing was submitted.
+                    Err(service::RecoveryError::Pre(_)) => return Err(Failure::NotSubmitted),
+                    // Post: an effect may have run, so the outcome is unresolved.
+                    Err(service::RecoveryError::Post(_)) => return Err(Failure::Unknown),
+                };
+                if matches!(outcome, O::Retained { .. }) {
+                    return Err(Failure::Unknown);
+                }
+                // Recovery is complete, but no healthy install is inferred and no new install is chained.
+                return Ok(Dispatch {
+                    handoff: Handoff::NotCommitted,
+                    complete: true,
+                });
             }
             if matches!(op, Operation::MetadataRepair) {
                 let complete = service::integration_metadata_repair(&deadline(30_000)?)
@@ -552,6 +662,9 @@ pub(crate) mod native {
         }
         fn verify(&mut self, op: Operation) -> Result<bool, Failure> {
             let observed = self.observe()?;
+            if self.recovered && op == Operation::MetadataRepair {
+                return Ok(observed.first_recovery_settled());
+            }
             Ok(observed.verified(op))
         }
     }
