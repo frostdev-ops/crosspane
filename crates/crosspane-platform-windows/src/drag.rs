@@ -304,7 +304,7 @@ impl Drop for Observer {
 
 use crate::{
     model::{
-        drag::{RestorePlacer, placed_origin, placement_monitor},
+        drag::{PLACE_RECOMPUTES, RestorePlacer, frame_changed, placed_origin, placement_monitor},
         geometry::DisplayIds,
     },
     window::MonitorReader,
@@ -425,29 +425,19 @@ impl RestorePlacer for WindowsRestorePlacer {
         if self.resolver.resolve(window) != Some(native) {
             return Err(PlatformError::NotFound);
         }
-        let target = placed_origin(outer, visible, origin, &monitor)?;
+        let mut target = placed_origin(outer, visible, origin, &monitor)?;
         if near((visible[0], visible[1]), target.visible) {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(PlatformError::Timeout);
         }
-        // SAFETY: the freshly resolved, PMv2-scoped window only. The asynchronous move is posted to
-        // its owning thread and changes no size, z-order, owner, activation or show state.
-        let moved = unsafe {
-            SetWindowPos(
-                hwnd,
-                null_mut(),
-                target.outer.0,
-                target.outer.1,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS,
-            )
-        };
-        if moved == 0 {
-            return Err(PlatformError::Backend("placement refused".into()));
-        }
+        post_move(hwnd, target.outer)?;
+        // The frame the current target was derived from. A mixed-DPI app that re-lays out on
+        // `WM_DPICHANGED` changes its visible size or border offset (W1.6b Low 2), so the target is
+        // re-derived from the new frame, at most `PLACE_RECOMPUTES` times.
+        let (mut basis_outer, mut basis_visible) = (outer, visible);
+        let mut recomputes = 0_u32;
         loop {
             if self.resolver.resolve(window) != Some(native) {
                 return Err(PlatformError::NotFound);
@@ -455,6 +445,21 @@ impl RestorePlacer for WindowsRestorePlacer {
             let now_visible = visible_bounds(hwnd)?;
             if near((now_visible[0], now_visible[1]), target.visible) {
                 return Ok(());
+            }
+            if recomputes < PLACE_RECOMPUTES {
+                let now_outer = outer_bounds(hwnd)?;
+                if frame_changed(basis_outer, basis_visible, now_outer, now_visible) {
+                    target = placed_origin(now_outer, now_visible, origin, &monitor)?;
+                    if Instant::now() >= deadline {
+                        return Err(PlatformError::Timeout);
+                    }
+                    if self.resolver.resolve(window) != Some(native) {
+                        return Err(PlatformError::NotFound);
+                    }
+                    post_move(hwnd, target.outer)?;
+                    (basis_outer, basis_visible) = (now_outer, now_visible);
+                    recomputes += 1;
+                }
             }
             let now = Instant::now();
             if now >= deadline {
@@ -503,6 +508,38 @@ fn visible_bounds(hwnd: HWND) -> Result<[i32; 4], PlatformError> {
         return Err(PlatformError::Backend("placement geometry unknown".into()));
     }
     Ok(corners(bounds))
+}
+
+/// GetWindowRect (outer) of a freshly resolved window, read by the placement read-back.
+fn outer_bounds(hwnd: HWND) -> Result<[i32; 4], PlatformError> {
+    let mut window_rect = RECT::default();
+    // SAFETY: exact RECT output buffer for the same freshly resolved window, under PMv2.
+    if unsafe { GetWindowRect(hwnd, &mut window_rect) } == 0 {
+        return Err(PlatformError::Backend("placement geometry unknown".into()));
+    }
+    Ok(corners(window_rect))
+}
+
+/// The one asynchronous, no-size move of the outer rectangle that placement issues. Callers check
+/// the deadline and the window identity first.
+fn post_move(hwnd: HWND, outer: (i32, i32)) -> Result<(), PlatformError> {
+    // SAFETY: the freshly resolved, PMv2-scoped window only. The asynchronous move is posted to
+    // its owning thread and changes no size, z-order, owner, activation or show state.
+    let moved = unsafe {
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            outer.0,
+            outer.1,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS,
+        )
+    };
+    if moved == 0 {
+        return Err(PlatformError::Backend("placement refused".into()));
+    }
+    Ok(())
 }
 
 fn corners(rect: RECT) -> [i32; 4] {

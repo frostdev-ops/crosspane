@@ -11,7 +11,10 @@ use crosspane_types::{
     id::WindowId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 pub const FORMAT: &str = "crosspane-win-mirror-v1";
 pub const COMMITTED_NAME: &str = "parking-mirror.journal";
@@ -329,6 +332,31 @@ pub fn validate_size_scale(size: PixelSize, scale: f64) -> Result<(), PlatformEr
     Ok(())
 }
 
+/// A failed monitor read is retried only while it has failed for less than this long (W3.2 R2).
+pub const MONITOR_READ_RETRY: Duration = Duration::from_millis(1_500);
+/// Pause between monitor-read attempts (W3.2 R2).
+pub const MONITOR_READ_POLL: Duration = Duration::from_millis(50);
+/// Spare room a retry keeps beyond the pause and one whole read (W3.2 F2), so a retry that just fits
+/// is not pushed past the call's deadline by scheduling jitter.
+pub const MONITOR_READ_MARGIN: Duration = Duration::from_millis(250);
+/// Retry only when the call still has room for the pause, one whole read and the margin, so a retry
+/// never pushes the call past its deadline. `None` means the call has no deadline.
+pub fn retry_monitor_read(failing_for: Duration, remaining: Option<Duration>) -> bool {
+    failing_for < MONITOR_READ_RETRY
+        && remaining.is_none_or(|left| {
+            left >= MONITOR_READ_POLL + super::displays::READ_BOUND + MONITOR_READ_MARGIN
+        })
+}
+/// The exact `Backend` detail for a monitor-facts read that failed and was not retried (W3.2 F1).
+pub const MONITOR_FACTS_UNAVAILABLE: &str = "parking monitor facts unavailable";
+/// Never NotFound (window gone) or Unsupported (taken as a twin refusal). Timeout stays Timeout.
+pub fn monitor_read_failure(error: PlatformError) -> PlatformError {
+    match error {
+        PlatformError::Timeout => PlatformError::Timeout,
+        _ => PlatformError::Backend(MONITOR_FACTS_UNAVAILABLE.into()),
+    }
+}
+
 /// Exact static reason carried locally by the agent; it never changes the engine/wire Failure.
 pub const PENDING_REPARK_REASON: &str =
     "This window is still waiting to be returned to a monitor that is no longer connected.";
@@ -598,7 +626,18 @@ impl<P: NativePort> Controller<P> {
         result.geometry.ok_or(PlatformError::NotFound)
     }
     pub fn set_fullscreen(&mut self, id: WindowId, requested: bool) -> Result<(), PlatformError> {
-        if self.geometry(id)?.fullscreen == requested {
+        let geometry = match self.geometry(id) {
+            Ok(geometry) => geometry,
+            // A transient monitor-facts failure says nothing about fullscreen. Refuse it like a
+            // twin refusal so the worker still resizes (F1). Every other error is unchanged.
+            Err(PlatformError::Backend(detail)) if detail == MONITOR_FACTS_UNAVAILABLE => {
+                return Err(PlatformError::Unsupported(
+                    "Windows mirror fullscreen transition",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if geometry.fullscreen == requested {
             Ok(())
         } else {
             Err(PlatformError::Unsupported(

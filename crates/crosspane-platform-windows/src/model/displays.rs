@@ -8,6 +8,10 @@ use std::{
     sync::Mutex,
 };
 
+/// The bound on one monitor read through the displays owner (monitor_reader,
+/// monitor_snapshot_reader, monitor_refresh). Waits sized around a read derive from it.
+pub const READ_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// An observed handle is transient; only the device path determines the retained ID.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeMonitor {

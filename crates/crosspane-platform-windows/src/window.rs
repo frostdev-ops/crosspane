@@ -110,11 +110,12 @@ impl WindowResolver {
         let healthy = || {
             self.state.alive.load(Ordering::Acquire)
                 && !self.state.fault.load(Ordering::Acquire)
-                && self
-                    .state
-                    .updated
-                    .lock()
-                    .is_ok_and(|updated| updated.elapsed() < BOUND)
+                && self.state.updated.lock().is_ok_and(|updated| {
+                    window::source_live(
+                        updated.elapsed(),
+                        self.state.reading.load(Ordering::Acquire),
+                    )
+                })
         };
         if !healthy() {
             return None;
@@ -141,6 +142,7 @@ struct State {
     admission: Option<Admission>,
     windows: Mutex<Windows>,
     updated: Mutex<Instant>,
+    reading: AtomicBool,
     alive: AtomicBool,
     fault: AtomicBool,
     cleaned: AtomicBool,
@@ -225,6 +227,7 @@ impl WindowsWindowSource {
             admission: admission.clone(),
             windows: Mutex::new(Windows::default()),
             updated: Mutex::new(Instant::now()),
+            reading: AtomicBool::new(false),
             alive: AtomicBool::new(true),
             fault: AtomicBool::new(false),
             cleaned: AtomicBool::new(false),
@@ -272,14 +275,17 @@ impl WindowsWindowSource {
         if !self.state.alive.load(Ordering::Acquire) || self.state.fault.load(Ordering::Acquire) {
             return Err(backend("window observer unavailable"));
         }
-        if self
+        // The `updated` guard spans the `reading` load: the observer stamps and sets
+        // `reading` around each read, so one coherent snapshot is needed for the verdict.
+        let updated = self
             .state
             .updated
             .lock()
-            .map_err(|_| backend("window observer state"))?
-            .elapsed()
-            >= BOUND
-        {
+            .map_err(|_| backend("window observer state"))?;
+        if !window::source_live(
+            updated.elapsed(),
+            self.state.reading.load(Ordering::Acquire),
+        ) {
             return Err(PlatformError::Timeout);
         }
         Ok(())
@@ -386,6 +392,14 @@ impl Drop for WindowsWindowSource {
 
 fn backend(context: &'static str) -> PlatformError {
     PlatformError::Backend(context.into())
+}
+/// Records progress for the resolver's freshness bound (the scan stamps around one read).
+fn stamp(state: &State) -> Result<(), PlatformError> {
+    *state
+        .updated
+        .lock()
+        .map_err(|_| backend("window observer state"))? = Instant::now();
+    Ok(())
 }
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
@@ -1227,7 +1241,12 @@ fn run(
         let step = (|| -> Result<(), PlatformError> {
             pump();
             if last_scan.elapsed() >= Duration::from_millis(250) {
+                stamp(state)?;
+                state.reading.store(true, Ordering::Release);
                 let read = reader();
+                let stamped = stamp(state);
+                state.reading.store(false, Ordering::Release);
+                stamped?;
                 let at = MonoTime::from_nanos(
                     context.start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
                 );
@@ -1317,10 +1336,7 @@ fn run(
                 .map_err(|_| backend("window observer state"))?
                 .focus(Some(foreground));
             emit(events, &sink);
-            *state
-                .updated
-                .lock()
-                .map_err(|_| backend("window observer state"))? = Instant::now();
+            stamp(state)?;
             if !initialized {
                 initialized = true;
                 if let Some(ready) = ready.take() {
@@ -1960,6 +1976,7 @@ mod tests {
             admission: None,
             windows: Mutex::new(Windows::default()),
             updated: Mutex::new(Instant::now()),
+            reading: AtomicBool::new(false),
             alive: AtomicBool::new(true),
             fault: AtomicBool::new(false),
             cleaned: AtomicBool::new(false),

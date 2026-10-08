@@ -5,7 +5,8 @@
 use crosspane_platform::{Parked, ParkingKind, PlatformError, WindowParking};
 use crosspane_platform_windows::model::{
     drag::{
-        PlacedRestore, Placement, RESTORE_AT_BOUND, RestorePlacer, placed_origin, placement_monitor,
+        PlacedRestore, Placement, RESTORE_AT_BOUND, RestorePlacer, frame_changed, placed_origin,
+        placement_monitor,
     },
     geometry::{DisplayIds, MonitorProbe},
 };
@@ -533,4 +534,65 @@ fn park_resize_set_fullscreen_geometry_and_recover_delegate_unchanged() {
         ]
     );
     assert!(h.reports.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_pure_translation_is_not_a_frame_change() {
+    // The window moves 37 px right and 13 px up; its outer and visible rectangles move together.
+    let moved = |rect: [i32; 4]| [rect[0] + 37, rect[1] - 13, rect[2] + 37, rect[3] - 13];
+    assert!(!frame_changed(OUTER, VISIBLE, moved(OUTER), moved(VISIBLE)));
+}
+
+#[test]
+fn a_visible_rescale_is_a_frame_change() {
+    // Width and height grow from 500x300 to 650x390 (1.3x); the border offsets stay 7/0/7/7.
+    assert!(frame_changed(
+        OUTER,
+        VISIBLE,
+        [93, 100, 757, 497],
+        [100, 100, 750, 490]
+    ));
+    // Height only: the visible rectangle becomes 500x350 and the offsets stay the same.
+    assert!(frame_changed(
+        OUTER,
+        VISIBLE,
+        [93, 100, 607, 457],
+        [100, 100, 600, 450]
+    ));
+}
+
+#[test]
+fn a_border_offset_change_at_the_same_size_is_a_frame_change() {
+    // The visible rectangle keeps its size and place; one outer border moves by one pixel.
+    let border_changes = [
+        [92, 100, 607, 407], // left inset 8, was 7
+        [93, 99, 607, 407],  // top inset 1, was 0
+        [93, 100, 608, 407], // right inset 8, was 7
+        [93, 100, 607, 408], // bottom inset 8, was 7
+    ];
+    for outer in border_changes {
+        assert!(frame_changed(OUTER, VISIBLE, outer, VISIBLE), "{outer:?}");
+    }
+}
+
+#[test]
+fn identical_frames_are_not_a_frame_change() {
+    assert!(!frame_changed(OUTER, VISIBLE, OUTER, VISIBLE));
+}
+
+#[test]
+fn extreme_frame_coordinates_compare_without_panicking() {
+    let full = [i32::MIN, i32::MIN, i32::MAX, i32::MAX];
+    let inset = [i32::MIN + 1, i32::MIN + 1, i32::MAX - 1, i32::MAX - 1];
+    // Identical extremes are unchanged; a visible width of 2^32 - 1 px against 2^32 - 3 px differs.
+    assert!(!frame_changed(full, full, full, full));
+    assert!(frame_changed(full, full, full, inset));
+    // A translation from one end of the range to the other is still not a change.
+    let low = [i32::MIN, 0, i32::MIN + 100, 100];
+    let high = [i32::MAX - 100, 0, i32::MAX, 100];
+    assert!(!frame_changed(low, low, high, high));
+    // Inverted rectangles are compared the same way and never panic.
+    let inverted = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
+    assert!(!frame_changed(inverted, inverted, inverted, inverted));
+    assert!(frame_changed(full, inset, full, full));
 }

@@ -6,6 +6,10 @@
 //! - `park` (P2): twin placement, monitor capture, resizes, maximized refusal, then restore.
 //! - `crash` (P3): park, record the fixture identity, then terminate this process (exit 137).
 //! - `recover` (P4): startup recovery after `crash`, then close the fixture.
+//! - `remode` (V3): three cycles of a twin re-mode (resize to 1.5, then 1.0) with one monitor stream
+//!   kept live. The stream ends or restarts on the new twin, and the window is resolved throughout.
+//! - `dpi_place` (V6): the fixture runs with `--dpi-resize` and is parked on a 1.5-scale twin. The
+//!   placer then moves it to a real monitor, and the visible top-left is checked within 1 px.
 //!
 //! Non-Windows builds have no probe.
 #![allow(unsafe_code)]
@@ -22,16 +26,18 @@ mod rows {
         store::FileStore,
     };
     use crosspane_platform::{
-        CaptureTarget, FrameCapture, FrameEvent, IoGate, ParkingKind, PlatformError, WindowParking,
-        WindowSource,
+        CaptureTarget, FrameCapture, FrameEvent, IoGate, ParkingKind, PlatformError,
+        StreamEndReason, StreamId, WindowParking, WindowSource,
     };
     use crosspane_platform_windows::{
         displays::WindowsDisplays,
+        drag::WindowsRestorePlacer,
         frame_capture::WindowsFrameCapture,
         model::{
+            drag::RestorePlacer,
             journal::{JOURNAL_NAME, JournalFile},
             parking::{Journal, NativeIdentity},
-            twin::TWIN_ABSENT_REASON,
+            twin::{TWIN_ABSENT_REASON, TWIN_UNAVAILABLE_REASON},
             twin_parking::TWIN_MAXIMIZED_REASON,
         },
         parking::MirrorJournalStore,
@@ -39,11 +45,11 @@ mod rows {
         twin_parking::{
             TwinParkingRecovery, WINDOW_COMMITTED_NAME, WINDOW_PENDING_NAME, WindowsTwinParking,
         },
-        window::{OwnedProcessAllowlist, OwnedProcessClaim, WindowsWindowSource},
+        window::{OwnedProcessAllowlist, OwnedProcessClaim, WindowResolver, WindowsWindowSource},
     };
     use crosspane_types::{
-        geom::{PixelRect, PixelSize},
-        id::WindowId,
+        geom::{PixelRect, PixelSize, PointDevice},
+        id::{DisplayId, WindowId},
     };
     use std::{
         fmt, fs,
@@ -52,7 +58,11 @@ mod rows {
         path::{Path, PathBuf},
         process::ExitCode,
         ptr::null_mut,
-        sync::{Arc, mpsc},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -60,7 +70,7 @@ mod rows {
         Win32::{
             Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT},
             Graphics::{
-                Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
+                Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
                 Gdi::{
                     GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONULL, MONITORINFO,
                     MonitorFromWindow,
@@ -71,7 +81,7 @@ mod rows {
             UI::{
                 HiDpi::{
                     DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-                    SetThreadDpiAwarenessContext,
+                    GetDpiForMonitor, MDT_EFFECTIVE_DPI, SetThreadDpiAwarenessContext,
                 },
                 WindowsAndMessaging::{
                     EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
@@ -91,6 +101,14 @@ mod rows {
     const CRASH_CODE: u32 = 137;
     /// A row that outlives this exits the probe with 124.
     const WATCHDOG: Duration = Duration::from_secs(60);
+    /// The `remode` row's re-mode count: three cycles of a resize to 1.5 and then to 1.0.
+    const REMODES: u32 = 6;
+    /// How long a re-mode's old monitor stream may take to end before it counts as `None`.
+    const OLD_END_WAIT: Duration = Duration::from_secs(3);
+    /// How long a fresh monitor stream may take to deliver its first frame.
+    const FIRST_FRAME_WAIT: Duration = Duration::from_secs(5);
+    /// The `remode` row's window resolution period.
+    const SAMPLE_PERIOD: Duration = Duration::from_millis(5);
 
     /// One `TWIN_PARK_ROW` line. `ms` is the row's timed operation; facts are `key=value` pairs.
     pub(super) struct Row {
@@ -319,10 +337,19 @@ mod rows {
 
     /// Startup recovery first, then the owned fixture, its admitted source and the bound facade.
     fn prepare(dir: &Path, row: &mut Row) -> Result<Setup, String> {
+        prepare_with(dir, row, FixtureChild::spawn)
+    }
+
+    /// [`prepare`], with the fixture child started by `spawn`.
+    fn prepare_with(
+        dir: &Path,
+        row: &mut Row,
+        spawn: fn() -> Result<FixtureChild, PlatformError>,
+    ) -> Result<Setup, String> {
         let mut parking = facade(dir)?;
         let startup = at(parking.recover_startup(), "startup recovery")?;
         row.fact("driver_present", startup.driver_present);
-        let mut fixture = at(FixtureChild::spawn(), "fixture spawn")?;
+        let mut fixture = at(spawn(), "fixture spawn")?;
         let original = at(fixture.rect(), "fixture rect")?;
         let displays = at(WindowsDisplays::new(), "displays")?;
         let source = source_for(&displays, &fixture.identity)?;
@@ -783,6 +810,534 @@ mod rows {
         let _ = fs::remove_file(dir.join(FIXTURE_STATE));
         Ok(())
     }
+
+    /// The monitor capture the `remode` row runs, the queue its streams report to, and the stream
+    /// kept live. `ends` keeps every end seen, so a wait that reads past one still finds it.
+    struct Feed {
+        capture: WindowsFrameCapture,
+        send: mpsc::Sender<FrameEvent>,
+        events: mpsc::Receiver<FrameEvent>,
+        live: Option<StreamId>,
+        ends: Vec<(StreamId, StreamEndReason)>,
+    }
+
+    impl Feed {
+        /// Starts a monitor stream on the twin `display`, cropped to `crop`, at 10 fps.
+        fn start(&mut self, display: DisplayId, crop: PixelRect) -> Result<StreamId, String> {
+            let tx = self.send.clone();
+            let sink = Arc::new(move |event: FrameEvent| {
+                let _ = tx.send(event);
+            });
+            at(
+                self.capture
+                    .start(CaptureTarget::Display(display), Some(crop), 10, sink),
+                "monitor capture start",
+            )
+        }
+
+        /// The next queued event before `until`, or `None`. An end is kept in `ends`.
+        fn next(&mut self, until: Instant) -> Option<FrameEvent> {
+            let event = self
+                .events
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+                .ok()?;
+            if let FrameEvent::Ended { stream, reason } = &event {
+                self.ends.push((*stream, *reason));
+            }
+            Some(event)
+        }
+
+        /// The first frame of `stream`, as its size. Events of other streams are skipped.
+        fn await_frame(&mut self, stream: StreamId) -> Result<PixelSize, String> {
+            let until = Instant::now() + FIRST_FRAME_WAIT;
+            loop {
+                match self.next(until) {
+                    Some(FrameEvent::Frame { stream: id, frame }) if id == stream => {
+                        return Ok(frame.size);
+                    }
+                    Some(FrameEvent::Ended { stream: id, .. }) if id == stream => {
+                        return Err("capture ended before a frame".to_owned());
+                    }
+                    Some(_) => {}
+                    None => return Err("no frame within 5 s".to_owned()),
+                }
+            }
+        }
+
+        /// The end reason of `stream` within [`OLD_END_WAIT`], or `None` while it still runs.
+        fn await_end(&mut self, stream: StreamId) -> Option<StreamEndReason> {
+            if let Some((_, reason)) = self.ends.iter().find(|(id, _)| *id == stream) {
+                return Some(*reason);
+            }
+            let until = Instant::now() + OLD_END_WAIT;
+            loop {
+                match self.next(until) {
+                    Some(FrameEvent::Ended { stream: id, reason }) if id == stream => {
+                        return Some(reason);
+                    }
+                    Some(_) => {}
+                    None => return None,
+                }
+            }
+        }
+    }
+
+    /// Resolves the fixture window every [`SAMPLE_PERIOD`] on its own thread, until `finish`.
+    struct Sampler {
+        stop: Arc<AtomicBool>,
+        worker: thread::JoinHandle<(u64, u64)>,
+    }
+
+    impl Sampler {
+        fn start(resolver: WindowResolver, window: WindowId) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+            let worker = thread::spawn(move || {
+                let (mut samples, mut missing) = (0_u64, 0_u64);
+                while !flag.load(Ordering::Acquire) {
+                    samples += 1;
+                    if resolver.resolve(window).is_none() {
+                        missing += 1;
+                    }
+                    thread::sleep(SAMPLE_PERIOD);
+                }
+                (samples, missing)
+            });
+            Self { stop, worker }
+        }
+
+        /// Stops the sampler. Returns the samples taken and the `None` results, or `None` if the
+        /// sampler thread panicked.
+        fn finish(self) -> Option<(u64, u64)> {
+            self.stop.store(true, Ordering::Release);
+            self.worker.join().ok()
+        }
+    }
+
+    /// The effective DPI of `display`, a twin or a real monitor, or `None` when it can't be read.
+    fn display_dpi(displays: &WindowsDisplays, display: DisplayId) -> Option<u32> {
+        let monitor = displays.monitor(display).ok()?;
+        let (mut horizontal, mut vertical) = (0_u32, 0_u32);
+        // SAFETY: writes two u32 locals through valid pointers; the monitor handle is only read.
+        let status = unsafe {
+            GetDpiForMonitor(
+                monitor as HMONITOR,
+                MDT_EFFECTIVE_DPI,
+                &mut horizontal,
+                &mut vertical,
+            )
+        };
+        (status == 0).then_some(horizontal)
+    }
+
+    /// A DPI as a number, or `U` when it is unknown.
+    fn dpi_text(dpi: Option<u32>) -> String {
+        dpi.map_or_else(|| "U".to_owned(), |dpi| dpi.to_string())
+    }
+
+    /// The effective DPI of the twin `display` as a number, or `U` when it can't be read.
+    fn twin_dpi(displays: &WindowsDisplays, display: DisplayId) -> String {
+        dpi_text(display_dpi(displays, display))
+    }
+
+    /// What the re-mode cycles counted. `old_end` and `twin_dpi` hold one entry per re-mode.
+    #[derive(Default)]
+    struct Remodes {
+        ok: u32,
+        twin_unavailable: u32,
+        retained: u32,
+        restart_frame: u32,
+        same_display: u32,
+        old_end: Vec<&'static str>,
+        twin_dpi: Vec<String>,
+    }
+
+    /// The name the row reports for a stream's end reason.
+    fn end_name(reason: StreamEndReason) -> &'static str {
+        match reason {
+            StreamEndReason::TargetGone => "TargetGone",
+            StreamEndReason::Failed => "Failed",
+            StreamEndReason::Blocked => "Blocked",
+            StreamEndReason::Requested => "Requested",
+            _ => "Other",
+        }
+    }
+
+    /// The content size of a parked window on its twin, as the park row computes it.
+    fn content_size(content: PixelRect) -> PixelSize {
+        PixelSize::new(content.width() as u32, content.height() as u32)
+    }
+
+    /// The six re-modes. Each one lets the old monitor stream end (or stops it), then starts a fresh
+    /// stream on the new twin. A failed re-mode ends the cycles, because the window is no longer
+    /// parked and there is no twin to restart on.
+    fn remode_cycles(
+        setup: &mut Setup,
+        feed: &mut Feed,
+        tally: &mut Remodes,
+        mut display: DisplayId,
+        mut content: PixelRect,
+    ) -> Result<(), String> {
+        let stream = feed.start(display, content)?;
+        feed.live = Some(stream);
+        let first = feed.await_frame(stream)?;
+        ensure(
+            first == content_size(content),
+            "the live stream's first frame is not the content size",
+        )?;
+        for index in 0..REMODES {
+            let scale = if index % 2 == 0 { 1.5 } else { 1.0 };
+            let old = feed.live.take();
+            let resized = setup
+                .parking
+                .resize(setup.window, PixelSize::new(640, 360), scale);
+            let old_end = match old {
+                None => "NoStream",
+                Some(stream) => match feed.await_end(stream) {
+                    Some(reason) => end_name(reason),
+                    None => {
+                        let _ = feed.capture.stop(stream);
+                        "None"
+                    }
+                },
+            };
+            tally.old_end.push(old_end);
+            match resized {
+                Ok(parked) => {
+                    tally.ok += 1;
+                    if parked.kind == ParkingKind::Twin && parked.display == display {
+                        tally.same_display += 1;
+                    }
+                    tally
+                        .twin_dpi
+                        .push(twin_dpi(&setup.displays, parked.display));
+                    display = parked.display;
+                    content = parked.content;
+                    if let Ok(stream) = feed.start(display, content) {
+                        feed.live = Some(stream);
+                        if feed.await_frame(stream) == Ok(content_size(content)) {
+                            tally.restart_frame += 1;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let unavailable = matches!(
+                        &error,
+                        PlatformError::Unsupported(reason) if *reason == TWIN_UNAVAILABLE_REASON
+                    );
+                    if unavailable {
+                        tally.twin_unavailable += 1;
+                    }
+                    if error.to_string().contains("journal retained") {
+                        tally.retained += 1;
+                    }
+                    tally.twin_dpi.push("U".to_owned());
+                    return Err(format!("re-mode {} at scale {scale}: {error}", index + 1));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// V3 `remode`: a twin re-mode keeps the window's projection (R-F1), and the window stays
+    /// resolvable through it (R1). The fixture is parked 640x360 at 1.0 with one monitor stream
+    /// live on its twin, and a sampler resolves the window every 5 ms. Three cycles then resize to
+    /// 640x360 at 1.5 and at 1.0. After each re-mode the old stream's end is recorded, and a fresh
+    /// stream on the new twin must deliver a frame of the content size. Then the window is restored
+    /// and the journals and own display paths are checked. Counts and sizes only, never titles.
+    pub(super) fn remode(row: &mut Row) -> Result<(), String> {
+        let dir = scratch()?;
+        let mut setup = prepare(&dir, row)?;
+        ensure(
+            setup.startup.driver_present,
+            "driver absent; the remode row needs the driver",
+        )?;
+        let parked = at(
+            setup
+                .parking
+                .park(setup.window, PixelSize::new(640, 360), 1.0),
+            "park",
+        )?;
+        row.fact("kind", format!("{:?}", parked.kind));
+        ensure(parked.kind == ParkingKind::Twin, "park is not a twin")?;
+
+        let gate = IoGate::new();
+        gate.set_engine_permits(true);
+        gate.set_session_permits(true);
+        let capture = at(
+            WindowsFrameCapture::new_with_monitor_reader(
+                gate,
+                setup.source.resolver(),
+                setup.displays.monitor_snapshot_reader(),
+            ),
+            "monitor capture",
+        )?;
+        let (send, events) = mpsc::channel::<FrameEvent>();
+        let mut feed = Feed {
+            capture,
+            send,
+            events,
+            live: None,
+            ends: Vec::new(),
+        };
+        let sampler = Sampler::start(setup.source.resolver(), setup.window);
+        let mut tally = Remodes::default();
+        let started = Instant::now();
+        let cycled = remode_cycles(
+            &mut setup,
+            &mut feed,
+            &mut tally,
+            parked.display,
+            parked.content,
+        );
+        row.ms = started.elapsed().as_millis();
+
+        // Cleanup runs on every path: the live stream, the sampler, then the window.
+        if let Some(stream) = feed.live.take() {
+            let _ = feed.capture.stop(stream);
+        }
+        let sampled = sampler.finish();
+        let restored = at(setup.parking.restore(setup.window), "restore");
+        let back = setup.fixture.rect().ok();
+        let rect_exact = back == Some(setup.original);
+        let empty = journals_empty(&dir).unwrap_or(false);
+        let own = own_paths().ok();
+        let closed = at(setup.fixture.close(), "fixture close");
+
+        let checks = [
+            ("remode_ok", tally.ok == REMODES),
+            ("twin_unavailable", tally.twin_unavailable == 0),
+            ("retained", tally.retained == 0),
+            ("restart_frame", tally.restart_frame == REMODES),
+            (
+                "resolve_none",
+                sampled.is_some_and(|(_, missing)| missing == 0),
+            ),
+            ("rect_exact", rect_exact),
+            ("journals_empty", empty),
+            ("own_paths", own == Some(0)),
+        ];
+        let failure = cycled
+            .err()
+            .or(restored.err())
+            .or(closed.err())
+            .or_else(|| {
+                checks
+                    .iter()
+                    .find(|(_, held)| !held)
+                    .map(|(name, _)| format!("{name} not as asserted"))
+            });
+
+        row.fact("remode_ok", format!("{}/{REMODES}", tally.ok));
+        row.fact("twin_unavailable", tally.twin_unavailable);
+        row.fact("retained", tally.retained);
+        row.fact(
+            "restart_frame",
+            format!("{}/{REMODES}", tally.restart_frame),
+        );
+        row.fact(
+            "resolve_none",
+            sampled.map_or_else(|| "U".to_owned(), |(_, missing)| missing.to_string()),
+        );
+        row.fact("rect_exact", u8::from(rect_exact));
+        row.fact("journals_empty", u8::from(empty));
+        row.fact(
+            "own_paths",
+            own.map_or_else(|| "U".to_owned(), |count| count.to_string()),
+        );
+        row.fact("old_end", tally.old_end.join(","));
+        row.fact("same_display", format!("{}/{REMODES}", tally.same_display));
+        row.fact("twin_dpi", tally.twin_dpi.join(","));
+        row.fact(
+            "resolve_samples",
+            sampled.map_or_else(|| "U".to_owned(), |(samples, _)| samples.to_string()),
+        );
+        row.fact("RESULT", if failure.is_none() { "PASS" } else { "FAIL" });
+        match failure {
+            None => Ok(()),
+            Some(stage) => Err(stage),
+        }
+    }
+
+    /// The `dpi_place` placement requests this offset from the real monitor's work-area top-left,
+    /// in device pixels. It lies inside the work area, so the placer's clamp leaves it unchanged.
+    const PLACE_OFFSET: (i32, i32) = (37, 41);
+    /// How long one placement may take, read-back included.
+    const PLACE_WAIT: Duration = Duration::from_secs(5);
+
+    /// The visible (DWM extended-frame) rectangle of the admitted fixture, after its owner is
+    /// checked, as `[left, top, right, bottom]`.
+    fn owned_visible(identity: &NativeIdentity) -> Result<[i32; 4], String> {
+        let window = identity.hwnd as usize as HWND;
+        let mut pid = 0_u32;
+        // SAFETY: reads the owner of a handle the fixture reported; no window state changes.
+        let thread = unsafe { GetWindowThreadProcessId(window, &mut pid) };
+        ensure(
+            thread == identity.tid && pid == identity.pid,
+            "fixture window identity changed",
+        )?;
+        let mut bounds = RECT::default();
+        // SAFETY: writes one RECT into a local of the stated size; reads the frame bounds only.
+        let status = unsafe {
+            DwmGetWindowAttribute(
+                window,
+                DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+                (&mut bounds as *mut RECT).cast(),
+                size_of::<RECT>() as u32,
+            )
+        };
+        ensure(status >= 0, "fixture visible bounds unavailable")?;
+        Ok([bounds.left, bounds.top, bounds.right, bounds.bottom])
+    }
+
+    /// The full and work-area rectangles of a monitor, each as `[left, top, right, bottom]`.
+    fn monitor_rects(monitor: usize) -> Result<([i32; 4], [i32; 4]), String> {
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: `info` has cbSize set as the API requires; the handle is only read.
+        let okay = unsafe { GetMonitorInfoW(monitor as HMONITOR, &mut info) } != 0;
+        ensure(okay, "monitor geometry unavailable")?;
+        let rect = |rect: RECT| [rect.left, rect.top, rect.right, rect.bottom];
+        Ok((rect(info.rcMonitor), rect(info.rcWork)))
+    }
+
+    /// `WxH` of a `[left, top, right, bottom]` rectangle.
+    fn size_text(rect: [i32; 4]) -> String {
+        format!("{}x{}", rect[2] - rect[0], rect[3] - rect[1])
+    }
+
+    /// What one `dpi_place` placement observed. `exercised` is false when the twin and the real
+    /// monitor share a DPI, or one is unreadable, so the mixed-DPI move cannot be established.
+    struct Landing {
+        exercised: bool,
+        placed: bool,
+    }
+
+    /// One `WindowsRestorePlacer::place` from the twin to the first real monitor, at the work-area
+    /// offset. The visible top-left is read back and checked against the request within 1 px.
+    fn land(setup: &Setup, twin: DisplayId, row: &mut Row) -> Result<Landing, String> {
+        let real = at(setup.displays.snapshot(), "display list")?
+            .displays
+            .iter()
+            .map(|display| display.id)
+            .find(|id| *id != twin)
+            .ok_or_else(|| "no real monitor besides the twin".to_owned())?;
+        let monitor = at(setup.displays.monitor(real), "real monitor")?;
+        let (full, work) = monitor_rects(monitor)?;
+        let requested = (work[0] + PLACE_OFFSET.0, work[1] + PLACE_OFFSET.1);
+        let origin = PointDevice::new(
+            f64::from(requested.0 - full[0]),
+            f64::from(requested.1 - full[1]),
+        );
+        let (twin_dpi, real_dpi) = (
+            display_dpi(&setup.displays, twin),
+            display_dpi(&setup.displays, real),
+        );
+        row.fact("twin_dpi", dpi_text(twin_dpi));
+        row.fact("real_dpi", dpi_text(real_dpi));
+        let exercised = matches!((twin_dpi, real_dpi), (Some(a), Some(b)) if a != b);
+        let before = owned_visible(&setup.fixture.identity)?;
+        let mut placer = WindowsRestorePlacer::new(
+            setup.source.resolver(),
+            setup.displays.ids(),
+            setup.displays.monitor_reader(),
+        );
+        let placed = placer.place(setup.window, real, origin, Instant::now() + PLACE_WAIT);
+        let after = owned_visible(&setup.fixture.identity)?;
+        let dx = i64::from(after[0]) - i64::from(requested.0);
+        let dy = i64::from(after[1]) - i64::from(requested.1);
+        if let Err(error) = &placed {
+            row.fact("place_error", error);
+        }
+        row.fact("visible_before", size_text(before));
+        row.fact("visible_after", size_text(after));
+        row.fact("dx", dx);
+        row.fact("dy", dy);
+        // `place` reports no recompute count, so the number of recomputes is not observable here.
+        row.fact("recomputes", "U");
+        let landed = placed.is_ok() && dx.abs() <= 1 && dy.abs() <= 1;
+        row.fact("placed", landed);
+        Ok(Landing {
+            exercised,
+            placed: landed,
+        })
+    }
+
+    /// V6 `dpi_place`: the fixture runs with `--dpi-resize` and is parked on a 1.5-scale twin. The
+    /// placer then moves it onto the first real monitor, so the move changes DPI and the fixture's
+    /// `WM_DPICHANGED` resize is what the placer's read-back must recompute for (W1.6b Low 2).
+    /// `RESULT=U` when the DPIs match or cannot be read. Otherwise `PASS` needs the visible
+    /// top-left within 1 px of the request. The park is always restored and the fixture always
+    /// closed; a cleanup failure is a `FAIL`. Counts, sizes and offsets only.
+    pub(super) fn dpi_place(row: &mut Row) -> Result<(), String> {
+        let dir = scratch()?;
+        let mut setup = prepare_with(&dir, row, FixtureChild::spawn_dpi_resize)?;
+        ensure(
+            setup.startup.driver_present,
+            "driver absent; the dpi_place row needs the driver",
+        )?;
+        let started = Instant::now();
+        let parked = at(
+            setup
+                .parking
+                .park(setup.window, PixelSize::new(640, 360), 1.5),
+            "park at scale 1.5",
+        )?;
+        row.fact("kind", format!("{:?}", parked.kind));
+        let landed = if parked.kind == ParkingKind::Twin {
+            land(&setup, parked.display, row)
+        } else {
+            Err("park is not a twin".to_owned())
+        };
+        row.ms = started.elapsed().as_millis();
+
+        // Cleanup runs on every path: the park is restored, its journals and paths are checked,
+        // then the fixture closes.
+        let restored = at(setup.parking.restore(setup.window), "restore");
+        let empty = journals_empty(&dir).unwrap_or(false);
+        let own = own_paths().ok();
+        let closed = at(setup.fixture.close(), "fixture close");
+        row.fact("journals_empty", empty);
+        row.fact(
+            "own_paths",
+            own.map_or_else(|| "U".to_owned(), |count| count.to_string()),
+        );
+        row.fact("closed", closed.is_ok());
+        let cleanup = restored
+            .err()
+            .or(closed.err())
+            .or_else(|| {
+                (!empty).then(|| "journals not empty after restore (or unreadable)".to_owned())
+            })
+            .or_else(|| {
+                (own != Some(0))
+                    .then(|| "own display paths not 0 after restore (or unreadable)".to_owned())
+            });
+
+        let exercised = landed.as_ref().is_ok_and(|landing| landing.exercised);
+        let placed = landed.as_ref().is_ok_and(|landing| landing.placed);
+        let failure = cleanup.or_else(|| match &landed {
+            Err(stage) => Some(stage.clone()),
+            Ok(_) if exercised && !placed => {
+                Some("placement not within 1 px of the request".to_owned())
+            }
+            Ok(_) => None,
+        });
+        let result = if failure.is_some() {
+            "FAIL"
+        } else if exercised {
+            "PASS"
+        } else {
+            "U"
+        };
+        row.fact("RESULT", result);
+        match failure {
+            None => Ok(()),
+            Some(stage) => Err(stage),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -790,7 +1345,11 @@ fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
 
     match std::env::args().nth(1).as_deref() {
-        Some("fixture") => fixture::run_fixture(),
+        Some("fixture") => match std::env::args().nth(2).as_deref() {
+            None => fixture::run_fixture(false),
+            Some("--dpi-resize") => fixture::run_fixture(true),
+            Some(_) => ExitCode::from(2),
+        },
         Some("store-selftest") => match store::selftest() {
             Ok(()) => {
                 println!("STORE_SELFTEST ok");
@@ -805,6 +1364,8 @@ fn main() -> std::process::ExitCode {
         Some("park") => rows::run("park", rows::park),
         Some("crash") => rows::run("crash", rows::crash),
         Some("recover") => rows::run("recover", rows::recover),
+        Some("remode") => rows::run("remode", rows::remode),
+        Some("dpi_place") => rows::run("dpi_place", rows::dpi_place),
         _ => {
             println!("unsupported mode");
             ExitCode::from(2)

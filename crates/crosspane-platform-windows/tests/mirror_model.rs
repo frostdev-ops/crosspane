@@ -2,12 +2,16 @@
 #![allow(clippy::unwrap_used)]
 use crosspane_platform::PlatformError;
 use crosspane_platform_windows::model::{
+    displays::READ_BOUND,
     geometry::{DisplayIds, MonitorProbe},
     journal::{Original, Show},
     parking::*,
 };
 use crosspane_types::{geom::PixelSize, id::WindowId};
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 fn identity() -> NativeIdentity {
     NativeIdentity {
@@ -100,6 +104,7 @@ struct Port {
     constrained: bool,
     original_monitor_present: bool,
     restore_preflight_error: bool,
+    inspect_backend: Option<&'static str>,
 }
 impl NativePort for Port {
     fn check(&self) -> Result<(), PlatformError> {
@@ -125,6 +130,8 @@ impl NativePort for Port {
         self.check()?;
         if self.query_error {
             Err(PlatformError::SecureInput)
+        } else if let Some(detail) = self.inspect_backend {
+            Err(PlatformError::Backend(detail.into()))
         } else {
             Ok(self.current.clone())
         }
@@ -190,6 +197,7 @@ fn controller() -> (Controller<Port>, Store) {
         constrained: false,
         original_monitor_present: true,
         restore_preflight_error: false,
+        inspect_backend: None,
     };
     (
         Controller::new(Box::new(store.clone()), port).unwrap(),
@@ -948,4 +956,69 @@ fn marker_desktop_fallback_never_masks_genuine_creation_failure_or_rollback() {
                 .is_empty()
         );
     }
+}
+
+#[test]
+fn monitor_read_retry_boundaries_follow_failure_age_and_remaining_room() {
+    let ms = Duration::from_millis;
+    assert!(retry_monitor_read(ms(0), None));
+    assert!(retry_monitor_read(ms(1_499), None));
+    assert!(!retry_monitor_read(ms(1_500), None));
+    assert!(retry_monitor_read(ms(0), Some(ms(2_300))));
+    assert!(!retry_monitor_read(ms(0), Some(ms(2_299))));
+    assert!(!retry_monitor_read(ms(1_500), Some(ms(10_000))));
+}
+#[test]
+fn monitor_read_retry_never_fires_on_the_two_second_m1_bound() {
+    // M1 gives the whole call 2 s, which leaves no room for a pause plus one whole read.
+    for failing_for in [0, 1, 1_499] {
+        assert!(!retry_monitor_read(
+            Duration::from_millis(failing_for),
+            Some(READ_BOUND)
+        ));
+    }
+}
+#[test]
+fn monitor_read_failure_hides_window_gone_and_twin_refusal_and_keeps_timeout() {
+    for error in [
+        PlatformError::NotFound,
+        PlatformError::Unsupported("ambiguous display topology/identity"),
+        PlatformError::Backend("monitor read failed".into()),
+    ] {
+        assert!(matches!(
+            monitor_read_failure(error),
+            PlatformError::Backend(detail) if detail == "parking monitor facts unavailable"
+        ));
+    }
+    assert!(matches!(
+        monitor_read_failure(PlatformError::Timeout),
+        PlatformError::Timeout
+    ));
+}
+#[test]
+fn transient_monitor_read_during_fullscreen_refuses_then_resize_can_proceed() {
+    // The fake reports the exact monitor-facts failure that a native monitor read surfaces.
+    let (mut c, _) = controller();
+    c.bind();
+    let id = WindowId(12345);
+    c.park(id, PixelSize::new(400, 300), 1.0).unwrap();
+    c.port.inspect_backend = Some(MONITOR_FACTS_UNAVAILABLE);
+    for requested in [true, false] {
+        // Unsupported is the worker's proceed-to-resize refusal (F1); it is never a Backend failure.
+        assert!(matches!(
+            c.set_fullscreen(id, requested),
+            Err(PlatformError::Unsupported(
+                "Windows mirror fullscreen transition"
+            ))
+        ));
+    }
+    // Any other Backend failure is not a monitor-facts refusal and still propagates unchanged.
+    c.port.inspect_backend = Some("owned other backend failure");
+    assert!(matches!(
+        c.set_fullscreen(id, true),
+        Err(PlatformError::Backend(detail)) if detail == "owned other backend failure"
+    ));
+    c.port.inspect_backend = None;
+    assert!(c.set_fullscreen(id, false).is_ok());
+    assert!(c.port.native_log.is_empty());
 }

@@ -369,6 +369,25 @@ fn twin_probe_never_maps_a_window_frame() {
     );
 }
 
+#[test]
+fn source_liveness_is_two_seconds_of_progress_or_four_inside_one_read() {
+    use crosspane_platform_windows::model::{
+        displays::READ_BOUND,
+        window::{PROGRESS_BOUND, source_live},
+    };
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    assert_eq!(PROGRESS_BOUND, Duration::from_secs(2));
+    assert_eq!(READ_BOUND, Duration::from_secs(2));
+    assert!(source_live(ms(0), false));
+    assert!(source_live(ms(1999), false));
+    assert!(!source_live(ms(2000), false));
+    assert!(!source_live(ms(3999), false));
+    assert!(source_live(ms(0), true));
+    assert!(source_live(ms(3999), true));
+    assert!(!source_live(ms(4000), true));
+}
+
 proptest::proptest! {
     #[test]
     fn every_observed_lifetime_gets_a_distinct_id(handles in proptest::collection::vec(1_u64..32, 1..200)) {

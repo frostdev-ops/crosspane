@@ -11,7 +11,10 @@ use std::{
     iter::once,
     process::{Child, Command, ExitCode, Stdio},
     ptr::{null, null_mut},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -30,9 +33,9 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetWindowRect,
             GetWindowThreadProcessId, IsWindow, IsZoomed, MSG, PM_REMOVE, PeekMessageW,
-            PostMessageW, PostQuitMessage, RegisterClassW, SW_MAXIMIZE, ShowWindow,
-            TranslateMessage, UnregisterClassW, WM_CLOSE, WM_DESTROY, WM_QUIT, WNDCLASSW,
-            WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+            PostMessageW, PostQuitMessage, RegisterClassW, SW_MAXIMIZE, SWP_NOACTIVATE,
+            SWP_NOZORDER, SetWindowPos, ShowWindow, TranslateMessage, UnregisterClassW, WM_CLOSE,
+            WM_DESTROY, WM_DPICHANGED, WM_QUIT, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
         },
     },
 };
@@ -47,10 +50,16 @@ const EXIT: Duration = Duration::from_secs(5);
 /// How long the parent waits for the maximized state to appear.
 const MAXIMIZE: Duration = Duration::from_secs(5);
 
+/// Whether the window answers `WM_DPICHANGED` with the suggested rectangle (`--dpi-resize`). Set
+/// once by [`run_window`] before the window exists; this process creates only that one window.
+static DPI_RESIZE: AtomicBool = AtomicBool::new(false);
+
 /// Child mode: creates the owned window, prints one `FIXTURE` identity line, then pumps messages
 /// until the window closes or [`LIFETIME`] passes. This process creates no other window.
-pub fn run_fixture() -> ExitCode {
-    match run_window() {
+/// `dpi_resize` is the `--dpi-resize` flag: the window then applies the rectangle that
+/// `WM_DPICHANGED` suggests, as a per-monitor-v2 app does. Without it the message is defaulted.
+pub fn run_fixture(dpi_resize: bool) -> ExitCode {
+    match run_window(dpi_resize) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("FIXTURE failed: {error}");
@@ -59,7 +68,7 @@ pub fn run_fixture() -> ExitCode {
     }
 }
 
-fn run_window() -> Result<(), PlatformError> {
+fn run_window(dpi_resize: bool) -> Result<(), PlatformError> {
     // SAFETY: PMv2 affects only this process's main thread, the only thread that owns a window
     // here. The process ends with the fixture, so the prior context is not restored.
     let previous =
@@ -67,6 +76,8 @@ fn run_window() -> Result<(), PlatformError> {
     if previous.is_null() {
         return Err(backend("fixture PMv2 context unavailable"));
     }
+    // Stored before the window exists, so the first message it receives already sees the flag.
+    DPI_RESIZE.store(dpi_resize, Ordering::Release);
     // SAFETY: returns this executable's module handle, which stays valid for the process lifetime.
     let module = unsafe { GetModuleHandleW(null()) };
     // SAFETY: reads this process's and thread's identifiers.
@@ -163,10 +174,30 @@ impl Drop for Owned {
 }
 
 /// The fixture's only window procedure. Destroying the window posts `WM_QUIT`, which ends the loop.
+/// With `--dpi-resize`, `WM_DPICHANGED` moves and resizes the window to the suggested rectangle.
 unsafe extern "system" fn procedure(window: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     if message == WM_DESTROY {
         // SAFETY: posts a quit to this thread's own queue, which only this fixture uses.
         unsafe { PostQuitMessage(0) };
+        return 0;
+    }
+    if message == WM_DPICHANGED && DPI_RESIZE.load(Ordering::Acquire) {
+        // SAFETY: on WM_DPICHANGED, lParam points to the suggested RECT for this message only. It
+        // is copied out here, before the message returns.
+        let suggested = unsafe { *(l as *const RECT) };
+        // SAFETY: moves and resizes only this fixture window, to the rectangle the system
+        // suggested. Z-order and activation are left unchanged.
+        unsafe {
+            SetWindowPos(
+                window,
+                null_mut(),
+                suggested.left,
+                suggested.top,
+                suggested.right - suggested.left,
+                suggested.bottom - suggested.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
         return 0;
     }
     // SAFETY: forwards this fixture window's message to the default procedure unchanged.
@@ -229,9 +260,23 @@ impl FixtureChild {
     /// Starts a fixture child from this same executable and reads its identity line within five
     /// seconds. A child that fails to report is killed.
     pub fn spawn() -> Result<Self, PlatformError> {
+        Self::spawn_with(false)
+    }
+
+    /// Like [`FixtureChild::spawn`], but the child runs with `--dpi-resize`, so it applies the
+    /// rectangle that `WM_DPICHANGED` suggests.
+    pub fn spawn_dpi_resize() -> Result<Self, PlatformError> {
+        Self::spawn_with(true)
+    }
+
+    fn spawn_with(dpi_resize: bool) -> Result<Self, PlatformError> {
         let exe = std::env::current_exe().map_err(io_error)?;
-        let mut child = Command::new(exe)
-            .arg("fixture")
+        let mut command = Command::new(exe);
+        command.arg("fixture");
+        if dpi_resize {
+            command.arg("--dpi-resize");
+        }
+        let mut child = command
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .stdout(Stdio::piped())

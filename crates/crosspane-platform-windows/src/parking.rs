@@ -8,7 +8,7 @@ pub use crate::model::parking::{MirrorJournalImages, MirrorJournalStore, MirrorR
 mod marker;
 use crate::{
     model::{
-        geometry::DisplayIds,
+        geometry::{DisplayIds, MonitorProbe},
         journal::Show,
         parking::{
             self, Controller, MirrorEntry, NativeIdentity, NativePort, Observed, RestoreOutcome,
@@ -366,6 +366,28 @@ impl Port {
         }
         Ok(())
     }
+    /// Reads monitor facts, riding out transient failures while the call still has room (W3.2 R2).
+    /// Every attempt repeats the deadline, abandon and fault fence first.
+    fn read_monitors(&self, reader: &MonitorReader) -> Result<Vec<MonitorProbe>, PlatformError> {
+        let started = Instant::now();
+        loop {
+            self.check()?;
+            match reader() {
+                Ok(probes) => return Ok(probes),
+                Err(error) => {
+                    self.check()?;
+                    let remaining = self
+                        .deadline
+                        .as_ref()
+                        .map(|d| d.until.saturating_duration_since(Instant::now()));
+                    if !parking::retry_monitor_read(started.elapsed(), remaining) {
+                        return Err(parking::monitor_read_failure(error));
+                    }
+                    thread::sleep(parking::MONITOR_READ_POLL);
+                }
+            }
+        }
+    }
     fn read(&mut self, pinned: &Pinned, id: Option<WindowId>) -> Result<Observed, PlatformError> {
         self.check()?;
         self.verify_resolver(pinned.identity, id)?;
@@ -443,7 +465,7 @@ impl Port {
                 .binding
                 .as_ref()
                 .ok_or(PlatformError::Unsupported("unbound Windows mirror parking"))?;
-            let probes = (binding.monitors)()?;
+            let probes = self.read_monitors(&binding.monitors)?;
             let (geometry, path) = parking::observed_geometry(
                 id,
                 rect(visible),

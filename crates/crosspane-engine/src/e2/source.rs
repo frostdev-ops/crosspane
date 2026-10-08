@@ -23,6 +23,7 @@ use crate::io::{Failure, InjectCmd, InjectId, Notice, Output, ProjectionKey};
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const PARK_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const FOCUS_GRACE: Duration = Duration::from_millis(300);
+const TWIN_REARM_GAP: Duration = START_TIMEOUT;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -98,6 +99,9 @@ pub(super) struct Source {
     pending_capture_target: Option<CaptureTarget>,
     pending_capture_crop: Option<PixelRect>,
     capture_switch: Option<MonoTime>,
+    /// When this projection's twin display capture last ended on its own and was re-armed (W3.2
+    /// R-F1). Cleared when a successful park answers a destination resize request.
+    twin_rearm: Option<MonoTime>,
     fullscreen: bool,
     wanted_fullscreen: bool,
     /// The fullscreen state the window was last seen in since the last park or resize was
@@ -385,6 +389,7 @@ impl E2 {
                 pending_capture_target: None,
                 pending_capture_crop: None,
                 capture_switch: None,
+                twin_rearm: None,
                 fullscreen: false,
                 wanted_fullscreen: false,
                 latest_state: None,
@@ -709,7 +714,8 @@ impl E2 {
         source.resizing = false;
         // Its request, if it was one, is answered by the geometry below; a newer queued one is
         // not (it has its own operation).
-        if let Some(request) = source.inflight.take() {
+        let answered_request = source.inflight.take();
+        if let Some(request) = answered_request {
             source.answered = request;
         }
         if initial {
@@ -723,6 +729,9 @@ impl E2 {
             self.end_source(projection, Reason::Failed, false, now, out);
             return;
         };
+        if answered_request.is_some() {
+            source.twin_rearm = None;
+        }
         source.parked = Some(parked);
         source.fullscreen = parked.fullscreen;
         source.reconcile_stand_in(&self.windows, now);
@@ -881,6 +890,17 @@ impl E2 {
                 && self.windows.contains_key(&source.window)
             {
                 source.stop_capture(out);
+                return;
+            }
+            if reason != Reason::Locked
+                && self.windows.contains_key(&source.window)
+                && source.rearms_twin_capture(now)
+            {
+                source.twin_rearm = Some(now);
+                source.stop_capture(out);
+                if !source.resizing {
+                    source.repark(now, out);
+                }
                 return;
             }
             self.end_source(projection, reason, false, now, out);
@@ -1437,6 +1457,21 @@ impl Source {
     fn capture_unavailable(&self) -> bool {
         // Off-Space without a local stand-in retains the projection but produces no frames.
         self.window_state == WindowState::Hidden && self.stand_in.is_none()
+    }
+
+    /// Whether a twin display capture that just ended on its own may be re-armed: a live twin
+    /// projection with a known destination size, and no re-arm within `TWIN_REARM_GAP`.
+    fn rearms_twin_capture(&self, now: MonoTime) -> bool {
+        self.stage == Stage::Live
+            && self.wanted.is_some()
+            && matches!(self.capture_target, Some(CaptureTarget::Display(_)))
+            && self
+                .parked
+                .and_then(geometry)
+                .is_some_and(|(_, k)| k == ParkingKind::Twin)
+            && self
+                .twin_rearm
+                .is_none_or(|at| now.saturating_duration_since(at) >= TWIN_REARM_GAP)
     }
 
     fn stop_capture(&mut self, out: &mut Vec<Output>) {

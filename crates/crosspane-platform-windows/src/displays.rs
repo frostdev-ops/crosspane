@@ -39,7 +39,7 @@ use windows_sys::Win32::{
     UI::{HiDpi::*, WindowsAndMessaging::*},
 };
 
-const BOUND: Duration = Duration::from_secs(2);
+const BOUND: Duration = crate::model::displays::READ_BOUND;
 const RECONCILE: Duration = Duration::from_millis(500);
 const LIMIT: usize = 128;
 static CLASSES: AtomicU64 = AtomicU64::new(0);

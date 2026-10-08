@@ -341,6 +341,37 @@ fn rect_pixel_size(rect: [i32; 4]) -> Option<PixelSize> {
     (width > 0 && height > 0).then(|| PixelSize::new(width, height))
 }
 
+/// Read-back recomputes allowed for one placement while the frame keeps changing (W3.2c, W1.6b
+/// Low 2): a mixed-DPI app re-lays out after the `WM_DPICHANGED` move, so the target is re-derived.
+pub const PLACE_RECOMPUTES: u32 = 2;
+
+/// Visible size or outer→visible offset differs; a pure translation is not a change.
+/// Rectangles are `[left, top, right, bottom]`, the convention of [`placed_origin`].
+pub fn frame_changed(
+    before_outer: [i32; 4],
+    before_visible: [i32; 4],
+    now_outer: [i32; 4],
+    now_visible: [i32; 4],
+) -> bool {
+    frame_shape(before_outer, before_visible) != frame_shape(now_outer, now_visible)
+}
+
+/// Visible width and height, then the visible rectangle's inset from the outer one on the left,
+/// top, right and bottom sides. Translating both rectangles together leaves every value unchanged.
+/// Coordinates are widened to `i64` first, so the saturating subtractions never clip a difference.
+fn frame_shape(outer: [i32; 4], visible: [i32; 4]) -> [i64; 6] {
+    let [outer_left, outer_top, outer_right, outer_bottom] = outer.map(i64::from);
+    let [left, top, right, bottom] = visible.map(i64::from);
+    [
+        right.saturating_sub(left),
+        bottom.saturating_sub(top),
+        left.saturating_sub(outer_left),
+        top.saturating_sub(outer_top),
+        outer_right.saturating_sub(right),
+        outer_bottom.saturating_sub(bottom),
+    ]
+}
+
 /// Native placement of an already restored window. Never parks, restores or journals.
 pub trait RestorePlacer: Send {
     /// Moves the window's visible top-left to `origin` and reads it back until `deadline`.

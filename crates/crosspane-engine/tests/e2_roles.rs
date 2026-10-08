@@ -353,6 +353,28 @@ fn sent_geometry(size: PixelSize, answers: u32) -> Output {
         }),
     }
 }
+/// The outputs of a projection that ended on the source with `reason`: its window is restored, an
+/// `End` goes to the peer, and the `ProjectionEnded` notice comes last.
+fn assert_ended(out: &[Output], reason: Reason) {
+    assert!(out.contains(&Output::Restore {
+        window: WINDOW,
+        place: None
+    }));
+    assert_eq!(
+        messages(out),
+        vec![Message::End {
+            projection: ID,
+            reason
+        }]
+    );
+    assert_eq!(
+        out.last(),
+        Some(&Output::Notice(Notice::ProjectionEnded {
+            key: key(A),
+            reason
+        }))
+    );
+}
 fn up() -> InjectCmd {
     InjectCmd::Key {
         usage: KEY,
@@ -1025,24 +1047,34 @@ fn crash_recovery_is_first_retries_and_has_independent_e1_ids() {
 
 #[test]
 fn source_end_paths_release_stop_restore_and_ignore_unrelated_peers() {
-    for (event, reason, sent) in [
-        (closed(B), Reason::LinkLost, false),
-        (locked(), Reason::Locked, true),
+    // A Twin display capture that ends on its own is re-armed, not ended (W3.2c R-F1). The two rows
+    // that expect the projection to end therefore use a Mirror projection, whose end still ends it.
+    for (event, reason, sent, kind) in [
+        (closed(B), Reason::LinkLost, false, PlatformParking::Twin),
+        (locked(), Reason::Locked, true, PlatformParking::Twin),
         (
             Input::Session(SessionEvent::WillSleep),
             Reason::Locked,
             true,
+            PlatformParking::Twin,
         ),
-        (Input::Grants(Default::default()), Reason::Revoked, true),
+        (
+            Input::Grants(Default::default()),
+            Reason::Revoked,
+            true,
+            PlatformParking::Twin,
+        ),
         (
             Input::Windows(WindowEvent::Removed(WINDOW)),
             Reason::WindowClosed,
             true,
+            PlatformParking::Twin,
         ),
         (
             Input::Command(Command::Return(key(A))),
             Reason::Returned,
             true,
+            PlatformParking::Twin,
         ),
         (
             Input::CaptureEnded {
@@ -1051,6 +1083,7 @@ fn source_end_paths_release_stop_restore_and_ignore_unrelated_peers() {
             },
             Reason::Locked,
             true,
+            PlatformParking::Twin,
         ),
         (
             Input::CaptureEnded {
@@ -1059,6 +1092,7 @@ fn source_end_paths_release_stop_restore_and_ignore_unrelated_peers() {
             },
             Reason::WindowClosed,
             true,
+            PlatformParking::Mirror,
         ),
         (
             Input::CaptureEnded {
@@ -1067,9 +1101,10 @@ fn source_end_paths_release_stop_restore_and_ignore_unrelated_peers() {
             },
             Reason::Failed,
             true,
+            PlatformParking::Mirror,
         ),
     ] {
-        let mut f = Fixture::source(PlatformParking::Twin);
+        let mut f = Fixture::source(kind);
         f.handle(input(B, press(1, true)), 0);
         assert!(f.handle(closed(C), 0).is_empty());
         assert!(
@@ -1127,6 +1162,348 @@ fn source_end_paths_release_stop_restore_and_ignore_unrelated_peers() {
         f.confirm(&out, true, 1);
         assert!(f.handle(input(B, press(2, true)), 2).is_empty());
         assert!(f.held().is_empty());
+    }
+}
+
+/// A Twin display capture that ends on its own is re-armed by a confirming re-park (W3.2c R-F1):
+/// the capture restarts on a fresh `Parked`. A second end within `TWIN_REARM_GAP` (10 s) ends the
+/// projection, unless an answered request cleared the budget in between.
+#[test]
+fn twin_display_capture_end_restarts_after_a_fresh_park_and_is_bounded() {
+    let resized = PixelSize::new(800, 600);
+    let capture_ended = |stream: u64, reason: StreamEndReason| Input::CaptureEnded {
+        stream: StreamId(stream),
+        reason,
+    };
+    let started = |stream: u64| Input::CaptureStarted {
+        projection: ID,
+        result: Ok(StreamId(stream)),
+    };
+    let stop = |stream: u64| Output::StopCapture {
+        stream: StreamId(stream),
+    };
+    let start = |p: Parked| Output::StartCapture {
+        projection: ID,
+        peer: B,
+        target: CaptureTarget::Display(DISPLAY),
+        crop: Some(p.content),
+        max_fps: 60,
+    };
+    let resize_parked = |size: PixelSize, scale: f64| Output::ResizeParked {
+        fullscreen: false,
+        window: WINDOW,
+        size,
+        scale,
+    };
+
+    // (A) Nothing is answered in between, so a second end within 10 s ends the projection.
+    let mut f = Fixture::source(PlatformParking::Twin);
+    assert_eq!(
+        f.handle(capture_ended(1, StreamEndReason::TargetGone), 100),
+        vec![stop(1), resize_parked(size(), 2.0)]
+    );
+    let p = parked(WINDOW, PlatformParking::Twin, size());
+    let out = f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Ok(p),
+        },
+        101,
+    );
+    assert_eq!(out[0], start(p));
+    assert!(f.handle(started(2), 102).is_empty());
+    let out = f.handle(capture_ended(2, StreamEndReason::Failed), 5_000);
+    assert_eq!(out[0], stop(2));
+    assert_ended(&out, Reason::Failed);
+
+    // (B) A resize is in flight when the capture ends: the end only stops the stream. The park that
+    // answers the resize clears the budget, so the next end is re-armed even within the gap.
+    let mut f = Fixture::source(PlatformParking::Twin);
+    assert_eq!(
+        f.handle(
+            control(
+                B,
+                Message::Resize {
+                    fullscreen: false,
+                    projection: ID,
+                    request: 1,
+                    size: resized,
+                    scale: 1.5,
+                }
+            ),
+            10
+        ),
+        vec![resize_parked(resized, 1.5)]
+    );
+    assert_eq!(
+        f.handle(capture_ended(1, StreamEndReason::TargetGone), 100),
+        vec![stop(1)]
+    );
+    let p = parked(WINDOW, PlatformParking::Twin, resized);
+    let out = f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Ok(p),
+        },
+        101,
+    );
+    assert_eq!(out[0], start(p));
+    assert!(f.handle(started(2), 102).is_empty());
+    assert_eq!(
+        f.handle(capture_ended(2, StreamEndReason::Failed), 103),
+        vec![stop(2), resize_parked(resized, 1.5)]
+    );
+    // This park answers no request, so the budget stays spent. A start that then fails ends the
+    // projection.
+    let p = parked(WINDOW, PlatformParking::Twin, resized);
+    let out = f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Ok(p),
+        },
+        104,
+    );
+    assert_eq!(out[0], start(p));
+    assert_ended(
+        &f.handle(
+            Input::CaptureStarted {
+                projection: ID,
+                result: Err(Failure::Other),
+            },
+            105,
+        ),
+        Reason::Failed,
+    );
+
+    // (C) The second end comes once the gap has passed, so it is re-armed again.
+    let mut f = Fixture::source(PlatformParking::Twin);
+    assert_eq!(
+        f.handle(capture_ended(1, StreamEndReason::Failed), 100),
+        vec![stop(1), resize_parked(size(), 2.0)]
+    );
+    let p = parked(WINDOW, PlatformParking::Twin, size());
+    let out = f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Ok(p),
+        },
+        101,
+    );
+    assert_eq!(out[0], start(p));
+    assert!(f.handle(started(2), 102).is_empty());
+    assert_eq!(
+        f.handle(capture_ended(2, StreamEndReason::TargetGone), 10_101),
+        vec![stop(2), resize_parked(size(), 2.0)]
+    );
+}
+
+/// A Twin display capture ends while the start for another display is still pending (W3.2c R-F1).
+/// Observed in both orders of the pending start and the confirming park: one `StartCapture` in all,
+/// no `End`, and stream 2 held by the projection on the other display.
+#[test]
+fn twin_display_stream_end_while_a_start_is_pending_converges_without_an_end() {
+    let other = DisplayId(5);
+    let capture_ended = |stream: u64, reason: StreamEndReason| Input::CaptureEnded {
+        stream: StreamId(stream),
+        reason,
+    };
+    for park_first in [false, true] {
+        let mut f = Fixture::source(PlatformParking::Twin);
+        // A resize to another scale is in flight. The park that answers it moves the capture to
+        // `other`, so stream 1 (on DISPLAY) is still live while that start is pending.
+        assert_eq!(
+            f.handle(
+                control(
+                    B,
+                    Message::Resize {
+                        fullscreen: false,
+                        projection: ID,
+                        request: 1,
+                        size: size(),
+                        scale: 1.5,
+                    }
+                ),
+                100
+            ),
+            vec![Output::ResizeParked {
+                fullscreen: false,
+                window: WINDOW,
+                size: size(),
+                scale: 1.5,
+            }]
+        );
+        let moved = Parked {
+            display: other,
+            ..parked(WINDOW, PlatformParking::Twin, size())
+        };
+        let mut seen = f.handle(
+            Input::Parked {
+                window: WINDOW,
+                result: Ok(moved),
+            },
+            101,
+        );
+        // Observed: the start on `other`, then the geometry answering request 1.
+        assert_eq!(
+            seen,
+            vec![
+                Output::StartCapture {
+                    projection: ID,
+                    peer: B,
+                    target: CaptureTarget::Display(other),
+                    crop: Some(moved.content),
+                    max_fps: 60,
+                },
+                sent_geometry(size(), 1),
+            ]
+        );
+        // Stream 1 ends while that start is pending. Observed: its stop, then a confirming re-park.
+        let out = f.handle(capture_ended(1, StreamEndReason::TargetGone), 102);
+        assert_eq!(
+            out,
+            vec![
+                Output::StopCapture {
+                    stream: StreamId(1)
+                },
+                Output::ResizeParked {
+                    fullscreen: false,
+                    window: WINDOW,
+                    size: size(),
+                    scale: 1.5,
+                },
+            ]
+        );
+        seen.extend(out);
+        let confirm = Parked {
+            display: other,
+            ..parked(WINDOW, PlatformParking::Twin, size())
+        };
+        let start_done = Input::CaptureStarted {
+            projection: ID,
+            result: Ok(StreamId(2)),
+        };
+        let park_done = Input::Parked {
+            window: WINDOW,
+            result: Ok(confirm),
+        };
+        let (first, second) = if park_first {
+            (park_done, start_done)
+        } else {
+            (start_done, park_done)
+        };
+        seen.extend(f.handle(first, 103));
+        seen.extend(f.handle(second, 104));
+        // Converged: one start in all, no End, and stream 2 is the one the projection holds.
+        assert_eq!(
+            seen.iter()
+                .filter(|o| matches!(o, Output::StartCapture { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !messages(&seen)
+                .iter()
+                .any(|m| matches!(m, Message::End { .. }))
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|o| matches!(o, Output::Notice(Notice::ProjectionEnded { .. })))
+        );
+        assert_ended(
+            &f.handle(capture_ended(2, StreamEndReason::Blocked), 105),
+            Reason::Locked,
+        );
+    }
+}
+
+/// A lock is never re-armed (fail-closed), and Mirror ends still end as they did (W3.2c R-F1).
+#[test]
+fn blocked_twin_stream_still_locks_and_mirror_stream_ends_are_unchanged() {
+    // Blocked with a size known and the budget free: the projection still ends Locked.
+    let mut f = Fixture::source(PlatformParking::Twin);
+    let out = f.handle(
+        Input::CaptureEnded {
+            stream: StreamId(1),
+            reason: StreamEndReason::Blocked,
+        },
+        100,
+    );
+    assert_eq!(
+        out[0],
+        Output::StopCapture {
+            stream: StreamId(1)
+        }
+    );
+    assert_ended(&out, Reason::Locked);
+
+    for (reason, expected) in [
+        (StreamEndReason::TargetGone, Reason::WindowClosed),
+        (StreamEndReason::Failed, Reason::Failed),
+    ] {
+        // A Display capture of a projection parked as a Mirror: that end is not re-armed.
+        let mut f = Fixture::source(PlatformParking::Twin);
+        f.handle(
+            control(
+                B,
+                Message::Resize {
+                    fullscreen: false,
+                    projection: ID,
+                    request: 1,
+                    size: size(),
+                    scale: 1.5,
+                },
+            ),
+            10,
+        );
+        let out = f.handle(
+            Input::Parked {
+                window: WINDOW,
+                result: Ok(parked(WINDOW, PlatformParking::Mirror, size())),
+            },
+            11,
+        );
+        assert_eq!(
+            out[0],
+            Output::StartCapture {
+                projection: ID,
+                peer: B,
+                target: CaptureTarget::Window(WINDOW),
+                crop: None,
+                max_fps: 60,
+            }
+        );
+        let out = f.handle(
+            Input::CaptureEnded {
+                stream: StreamId(1),
+                reason,
+            },
+            12,
+        );
+        assert_eq!(
+            out[0],
+            Output::StopCapture {
+                stream: StreamId(1)
+            }
+        );
+        assert_ended(&out, expected);
+
+        // A window (Mirror) capture: ends as before.
+        let mut f = Fixture::source(PlatformParking::Mirror);
+        let out = f.handle(
+            Input::CaptureEnded {
+                stream: StreamId(1),
+                reason,
+            },
+            100,
+        );
+        assert_eq!(
+            out[0],
+            Output::StopCapture {
+                stream: StreamId(1)
+            }
+        );
+        assert_ended(&out, expected);
     }
 }
 

@@ -367,3 +367,14 @@ impl MonitorReads {
         }
     }
 }
+
+/// How long the window source may go without progress before it is stale. Progress is stamped
+/// at the end of every observer step (about every 10 ms when healthy).
+pub const PROGRESS_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Live: progress stamped < PROGRESS_BOUND ago, or inside one bounded monitor read whose
+/// pre-read stamp is < PROGRESS_BOUND + READ_BOUND old.
+pub fn source_live(since_progress: std::time::Duration, reading: bool) -> bool {
+    since_progress < PROGRESS_BOUND
+        || (reading && since_progress < PROGRESS_BOUND + super::displays::READ_BOUND)
+}
