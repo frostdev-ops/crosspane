@@ -10,7 +10,9 @@ object. Duplicate handles share that capability; independent opens do not. Each
 open owns at most one monitor, with four opens and four monitors in total. A
 5-second lease requires a strictly increasing heartbeat at least once per second.
 Late or replayed heartbeats cannot revive an expired client. LIST returns only
-that client's monitor. Resize removes the old monitor and adds a new identity.
+that client's monitor. Resize removes the old monitor and adds a new monitor ID on
+the same lane. A slot keeps one EDID identity (serial slot + 1) across that REMOVE
+and ADD, so Windows persists at most four display identities.
 
 Supported descriptors are generated 128-byte EDID 1.3 for 1280x720 or 1920x1080
 at 60 Hz, 32 bpp, and a physical size of 10–2000 mm. The CPD manufacturer, product

@@ -314,6 +314,61 @@ fn monitor_conversion_uses_retained_ids_negative_origins_and_fractional_scale() 
     );
 }
 
+#[test]
+fn failed_monitor_reads_are_skipped_and_fault_only_after_the_grace() {
+    use crosspane_platform_windows::model::window::{
+        MONITOR_READ_GRACE, MonitorRead, MonitorReads,
+    };
+    let at = |ms: u64| MonoTime::from_nanos(ms * 1_000_000);
+    let grace = u64::try_from(MONITOR_READ_GRACE.as_millis()).unwrap();
+    let mut reads = MonitorReads::default();
+    assert_eq!(reads.record(true, at(0)), MonitorRead::Scan);
+    assert_eq!(reads.record(false, at(250)), MonitorRead::Skip);
+    assert_eq!(reads.record(false, at(250 + grace - 1)), MonitorRead::Skip);
+    assert_eq!(reads.record(true, at(250 + grace)), MonitorRead::Scan);
+    assert_eq!(reads.record(false, at(2 * grace)), MonitorRead::Skip);
+    assert_eq!(reads.record(false, at(3 * grace - 1)), MonitorRead::Skip);
+    assert_eq!(reads.record(false, at(3 * grace)), MonitorRead::Fault);
+}
+
+#[test]
+fn twin_probe_never_maps_a_window_frame() {
+    use crosspane_platform_windows::model::{
+        geometry::{DisplayIds, MonitorProbe},
+        window::logical_frame,
+    };
+    let frame = [-1770, -930, -1470, -630];
+    let probe = MonitorProbe {
+        device_path: "fixture-monitor".into(),
+        name: "fixture-display".into(),
+        rc_monitor: [-1920, -1080, 0, 0],
+        rc_work: [-1920, -1080, 0, 0],
+        primary: true,
+        dpi: 144,
+        refresh_millihz: 60000,
+        edid: None,
+        twin: true,
+        quarter_turns: 0,
+    };
+    let mut ids = DisplayIds::default();
+    let twins = [probe.clone()];
+    assert!(logical_frame(frame, twins[0].rc_monitor, &twins[0].name, &twins, &mut ids).is_err());
+    // The same monitor without the twin flag maps, so the refusal above comes from the flag.
+    let mut visible = probe;
+    visible.twin = false;
+    let visible = [visible];
+    assert!(
+        logical_frame(
+            frame,
+            visible[0].rc_monitor,
+            &visible[0].name,
+            &visible,
+            &mut ids
+        )
+        .is_ok()
+    );
+}
+
 proptest::proptest! {
     #[test]
     fn every_observed_lifetime_gets_a_distinct_id(handles in proptest::collection::vec(1_u64..32, 1..200)) {

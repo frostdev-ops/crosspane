@@ -5,6 +5,7 @@
 pub mod audio;
 pub mod capture;
 pub mod clipboard;
+pub mod cpd;
 pub mod cursor;
 pub mod displays;
 pub mod drag;
@@ -22,6 +23,9 @@ pub mod parking;
 pub mod popup;
 pub mod session;
 pub mod tray;
+pub mod twin;
+pub mod twin_ledger;
+pub mod twin_parking;
 #[cfg(feature = "video")]
 pub mod video;
 pub mod window;

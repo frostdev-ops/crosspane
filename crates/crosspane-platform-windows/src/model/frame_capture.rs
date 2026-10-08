@@ -134,7 +134,8 @@ impl MonitorTarget {
 
 /// Resolve only the requested retained ID. Never allocate an ID or choose a primary,
 /// nearest or last-known monitor. DisplayInfo.name and MonitorProbe.name are the exact
-/// MONITORINFOEX GDI source name committed by the same W1.5c observation.
+/// MONITORINFOEX GDI source name committed by the same W1.5c observation. A twin, which is
+/// hidden from `displays`, resolves only when no DisplayInfo is published for the same ID.
 pub fn resolve_monitor(
     snapshot: &MonitorSnapshot,
     id: DisplayId,
@@ -145,7 +146,9 @@ pub fn resolve_monitor(
         return Err(invalid());
     }
     let mut displays = snapshot.displays.iter().filter(|d| d.id == id);
-    let display = displays.next().ok_or_else(invalid)?;
+    let Some(display) = displays.next() else {
+        return resolve_twin(snapshot, id, handle);
+    };
     if displays.next().is_some()
         || display.name.is_empty()
         || snapshot
@@ -177,6 +180,47 @@ pub fn resolve_monitor(
         || !(1..=i64::from(i32::MAX)).contains(&height)
         || display.geometry.pixel_size != PixelSize::new(width as u32, height as u32)
     {
+        return Err(PlatformError::Backend(
+            "invalid capture monitor geometry".into(),
+        ));
+    }
+    Ok(MonitorTarget {
+        id,
+        handle,
+        device_path: probe.device_path.clone(),
+        bounds: PixelRect::new((left, top).into(), (right, bottom).into()),
+    })
+}
+
+/// Exactly one twin probe may assign to the ID. Assignment runs on a clone of the allocator, so
+/// resolving a twin never reserves or mints an ID; zero or several matches are refused.
+fn resolve_twin(
+    snapshot: &MonitorSnapshot,
+    id: DisplayId,
+    handle: usize,
+) -> Result<MonitorTarget, PlatformError> {
+    let invalid = || PlatformError::Backend("ambiguous capture monitor mapping".into());
+    let mut ids = snapshot.ids.clone();
+    let mut twins = snapshot
+        .probes
+        .iter()
+        .filter(|p| p.twin && ids.assign(&p.device_path).ok() == Some(id));
+    let probe = twins.next().ok_or_else(invalid)?;
+    if twins.next().is_some()
+        || probe.device_path.is_empty()
+        || snapshot
+            .probes
+            .iter()
+            .filter(|p| p.device_path == probe.device_path)
+            .count()
+            != 1
+    {
+        return Err(invalid());
+    }
+    let [left, top, right, bottom] = probe.rc_monitor;
+    let width = i64::from(right) - i64::from(left);
+    let height = i64::from(bottom) - i64::from(top);
+    if !(1..=i64::from(i32::MAX)).contains(&width) || !(1..=i64::from(i32::MAX)).contains(&height) {
         return Err(PlatformError::Backend(
             "invalid capture monitor geometry".into(),
         ));

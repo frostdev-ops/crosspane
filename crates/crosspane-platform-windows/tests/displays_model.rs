@@ -133,6 +133,7 @@ fn target(source: &str) -> TargetPath {
         refresh_numerator: 60_000,
         refresh_denominator: 1001,
         quarter_turns: 1,
+        twin: false,
     }
 }
 
@@ -231,4 +232,27 @@ fn mixed_dpi_geometry_keeps_matching_allocator_and_handles() {
     }
     assert_eq!(snapshot.probes[1].dpi, 144);
     assert_eq!(snapshot.displays.len(), 2);
+}
+
+#[test]
+fn twin_path_marks_probe_and_commit_keeps_it_out_of_displays() {
+    let physical = monitor("a", 1, true);
+    let twin = monitor("twin", 2, false);
+    let physical_source = physical.probe.name.clone();
+    let twin_source = twin.probe.name.clone();
+    let mut twin_path = target(&twin_source);
+    twin_path.twin = true;
+    let joined = join_paths(vec![physical, twin], &[target(&physical_source), twin_path]).unwrap();
+    assert!(!joined[0].probe.twin);
+    assert!(joined[1].probe.twin);
+    let snapshot = commit(joined, &mut DisplayIds::default()).unwrap();
+    let twin_id = snapshot
+        .ids
+        .clone()
+        .assign(&format!("actual-target-{twin_source}"))
+        .unwrap();
+    assert_eq!(snapshot.displays.len(), 1);
+    assert!(snapshot.displays.iter().all(|d| d.id != twin_id));
+    assert_eq!(snapshot.monitors[&twin_id], 2);
+    assert!(snapshot.probes.iter().any(|p| p.twin));
 }

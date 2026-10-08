@@ -404,6 +404,90 @@ fn absolute_device_mapping_negative_origin_retained_ids_and_invalid_points() {
     assert_eq!(ids.assign("left").unwrap(), left);
 }
 
+fn twin(path: &str, rect: [i32; 4]) -> crosspane_platform_windows::model::geometry::MonitorProbe {
+    crosspane_platform_windows::model::geometry::MonitorProbe {
+        twin: true,
+        ..monitor(path, rect, false)
+    }
+}
+
+#[test]
+fn absolute_move_maps_a_twin_by_id_into_its_rect() {
+    use crosspane_platform_windows::model::geometry::DisplayIds;
+    use crosspane_types::geom::PointDevice;
+    // Bounding box [0, 256) x [0, 128): spans 255 and 127, so 65535 / span is exact here.
+    let probes = [
+        monitor("primary", [0, 0, 128, 128], true),
+        twin("twin", [128, 0, 256, 128]),
+    ];
+    let mut ids = DisplayIds::default();
+    let primary = ids.assign("primary").unwrap();
+    let twin_id = ids.assign("twin").unwrap();
+    let (packet, probe) =
+        absolute_move(&probes, &mut ids, twin_id, PointDevice::new(0.0, 0.0)).unwrap();
+    assert_eq!(packet, Packet::Move { x: 32896, y: 0 });
+    assert_eq!(probe, probes[1]);
+    let (packet, probe) =
+        absolute_move(&probes, &mut ids, twin_id, PointDevice::new(127.0, 127.0)).unwrap();
+    assert_eq!(packet, Packet::Move { x: 65535, y: 65535 });
+    assert_eq!(probe, probes[1]);
+    assert_eq!(
+        absolute_move(&probes, &mut ids, primary, PointDevice::new(127.0, 127.0))
+            .unwrap()
+            .0,
+        Packet::Move { x: 32639, y: 65535 }
+    );
+}
+
+#[test]
+fn absolute_move_refuses_unknown_twin_ids_points_and_degenerate_rects() {
+    use crosspane_platform_windows::model::geometry::DisplayIds;
+    use crosspane_types::geom::PointDevice;
+    let probes = [
+        monitor("primary", [0, 0, 128, 128], true),
+        twin("twin", [128, 0, 256, 128]),
+        twin("flat", [256, 0, 256, 128]),
+    ];
+    let mut ids = DisplayIds::default();
+    let twin_id = ids.assign("twin").unwrap();
+    let flat = ids.assign("flat").unwrap();
+    let ghost = ids.assign("ghost").unwrap();
+    for (display, point) in [
+        (ghost, PointDevice::new(0.0, 0.0)),
+        (twin_id, PointDevice::new(128.0, 0.0)),
+        (twin_id, PointDevice::new(-1.0, 0.0)),
+        (flat, PointDevice::new(0.0, 0.0)),
+    ] {
+        assert!(matches!(
+            absolute_move(&probes, &mut ids, display, point),
+            Err(PlatformError::NotFound)
+        ));
+    }
+}
+
+#[test]
+fn absolute_move_refuses_two_twin_probes_for_one_id() {
+    use crosspane_platform_windows::model::geometry::DisplayIds;
+    use crosspane_types::geom::PointDevice;
+    let probes = [
+        monitor("primary", [0, 0, 128, 128], true),
+        twin("twin", [128, 0, 256, 128]),
+        twin("twin", [256, 0, 384, 128]),
+        twin("other", [384, 0, 512, 128]),
+    ];
+    let mut ids = DisplayIds::default();
+    let twin_id = ids.assign("twin").unwrap();
+    let other_id = ids.assign("other").unwrap();
+    assert!(matches!(
+        absolute_move(&probes, &mut ids, twin_id, PointDevice::new(0.0, 0.0)),
+        Err(PlatformError::NotFound)
+    ));
+    // Another twin path does not share the ambiguity.
+    assert!(absolute_move(&probes, &mut ids, other_id, PointDevice::new(0.0, 0.0)).is_ok());
+    // With one of the two duplicates gone, the same id resolves.
+    assert!(absolute_move(&probes[..2], &mut ids, twin_id, PointDevice::new(0.0, 0.0)).is_ok());
+}
+
 #[test]
 fn fractional_wheel_units_do_not_add_pixels_or_submit_zero_stops() {
     let delta = ScrollDelta {

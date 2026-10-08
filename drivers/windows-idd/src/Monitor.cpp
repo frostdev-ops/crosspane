@@ -354,7 +354,9 @@ bool NativeDevice::create_monitor(EffectToken effect, const CPD_MODE& mode,
                                   bool& arrived, NTSTATUS& status) {
     arrived = false;
     status = STATUS_DEVICE_NOT_READY;
-    const auto descriptor = generate_edid(mode, effect.monitor.id);
+    // Fixed per-slot serial (slot + 1, nonzero), not the monitor id: a slot keeps one EDID identity
+    // across ADD and resize, so Windows persists at most CPD_MAX_MONITORS display identities.
+    const auto descriptor = generate_edid(mode, static_cast<std::uint64_t>(effect.monitor.slot) + 1U);
     if (descriptor.decision != Decision::Accepted || !effect_allowed(effect)) return false;
     auto* state = new (std::nothrow) NativeMonitor(*this, effect.monitor, mode, descriptor);
     if (!state) { status = STATUS_INSUFFICIENT_RESOURCES; return false; }

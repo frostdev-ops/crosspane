@@ -42,6 +42,10 @@ pub mod session;
 pub mod stubs;
 #[cfg(windows)]
 pub mod tray;
+#[cfg(windows)]
+pub mod twin;
+#[cfg(windows)]
+pub mod twin_parking;
 #[cfg(all(windows, feature = "video"))]
 pub mod video;
 #[cfg(windows)]

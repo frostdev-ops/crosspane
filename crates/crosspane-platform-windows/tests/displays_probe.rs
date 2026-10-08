@@ -7,7 +7,7 @@ use crosspane_platform::{
     StreamEndReason, WindowSource,
 };
 use crosspane_platform_windows::hotkey::WindowsHotkeys;
-pub use crosspane_platform_windows::{clock, inject, model};
+pub use crosspane_platform_windows::{clock, inject, model, twin};
 use crosspane_types::hid::HidUsage;
 use std::{
     mem::size_of,

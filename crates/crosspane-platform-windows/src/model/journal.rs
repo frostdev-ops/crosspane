@@ -33,6 +33,13 @@ pub const EDID_BYTES: usize = 128;
 pub const EDID_MARKER: &[u8; 13] = b"CrosspaneTwin";
 const MAX_BYTES: u64 = 1024 * 1024;
 const MAX_ENTRIES: usize = 128;
+/// Ledger capacity. The native client also caps open lanes separately (`cpd::MAX_OPENS`).
+pub const MAX_TWINS: usize = 8;
+/// Mirrors `model/twin.rs` (`MODES`, `MM_MIN`, `MM_MAX`); kept here so this file has no
+/// dependency on the twin model's wording.
+const TWIN_MODES: [(u32, u32); 2] = [(1280, 720), (1920, 1080)];
+const TWIN_MM_MIN: u32 = 10;
+const TWIN_MM_MAX: u32 = 2_000;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// A complete physical RECT [left, top, right, bottom]; DPI is a supplied observation.
@@ -81,11 +88,33 @@ pub enum Phase {
     Moved,
 }
 
+/// Lifecycle of one twin in the ledger. `Adding` has no monitor id yet; `Up` and `Removing` do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TwinPhase {
+    Adding,
+    Up,
+    Removing,
+}
+
+/// One ledger record for a twin lane. `mode` and `size_mm` are the requested geometry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TwinRecord {
+    pub key: u32,
+    pub phase: TwinPhase,
+    pub mode: (u32, u32),
+    pub size_mm: (u32, u32),
+    pub monitor_id: Option<u32>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Document {
     format: String,
     entries: Vec<Entry>,
+    /// Absent when empty, so a document without twins keeps its pre-ledger bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    twins: Vec<TwinRecord>,
 }
 
 /// Edits are staged in memory: save must succeed before a caller performs a native mutation.
@@ -93,6 +122,7 @@ struct Document {
 pub struct JournalFile {
     path: PathBuf,
     entries: BTreeMap<u64, Entry>,
+    twins: BTreeMap<u32, TwinRecord>,
 }
 
 impl JournalFile {
@@ -104,6 +134,7 @@ impl JournalFile {
                 return Ok(Self {
                     path: path.to_owned(),
                     entries: BTreeMap::new(),
+                    twins: BTreeMap::new(),
                 });
             }
             Err(error) => return Err(io_error(error)),
@@ -118,15 +149,25 @@ impl JournalFile {
             return Err(invalid());
         }
         let document: Document = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-        if document.format != FORMAT || document.entries.len() > MAX_ENTRIES {
+        if document.format != FORMAT
+            || document.entries.len() > MAX_ENTRIES
+            || document.twins.len() > MAX_TWINS
+        {
             return Err(invalid());
         }
         let mut journal = Self {
             path: path.to_owned(),
             entries: BTreeMap::new(),
+            twins: BTreeMap::new(),
         };
         for entry in document.entries {
             journal.insert(entry)?;
+        }
+        for record in document.twins {
+            let key = record.key;
+            if !valid_twin(&record) || journal.twins.insert(key, record).is_some() {
+                return Err(invalid());
+            }
         }
         Ok(journal)
     }
@@ -185,6 +226,7 @@ impl JournalFile {
         let bytes = serde_json::to_vec(&Document {
             format: FORMAT.to_owned(),
             entries: self.entries.values().cloned().collect(),
+            twins: self.twins.values().cloned().collect(),
         })
         .map_err(|_| invalid())?;
         if bytes.len() as u64 > MAX_BYTES {
@@ -226,6 +268,81 @@ impl JournalFile {
         }
         Err(invalid())
     }
+}
+
+/// Twin ledger. Like entries, edits are staged in memory and `save` makes them durable.
+impl JournalFile {
+    /// Records in key order.
+    pub fn twins(&self) -> impl Iterator<Item = &TwinRecord> {
+        self.twins.values()
+    }
+
+    pub fn twin(&self, key: u32) -> Option<&TwinRecord> {
+        self.twins.get(&key)
+    }
+
+    /// Stages one record. It must be valid and a permitted transition from the current record
+    /// (see [`twin_transition_allowed`]); a new key also needs spare capacity.
+    pub fn put_twin(&mut self, record: TwinRecord) -> Result<(), PlatformError> {
+        let is_new = !self.twins.contains_key(&record.key);
+        if !twin_transition_allowed(self.twins.get(&record.key), &record)
+            || (is_new && self.twins.len() >= MAX_TWINS)
+        {
+            return Err(invalid());
+        }
+        self.twins.insert(record.key, record);
+        Ok(())
+    }
+
+    /// Stages the removal of a record; the caller saves afterwards.
+    pub fn forget_twin(&mut self, key: u32) -> Option<TwinRecord> {
+        self.twins.remove(&key)
+    }
+
+    pub fn clear_twins(&mut self) {
+        self.twins.clear();
+    }
+}
+
+/// Whether a twin may move from `old` (`None` for a new key) to `new`. Allowed moves are
+/// none → `Adding`, `Adding` → `Up` and `Up` → `Removing` (same mode, millimetres and id),
+/// `Removing` → `Adding` (resize, any mode), and an identical record (idempotent).
+pub fn twin_transition_allowed(old: Option<&TwinRecord>, new: &TwinRecord) -> bool {
+    if !valid_twin(new) {
+        return false;
+    }
+    match old {
+        None => new.phase == TwinPhase::Adding,
+        Some(old) if old == new => true,
+        Some(old) if old.key != new.key => false,
+        Some(old) => match (old.phase, new.phase) {
+            (TwinPhase::Adding, TwinPhase::Up) => {
+                old.mode == new.mode && old.size_mm == new.size_mm
+            }
+            (TwinPhase::Up, TwinPhase::Removing) => {
+                old.mode == new.mode
+                    && old.size_mm == new.size_mm
+                    && old.monitor_id == new.monitor_id
+            }
+            (TwinPhase::Removing, TwinPhase::Adding) => true,
+            _ => false,
+        },
+    }
+}
+
+/// Nonzero key, a known mode, millimetres within bounds, and a monitor id exactly when the
+/// phase has one (`Adding` has none; `Up` and `Removing` have a nonzero one).
+fn valid_twin(record: &TwinRecord) -> bool {
+    let (width_mm, height_mm) = record.size_mm;
+    record.key != 0
+        && TWIN_MODES.contains(&record.mode)
+        && (TWIN_MM_MIN..=TWIN_MM_MAX).contains(&width_mm)
+        && (TWIN_MM_MIN..=TWIN_MM_MAX).contains(&height_mm)
+        && match (record.phase, record.monitor_id) {
+            (TwinPhase::Adding, None) => true,
+            (TwinPhase::Up | TwinPhase::Removing, Some(id)) => id != 0,
+            _ => false,
+        }
 }
 
 fn invalid() -> PlatformError {

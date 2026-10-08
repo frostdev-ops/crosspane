@@ -331,3 +331,39 @@ pub fn may_activate(
         && default_desktop
         && state != WindowState::Hidden
 }
+
+/// How long the source rides out failing monitor reads before it faults. Adding, re-moding or
+/// removing a twin display, or plugging a monitor, fails coherent reads for a moment.
+pub const MONITOR_READ_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the source does after one monitor read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MonitorRead {
+    /// The read succeeded: scan with its probes.
+    Scan,
+    /// Failed within the grace: map no frame, keep every identity, retry at the next scan.
+    Skip,
+    /// Reads have failed for the whole grace: the source faults, as before.
+    Fault,
+}
+
+/// Failing monitor reads. A failed read never closes or forgets a window.
+#[derive(Debug, Default)]
+pub struct MonitorReads {
+    failing_since: Option<MonoTime>,
+}
+
+impl MonitorReads {
+    pub fn record(&mut self, ok: bool, now: MonoTime) -> MonitorRead {
+        if ok {
+            self.failing_since = None;
+            return MonitorRead::Scan;
+        }
+        let since = *self.failing_since.get_or_insert(now);
+        if now.saturating_duration_since(since) >= MONITOR_READ_GRACE {
+            MonitorRead::Fault
+        } else {
+            MonitorRead::Skip
+        }
+    }
+}

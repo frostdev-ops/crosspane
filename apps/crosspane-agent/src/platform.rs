@@ -880,6 +880,8 @@ fn windows_hotkeys_after_host_with(
 #[cfg(windows)]
 pub(crate) struct WindowsRecoveredMirror {
     pub(crate) parking: crosspane_platform_windows::parking::WindowsMirrorParking,
+    /// M2 twin parking (WP-W3.2). `None` in E1 and destination scratch, which skip recovery.
+    pub(crate) twin: Option<crosspane_platform_windows::twin_parking::WindowsTwinParking>,
     pub(crate) startup: StartupRecovery,
     pub(crate) pending: usize,
 }
@@ -887,6 +889,9 @@ pub(crate) struct WindowsRecoveredMirror {
 struct WindowsMirrorStore {
     directory: std::path::PathBuf,
     empty_required: bool,
+    /// The two journal file names. M1 and M2 use the same format under different names.
+    committed: &'static str,
+    pending: &'static str,
 }
 #[cfg(windows)]
 impl WindowsMirrorStore {
@@ -919,10 +924,10 @@ impl crosspane_platform_windows::parking::MirrorJournalStore for WindowsMirrorSt
     fn read(
         &mut self,
     ) -> Result<crosspane_platform_windows::parking::MirrorJournalImages, PlatformError> {
-        use crosspane_platform_windows::model::parking::{COMMITTED_NAME, Journal, PENDING_NAME};
+        use crosspane_platform_windows::model::parking::Journal;
         let images = crosspane_platform_windows::parking::MirrorJournalImages {
-            committed: self.read_image(COMMITTED_NAME)?,
-            pending: self.read_image(PENDING_NAME)?,
+            committed: self.read_image(self.committed)?,
+            pending: self.read_image(self.pending)?,
         };
         // E1/destination scratch is forbidden from inspecting a persisted owner's source HWND.
         // Fully validate the same journal but refuse outstanding entries before native work.
@@ -934,13 +939,13 @@ impl crosspane_platform_windows::parking::MirrorJournalStore for WindowsMirrorSt
         Ok(images)
     }
     fn commit(&mut self, document: &[u8]) -> Result<(), PlatformError> {
-        use crosspane_platform_windows::model::parking::{COMMITTED_NAME, MAX_BYTES, PENDING_NAME};
+        use crosspane_platform_windows::model::parking::MAX_BYTES;
         if document.len() > MAX_BYTES {
             return Err(PlatformError::Backend("mirror journal byte bound".into()));
         }
         // write_private writes/flushed its private same-directory temporary before publishing.
         // A failure in either publish faults the parking stream; no native mutation follows.
-        for name in [PENDING_NAME, COMMITTED_NAME] {
+        for name in [self.pending, self.committed] {
             crate::paths::write_private(&self.directory.join(name), document).map_err(|_| {
                 PlatformError::Backend("mirror journal publication failed; retained".into())
             })?;
@@ -954,6 +959,13 @@ pub(crate) fn recover_windows_mirror_before_host(
     config: &crate::config::Config,
 ) -> anyhow::Result<WindowsRecoveredMirror> {
     use anyhow::Context;
+    use crosspane_platform_windows::{
+        model::{
+            journal::JOURNAL_NAME,
+            parking::{COMMITTED_NAME, PENDING_NAME},
+        },
+        twin_parking::{WINDOW_COMMITTED_NAME, WINDOW_PENDING_NAME, WindowsTwinParking},
+    };
     // Scratch validation precedes even host construction and any native source field queries.
     let e1 = acceptance_e1(state_dir, config)?;
     let destination = acceptance_e2_destination(state_dir, config)?;
@@ -962,12 +974,14 @@ pub(crate) fn recover_windows_mirror_before_host(
     let store = WindowsMirrorStore {
         directory: state_dir.to_owned(),
         empty_required: scratch,
+        committed: COMMITTED_NAME,
+        pending: PENDING_NAME,
     };
     let mut parking =
         crosspane_platform_windows::parking::WindowsMirrorParking::new(Box::new(store))
             .context("Windows mirror journal (required)")?;
-    let (startup, pending) = if e1 || destination {
-        (StartupRecovery::None, 0)
+    let (startup, pending, twin) = if e1 || destination {
+        (StartupRecovery::None, 0, None)
     } else {
         let recovery = parking
             .recover_startup()
@@ -978,17 +992,45 @@ pub(crate) fn recover_windows_mirror_before_host(
             pending = recovery.pending,
             "Windows mirror recovery"
         );
-        (
-            if recovery.pending > 0 {
-                StartupRecovery::Failed
-            } else {
-                StartupRecovery::combine(&[Ok(recovery.restored)])
-            },
-            recovery.pending,
-        )
+        // M2 keeps the window originals in the same format under its own names. Scratch modes
+        // never reach the driver (`twins` is off), but still refuse outstanding entries.
+        let twin_store = WindowsMirrorStore {
+            directory: state_dir.to_owned(),
+            empty_required: scratch,
+            committed: WINDOW_COMMITTED_NAME,
+            pending: WINDOW_PENDING_NAME,
+        };
+        let mut twin =
+            WindowsTwinParking::new(Box::new(twin_store), state_dir.join(JOURNAL_NAME), !scratch)
+                .context("Windows twin parking journal (required)")?;
+        let twin_recovery = twin
+            .recover_startup()
+            .context("Windows pre-host twin recovery (required)")?;
+        tracing::info!(
+            restored = twin_recovery.windows.restored,
+            retired = twin_recovery.windows.retired,
+            pending = twin_recovery.windows.pending,
+            twins_journaled = twin_recovery.twins_journaled,
+            driver_present = twin_recovery.driver_present,
+            "Windows twin recovery"
+        );
+        if let Some(reason) = twin_recovery.unavailable {
+            tracing::warn!(
+                reason,
+                "twin parking unavailable: projected windows stay in place (mirror mode, M1)"
+            );
+        }
+        let pending = recovery.pending + twin_recovery.windows.pending;
+        let startup = if pending > 0 {
+            StartupRecovery::Failed
+        } else {
+            StartupRecovery::combine(&[Ok(recovery.restored), Ok(twin_recovery.windows.restored)])
+        };
+        (startup, pending, Some(twin))
     };
     Ok(WindowsRecoveredMirror {
         parking,
+        twin,
         startup,
         pending,
     })
@@ -1071,6 +1113,7 @@ pub fn create(
         )
     };
     let parking = if let Some(windows) = windows.as_ref() {
+        use crosspane_platform_windows::{drag::WindowsRestorePlacer, model::drag::PlacedRestore};
         recovered
             .parking
             .bind_source(
@@ -1079,7 +1122,35 @@ pub fn create(
                 displays.monitor_reader(),
             )
             .context("Windows mirror source binding (required)")?;
-        Some(Box::new(recovered.parking) as Box<dyn WindowParking>)
+        // DRAG-v0 D-6 placed return decorates the final stack. The decorator needs the concrete
+        // stack, so each arm wraps and then boxes its own; a boxed mirror cannot be wrapped.
+        let placer = WindowsRestorePlacer::new(
+            windows.resolver(),
+            displays.ids(),
+            displays.monitor_reader(),
+        );
+        let report: Box<dyn Fn(&PlatformError) + Send> = Box::new(|error: &PlatformError| {
+            tracing::warn!(%error, "restored window placement refused; restore remains successful");
+        });
+        match recovered.twin.take() {
+            // Scratch modes keep M1 alone.
+            Some(mut twin) if !scratch_only => {
+                twin.bind_source(
+                    windows.resolver(),
+                    displays.ids(),
+                    displays.monitor_reader(),
+                )
+                .context("Windows twin parking source binding (required)")?;
+                let stack =
+                    crate::twin::TwinOrMirror::new(Box::new(twin), Box::new(recovered.parking));
+                let placed = PlacedRestore::new(stack, placer, report);
+                Some(Box::new(placed) as Box<dyn WindowParking>)
+            }
+            _ => {
+                let placed = PlacedRestore::new(recovered.parking, placer, report);
+                Some(Box::new(placed) as Box<dyn WindowParking>)
+            }
+        }
     } else {
         None
     };
@@ -2279,6 +2350,8 @@ mod windows_mirror_store_tests {
         let mut store = WindowsMirrorStore {
             directory: directory.0.clone(),
             empty_required: false,
+            committed: COMMITTED_NAME,
+            pending: PENDING_NAME,
         };
         let bytes = Journal::empty().bytes().unwrap();
         store.commit(&bytes).unwrap();
@@ -2299,6 +2372,8 @@ mod windows_mirror_store_tests {
         let mut store = WindowsMirrorStore {
             directory: directory.0.clone(),
             empty_required: true,
+            committed: COMMITTED_NAME,
+            pending: PENDING_NAME,
         };
         let empty = Journal::empty().bytes().unwrap();
         store.commit(&empty).unwrap();

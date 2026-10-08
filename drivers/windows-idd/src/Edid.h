@@ -14,7 +14,9 @@ struct EdidResult {
     std::array<std::uint8_t, 128> bytes{};
     SignalTiming timing{};
 };
-// Serial must be the already-reserved monotonic monitor ID; no wrapping/truncation.
+// Serial is the slot's fixed identity, slot + 1, not the monitor ID: a slot keeps one EDID
+// across REMOVE and ADD (NativeDevice::create_monitor in Monitor.cpp). Must be nonzero; no
+// wrapping/truncation.
 EdidResult generate_edid(const CPD_MODE& mode, std::uint64_t serial) noexcept;
 bool canonical_edid(const std::array<std::uint8_t, 128>& bytes,
                     const CPD_MODE& mode, std::uint64_t serial) noexcept;

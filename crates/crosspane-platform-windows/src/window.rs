@@ -1222,43 +1222,62 @@ fn run(
     let mut initialized = false;
     let mut ready = Some(ready);
     let mut probes = Vec::new();
+    let mut reads = window::MonitorReads::default();
     while state.alive.load(Ordering::Acquire) && !state.fault.load(Ordering::Acquire) {
         let step = (|| -> Result<(), PlatformError> {
             pump();
             if last_scan.elapsed() >= Duration::from_millis(250) {
-                probes = reader()?;
-                let mut enumeration = Enumeration {
-                    observer: native.window,
-                    context: &context,
-                    windows: Vec::new(),
-                };
-                // SAFETY: synchronous callback borrows this stack-local enumeration only.
-                if unsafe {
-                    EnumWindows(
-                        Some(enumerate),
-                        (&mut enumeration as *mut Enumeration<'_>) as LPARAM,
-                    )
-                } == 0
-                {
-                    return Err(backend("window enumeration"));
-                }
-                for id in enumeration.windows {
-                    observe(id, &context, &native, &probes, &ids, &sink)?;
-                }
-                // Also retain/check already admitted hidden HWNDs omitted by EnumWindows.
-                let table = state
-                    .windows
-                    .lock()
-                    .map_err(|_| backend("window observer state"))?;
-                let known: Vec<_> = table
-                    .list()
-                    .iter()
-                    .filter_map(|w| table.identity(w.id))
-                    .map(|i| i.hwnd)
-                    .collect();
-                drop(table);
-                for id in known {
-                    observe(id, &context, &native, &probes, &ids, &sink)?;
+                let read = reader();
+                let at = MonoTime::from_nanos(
+                    context.start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                );
+                match (reads.record(read.is_ok(), at), read) {
+                    (window::MonitorRead::Scan, Ok(fresh)) => {
+                        probes = fresh;
+                        let mut enumeration = Enumeration {
+                            observer: native.window,
+                            context: &context,
+                            windows: Vec::new(),
+                        };
+                        // SAFETY: synchronous callback borrows this stack-local enumeration only.
+                        if unsafe {
+                            EnumWindows(
+                                Some(enumerate),
+                                (&mut enumeration as *mut Enumeration<'_>) as LPARAM,
+                            )
+                        } == 0
+                        {
+                            return Err(backend("window enumeration"));
+                        }
+                        for id in enumeration.windows {
+                            observe(id, &context, &native, &probes, &ids, &sink)?;
+                        }
+                        // Also retain/check already admitted hidden HWNDs omitted by EnumWindows.
+                        let table = state
+                            .windows
+                            .lock()
+                            .map_err(|_| backend("window observer state"))?;
+                        let known: Vec<_> = table
+                            .list()
+                            .iter()
+                            .filter_map(|w| table.identity(w.id))
+                            .map(|i| i.hwnd)
+                            .collect();
+                        drop(table);
+                        for id in known {
+                            observe(id, &context, &native, &probes, &ids, &sink)?;
+                        }
+                    }
+                    // The first read still fails closed (startup unchanged). A lasting
+                    // outage faults.
+                    (outcome, Err(error))
+                        if !initialized || outcome == window::MonitorRead::Fault =>
+                    {
+                        return Err(error);
+                    }
+                    // A topology change failed one coherent read. No frame is mapped until a
+                    // read succeeds; every admitted identity stays resolvable.
+                    _ => probes.clear(),
                 }
                 last_scan = Instant::now();
             }

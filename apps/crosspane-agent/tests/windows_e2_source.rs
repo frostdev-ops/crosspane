@@ -396,7 +396,6 @@ mod proxy_controller {
     use std::{
         cell::RefCell,
         collections::VecDeque,
-        ffi::c_void,
         fs::{File, OpenOptions},
         io::{Read, Write},
         mem::size_of,
@@ -509,8 +508,8 @@ mod proxy_controller {
         let mut exited = FILETIME::default();
         let mut kernel = FILETIME::default();
         let mut user = FILETIME::default();
-        // SAFETY: retained live process handle and exact initialized writable FILETIME outputs.
         ensure!(
+            // SAFETY: retained live process handle and exact initialized writable FILETIME outputs.
             unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) }
                 != 0,
             "W24C_CREATION"
@@ -519,8 +518,8 @@ mod proxy_controller {
     }
     fn limited(process: HANDLE) -> Result<()> {
         let mut raw = ptr::null_mut();
-        // SAFETY: query-only access on the original retained process or current pseudo-handle.
         ensure!(
+            // SAFETY: query-only access on the original retained process or current pseudo-handle.
             unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut raw) } != 0,
             "W24C_TOKEN"
         );
@@ -528,8 +527,8 @@ mod proxy_controller {
         for class in [TokenElevation, TokenUIAccess] {
             let mut value = 1u32;
             let mut returned = 0;
-            // SAFETY: both fixed information classes have exactly one DWORD writable layout.
             ensure!(
+                // SAFETY: both fixed information classes have exactly one DWORD writable layout.
                 unsafe {
                     GetTokenInformation(
                         token.0,
@@ -574,8 +573,8 @@ mod proxy_controller {
             .open(path)
             .map_err(|_| anyhow::anyhow!("W24C_IMAGE"))?;
         let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
-        // SAFETY: retained actual file handle and correctly sized initialized attribute output.
         ensure!(
+            // SAFETY: retained actual file handle and correctly sized initialized attribute output.
             unsafe {
                 GetFileInformationByHandleEx(
                     file.as_raw_handle().cast(),
@@ -595,8 +594,8 @@ mod proxy_controller {
             "W24C_IMAGE_SIZE"
         );
         let mut algorithm = ptr::null_mut();
-        // SAFETY: fixed documented SHA256 provider, initialized writable handle output, no secrets.
         ensure!(
+            // SAFETY: fixed documented SHA256 provider, initialized writable handle output, no secrets.
             unsafe {
                 BCryptOpenAlgorithmProvider(&mut algorithm, BCRYPT_SHA256_ALGORITHM, ptr::null(), 0)
             } >= 0,
@@ -605,8 +604,8 @@ mod proxy_controller {
         let algorithm = Algorithm(algorithm);
         let mut size = 0u32;
         let mut returned = 0u32;
-        // SAFETY: provider is live; exact DWORD object-length property storage.
         ensure!(
+            // SAFETY: provider is live; exact DWORD object-length property storage.
             unsafe {
                 BCryptGetProperty(
                     algorithm.0,
@@ -624,8 +623,8 @@ mod proxy_controller {
         );
         let mut object = vec![0u8; size as usize];
         let mut raw = ptr::null_mut();
-        // SAFETY: object storage stays fixed and alive through Hash destruction; unkeyed hash only.
         ensure!(
+            // SAFETY: object storage stays fixed and alive through Hash destruction; unkeyed hash only.
             unsafe {
                 BCryptCreateHash(
                     algorithm.0,
@@ -652,15 +651,15 @@ mod proxy_controller {
             }
             total += count as u64;
             ensure!(total <= bytes, "W24C_IMAGE_SIZE");
-            // SAFETY: bounded live image buffer, exact input length, live unkeyed hash object.
             ensure!(
+                // SAFETY: bounded live image buffer, exact input length, live unkeyed hash object.
                 unsafe { BCryptHashData(hash.0, chunk.as_ptr(), count as u32, 0) } >= 0,
                 "W24C_SHA"
             );
         }
         let mut digest = [0u8; 32];
-        // SAFETY: SHA256 requires exactly the initialized 32-byte writable output.
         ensure!(
+            // SAFETY: SHA256 requires exactly the initialized 32-byte writable output.
             unsafe { BCryptFinishHash(hash.0, digest.as_mut_ptr(), 32, 0) } >= 0,
             "W24C_SHA"
         );
@@ -676,16 +675,16 @@ mod proxy_controller {
             lpSecurityDescriptor: ptr::null_mut(),
             bInheritHandle: 1,
         };
-        // SAFETY: exact initialized security struct, writable outputs, private anonymous pipe only.
         ensure!(
+            // SAFETY: exact initialized security struct, writable outputs, private anonymous pipe only.
             unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } != 0,
             "W24C_PIPE"
         );
         Ok((Kernel(read), Kernel(write)))
     }
     fn no_inherit(handle: &Kernel) -> Result<()> {
-        // SAFETY: exact owned parent endpoint; changes only its inherit flag, not ACL/security policy.
         ensure!(
+            // SAFETY: exact owned parent endpoint; changes only its inherit flag, not ACL/security policy.
             unsafe { SetHandleInformation(handle.0, HANDLE_FLAG_INHERIT, 0) } != 0,
             "W24C_PIPE"
         );
@@ -796,8 +795,8 @@ mod proxy_controller {
     impl Watchdog {
         fn start(job: &Kernel) -> Result<Self> {
             let mut duplicated = ptr::null_mut();
-            // SAFETY: original live job, borrowed current-process pseudo-handles, separate owned duplicate.
             ensure!(
+                // SAFETY: original live job, borrowed current-process pseudo-handles, separate owned duplicate.
                 unsafe {
                     DuplicateHandle(
                         GetCurrentProcess(),
@@ -1093,7 +1092,7 @@ mod proxy_controller {
             "W24C_ROOT"
         );
         ensure!(
-            PathBuf::from(std::env::var_os("APPDATA").ok_or_else(|| anyhow::anyhow!("W24C_ROOT"))?)
+            std::env::var_os("APPDATA").ok_or_else(|| anyhow::anyhow!("W24C_ROOT"))?
                 == root.join("roaming"),
             "W24C_ROOT"
         );
@@ -1105,8 +1104,8 @@ mod proxy_controller {
     }
     fn accounting(job: &Kernel) -> Result<u32> {
         let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-        // SAFETY: original private job handle and exact initialized writable accounting structure.
         ensure!(
+            // SAFETY: original private job handle and exact initialized writable accounting structure.
             unsafe {
                 QueryInformationJobObject(
                     job.0,
@@ -1210,8 +1209,8 @@ mod proxy_controller {
         limits.BasicLimitInformation.LimitFlags =
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
         limits.BasicLimitInformation.ActiveProcessLimit = 1;
-        // SAFETY: original private job and exact generated initialized extended-limit struct.
         ensure!(
+            // SAFETY: original private job and exact generated initialized extended-limit struct.
             unsafe {
                 SetInformationJobObject(
                     job.handle.0,
@@ -1239,8 +1238,8 @@ mod proxy_controller {
             words: vec![0u128; length.div_ceil(size_of::<u128>())],
             live: false,
         };
-        // SAFETY: aligned initialized allocation holds requested byte count; exact one attribute.
         ensure!(
+            // SAFETY: aligned initialized allocation holds requested byte count; exact one attribute.
             unsafe {
                 InitializeProcThreadAttributeList(
                     attributes.words.as_mut_ptr().cast(),
@@ -1252,8 +1251,8 @@ mod proxy_controller {
             "W24C_ATTRIBUTES"
         );
         attributes.live = true;
-        // SAFETY: exact three inheritable anonymous CHILD endpoints live through CreateProcess; excludes all parent/job handles.
         ensure!(
+            // SAFETY: exact three inheritable anonymous CHILD endpoints live through CreateProcess; excludes all parent/job handles.
             unsafe {
                 UpdateProcThreadAttribute(
                     attributes.words.as_mut_ptr().cast(),
@@ -1283,9 +1282,9 @@ mod proxy_controller {
         let environment = environment(&root)?;
         let mut process = PROCESS_INFORMATION::default();
         ensure!(Instant::now() < until, "W24C_DEADLINE");
-        // SAFETY: fixed image/argv/environment/CWD, fully initialized STARTUPINFOEX cb/layout;
-        // no parent borrowed pointer survives this synchronous call; child starts SUSPENDED.
         ensure!(
+            // SAFETY: fixed image/argv/environment/CWD, fully initialized STARTUPINFOEX cb/layout;
+            // no parent borrowed pointer survives this synchronous call; child starts SUSPENDED.
             unsafe {
                 CreateProcessW(
                     application.as_ptr(),
@@ -1307,15 +1306,15 @@ mod proxy_controller {
             assigned: false,
         };
         let main_thread = Kernel(process.hThread);
-        // SAFETY: original returned handles exclusively owned here; assign before resume/windows.
         ensure!(
+            // SAFETY: original returned handles exclusively owned here; assign before resume/windows.
             unsafe { AssignProcessToJobObject(job.handle.0, original.handle.0) } != 0,
             "W24C_ASSIGN"
         );
         original.assigned = true;
         let mut watchdog = Watchdog::start(&job.handle)?;
-        // SAFETY: exact original handle IDs/liveness, no OpenProcess or PID-based acquisition.
         ensure!(
+            // SAFETY: exact original handle IDs/liveness, no OpenProcess or PID-based acquisition.
             unsafe { GetProcessId(original.handle.0) } == process.dwProcessId
                 // SAFETY: retained original primary-thread handle returned by this CreateProcess.
                 && unsafe { GetThreadId(main_thread.0) } == process.dwThreadId
@@ -1331,8 +1330,8 @@ mod proxy_controller {
         limited(original.handle.0)?;
         let mut actual = [0u16; 1024];
         let mut units = 1024;
-        // SAFETY: original query-capable process handle and initialized bounded image-path output.
         ensure!(
+            // SAFETY: original query-capable process handle and initialized bounded image-path output.
             unsafe {
                 QueryFullProcessImageNameW(original.handle.0, 0, actual.as_mut_ptr(), &mut units)
             } != 0
@@ -1388,8 +1387,8 @@ mod proxy_controller {
             std::thread::sleep(Duration::from_millis(10));
         }
         let mut exit = u32::MAX;
-        // SAFETY: signalled original process handle remains open, writable DWORD exit output.
         ensure!(
+            // SAFETY: signalled original process handle remains open, writable DWORD exit output.
             unsafe { GetExitCodeProcess(original.handle.0, &mut exit) } != 0,
             "W24C_EXIT"
         );

@@ -114,9 +114,9 @@ fn fixture_check_dpi(counter: &std::sync::atomic::AtomicUsize) -> Result<(), Pla
     Ok(())
 }
 /// PMv2 is scoped even before winit establishes process DPI behavior.
-struct DpiScope(DPI_AWARENESS_CONTEXT);
+pub(crate) struct DpiScope(pub(crate) DPI_AWARENESS_CONTEXT);
 impl DpiScope {
-    fn new() -> Result<Self, PlatformError> {
+    pub(crate) fn new() -> Result<Self, PlatformError> {
         #[cfg(test)]
         if FAIL_NEXT_DPI.swap(false, Ordering::AcqRel) {
             return Err(backend("owned injected context failure; journal retained"));
@@ -335,23 +335,23 @@ impl Pinned {
                 == self.identity.process_created)
     }
 }
-struct Binding {
-    resolver: WindowResolver,
-    ids: Arc<Mutex<DisplayIds>>,
-    monitors: MonitorReader,
+pub(crate) struct Binding {
+    pub(crate) resolver: WindowResolver,
+    pub(crate) ids: Arc<Mutex<DisplayIds>>,
+    pub(crate) monitors: MonitorReader,
 }
-struct Shared {
-    alive: AtomicBool,
-    fault: AtomicBool,
+pub(crate) struct Shared {
+    pub(crate) alive: AtomicBool,
+    pub(crate) fault: AtomicBool,
 }
-struct Deadline {
-    until: Instant,
-    abandoned: Arc<AtomicBool>,
+pub(crate) struct Deadline {
+    pub(crate) until: Instant,
+    pub(crate) abandoned: Arc<AtomicBool>,
 }
-struct Port {
-    binding: Option<Binding>,
-    shared: Arc<Shared>,
-    deadline: Option<Deadline>,
+pub(crate) struct Port {
+    pub(crate) binding: Option<Binding>,
+    pub(crate) shared: Arc<Shared>,
+    pub(crate) deadline: Option<Deadline>,
 }
 impl Port {
     fn verify_resolver(
@@ -444,7 +444,7 @@ impl Port {
                 .as_ref()
                 .ok_or(PlatformError::Unsupported("unbound Windows mirror parking"))?;
             let probes = (binding.monitors)()?;
-            let (geometry, path) = parking::actual_geometry(
+            let (geometry, path) = parking::observed_geometry(
                 id,
                 rect(visible),
                 &text(&monitor.szDevice),
@@ -497,17 +497,17 @@ impl Port {
         }
         Ok((pinned, before))
     }
-    fn move_checked(
+    /// One fenced `SetWindowPos` to the physical `outer` rectangle, then its read-back.
+    fn move_once(
         &mut self,
+        pinned: &Pinned,
         identity: NativeIdentity,
         outer: [i32; 4],
-        show: Show,
+        size: PixelSize,
         id: Option<WindowId>,
     ) -> Result<Observed, PlatformError> {
-        let (pinned, before) = self.preflight(identity, show, id)?;
-        let size = parking::rect_size(outer)?;
         // Queries can reenter native code. The fresh resolver, token and cancellation fences are
-        // repeated immediately before the synchronous call. There is no ASYNCWINDOWPOS fallback.
+        // repeated immediately before every synchronous call. There is no ASYNCWINDOWPOS fallback.
         self.verify_resolver(identity, id)?;
         if !pinned.matches()? {
             return Err(PlatformError::NotFound);
@@ -538,7 +538,31 @@ impl Port {
             return Err(backend("mirror window resize refused; journal retained"));
         }
         self.check()?;
-        let actual = self.read(&pinned, id)?;
+        self.read(pinned, id)
+    }
+    fn move_checked(
+        &mut self,
+        identity: NativeIdentity,
+        outer: [i32; 4],
+        show: Show,
+        id: Option<WindowId>,
+    ) -> Result<Observed, PlatformError> {
+        // One call plus at most two re-asserts. Apps that handle WM_DPICHANGED can rescale to their
+        // suggested rect after a single move; re-asserting the same target restores the requested
+        // rect once that rescale has settled. Each attempt repeats every fence and checks the
+        // deadline first. The final read-back is returned unchanged for the caller's proof.
+        const ATTEMPTS: usize = 3;
+        let (pinned, before) = self.preflight(identity, show, id)?;
+        let size = parking::rect_size(outer)?;
+        let mut actual = self.move_once(&pinned, identity, outer, size, id)?;
+        for _ in 1..ATTEMPTS {
+            // Stop on a matching read-back, on a lost eligibility, or on a changed show state.
+            if actual.outer == outer || !actual.eligible || actual.show != show {
+                break;
+            }
+            self.check()?;
+            actual = self.move_once(&pinned, identity, outer, size, id)?;
+        }
         if !actual.eligible {
             return Err(PlatformError::Locked);
         }

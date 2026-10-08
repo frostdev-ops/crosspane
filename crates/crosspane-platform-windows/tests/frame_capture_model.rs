@@ -383,3 +383,99 @@ fn monitor_mapping_failure_and_gate_epoch_loss_have_distinct_end_reasons() {
     );
     assert_eq!(end_reason(true, true, TargetState::Live), None);
 }
+
+fn twin_monitor(path: &str, handle: usize, bounds: [i32; 4]) -> NativeMonitor {
+    let mut native = monitor(path, handle, bounds, false);
+    native.probe.twin = true;
+    native
+}
+fn twin_snapshot(ids: &mut DisplayIds, twin: [i32; 4]) -> MonitorSnapshot {
+    commit(
+        vec![
+            monitor("left", 11, [-100, -20, 0, 80], true),
+            monitor("right", 22, [0, -20, 200, 80], false),
+            twin_monitor("twin", 33, twin),
+        ],
+        ids,
+    )
+    .unwrap()
+}
+fn twin_id(snapshot: &MonitorSnapshot, path: &str) -> DisplayId {
+    snapshot.ids.clone().assign(path).unwrap()
+}
+
+#[test]
+fn twin_id_resolves_to_its_rc_monitor_and_refresh_still_works() {
+    let mut ids = DisplayIds::default();
+    let first = twin_snapshot(&mut ids, [400, 0, 1680, 720]);
+    let id = twin_id(&first, "twin");
+    assert!(first.displays.iter().all(|d| d.id != id));
+    assert_eq!(first.monitors[&id], 33);
+    let target = resolve_monitor(&first, id).unwrap();
+    assert_eq!(target.handle, 33);
+    assert_eq!(target.device_path, "twin");
+    assert_eq!(target.bounds, rect(400, 0, 1280, 720));
+    let right = display(&first, "source-right");
+    assert_eq!(
+        resolve_monitor(&first, right).unwrap().bounds,
+        rect(0, -20, 200, 100)
+    );
+    let grown = twin_snapshot(&mut ids, [400, 0, 2320, 1080]);
+    assert_eq!(twin_id(&grown, "twin"), id);
+    let refreshed = refresh_monitor(&grown, &target).unwrap();
+    assert!(target.same_binding(&refreshed));
+    assert_eq!(refreshed.bounds, rect(400, 0, 1920, 1080));
+    let removed = commit(
+        vec![
+            monitor("left", 11, [-100, -20, 0, 80], true),
+            monitor("right", 22, [0, -20, 200, 80], false),
+        ],
+        &mut ids,
+    )
+    .unwrap();
+    assert!(matches!(
+        refresh_monitor(&removed, &target),
+        Err(PlatformError::NotFound)
+    ));
+}
+
+#[test]
+fn each_twin_resolves_only_through_the_probe_assigned_to_its_id() {
+    let snapshot = commit(
+        vec![
+            monitor("left", 11, [-100, -20, 0, 80], true),
+            twin_monitor("twin", 33, [400, 0, 1680, 720]),
+            twin_monitor("twin-b", 44, [1800, 0, 3080, 720]),
+        ],
+        &mut DisplayIds::default(),
+    )
+    .unwrap();
+    let first = twin_id(&snapshot, "twin");
+    let second = twin_id(&snapshot, "twin-b");
+    assert_ne!(first, second);
+    assert_eq!(
+        resolve_monitor(&snapshot, first).unwrap().bounds,
+        rect(400, 0, 1280, 720)
+    );
+    let other = resolve_monitor(&snapshot, second).unwrap();
+    assert_eq!(other.handle, 44);
+    assert_eq!(other.bounds, rect(1800, 0, 1280, 720));
+}
+
+#[test]
+fn ambiguous_or_missing_twin_probe_is_refused_not_guessed() {
+    let mut ids = DisplayIds::default();
+    let snapshot = twin_snapshot(&mut ids, [400, 0, 1680, 720]);
+    let id = twin_id(&snapshot, "twin");
+    let mut duplicate = snapshot.clone();
+    let twin = duplicate.probes.iter().find(|p| p.twin).unwrap().clone();
+    duplicate.probes.push(twin);
+    let error = resolve_monitor(&duplicate, id).unwrap_err();
+    assert_eq!(failure_reason(true, true, &error), StreamEndReason::Failed);
+    let mut missing = snapshot.clone();
+    missing.probes.retain(|p| !p.twin);
+    assert!(matches!(
+        resolve_monitor(&missing, id),
+        Err(PlatformError::Backend(_))
+    ));
+}

@@ -587,6 +587,8 @@ pub fn scroll_packets(delta: ScrollDelta) -> Vec<Packet> {
     packets
 }
 
+/// A display with a published `DisplayInfo` maps through its logical geometry. A twin resolves
+/// only when exactly one twin probe assigns to `display`; its point is taken as its own pixels.
 pub fn absolute_move(
     probes: &[MonitorProbe],
     ids: &mut DisplayIds,
@@ -597,24 +599,47 @@ pub fn absolute_move(
         return Err(PlatformError::NotFound);
     }
     let layout = displays(probes, ids).map_err(|_| PlatformError::NotFound)?;
-    let info = layout
-        .displays
-        .iter()
-        .find(|d| d.id == display)
-        .ok_or(PlatformError::NotFound)?;
-    let probe = probes
-        .iter()
-        .find(|p| !p.twin && ids.assign(&p.device_path).ok() == Some(display))
-        .ok_or(PlatformError::NotFound)?;
-    let device = info
-        .geometry
-        .logical_to_device(info.geometry.device_to_logical(point));
-    let size = info.geometry.pixel_size;
-    if device.x < 0.0
-        || device.y < 0.0
-        || device.x >= f64::from(size.width)
-        || device.y >= f64::from(size.height)
-    {
+    let (device, (width, height), probe) = match layout.displays.iter().find(|d| d.id == display) {
+        Some(info) => {
+            let probe = probes
+                .iter()
+                .find(|p| !p.twin && ids.assign(&p.device_path).ok() == Some(display))
+                .ok_or(PlatformError::NotFound)?;
+            let device = info
+                .geometry
+                .logical_to_device(info.geometry.device_to_logical(point));
+            let size = info.geometry.pixel_size;
+            (
+                device,
+                (f64::from(size.width), f64::from(size.height)),
+                probe,
+            )
+        }
+        None => {
+            // A twin has no published DisplayInfo, so it has no scale or origin. The lookup runs
+            // on a clone, so a refused or ambiguous lookup never changes the allocator.
+            let mut scratch = ids.clone();
+            let mut matching = probes.iter().filter(|p| {
+                p.twin
+                    && !p.device_path.is_empty()
+                    && scratch.assign(&p.device_path).ok() == Some(display)
+            });
+            let probe = matching.next().ok_or(PlatformError::NotFound)?;
+            if matching.next().is_some() {
+                return Err(PlatformError::NotFound);
+            }
+            let rc = probe.rc_monitor;
+            if rc[2] <= rc[0] || rc[3] <= rc[1] {
+                return Err(PlatformError::NotFound);
+            }
+            let size = (
+                f64::from(rc[2]) - f64::from(rc[0]),
+                f64::from(rc[3]) - f64::from(rc[1]),
+            );
+            (point, size, probe)
+        }
+    };
+    if device.x < 0.0 || device.y < 0.0 || device.x >= width || device.y >= height {
         return Err(PlatformError::NotFound);
     }
     let left = probes

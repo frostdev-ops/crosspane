@@ -3,7 +3,7 @@
 
 use super::{
     geometry::{self, DisplayIds, MonitorProbe},
-    journal::{Original, Show},
+    journal::{Original, Show, parked_geometry},
 };
 use crosspane_platform::{Parked, ParkingKind, PlatformError};
 use crosspane_types::{
@@ -269,6 +269,32 @@ pub fn actual_geometry(
         probe.device_path.clone(),
     ))
 }
+/// M2 geometry: exactly one twin probe with the same GDI name and rect maps the visible frame to
+/// the twin's local pixels. Without one, the physical monitor path applies. Twins are never
+/// published, so the twin display is assigned from its path only.
+pub fn observed_geometry(
+    window: WindowId,
+    visible: [i32; 4],
+    name: &str,
+    monitor_rect: [i32; 4],
+    probes: &[MonitorProbe],
+    ids: &mut DisplayIds,
+    fullscreen: bool,
+) -> Result<(Parked, String), PlatformError> {
+    let mut matching = probes
+        .iter()
+        .filter(|p| p.twin && p.name == name && p.rc_monitor == monitor_rect);
+    let Some(probe) = matching.next() else {
+        return actual_geometry(window, visible, name, monitor_rect, probes, ids, fullscreen);
+    };
+    if matching.next().is_some() {
+        return Err(invalid());
+    }
+    let display = ids.assign(&probe.device_path).map_err(|_| invalid())?;
+    let mut parked = parked_geometry(window, visible, probe.rc_monitor, display)?;
+    parked.fullscreen = fullscreen;
+    Ok((parked, probe.device_path.clone()))
+}
 pub fn resized_outer(observed: &Observed, size: PixelSize) -> Result<[i32; 4], PlatformError> {
     validate_size_scale(size, 1.0)?;
     let old_visible = rect_size(observed.visible)?;
@@ -415,6 +441,15 @@ impl<P: NativePort> Controller<P> {
             .inspect(identity, id)?
             .ok_or(PlatformError::NotFound)
     }
+    /// Read-only identity-checked observation before any park. Writes nothing and never mutates.
+    pub fn inspect(&mut self, id: WindowId) -> Result<Observed, PlatformError> {
+        self.check(true)?;
+        let identity = self.port.resolve(id)?;
+        if self.pending.contains(&identity) {
+            return Err(PlatformError::Unsupported(PENDING_REPARK_REASON));
+        }
+        self.observed(identity, Some(id))
+    }
     pub fn park(
         &mut self,
         id: WindowId,
@@ -530,6 +565,37 @@ impl<P: NativePort> Controller<P> {
             return Err(PlatformError::Locked);
         }
         result.geometry.ok_or(PlatformError::NotFound) // Actual app constraints, never requested dimensions.
+    }
+    /// Moves a parked window to the exact physical `outer` rect. The journal records
+    /// `may_have_mutated` durably before the native move; a publication failure makes no call.
+    pub fn relocate(&mut self, id: WindowId, outer: [i32; 4]) -> Result<Parked, PlatformError> {
+        self.check(true)?;
+        rect_size(outer)?;
+        let entry = self.entry(id)?;
+        let actual = self.observed(entry.identity, Some(id))?;
+        if !actual.eligible {
+            return Err(PlatformError::Locked);
+        }
+        if actual.show == Show::Maximized || actual.fullscreen {
+            return Err(PlatformError::Unsupported(
+                "Windows mirror maximized/fullscreen relocate",
+            ));
+        }
+        self.publish(self.journal.mark_mutation(entry.identity)?)?;
+        // The fresh resolver is checked after durable publication and immediately before native work.
+        if self.port.resolve(id)? != entry.identity {
+            return Err(PlatformError::NotFound);
+        }
+        self.port.check()?;
+        let result = self.port.resize(entry.identity, outer, id)?;
+        self.port.check()?;
+        if self.port.resolve(id)? != entry.identity {
+            return Err(PlatformError::NotFound);
+        }
+        if !result.eligible {
+            return Err(PlatformError::Locked);
+        }
+        result.geometry.ok_or(PlatformError::NotFound)
     }
     pub fn set_fullscreen(&mut self, id: WindowId, requested: bool) -> Result<(), PlatformError> {
         if self.geometry(id)?.fullscreen == requested {

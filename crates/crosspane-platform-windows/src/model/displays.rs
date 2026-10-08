@@ -88,6 +88,8 @@ pub struct TargetPath {
     pub refresh_numerator: u32,
     pub refresh_denominator: u32,
     pub quarter_turns: u8,
+    /// Crosspane's own twin display: hidden from `displays`, still capturable by its id.
+    pub twin: bool,
 }
 
 pub fn join_paths(
@@ -115,6 +117,7 @@ pub fn join_paths(
         // Frozen consumers match GetMonitorInfoW.szDevice, not the CCD friendly name.
         monitor.probe.refresh_millihz = refresh;
         monitor.probe.quarter_turns = path.quarter_turns;
+        monitor.probe.twin = path.twin;
     }
     Ok(monitors)
 }

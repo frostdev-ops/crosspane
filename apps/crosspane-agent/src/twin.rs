@@ -2,7 +2,8 @@
 //! reported fallback) when it can't (`Unsupported`): on the Mac the opt-in private-API virtual
 //! display (D7, `mac_virtual_display`) may be missing; on Hyprland a headless output may fail to
 //! allocate (a nested Hyprland always does). Each window stays with the backend that parked it
-//! until it is restored.
+//! until it is restored. On Windows the twin is the IddCx display (WP-W3.2); a window waiting for a
+//! monitor that is gone (`PENDING_REPARK_REASON`) is refused without falling back to mirroring.
 
 use std::collections::BTreeSet;
 
@@ -49,6 +50,14 @@ impl WindowParking for TwinOrMirror {
             return self.mirror.park(window, size, scale);
         }
         match self.twin.park(window, size, scale) {
+            // A window waiting for a monitor that is gone stays pending. Mirroring it would not
+            // return it, so the refusal stands.
+            #[cfg(windows)]
+            Err(PlatformError::Unsupported(why))
+                if why == crosspane_platform_windows::model::parking::PENDING_REPARK_REASON =>
+            {
+                Err(PlatformError::Unsupported(why))
+            }
             Err(PlatformError::Unsupported(why)) => {
                 tracing::warn!(why, "no twin display: this window is mirrored instead (M1)");
                 let parked = self.mirror.park(window, size, scale)?;
@@ -327,5 +336,59 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// A twin that refuses every park for a window whose monitor is gone.
+    #[cfg(windows)]
+    struct Pending;
+
+    #[cfg(windows)]
+    impl WindowParking for Pending {
+        fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+            Err(PlatformError::Unsupported("fullscreen is not implemented"))
+        }
+
+        fn park(&mut self, _: WindowId, _: PixelSize, _: f64) -> Result<Parked, PlatformError> {
+            Err(PlatformError::Unsupported(
+                crosspane_platform_windows::model::parking::PENDING_REPARK_REASON,
+            ))
+        }
+
+        fn resize(&mut self, _: WindowId, _: PixelSize, _: f64) -> Result<Parked, PlatformError> {
+            Err(PlatformError::NotFound)
+        }
+
+        fn geometry(&self, _: WindowId) -> Result<Parked, PlatformError> {
+            Err(PlatformError::NotFound)
+        }
+
+        fn restore(&mut self, _: WindowId) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_pending_window_is_refused_and_never_mirrored() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mirror = Fake {
+            name: "mirror",
+            unsupported: false,
+            restore_fails: false,
+            calls: calls.clone(),
+        };
+        let mut p = TwinOrMirror::new(Box::new(Pending), Box::new(mirror));
+        let refused = p.park(WindowId(9), PixelSize::new(800, 600), 1.0);
+        assert!(matches!(
+            refused,
+            Err(PlatformError::Unsupported(reason))
+                if reason == crosspane_platform_windows::model::parking::PENDING_REPARK_REASON
+        ));
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(!p.mirrored.contains(&WindowId(9)));
     }
 }

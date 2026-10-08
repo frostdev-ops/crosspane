@@ -698,8 +698,30 @@ unsafe extern "system" fn enum_monitor(
         1
     }
 }
+/// The last own adapter interface `paths()` saw. A transient CM failure reuses it, so live twins
+/// are not published as real displays for one snapshot.
+static OWN_ADAPTER: Mutex<Option<String>> = Mutex::new(None);
+
+/// This snapshot's own adapter interface: the live value when it is readable, else the last one.
+fn own_adapter_or_last() -> Option<String> {
+    let live = crate::twin::own_adapter_interface();
+    let mut last = OWN_ADAPTER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match live {
+        Some(live) => {
+            *last = Some(live.clone());
+            Some(live)
+        }
+        None => last.clone(),
+    }
+}
+
 fn paths() -> Result<Vec<TargetPath>, PlatformError> {
-    for _ in 0..3 {
+    // Our own adapter's interface path is the only identity that marks a twin. Without a live or
+    // remembered driver interface no adapter is queried, and every path stays visible.
+    let own_adapter = own_adapter_or_last();
+    'attempt: for _ in 0..3 {
         let (mut path_count, mut mode_count) = (0, 0);
         // SAFETY: initialized count outputs, active paths only, no system mutation.
         if unsafe {
@@ -735,6 +757,8 @@ fn paths() -> Result<Vec<TargetPath>, PlatformError> {
             return Err(backend("query active monitor paths failed"));
         }
         let mut result = Vec::with_capacity(path_count as usize);
+        // Each distinct target adapter LUID is queried once, keyed by (HighPart, LowPart).
+        let mut adapter_marks: Vec<((i32, u32), bool)> = Vec::new();
         for path in paths.into_iter().take(path_count as usize) {
             let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
                 header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
@@ -771,6 +795,41 @@ fn paths() -> Result<Vec<TargetPath>, PlatformError> {
                 DISPLAYCONFIG_ROTATION_ROTATE270 => 3,
                 _ => return Err(backend("invalid monitor rotation")),
             };
+            let twin = match own_adapter.as_deref() {
+                None => false,
+                Some(own) => {
+                    let luid = path.targetInfo.adapterId;
+                    let key = (luid.HighPart, luid.LowPart);
+                    match adapter_marks.iter().find(|(known, _)| *known == key) {
+                        Some(&(_, marked)) => marked,
+                        None => {
+                            let mut adapter = DISPLAYCONFIG_ADAPTER_NAME {
+                                header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME,
+                                    size: size_of::<DISPLAYCONFIG_ADAPTER_NAME>() as u32,
+                                    adapterId: luid,
+                                    id: 0,
+                                },
+                                ..Default::default()
+                            };
+                            // SAFETY: exact initialized request structure, read-only CCD query.
+                            // A failure is most likely an adapter removed mid-snapshot, so the
+                            // bounded attempt loop starts over. Nothing is marked from it.
+                            if unsafe { DisplayConfigGetDeviceInfo(&mut adapter.header) } != 0 {
+                                continue 'attempt;
+                            }
+                            // Only the interface path is compared. A foreign name is neither kept
+                            // nor printed. A malformed path cannot equal our validated interface,
+                            // so that adapter is not ours.
+                            let marked = text(&adapter.adapterDevicePath).is_ok_and(|path| {
+                                crate::model::twin::interface_path_eq(&path, own)
+                            });
+                            adapter_marks.push((key, marked));
+                            marked
+                        }
+                    }
+                }
+            };
             result.push(TargetPath {
                 source_name: text(&source.viewGdiDeviceName)?,
                 device_path: text(&target.monitorDevicePath)?,
@@ -778,6 +837,7 @@ fn paths() -> Result<Vec<TargetPath>, PlatformError> {
                 refresh_numerator: path.targetInfo.refreshRate.Numerator,
                 refresh_denominator: path.targetInfo.refreshRate.Denominator,
                 quarter_turns,
+                twin,
             });
         }
         result.sort_by(|a, b| {

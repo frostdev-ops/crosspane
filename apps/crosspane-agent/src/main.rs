@@ -23,10 +23,11 @@ mod tray;
 mod trust;
 #[cfg(windows)]
 mod windows;
-// Twin-or-mirror parking: Hyprland, and macOS builds with `private-vdisplay`.
+// Twin-or-mirror parking: Hyprland, Windows, and macOS builds with `private-vdisplay`.
 #[cfg_attr(
     not(any(
         target_os = "linux",
+        windows,
         all(target_os = "macos", feature = "private-vdisplay")
     )),
     allow(dead_code)

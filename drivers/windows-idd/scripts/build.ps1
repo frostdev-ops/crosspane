@@ -34,7 +34,7 @@ $NativePins = [ordered]@{
     'src\Control.h' = '19a915da28419f86c5fd5565520faea8b5cfd4971bea48aa20cc4da6237a6a34'
     'src\Control.cpp' = '3300f11a193bc7b8c543d7fac7f1ba9782818352fb1cd685663ddbcc3276b67f'
     'src\Monitor.h' = 'bcb0d36151b3a28c6aca484594724266a6117a76f64a4d838e02b3b519bc7042'
-    'src\Monitor.cpp' = 'eaf5418abec64ee62c2c2a680b385124a1e0acc12e6b45da1e47116b87034b39'
+    'src\Monitor.cpp' = 'cf29a29c0b7c2e0a3ac1e4ae99ebb594a9b0f6b4bd5bbf991bdd0ec767064ace'
     'src\Trace.h' = '0f95be57532cf0af5a9cd6ebd73e65dc89fef667ec0f4998d03a85d7e3872650'
 }
 $RequiredNativeRoles = @('src\Driver.cpp','src\Driver.h','src\Control.cpp','src\Control.h','src\Monitor.cpp','src\Monitor.h','src\Trace.h')
@@ -185,7 +185,7 @@ $SourcePins = [ordered]@{
     'include\crosspane_idd_v1.h' = 'f60bbc0e64249f4812e8088461a7ec00b1349abe2667f033172967a62034f38b'
     'src\Lease.h' = '9ed6c7f45f9c87ee94bb3fd949d3f88dc74095b7fd8f6683a3b15bee94b3fabd'
     'src\Lease.cpp' = 'fc418a97817921eccc68d02b6d2890c07330812efaf92b2b882537c19214aef2'
-    'src\Edid.h' = '0f5471fa1df6a75429d4b1bc9baae1458b6b7a481c5d3dbef339112a141259f0'
+    'src\Edid.h' = '3cc0c844acf44d62f19b7c387ff18a800b11335ea1aba997211d1fc12009ea7f'
     'src\Edid.cpp' = '59724061cca9eb6314b97238ca166013baa7df83038b8799d292d7a76489efae'
     'tests\abi_lease_tests.cpp' = 'cd951d37431939c317204a4eb86bbeb5d49b75640a1842782c9b67c135283bf8'
     'CrosspaneIdd.inf' = 'd733de171c08ffef83cfecc492381d5329963dfeb0f6f345777e80645bbec714'
