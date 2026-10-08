@@ -31,7 +31,8 @@ try {
     $module = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules\NetSecurity\NetSecurity.psd1'
     Import-Module $module -ErrorAction Stop
     $ruleErrors = @()
-    $rules = @(NetSecurity\Get-NetFirewallRule -Name 'Crosspane.Agent.UDP.Private.*' -ErrorAction SilentlyContinue -ErrorVariable ruleErrors)
+    # COM INetFwRule::Name is the PowerShell DisplayName; the PowerShell Name is a generated GUID.
+    $rules = @(NetSecurity\Get-NetFirewallRule -DisplayName 'Crosspane.Agent.UDP.Private.*' -ErrorAction SilentlyContinue -ErrorVariable ruleErrors)
     foreach ($errorRecord in $ruleErrors) {
         if ($errorRecord.CategoryInfo.Category -ne [System.Management.Automation.ErrorCategory]::ObjectNotFound) { throw 'query unavailable' }
     }
@@ -49,7 +50,7 @@ try {
             if ($filter -ne 1) { throw 'ambiguous filter' }
         }
         $rows += [ordered]@{
-            name=[string]$rule.Name; group=[string]$rule.Group; program=[string]$application[0].Program
+            name=[string]$rule.DisplayName; group=[string]$rule.Group; program=[string]$application[0].Program
             enabled=[string]$rule.Enabled; direction=[string]$rule.Direction; action=[string]$rule.Action
             profile=[string]$rule.Profile; edge=[string]$rule.EdgeTraversalPolicy; protocol=[string]$port[0].Protocol
             local_port=@($port[0].LocalPort | ForEach-Object {[string]$_}); remote_port=@($port[0].RemotePort | ForEach-Object {[string]$_})
@@ -298,7 +299,9 @@ mod tests {
         // Exercise constant/static query coverage without executing it.
         assert_eq!(QUERY_WAIT.as_secs(), 5);
         assert_eq!(QUERY_SPACING.as_secs(), 60);
-        assert!(QUERY.contains("-Name 'Crosspane.Agent.UDP.Private.*'"));
+        assert!(QUERY.contains("-DisplayName 'Crosspane.Agent.UDP.Private.*'"));
+        assert!(QUERY.contains("name=[string]$rule.DisplayName;"));
+        assert!(!QUERY.contains("-Name 'Crosspane.Agent.UDP.Private.*'"));
         // Referencing the production function verifies its compilation; it is never called.
         let _query: fn(&AtomicBool) -> RuleEvidence = query;
     }

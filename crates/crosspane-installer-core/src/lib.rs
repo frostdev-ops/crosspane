@@ -1,4 +1,5 @@
 //! OS-free installer flow, live evidence, and data-only installation receipts.
+pub mod elevated;
 mod evidence;
 mod flow;
 mod receipt;

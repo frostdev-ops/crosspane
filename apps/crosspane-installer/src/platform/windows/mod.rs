@@ -1,6 +1,8 @@
 //! Limited-token Windows foundation and an unavailable wizard port. The shell port owns no
 //! install, agent, task or payload capability.
 pub mod detect;
+#[cfg(windows)]
+pub mod elevated_launch;
 #[cfg(any(windows, test))]
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) mod first_install;
