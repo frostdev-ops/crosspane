@@ -590,3 +590,343 @@ fn journal_and_report_round_trip_and_refuse_unknown_fields() {
         json!("Outcome")
     );
 }
+
+/// The same program under another install ID: its rule name, and so its lines, differ.
+fn other_id_scope() -> RuleScope {
+    RuleScope {
+        id: InstallId::parse("w41c-vm-2").unwrap(),
+        program: AgentProgram::parse(PROGRAM).unwrap(),
+    }
+}
+
+/// The same install ID under another program: its firewall line differs.
+fn other_program_scope() -> RuleScope {
+    RuleScope {
+        id: InstallId::parse("w41c-vm-1").unwrap(),
+        program: AgentProgram::parse(r"D:\Tools\Programs\Crosspane\crosspane-agent.exe").unwrap(),
+    }
+}
+
+#[test]
+fn combined_describe_is_the_parts_text_in_run_order() {
+    // Setup runs AddFirewall, then InstallDriver.
+    let setup = describe(&Verb::Setup(scope()));
+    assert_eq!(
+        setup,
+        [
+            describe(&Verb::AddFirewall(scope())),
+            describe(&Verb::InstallDriver),
+        ]
+        .concat()
+    );
+    assert_eq!(
+        setup,
+        vec![
+            r#"Allow C:\Users\user\AppData\Local\Programs\Crosspane\crosspane-agent.exe to receive UDP traffic from your local subnet on private networks (Windows Defender Firewall rule "Crosspane.Agent.UDP.Private.w41c-vm-1")."#,
+            "Add the Crosspane display driver (CrosspaneIdd.inf, publisher Crosspane) to the Windows driver store.",
+            "Create one Crosspane virtual display adapter (hardware ID Crosspane\\IddTwinV1). It shows no display until Crosspane needs one.",
+        ]
+    );
+
+    // Teardown runs RemoveDriver, then RemoveFirewall.
+    let teardown = describe(&Verb::Teardown(scope()));
+    assert_eq!(
+        teardown,
+        [
+            describe(&Verb::RemoveDriver),
+            describe(&Verb::RemoveFirewall(scope())),
+        ]
+        .concat()
+    );
+    assert_eq!(
+        teardown,
+        vec![
+            "Remove the Crosspane virtual display adapter (hardware ID Crosspane\\IddTwinV1).",
+            "Remove the Crosspane display driver from the Windows driver store.",
+            r#"Remove the Windows Defender Firewall rule "Crosspane.Agent.UDP.Private.w41c-vm-1"."#,
+        ]
+    );
+}
+
+#[test]
+fn combined_verified_holds_only_when_both_parts_reach_their_state() {
+    // Setup: firewall Present and driver Installed. Teardown: firewall Missing and driver Absent.
+    assert!(verified(
+        &Verb::Setup(scope()),
+        &report(DriverState::Installed, FirewallState::Present)
+    ));
+    assert!(verified(
+        &Verb::Teardown(scope()),
+        &report(DriverState::Absent, FirewallState::Missing)
+    ));
+
+    // Either part alone is not enough, including a state that is close but not the target.
+    for (verb, driver, firewall) in [
+        (
+            Verb::Setup(scope()),
+            DriverState::Installed,
+            FirewallState::Missing,
+        ),
+        (
+            Verb::Setup(scope()),
+            DriverState::Absent,
+            FirewallState::Present,
+        ),
+        (
+            Verb::Setup(scope()),
+            DriverState::PackageOnly,
+            FirewallState::Present,
+        ),
+        (
+            Verb::Setup(scope()),
+            DriverState::Installed,
+            FirewallState::Mismatch,
+        ),
+        (
+            Verb::Setup(scope()),
+            DriverState::Installed,
+            FirewallState::NotRequested,
+        ),
+        (
+            Verb::Teardown(scope()),
+            DriverState::Absent,
+            FirewallState::Present,
+        ),
+        (
+            Verb::Teardown(scope()),
+            DriverState::Installed,
+            FirewallState::Missing,
+        ),
+        (
+            Verb::Teardown(scope()),
+            DriverState::Mismatch,
+            FirewallState::Missing,
+        ),
+        (
+            Verb::Teardown(scope()),
+            DriverState::Absent,
+            FirewallState::NotRequested,
+        ),
+    ] {
+        assert!(
+            !verified(&verb, &report(driver, firewall)),
+            "{} accepted driver {driver:?} with firewall {firewall:?}",
+            verb.name().as_str()
+        );
+    }
+
+    for driver in DRIVER_STATES {
+        for firewall in FIREWALL_STATES {
+            let observed = report(driver, firewall);
+            assert_eq!(
+                verified(&Verb::Setup(scope()), &observed),
+                driver == DriverState::Installed && firewall == FirewallState::Present,
+                "setup with driver {driver:?} and firewall {firewall:?}"
+            );
+            assert_eq!(
+                verified(&Verb::Teardown(scope()), &observed),
+                driver == DriverState::Absent && firewall == FirewallState::Missing,
+                "teardown with driver {driver:?} and firewall {firewall:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn combined_consent_carries_the_exact_verb_and_scope() {
+    let setup =
+        Consent::presented(&Verb::Setup(scope()), &describe(&Verb::Setup(scope()))).unwrap();
+    assert_eq!(setup.verb(), VerbName::Setup);
+    assert_eq!(setup.action(), &Verb::Setup(scope()));
+    assert_eq!(setup.action().scope(), Some(&scope()));
+
+    let teardown = Consent::presented(
+        &Verb::Teardown(scope()),
+        &describe(&Verb::Teardown(scope())),
+    )
+    .unwrap();
+    assert_eq!(teardown.verb(), VerbName::Teardown);
+    assert_eq!(teardown.action(), &Verb::Teardown(scope()));
+    assert_eq!(teardown.action().scope(), Some(&scope()));
+}
+
+#[test]
+fn combined_consent_refuses_edited_partial_reordered_and_foreign_lines() {
+    for verb in [Verb::Setup(scope()), Verb::Teardown(scope())] {
+        let shown = describe(&verb);
+        for index in 0..shown.len() {
+            let mut edited = shown.clone();
+            edited[index].push('.');
+            assert_eq!(
+                Consent::presented(&verb, &edited),
+                Err(ElevatedError::Consent),
+                "{} accepted an edited line {index}",
+                verb.name().as_str()
+            );
+        }
+
+        // A missing line, an extra line and one part's text alone are refused.
+        assert_eq!(
+            Consent::presented(&verb, &shown[..shown.len() - 1]),
+            Err(ElevatedError::Consent)
+        );
+        let mut extra = shown.clone();
+        extra.push(String::new());
+        assert_eq!(
+            Consent::presented(&verb, &extra),
+            Err(ElevatedError::Consent)
+        );
+        for part in verb.parts() {
+            assert_eq!(
+                Consent::presented(&verb, &describe(&part)),
+                Err(ElevatedError::Consent),
+                "{} accepted only the {} lines",
+                verb.name().as_str(),
+                part.name().as_str()
+            );
+        }
+
+        // The parts swapped out of run order are refused, even with the same lines.
+        let parts = verb.parts();
+        let swapped: Vec<String> = [describe(&parts[1]), describe(&parts[0])].concat();
+        assert_eq!(
+            Consent::presented(&verb, &swapped),
+            Err(ElevatedError::Consent)
+        );
+    }
+}
+
+#[test]
+fn combined_consent_refuses_lines_of_another_scope_or_verb() {
+    let setup = Verb::Setup(scope());
+    let teardown = Verb::Teardown(scope());
+    let foreign = [
+        (&setup, Verb::Setup(other_id_scope())),
+        (&setup, Verb::Setup(other_program_scope())),
+        (&setup, Verb::Teardown(scope())),
+        (&teardown, Verb::Teardown(other_id_scope())),
+        (&teardown, Verb::Setup(scope())),
+    ];
+    for (verb, shown_for) in foreign {
+        assert_eq!(
+            Consent::presented(verb, &describe(&shown_for)),
+            Err(ElevatedError::Consent),
+            "{} accepted the lines of {}",
+            verb.name().as_str(),
+            shown_for.name().as_str()
+        );
+    }
+
+    // The frozen removal text names only the rule, and the rule name comes from the install ID
+    // alone. A teardown under another program therefore reads the same as this one. The helper
+    // still refuses to remove a rule whose program differs (`plan_remove`), so the text is not the
+    // only guard.
+    assert_eq!(
+        describe(&Verb::Teardown(other_program_scope())),
+        describe(&teardown)
+    );
+}
+
+#[test]
+fn combined_journal_entries_name_the_setup_resource_and_observe_nothing() {
+    let absent = report(DriverState::Absent, FirewallState::Missing);
+    let installed = report(DriverState::Installed, FirewallState::Present);
+
+    for verb in [Verb::Setup(scope()), Verb::Teardown(scope())] {
+        for before in [None, Some(&absent), Some(&installed)] {
+            let intent = intent_entry(&verb, before);
+            assert_eq!(intent.phase, JournalPhase::Intent);
+            assert_eq!(intent.verb, verb.name());
+            assert_eq!(intent.exit, None);
+            assert_eq!(intent.receipt.resource_id, "windows-elevated-setup");
+            assert_eq!(intent.receipt.resolved_path, RULE);
+            assert_eq!(intent.receipt.ownership, ResourceOwnership::Created);
+            assert_eq!(intent.receipt.before, ResourceObservation::Unknown);
+            assert_eq!(intent.receipt.after, ResourceObservation::Unknown);
+            assert_eq!(intent.receipt.outcome, MutationOutcome::Unknown);
+        }
+
+        for after in [None, Some(&absent), Some(&installed)] {
+            let outcome = outcome_entry(&verb, Some(Outcome::Done), after);
+            assert_eq!(outcome.phase, JournalPhase::Outcome);
+            assert_eq!(outcome.verb, verb.name());
+            assert_eq!(outcome.receipt.resource_id, "windows-elevated-setup");
+            assert_eq!(outcome.receipt.resolved_path, RULE);
+            assert_eq!(outcome.receipt.ownership, ResourceOwnership::Created);
+            assert_eq!(outcome.receipt.before, ResourceObservation::Unknown);
+            assert_eq!(outcome.receipt.after, ResourceObservation::Unknown);
+        }
+    }
+
+    // The outcome is Verified only when the combined verb's own state is reached.
+    let table = [
+        (
+            Verb::Setup(scope()),
+            Some(Outcome::Done),
+            Some(&installed),
+            MutationOutcome::Verified,
+        ),
+        (
+            Verb::Setup(scope()),
+            Some(Outcome::AlreadyDone),
+            Some(&installed),
+            MutationOutcome::Verified,
+        ),
+        (
+            Verb::Setup(scope()),
+            Some(Outcome::Done),
+            Some(&absent),
+            MutationOutcome::Unknown,
+        ),
+        (
+            Verb::Setup(scope()),
+            Some(Outcome::Done),
+            None,
+            MutationOutcome::Unknown,
+        ),
+        (
+            Verb::Setup(scope()),
+            Some(Outcome::Refused),
+            Some(&installed),
+            MutationOutcome::Refused,
+        ),
+        (
+            Verb::Setup(scope()),
+            Some(Outcome::Failed),
+            Some(&installed),
+            MutationOutcome::Failed,
+        ),
+        (
+            Verb::Teardown(scope()),
+            Some(Outcome::Done),
+            Some(&absent),
+            MutationOutcome::Verified,
+        ),
+        (
+            Verb::Teardown(scope()),
+            Some(Outcome::Done),
+            Some(&installed),
+            MutationOutcome::Unknown,
+        ),
+        (
+            Verb::Teardown(scope()),
+            Some(Outcome::NotElevated),
+            None,
+            MutationOutcome::Refused,
+        ),
+        (
+            Verb::Teardown(scope()),
+            Some(Outcome::Failed),
+            None,
+            MutationOutcome::Failed,
+        ),
+    ];
+    for (verb, outcome, after, expected) in table {
+        assert_eq!(
+            outcome_entry(&verb, outcome, after).receipt.outcome,
+            expected,
+            "{} {outcome:?} after {after:?}",
+            verb.name().as_str()
+        );
+    }
+}

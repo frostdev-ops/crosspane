@@ -2,7 +2,16 @@
 //! install, agent, task or payload capability.
 pub mod detect;
 #[cfg(windows)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) mod elevated_kit;
+#[cfg(windows)]
 pub mod elevated_launch;
+#[cfg(windows)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) mod elevated_step;
+#[cfg(windows)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) mod elevated_store;
 #[cfg(any(windows, test))]
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) mod first_install;

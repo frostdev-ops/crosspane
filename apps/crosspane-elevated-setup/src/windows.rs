@@ -75,13 +75,15 @@ pub(crate) type HelperResult<T> = Result<T, HelperError>;
 
 /// Runs one verb and returns the process exit code. `status` prints its report and exits 0.
 pub(crate) fn entry(arguments: &[OsString]) -> i32 {
-    run(arguments).exit_code()
+    run(arguments)
 }
 
-/// The dispatcher: DLL hardening first, then parse, the elevation check and the verb.
-fn run(arguments: &[OsString]) -> Outcome {
+/// The dispatcher: DLL hardening first, then parse, the elevation check and the verb. It returns
+/// the process exit code: one part's outcome, or the pair code of a combined verb. `setup` and
+/// `teardown` always run both parts, in run order, and each part keeps its own rollback.
+fn run(arguments: &[OsString]) -> i32 {
     if let Err(error) = harden_dll_search() {
-        return failure(error);
+        return failure(error).exit_code();
     }
     let Some(texts) = arguments
         .iter()
@@ -89,15 +91,15 @@ fn run(arguments: &[OsString]) -> Outcome {
         .collect::<Option<Vec<&str>>>()
     else {
         note("arguments are not UTF-8");
-        return Outcome::Refused;
+        return Outcome::Refused.exit_code();
     };
     let Ok(verb) = parse_arguments(&texts) else {
         note("unsupported arguments");
-        return Outcome::Refused;
+        return Outcome::Refused.exit_code();
     };
     if verb.mutates() && !elevated() {
         note("this verb needs an elevated token");
-        return Outcome::NotElevated;
+        return Outcome::NotElevated.exit_code();
     }
     let result = match verb {
         Verb::Status(scope) => Ok(print_status(&observe_status(scope.as_ref()))),
@@ -105,8 +107,20 @@ fn run(arguments: &[OsString]) -> Outcome {
         Verb::RemoveDriver => remove_driver(),
         Verb::AddFirewall(scope) => add_firewall(&scope),
         Verb::RemoveFirewall(scope) => remove_firewall(&scope),
+        Verb::Setup(scope) => {
+            return Outcome::pair_exit_code(
+                add_firewall(&scope).unwrap_or_else(failure),
+                install_driver().unwrap_or_else(failure),
+            );
+        }
+        Verb::Teardown(scope) => {
+            return Outcome::pair_exit_code(
+                remove_driver().unwrap_or_else(failure),
+                remove_firewall(&scope).unwrap_or_else(failure),
+            );
+        }
     };
-    result.unwrap_or_else(failure)
+    result.unwrap_or_else(failure).exit_code()
 }
 
 /// T21, the first call of the process. The default DLL search is System32 plus explicitly added

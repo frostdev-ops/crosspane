@@ -10,6 +10,11 @@ pub mod supervisor;
 pub mod task;
 
 use super::native_io::{NativeError, NativeResult};
+#[cfg(all(windows, not(test)))]
+use crosspane_installer_core::elevated::{
+    kit::KitManifest,
+    step::{ElevatedPlan, StepResult},
+};
 
 #[cfg(all(windows, not(test)))]
 pub(crate) enum FirstInstallOutcome {
@@ -17,26 +22,47 @@ pub(crate) enum FirstInstallOutcome {
     NotSubmitted(&'static str),
     Unknown,
 }
+/// W4.1c2 N4. The administrator step that the first install runs once between FilesVerified and
+/// TaskIntent. `sources` is `None` when the kit is not available from this run's payload.
+#[cfg(all(windows, not(test)))]
+pub(crate) struct ElevatedInstall {
+    pub plan: ElevatedPlan,
+    pub manifest: KitManifest,
+    pub sources: Option<super::elevated_kit::KitSources>,
+}
 /// Additive cold facade. No Stop, keeper, parent-exit or old-tree capability is involved.
 #[cfg(all(windows, not(test)))]
 pub(crate) fn begin_first_install(
     sources: [Box<dyn std::io::Read + Send>; 3],
     deadline: &super::native_io::Deadline,
 ) -> NativeResult<FirstInstallOutcome> {
-    first_native::begin(sources, deadline)
+    begin_first_install_elevated(sources, None, deadline).map(|(outcome, _)| outcome)
+}
+/// W4.1c2 N4. Like `begin_first_install`, with the administrator step. The step's result is
+/// returned whenever the install's port was reached, whether the install completed or became
+/// Unknown. It is `None` when the step never ran.
+#[cfg(all(windows, not(test)))]
+pub(crate) fn begin_first_install_elevated(
+    sources: [Box<dyn std::io::Read + Send>; 3],
+    elevated: Option<ElevatedInstall>,
+    deadline: &super::native_io::Deadline,
+) -> NativeResult<(FirstInstallOutcome, Option<StepResult>)> {
+    first_native::begin(sources, elevated, deadline)
 }
 
 #[cfg(all(windows, not(test)))]
 mod first_native {
     use super::super::{
+        elevated_step::{self, ElevatedRun},
+        elevated_store::LockSource,
         first_install::{
             self,
             driver::{self, FirstInstallPort},
             record::FirstInstallRecord,
         },
         native_io::{
-            self, Deadline, FirstInstallMutationPermit, FirstInstallReservation, InstallerLock,
-            PayloadRoot, StagedPe, WindowsNativeIo,
+            self, Cancellation, Deadline, FirstInstallMutationPermit, FirstInstallReservation,
+            InstallerLock, PayloadRoot, StagedPe, WindowsNativeIo,
             records::{PublicationRecovery, RecordName},
             supervisor_owner::{FirstInstallReady, observe_first_ready},
         },
@@ -66,6 +92,10 @@ mod first_native {
         verified: Option<Arc<VerifiedPayload>>,
         ready: Option<FirstInstallReady>,
         launched: bool,
+        /// Taken once by `elevated`; `None` skips the administrator step.
+        elevated: Option<ElevatedInstall>,
+        /// Set once the administrator step has run, whatever its outcome.
+        elevated_result: Option<StepResult>,
     }
     impl Port {
         fn lock(&self) -> NativeResult<&InstallerLock> {
@@ -310,6 +340,38 @@ mod first_native {
             self.verified = Some(verified);
             Ok(())
         }
+        /// W4.1c2 N4. Runs the administrator step once, with the install lock held, under a fresh
+        /// budget before and after it. The result is kept on the port for the caller.
+        fn elevated(&mut self, record: &FirstInstallRecord) -> NativeResult<()> {
+            let Some(request) = self.elevated.take() else {
+                return Ok(());
+            };
+            self.deadline = Deadline::new(
+                native_io::process::MAX_NATIVE_TIMEOUT_MS,
+                self.io.bound_clock(),
+                Cancellation::default(),
+            )?;
+            self.renew(record)?;
+            let result = elevated_step::run(ElevatedRun {
+                io: &self.io,
+                lock: LockSource::Held(self.lock()?),
+                plan: &request.plan,
+                manifest: &request.manifest,
+                sources: request.sources.as_ref(),
+            });
+            // Kept before the budget is renewed, so a failed renewal never drops the result.
+            let journal_failed = result.journal_failed;
+            self.elevated_result = Some(result);
+            self.deadline = Deadline::new(
+                native_io::process::MAX_NATIVE_TIMEOUT_MS,
+                self.io.bound_clock(),
+                Cancellation::default(),
+            )?;
+            if journal_failed {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            self.renew(record)
+        }
         fn activate(&mut self, record: &FirstInstallRecord) -> NativeResult<FirstInstallRecord> {
             self.renew(record)?;
             let payload = self
@@ -406,13 +468,14 @@ mod first_native {
     }
     pub(super) fn begin(
         sources: [Box<dyn std::io::Read + Send>; 3],
+        elevated: Option<ElevatedInstall>,
         deadline: &Deadline,
-    ) -> NativeResult<FirstInstallOutcome> {
+    ) -> NativeResult<(FirstInstallOutcome, Option<StepResult>)> {
         if UNKNOWN
             .get()
             .is_some_and(|s| s.lock().map_or(true, |s| s.is_some()))
         {
-            return Ok(FirstInstallOutcome::Unknown);
+            return Ok((FirstInstallOutcome::Unknown, None));
         }
         let prepared: NativeResult<Result<_, &'static str>> = (|| {
             let inventory = ApprovedInventory::embedded()?;
@@ -489,15 +552,18 @@ mod first_native {
         })();
         let (io, inventory, installer, inputs, reopened, reinstalling) = match prepared {
             Ok(Ok(values)) => values,
-            Ok(Err(reason)) => return Ok(FirstInstallOutcome::NotSubmitted(reason)),
-            Err(NativeError::OutcomeUnknown) => return Ok(FirstInstallOutcome::Unknown),
+            Ok(Err(reason)) => return Ok((FirstInstallOutcome::NotSubmitted(reason), None)),
+            Err(NativeError::OutcomeUnknown) => return Ok((FirstInstallOutcome::Unknown, None)),
             Err(_) => {
-                return Ok(FirstInstallOutcome::NotSubmitted(
-                    "first-install admission unavailable",
+                return Ok((
+                    FirstInstallOutcome::NotSubmitted("first-install admission unavailable"),
+                    None,
                 ));
             }
         };
         // From here the lock foundation may have changed. No failure refunds submission.
+        // The administrator result is None unless the port below ran the step.
+        let mut elevated_result = None;
         let effect = (|| {
             if reinstalling
                 && io
@@ -603,6 +669,8 @@ mod first_native {
                 verified: None,
                 ready: None,
                 launched: observing,
+                elevated,
+                elevated_result: None,
             };
             let result = (|| {
                 if observing {
@@ -618,6 +686,8 @@ mod first_native {
                     driver::apply(&mut port, &mut record)
                 }
             })();
+            // Taken before the port can be stashed, so Complete and Unknown both return it.
+            elevated_result = port.elevated_result.take();
             if result.is_err() {
                 if port.launched {
                     port.permit.take();
@@ -629,11 +699,14 @@ mod first_native {
             }
             Ok(())
         })();
-        Ok(if effect.is_ok() {
-            FirstInstallOutcome::Complete
-        } else {
-            FirstInstallOutcome::Unknown
-        })
+        Ok((
+            if effect.is_ok() {
+                FirstInstallOutcome::Complete
+            } else {
+                FirstInstallOutcome::Unknown
+            },
+            elevated_result,
+        ))
     }
 }
 

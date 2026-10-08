@@ -17,8 +17,9 @@ use crate::{
     },
     view::{ProgressGroup, ScreenId, WizardAction, WizardView},
 };
+use crosspane_installer_core::elevated::step::INSTALL_DECLINE_NOTE;
 use crosspane_installer_core::{ApplyOutcome, JobStage, ObservationSource, StepId, WaitKind};
-use domains::{Domains, Failure, Operation};
+use domains::{Domains, ElevatedPlanning, ElevatedRequest, Failure, Operation};
 use ports::{AgentSlot, CloseState, Command};
 use std::{
     collections::BTreeMap,
@@ -29,7 +30,7 @@ use std::{
         mpsc,
     },
 };
-use worker::{Coordinator, Fence, Outcome};
+use worker::{Coordinator, ELEVATED_UNCHECKED, Fence, Outcome};
 const SUPPORT: StepId = StepId(10);
 const INSTALL: StepId = StepId(20);
 const AGENT: StepId = StepId(30);
@@ -37,6 +38,12 @@ const PRACTICE: StepId = StepId(40);
 const DISTRIBUTION: StepId = StepId(50);
 const ADMIN: StepId = StepId(55);
 const ATTENDED: StepId = StepId(56);
+/// The removal choice that also tears down the firewall rule and the display driver.
+const TEARDOWN_CHOICE: u16 = 2;
+pub(crate) const TEARDOWN_LABEL: &str = "Also remove the Windows Defender Firewall rule and the Crosspane display driver (Windows asks for administrator approval)";
+pub(crate) const ELEVATED_WAITING: &str =
+    "Windows asks for administrator approval during this step";
+/// The same text `Coordinator::plan_elevated` uses when the domain can't plan the teardown.
 static PARENT_EXIT: AtomicBool = AtomicBool::new(false);
 pub(crate) fn take_parent_exit() -> bool {
     PARENT_EXIT.swap(false, Ordering::AcqRel)
@@ -86,7 +93,7 @@ pub(crate) fn description() -> live::PlatformDescription {
         ),
         (
             ADMIN,
-            vec![SUPPORT],
+            vec![INSTALL],
             false,
             true,
             ScreenId::Compatibility,
@@ -304,6 +311,9 @@ pub(crate) fn run<D: Domains>(
     let mut coordinator = Coordinator::new(domains);
     let mut repair_plan: u64 = 0;
     let mut removal_plan = 0;
+    // The last administrator-step report per slot (L14). Verify shows it again; only the slot's next
+    // Detect or Plan forgets it.
+    let mut elevated_reports: BTreeMap<u16, String> = BTreeMap::new();
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -322,9 +332,12 @@ pub(crate) fn run<D: Domains>(
                             "Windows operation checked; deferred capabilities remain unavailable"
                                 .to_owned();
                         let slot = job.step.0;
+                        if matches!(job.stage, JobStage::Detect | JobStage::Plan) {
+                            elevated_reports.remove(&slot);
+                        }
                         let outcome = if !fence.admits(job.operation.0) {
                             NativeOutcome::NotSubmitted
-                        } else if [PRACTICE, DISTRIBUTION, ADMIN, ATTENDED].contains(&job.step) {
+                        } else if [PRACTICE, DISTRIBUTION, ATTENDED].contains(&job.step) {
                             NativeOutcome::Unsupported
                         } else if job.step == SUPPORT || job.step == AGENT {
                             match coordinator.detect() {
@@ -353,18 +366,59 @@ pub(crate) fn run<D: Domains>(
                             }
                         } else {
                             match job.stage {
+                                JobStage::Detect if job.step == ADMIN => {
+                                    match coordinator.domains.elevated_detect() {
+                                        Ok(check) => {
+                                            detail = check.detail;
+                                            NativeOutcome::Detected {
+                                                needs_action: !check.configured,
+                                            }
+                                        }
+                                        Err(_) => NativeOutcome::Unsupported,
+                                    }
+                                }
                                 JobStage::Detect => match coordinator.detect() {
                                     Ok(v) => NativeOutcome::Detected {
                                         needs_action: !v.healthy(),
                                     },
                                     Err(_) => NativeOutcome::Unsupported,
                                 },
+                                JobStage::Plan if job.step == ADMIN => match coordinator
+                                    .plan_elevated(
+                                        slot,
+                                        job.operation.0,
+                                        Operation::Elevated,
+                                        Some(ElevatedRequest::Setup),
+                                    ) {
+                                    Ok(v) => NativeOutcome::Planned {
+                                        preview: compose_preview(
+                                            &preview(Operation::Elevated, v.snapshot.cold),
+                                            v.elevated.as_ref(),
+                                            false,
+                                        ),
+                                    },
+                                    Err(_) => NativeOutcome::Unsupported,
+                                },
                                 JobStage::Plan => match coordinator.detect().and_then(|v| {
-                                    coordinator.plan(slot, job.operation.0, v.install_operation())
+                                    let operation = v.install_operation();
+                                    if install_setup_requested(operation, v.cold) {
+                                        coordinator.plan_elevated(
+                                            slot,
+                                            job.operation.0,
+                                            operation,
+                                            Some(ElevatedRequest::Setup),
+                                        )
+                                    } else {
+                                        coordinator.plan(slot, job.operation.0, operation)
+                                    }
                                 }) {
                                     Ok(v) => NativeOutcome::Planned {
                                         preview: if v.operation == Operation::Install {
-                                            install_preview(v.snapshot.cold).into()
+                                            compose_preview(
+                                                install_preview(v.snapshot.cold),
+                                                v.elevated.as_ref(),
+                                                true,
+                                            )
                                         } else {
                                             preview(v.operation, v.snapshot.cold)
                                         },
@@ -374,6 +428,14 @@ pub(crate) fn run<D: Domains>(
                                 JobStage::Apply => {
                                     let applied =
                                         consent.filter(|c| c.operation == job.operation).map(|c| {
+                                            if coordinator.elevated_planned(slot, c.plan.0) {
+                                                let _ =
+                                                    reports.send(NativeReport::Step(StepReport {
+                                                        job: job.clone(),
+                                                        outcome: NativeOutcome::Progress,
+                                                        detail: ELEVATED_WAITING.into(),
+                                                    }));
+                                            }
                                             coordinator.apply(
                                                 slot,
                                                 job.operation.0,
@@ -393,18 +455,38 @@ pub(crate) fn run<D: Domains>(
                                             {
                                                 detail = reason.into();
                                             }
+                                            let report = coordinator.domains.take_elevated_report();
+                                            if !report.is_empty() {
+                                                elevated_reports.insert(slot, report.join(" "));
+                                                detail = std::iter::once(detail)
+                                                    .chain(report)
+                                                    .collect::<Vec<_>>()
+                                                    .join(" ");
+                                            }
                                             native_outcome(v.outcome, (clock)())
                                         }
                                         None => NativeOutcome::NotSubmitted,
                                     }
                                 }
-                                JobStage::Verify => match coordinator.verify(Operation::Upgrade) {
-                                    Outcome::Verified => NativeOutcome::Verified {
-                                        source: ObservationSource::Live,
-                                        observed_at_ms: (clock)(),
-                                    },
-                                    _ => NativeOutcome::Waiting(WaitKind::Contract),
-                                },
+                                JobStage::Verify => {
+                                    let checked = coordinator.verify(if job.step == ADMIN {
+                                        Operation::Elevated
+                                    } else {
+                                        Operation::Upgrade
+                                    });
+                                    // The controller replaces the step detail with this one, so the
+                                    // remembered report is joined on, as the Apply path joins it.
+                                    if let Some(report) = elevated_reports.get(&slot) {
+                                        detail = format!("{detail} {report}");
+                                    }
+                                    match checked {
+                                        Outcome::Verified => NativeOutcome::Verified {
+                                            source: ObservationSource::Live,
+                                            observed_at_ms: (clock)(),
+                                        },
+                                        _ => NativeOutcome::Waiting(WaitKind::Contract),
+                                    }
+                                }
                             }
                         };
                         NativeReport::Step(StepReport {
@@ -434,24 +516,38 @@ pub(crate) fn run<D: Domains>(
                                     .as_ref()
                                     .map(|s| s.repair_operation())
                                     .unwrap_or(Operation::MetadataRepair);
+                                let mut choices = vec![live::RemovalChoice {
+                                    id: 1,
+                                    role: crate::view::ToggleRole::DeleteIdentity,
+                                    label: "Erase the Crosspane identity and trust".into(),
+                                    checked: false,
+                                    enabled: !matches!(&snapshot,Ok(s) if s.cold==domains::Cold::Partial),
+                                }];
+                                // Read-only: the teardown plan is made again at PlanUninstall.
+                                choices.extend(teardown_choice(
+                                    coordinator
+                                        .domains
+                                        .elevated_plan(ElevatedRequest::Teardown)
+                                        .unwrap_or(ElevatedPlanning::Unavailable(
+                                            ELEVATED_UNCHECKED,
+                                        )),
+                                ));
                                 MaintenanceReport::Inspected {
                                     id,
                                     uninstall: availability(Operation::Removal {
                                         erase_identity: false,
                                     }),
                                     repair: availability(repair),
-                                    choices: vec![live::RemovalChoice {
-                                        id: 1,
-                                        role: crate::view::ToggleRole::DeleteIdentity,
-                                        label: "Erase the Crosspane identity and trust".into(),
-                                        checked: false,
-                                        enabled: !matches!(&snapshot,Ok(s) if s.cold==domains::Cold::Partial),
-                                    }],
+                                    choices,
                                 }
                             }
                             MaintenanceRequest::PlanUninstall { choices, .. } => {
                                 removal_plan = id.0;
-                                match coordinator.plan(
+                                let teardown = choices
+                                    .iter()
+                                    .any(|(choice, on)| *choice == TEARDOWN_CHOICE && *on)
+                                    .then_some(ElevatedRequest::Teardown);
+                                match coordinator.plan_elevated(
                                     101,
                                     id.0,
                                     Operation::Removal {
@@ -459,10 +555,15 @@ pub(crate) fn run<D: Domains>(
                                             .iter()
                                             .any(|(id, on)| *id == 1 && *on),
                                     },
+                                    teardown,
                                 ) {
                                     Ok(p) => MaintenanceReport::Planned {
                                         id,
-                                        preview: preview(p.operation, p.snapshot.cold),
+                                        preview: compose_preview(
+                                            &preview(p.operation, p.snapshot.cold),
+                                            p.elevated.as_ref(),
+                                            false,
+                                        ),
                                     },
                                     Err(_) => MaintenanceReport::Refused {
                                         id,
@@ -492,6 +593,11 @@ pub(crate) fn run<D: Domains>(
                                 if applied.handoff.permits_exit() {
                                     close.handed_off.store(true, Ordering::Release);
                                 }
+                                let mut lines = vec![format!(
+                                    "Removal submission: {:?}; completion is independently verified",
+                                    applied.outcome
+                                )];
+                                lines.extend(coordinator.domains.take_elevated_report());
                                 MaintenanceReport::Finished {
                                     id,
                                     outcome: if matches!(
@@ -502,10 +608,7 @@ pub(crate) fn run<D: Domains>(
                                     } else {
                                         MaintenanceOutcome::Partial
                                     },
-                                    lines: vec![format!(
-                                        "Removal submission: {:?}; completion is independently verified",
-                                        applied.outcome
-                                    )],
+                                    lines,
                                 }
                             }
                             MaintenanceRequest::ConfirmRepair { plan, revision, .. } => {
@@ -670,6 +773,7 @@ fn preview(operation: Operation, cold: domains::Cold) -> String {
         Operation::Removal { erase_identity:true } => "Stop Crosspane cleanly, erase its identity once, and remove owned installation files".into(),
         Operation::MetadataRepair => "Repair the exact task or archive settled metadata; preserve a user-disabled task".into(),
         Operation::PayloadRepair => "Verify the supplied release, transfer repair to an owned keeper, stop cleanly, replace and verify the files".into(),
+        Operation::Elevated => "Ask Windows once for administrator approval to add the firewall rule and the display driver".into(),
     }
 }
 pub(crate) fn install_preview(cold: domains::Cold) -> &'static str {
@@ -693,6 +797,48 @@ pub(crate) fn install_preview(cold: domains::Cold) -> &'static str {
         domains::Cold::AccessDenied => "First install access denied; nothing will be submitted",
         domains::Cold::Existing => "An existing installation requires an update",
     }
+}
+/// Only a fresh or post-removal first install asks for the administrator step inside its preview.
+pub(crate) fn install_setup_requested(operation: Operation, cold: domains::Cold) -> bool {
+    operation == Operation::Install
+        && matches!(
+            cold,
+            domains::Cold::Eligible | domains::Cold::CompletedRemoval
+        )
+}
+/// `base`, then the administrator step's block or its reason. A block in an install is followed
+/// by the decline note, so a declined step still lets the install complete.
+pub(crate) fn compose_preview(
+    base: &str,
+    elevated: Option<&ElevatedPlanning>,
+    install: bool,
+) -> String {
+    match elevated {
+        None | Some(ElevatedPlanning::NotNeeded) => base.to_owned(),
+        Some(ElevatedPlanning::Planned(plan)) if install => {
+            format!("{base}\n\n{}\n{INSTALL_DECLINE_NOTE}", plan.preview_block())
+        }
+        Some(ElevatedPlanning::Planned(plan)) => format!("{base}\n\n{}", plan.preview_block()),
+        Some(ElevatedPlanning::Unavailable(reason)) => format!("{base}\n\n{reason}"),
+    }
+}
+/// Removal choice 2: checked when Windows will be asked, disabled with its reason when the
+/// teardown can't be checked, and absent when no administrator step is needed.
+fn teardown_choice(planning: ElevatedPlanning) -> Option<live::RemovalChoice> {
+    let (label, checked, enabled) = match planning {
+        ElevatedPlanning::NotNeeded => return None,
+        ElevatedPlanning::Planned(_) => (TEARDOWN_LABEL.to_owned(), true, true),
+        ElevatedPlanning::Unavailable(reason) => {
+            (format!("{TEARDOWN_LABEL} — {reason}"), false, false)
+        }
+    };
+    Some(live::RemovalChoice {
+        id: TEARDOWN_CHOICE,
+        role: crate::view::ToggleRole::Grant,
+        label,
+        checked,
+        enabled,
+    })
 }
 #[cfg(all(windows, not(test)))]
 fn agent_call(call: AgentCall, queued_at: u64, clock: &Clock) -> AgentReply {

@@ -1,8 +1,14 @@
 //! Owned, read-only Crosspane-rule query. No elevation, mutation, profile query or denial inference.
-use crate::reachability::{FirewallRule, RuleEvidence, rule_evidence};
+use crate::reachability::{
+    FirewallRule, MAX_RECORD_READ, RULE_PREFIX, RecordedId, RuleEvidence, recorded_install_id,
+    rule_evidence,
+};
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::process::CommandExt;
 use std::{
-    io::{Read, Result as IoResult},
+    fs::OpenOptions,
+    io::{self, Read, Result as IoResult},
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -12,16 +18,20 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+};
 
-const QUERY_WAIT: Duration = Duration::from_secs(5);
+// Background diagnostic, never on a callback path. Measured up to ~43 s on a slow Limited VM
+// (Get-NetFirewall*Filter cmdlets ~22 s), so a shorter budget reports Unavailable for a present rule.
+const QUERY_WAIT: Duration = Duration::from_secs(60);
 const QUERY_SPACING: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(25);
 const MAX_OUTPUT: u64 = 64 * 1024;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-// TODO(W4.1c): replace prefix lookup with the exact recorded name once the installer journal
-// supplies its stable install ID. Only this Crosspane name family is ever queried, including
-// filter associations. The persistent store is a rule-presence fact, not effective policy.
+// Only the exact recorded rule name is queried, including filter associations. The persistent
+// store is a rule-presence fact, not effective policy.
 const QUERY: &str = r#"
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -32,7 +42,7 @@ try {
     Import-Module $module -ErrorAction Stop
     $ruleErrors = @()
     # COM INetFwRule::Name is the PowerShell DisplayName; the PowerShell Name is a generated GUID.
-    $rules = @(NetSecurity\Get-NetFirewallRule -DisplayName 'Crosspane.Agent.UDP.Private.*' -ErrorAction SilentlyContinue -ErrorVariable ruleErrors)
+    $rules = @(NetSecurity\Get-NetFirewallRule -DisplayName '__CROSSPANE_RULE_NAME__' -ErrorAction SilentlyContinue -ErrorVariable ruleErrors)
     foreach ($errorRecord in $ruleErrors) {
         if ($errorRecord.CategoryInfo.Category -ne [System.Management.Automation.ErrorCategory]::ObjectNotFound) { throw 'query unavailable' }
     }
@@ -70,6 +80,7 @@ try {
     [Console]::Out.Write('{"available":false,"rules":[]}')
 }
 "#;
+const RULE_NAME_PLACEHOLDER: &str = "__CROSSPANE_RULE_NAME__";
 
 #[derive(Clone, Default)]
 pub(crate) struct Snapshot {
@@ -255,21 +266,89 @@ fn run_owned(script: &str, stop: &AtomicBool) -> Option<RunOutput> {
         reaped,
     })
 }
-fn query(stop: &AtomicBool) -> RuleEvidence {
-    let run = || -> Option<RuleEvidence> {
-        let program = std::env::current_exe().ok()?.canonicalize().ok()?;
-        let program = program.to_str()?;
-        let result = run_owned(QUERY, stop)?;
-        if result.timed_out || !result.reaped {
-            return None;
-        }
-        let output: QueryOutput = serde_json::from_slice(&result.bytes?).ok()?;
-        if !output.available {
-            return None;
-        }
-        Some(rule_evidence(program, &output.rules))
+/// Only ASCII letters, digits, `-` and `.` are literal inside the single-quoted filter. The
+/// recorded id grammar already guarantees this; any other name is refused, never escaped.
+fn literal_rule_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+}
+/// The fixed read-only query for one exact rule name. The name is substituted as a literal.
+fn script(rule_name: &str) -> String {
+    assert!(literal_rule_name(rule_name), "rule name must be a literal");
+    QUERY.replace(RULE_NAME_PLACEHOLDER, rule_name)
+}
+/// Presence of the exact rule `RULE_PREFIX + install_id` for `program`. Any failure is
+/// `None`, which the caller reports as `Unavailable`.
+fn query_rule(program: &str, install_id: &str, stop: &AtomicBool) -> Option<RuleEvidence> {
+    let rule_name = format!("{RULE_PREFIX}{install_id}");
+    if !literal_rule_name(&rule_name) {
+        return None;
+    }
+    let result = run_owned(&script(&rule_name), stop)?;
+    if result.timed_out || !result.reaped {
+        return None;
+    }
+    let output: QueryOutput = serde_json::from_slice(&result.bytes?).ok()?;
+    if !output.available {
+        return None;
+    }
+    Some(rule_evidence(program, install_id, &output.rules))
+}
+/// Reads `Installer\elevated-setup.json` under `state` (`%LOCALAPPDATA%\Crosspane`, the agent's
+/// state directory). A missing record is `Absent`. An unset `LOCALAPPDATA`, a link, a non-file or
+/// any other read failure is `Unreadable`. At most `MAX_RECORD_READ + 1` bytes are read, so an
+/// oversized record is refused by `recorded_install_id`.
+fn recorded_install_id_on_disk() -> RecordedId {
+    let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+        return RecordedId::Unreadable;
     };
-    run().unwrap_or_default()
+    match read_record(&PathBuf::from(local).join("Crosspane")) {
+        Ok(bytes) => recorded_install_id(Some(&bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => RecordedId::Absent,
+        Err(_) => RecordedId::Unreadable,
+    }
+}
+fn read_record(state: &Path) -> IoResult<Vec<u8>> {
+    let installer = state.join("Installer");
+    // The two directories are checked without following links, so a junction cannot redirect
+    // the record read.
+    for directory in [state, installer.as_path()] {
+        let metadata = std::fs::symlink_metadata(directory)?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::other(
+                "record directory is not a plain directory",
+            ));
+        }
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        // Open a final link itself, then refuse it below instead of following it.
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(installer.join("elevated-setup.json"))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::other("record is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_RECORD_READ as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+fn query(stop: &AtomicBool) -> RuleEvidence {
+    match recorded_install_id_on_disk() {
+        // No record means no exact name was ever recorded, so nothing is queried.
+        RecordedId::Absent => RuleEvidence::Missing,
+        RecordedId::Unreadable => RuleEvidence::Unavailable,
+        RecordedId::Id(id) => {
+            let run = || -> Option<RuleEvidence> {
+                let program = std::env::current_exe().ok()?.canonicalize().ok()?;
+                query_rule(program.to_str()?, &id, stop)
+            };
+            run().unwrap_or_default()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -297,11 +376,17 @@ mod tests {
         assert!(watch.snapshot().checked.is_none());
         assert!(watch.thread.is_none());
         // Exercise constant/static query coverage without executing it.
-        assert_eq!(QUERY_WAIT.as_secs(), 5);
+        assert_eq!(QUERY_WAIT.as_secs(), 60);
         assert_eq!(QUERY_SPACING.as_secs(), 60);
-        assert!(QUERY.contains("-DisplayName 'Crosspane.Agent.UDP.Private.*'"));
+        assert!(QUERY.contains("-DisplayName '__CROSSPANE_RULE_NAME__'"));
+        assert!(!QUERY.contains("Private.*"));
         assert!(QUERY.contains("name=[string]$rule.DisplayName;"));
         assert!(!QUERY.contains("-Name 'Crosspane.Agent.UDP.Private.*'"));
+        // script() substitutes only the exact rule name; the placeholder never survives.
+        let text = script("Crosspane.Agent.UDP.Private.fixture-id");
+        assert!(text.contains("-DisplayName 'Crosspane.Agent.UDP.Private.fixture-id' "));
+        assert!(!text.contains(RULE_NAME_PLACEHOLDER));
+        assert!(!text.contains("Private.*"));
         // Referencing the production function verifies its compilation; it is never called.
         let _query: fn(&AtomicBool) -> RuleEvidence = query;
     }
@@ -330,14 +415,15 @@ mod tests {
     fn owned_query_timeout_kills_and_reaps() {
         limited_opt_in();
         let started = Instant::now();
+        // Sleeps well past QUERY_WAIT so the owned budget, not the child, ends the query.
         let result = run_owned(
-            "Start-Sleep -Seconds 30; [Console]::Out.Write('late')",
+            "Start-Sleep -Seconds 120; [Console]::Out.Write('late')",
             &AtomicBool::new(false),
         )
         .unwrap();
         assert!(result.timed_out && result.reaped && result.bytes.is_none());
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < QUERY_WAIT + Duration::from_secs(10),
             "owned timeout did not settle promptly"
         );
         eprintln!("owned_query_timeout timed_out=true reaped=true late_output=false");
@@ -348,5 +434,19 @@ mod tests {
         limited_opt_in();
         let rule = query(&AtomicBool::new(false));
         eprintln!("owned_crosspane_rule_query evidence={}", rule.token());
+    }
+    #[test]
+    #[ignore = "Limited owned exact-rule query; W4.1c2 V5 opt-in with test-only variables"]
+    fn owned_exact_rule_probe() {
+        let (Ok(install_id), Ok(program)) = (
+            std::env::var("CROSSPANE_W41C2_INSTALL_ID"),
+            std::env::var("CROSSPANE_W41C2_PROGRAM"),
+        ) else {
+            eprintln!("owned_exact_rule_probe SKIP: CROSSPANE_W41C2_INSTALL_ID or _PROGRAM unset");
+            return;
+        };
+        limited_opt_in();
+        let rule = query_rule(&program, &install_id, &AtomicBool::new(false)).unwrap_or_default();
+        eprintln!("owned_exact_rule_probe evidence={}", rule.token());
     }
 }

@@ -77,6 +77,14 @@ pub(crate) struct DecodedHistory<'a> {
 pub(crate) fn classify_history(history: DecodedHistory<'_>) -> FirstInstallDisposition {
     use super::removal::RemovalCursor as R;
     use FirstInstallDisposition as D;
+    use crosspane_installer_core::elevated::journal;
+    // The elevated-setup record is never deleted, so it must never change the branch taken.
+    let names: Vec<&str> = history
+        .names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| *name != journal::RECORD_LEAF)
+        .collect();
     if let Some(removal) = history.removal {
         return if matches!(
             removal,
@@ -95,18 +103,17 @@ pub(crate) fn classify_history(history: DecodedHistory<'_>) -> FirstInstallDispo
             record::Phase::Complete => D::Existing,
             record::Phase::Unknown => D::Unknown,
             record::Phase::Intent
-                if history
-                    .names
+                if names
                     .iter()
-                    .all(|n| matches!(n.as_str(), "install.lock" | "first-install.json")) =>
+                    .all(|n| matches!(*n, "install.lock" | "first-install.json")) =>
             {
                 D::Resume
             }
             phase
                 if phase.rank() >= record::Phase::RunIntent.rank()
-                    && history.names.iter().all(|n| {
+                    && names.iter().all(|n| {
                         matches!(
-                            n.as_str(),
+                            *n,
                             "install.lock"
                                 | "first-install.json"
                                 | "supervisor.json"
@@ -126,16 +133,16 @@ pub(crate) fn classify_history(history: DecodedHistory<'_>) -> FirstInstallDispo
     if history.journal == Some(super::service::journal::Phase::Finished)
         || history.logon
         || history.claimed_activation
-        || history.names.iter().any(|n| {
+        || names.iter().any(|n| {
             matches!(
-                n.as_str(),
+                *n,
                 "supervisor-epoch-0.json" | "supervisor-epoch-1.json" | "supervisor-epoch-2.json"
             )
         })
     {
         return D::CompletedRemoval;
     }
-    if history.names.iter().any(|n| n != "install.lock") {
+    if names.iter().any(|n| *n != "install.lock") {
         D::Partial
     } else {
         D::Eligible

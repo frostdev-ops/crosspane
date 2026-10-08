@@ -1,5 +1,8 @@
 //! One bounded background owner; no GUI method waits for an operation or thread settlement.
-use super::domains::{Cold, Dispatch, Domains, Failure, Handoff, Operation, Snapshot};
+use super::domains::{
+    Cold, Dispatch, Domains, ElevatedPlanning, ElevatedRequest, Failure, Handoff, Operation,
+    Snapshot,
+};
 use std::collections::BTreeMap;
 use std::sync::{
     Arc,
@@ -29,6 +32,7 @@ pub(crate) struct Plan {
     pub ticket: u64,
     pub operation: Operation,
     pub snapshot: Snapshot,
+    pub elevated: Option<ElevatedPlanning>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
@@ -58,6 +62,9 @@ impl Applied {
         }
     }
 }
+/// The planning result when the elevated state can't be read.
+pub(crate) const ELEVATED_UNCHECKED: &str =
+    "The firewall rule and display driver can't be checked right now.";
 pub(crate) struct Coordinator<D> {
     pub domains: D,
     plans: BTreeMap<u16, Plan>,
@@ -77,14 +84,38 @@ impl<D: Domains> Coordinator<D> {
         self.domains.observe()
     }
     pub fn plan(&mut self, slot: u16, ticket: u64, operation: Operation) -> Result<Plan, Failure> {
+        self.plan_elevated(slot, ticket, operation, None)
+    }
+    /// An Err from elevated_plan becomes Unavailable("The firewall rule and display driver can't
+    /// be checked right now."). A None request never calls elevated_plan.
+    pub fn plan_elevated(
+        &mut self,
+        slot: u16,
+        ticket: u64,
+        operation: Operation,
+        request: Option<ElevatedRequest>,
+    ) -> Result<Plan, Failure> {
         let snapshot = self.domains.observe()?;
+        let elevated = request.map(|r| {
+            self.domains
+                .elevated_plan(r)
+                .unwrap_or(ElevatedPlanning::Unavailable(ELEVATED_UNCHECKED))
+        });
         let plan = Plan {
             ticket,
             operation,
             snapshot,
+            elevated,
         };
         self.plans.insert(slot, plan.clone());
         Ok(plan)
+    }
+    /// Whether the plan in `slot` with `plan_ticket` carries a planned administrator step.
+    pub fn elevated_planned(&self, slot: u16, plan_ticket: u64) -> bool {
+        self.plans.get(&slot).is_some_and(|plan| {
+            plan.ticket == plan_ticket
+                && matches!(plan.elevated, Some(ElevatedPlanning::Planned(_)))
+        })
     }
     pub fn apply(
         &mut self,
@@ -134,7 +165,11 @@ impl<D: Domains> Coordinator<D> {
                 Outcome::NotSubmitted
             });
         }
-        let result = self.domains.apply(plan.operation);
+        let planned = match &plan.elevated {
+            Some(ElevatedPlanning::Planned(consent)) => Some(consent),
+            _ => None,
+        };
+        let result = self.domains.apply_elevated(plan.operation, planned);
         match result {
             Ok(Dispatch { handoff, complete }) => {
                 // A first-install recovery removal completes in place: there is no keeper to hand off.
@@ -164,7 +199,13 @@ impl<D: Domains> Coordinator<D> {
                     complete,
                 }
             }
-            Err(Failure::NotSubmitted) if !settled => {
+            // A declined teardown gate is a refund even when settle archived metadata (L15): the gate
+            // runs before any other effect, and that archival is idempotent.
+            Err(Failure::NotSubmitted)
+                if !settled
+                    || (matches!(plan.operation, Operation::Removal { .. })
+                        && matches!(plan.elevated, Some(ElevatedPlanning::Planned(_)))) =>
+            {
                 self.dispatched.remove(&slot);
                 self.uncertain = false;
                 Applied::failure(Outcome::NotSubmitted)

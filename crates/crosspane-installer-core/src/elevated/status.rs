@@ -79,13 +79,25 @@ pub fn verified(verb: &Verb, report: &StatusReport) -> bool {
         Verb::RemoveDriver => report.driver.state == DriverState::Absent,
         Verb::AddFirewall(_) => report.firewall.state == FirewallState::Present,
         Verb::RemoveFirewall(_) => report.firewall.state == FirewallState::Missing,
+        Verb::Setup(_) => {
+            report.firewall.state == FirewallState::Present
+                && report.driver.state == DriverState::Installed
+        }
+        Verb::Teardown(_) => {
+            report.firewall.state == FirewallState::Missing
+                && report.driver.state == DriverState::Absent
+        }
     }
 }
 
-/// The consent lines shown to the user for `verb`, in the frozen wording. `Status` has none.
+/// The consent lines shown to the user for `verb`, in the frozen wording. `Status` has none. A
+/// combined verb shows the lines of its parts in run order.
 pub fn describe(verb: &Verb) -> Vec<String> {
     match verb {
         Verb::Status(_) => Vec::new(),
+        Verb::Setup(_) | Verb::Teardown(_) => {
+            verb.parts().iter().flat_map(describe).collect()
+        }
         Verb::InstallDriver => vec![
             "Add the Crosspane display driver (CrosspaneIdd.inf, publisher Crosspane) to the Windows driver store.".to_owned(),
             "Create one Crosspane virtual display adapter (hardware ID Crosspane\\IddTwinV1). It shows no display until Crosspane needs one.".to_owned(),
@@ -109,21 +121,26 @@ pub fn describe(verb: &Verb) -> Vec<String> {
 /// Consent to one mutating verb. It can only be made from the exact lines `describe` returns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Consent {
-    verb: VerbName,
+    verb: Verb,
 }
 
 impl Consent {
     /// Accepts `shown` only when `verb` mutates and `shown` equals `describe(verb)` line for line.
     pub fn presented(verb: &Verb, shown: &[String]) -> Result<Self, ElevatedError> {
         if verb.mutates() && shown == describe(verb).as_slice() {
-            Ok(Self { verb: verb.name() })
+            Ok(Self { verb: verb.clone() })
         } else {
             Err(ElevatedError::Consent)
         }
     }
 
     pub fn verb(&self) -> VerbName {
-        self.verb
+        self.verb.name()
+    }
+
+    /// The exact verb consented to, scope included.
+    pub fn action(&self) -> &Verb {
+        &self.verb
     }
 }
 
@@ -202,17 +219,22 @@ fn resource_id(verb: &Verb) -> &'static str {
         Verb::Status(_) => "windows-elevated-status",
         Verb::InstallDriver | Verb::RemoveDriver => "windows-idd-driver",
         Verb::AddFirewall(_) | Verb::RemoveFirewall(_) => "windows-firewall-rule",
+        Verb::Setup(_) | Verb::Teardown(_) => "windows-elevated-setup",
     }
 }
 
 fn resolved_path(verb: &Verb) -> String {
     match verb {
-        Verb::AddFirewall(scope) | Verb::RemoveFirewall(scope) => scope.id.rule_name(),
+        Verb::AddFirewall(scope)
+        | Verb::RemoveFirewall(scope)
+        | Verb::Setup(scope)
+        | Verb::Teardown(scope) => scope.id.rule_name(),
         Verb::Status(_) | Verb::InstallDriver | Verb::RemoveDriver => HARDWARE_ID.to_owned(),
     }
 }
 
-/// Firewall verbs observe the firewall state; every other verb observes the driver state.
+/// Firewall verbs observe the firewall state; every other single verb observes the driver state.
+/// Combined verbs are never journaled, so they observe nothing.
 fn observe(verb: &Verb, report: &StatusReport) -> ResourceObservation {
     match verb {
         Verb::AddFirewall(_) | Verb::RemoveFirewall(_) => {
@@ -221,6 +243,7 @@ fn observe(verb: &Verb, report: &StatusReport) -> ResourceObservation {
         Verb::Status(_) | Verb::InstallDriver | Verb::RemoveDriver => {
             driver_observation(report.driver.state)
         }
+        Verb::Setup(_) | Verb::Teardown(_) => ResourceObservation::Unknown,
     }
 }
 

@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crosspane_installer_core::elevated::step::PREVIEW_HEADER;
 use crosspane_installer_core::{
     Flow, FlowError, FlowEvent, JobIntent, JobStage, ObservationSource, OperationId, StepId,
     StepState, Summary, Verification,
@@ -153,12 +154,22 @@ const ADVANCE_PAUSE_MS: u64 = 700;
 
 /// The screens of the user-scope installation. Their changes stay inside the person's own
 /// account (no administrator, no system permission, no firewall), so once setup is started
-/// they run without asking again. Steps on every other screen ask first.
+/// they run without asking again. Steps on every other screen ask first. A step on these screens
+/// whose preview asks for an administrator still asks (see [`asks_for_administrator`]).
 pub(super) fn automatic_screen(screen: ScreenId) -> bool {
     matches!(
         screen,
         ScreenId::Compatibility | ScreenId::InstallPlan | ScreenId::Installing
     )
+}
+
+/// Whether a stored preview carries the elevated administrator block: a line that starts with
+/// `PREVIEW_HEADER`. The block follows the step's own text, so any line counts. Previews are
+/// stored through `bounded_lines`, which keeps line breaks and leaves this ASCII header alone.
+/// A prefix match is deliberately wider than equality: a header line that is cut short or has
+/// text after it still counts as the block, so the step asks.
+pub(super) fn asks_for_administrator(preview: &str) -> bool {
+    preview.lines().any(|line| line.starts_with(PREVIEW_HEADER))
 }
 
 /// Screens that move on by themselves once complete. The welcome, the numbers comparison, the
@@ -858,6 +869,10 @@ impl LiveController {
     /// click, recorded against that exact preview. Never for steps that need an administrator, a
     /// system permission or a firewall change, and never while the agent is in use (a restart or
     /// replacement would cut that short): then the step asks, with its preview, like any other.
+    /// A step whose stored preview carries the elevated administrator block (a line that starts
+    /// with `PREVIEW_HEADER`, see [`asks_for_administrator`]) is never taken by itself either,
+    /// whatever its plan says: the Windows install and administrator steps always wait for the
+    /// person's click, with that block in front of them.
     /// Each step goes ahead by itself at most once per run; after that it asks (see
     /// [`Self::auto_consented`]).
     fn auto_consent(&mut self) {
@@ -872,6 +887,10 @@ impl LiveController {
                 self.step_state(m.id) == StepState::NeedsAction
                     && self.previews.contains_key(&m.id)
                     && self.job(m.id, JobStage::Plan).is_some()
+                    && !self
+                        .previews
+                        .get(&m.id)
+                        .is_some_and(|preview| asks_for_administrator(preview))
             })
             .map(|m| m.id)
             .collect();

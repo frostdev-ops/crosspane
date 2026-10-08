@@ -137,7 +137,7 @@ pub(crate) struct FirewallRule {
     pub loose_source_mapping: bool,
     pub local_only_mapping: bool,
 }
-const RULE_PREFIX: &str = "Crosspane.Agent.UDP.Private.";
+pub(crate) const RULE_PREFIX: &str = "Crosspane.Agent.UDP.Private.";
 
 /// Compare canonical DOS/UNC text without resolving or opening another program's path. The
 /// installer records the canonical program path; only our current executable is canonicalized.
@@ -190,7 +190,8 @@ impl FirewallRule {
             && one(&self.interface_type, "Any")
             && one(&self.interface_alias, "Any")
             && self.service == "Any"
-            && self.package == "Any"
+            // A rule with no package condition reads as "" through the COM-created filter (VM, W4.1c2 V5).
+            && matches!(self.package.as_str(), "Any" | "")
             && self.authentication == "NotRequired"
             && self.encryption == "NotRequired"
             && !self.override_block
@@ -203,7 +204,66 @@ impl FirewallRule {
     }
 }
 
-pub(crate) fn rule_evidence(program: &str, rules: &[FirewallRule]) -> RuleEvidence {
+/// Largest `Installer\elevated-setup.json` the agent reads. A larger file is `Unreadable`.
+pub(crate) const MAX_RECORD_READ: usize = 64 * 1024;
+
+/// What the installer's `elevated-setup` record says about the install id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RecordedId {
+    /// No record exists, so no exact rule name was recorded.
+    Absent,
+    /// A record exists but is not one this agent can trust. Never a presence claim.
+    Unreadable,
+    Id(String),
+}
+
+/// The only envelope fields this reader checks. Serde ignores every other field.
+#[derive(serde::Deserialize)]
+struct RecordEnvelope {
+    schema_version: u32,
+    kind: String,
+    data: RecordData,
+}
+
+#[derive(serde::Deserialize)]
+struct RecordData {
+    install_id: String,
+}
+
+fn valid_install_id(text: &str) -> bool {
+    (1..=64).contains(&text.len())
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// Reads the install id from the installer's record, matching its `{schema_version, kind, data}`
+/// envelope. `None` gives `Absent`. Oversized, non-JSON, another kind or schema, or a
+/// `data.install_id` outside `^[A-Za-z0-9-]{1,64}$` gives `Unreadable`. Other fields are ignored.
+pub(crate) fn recorded_install_id(bytes: Option<&[u8]>) -> RecordedId {
+    let Some(bytes) = bytes else {
+        return RecordedId::Absent;
+    };
+    if bytes.len() > MAX_RECORD_READ {
+        return RecordedId::Unreadable;
+    }
+    let Ok(envelope) = serde_json::from_slice::<RecordEnvelope>(bytes) else {
+        return RecordedId::Unreadable;
+    };
+    let id = envelope.data.install_id;
+    if envelope.kind != "elevated-setup" || envelope.schema_version != 1 || !valid_install_id(&id) {
+        return RecordedId::Unreadable;
+    }
+    RecordedId::Id(id)
+}
+
+/// Presence of the exact recorded rule name for `program`. A row under any other name is
+/// unexpected query output, so it gives `Unavailable`.
+pub(crate) fn rule_evidence(
+    program: &str,
+    install_id: &str,
+    rules: &[FirewallRule],
+) -> RuleEvidence {
     let Some(program) = program_text(program) else {
         return RuleEvidence::Unavailable;
     };
@@ -213,8 +273,10 @@ pub(crate) fn rule_evidence(program: &str, rules: &[FirewallRule]) -> RuleEviden
     let mut matching = 0;
     let mut mismatch = false;
     for rule in rules {
-        // The query is prefix scoped. Treat unexpected/oversized output as query failure.
-        if !rule.name.starts_with(RULE_PREFIX) || rule.name.len() > 1024 || rule.group.len() > 1024
+        // The query is exact-name scoped. Treat unexpected/oversized output as query failure.
+        if rule.name.strip_prefix(RULE_PREFIX) != Some(install_id)
+            || rule.name.len() > 1024
+            || rule.group.len() > 1024
         {
             return RuleEvidence::Unavailable;
         }
@@ -365,22 +427,52 @@ mod firewall_tests {
     #[test]
     fn rule_presence_is_exact_program_and_full_spec_only() {
         let program = r"\\?\C:\Crosspane\crosspane-agent.exe";
-        assert_eq!(rule_evidence(program, &[rule()]), RuleEvidence::Present);
-        assert_eq!(rule_evidence(program, &[]), RuleEvidence::Missing);
+        assert_eq!(
+            rule_evidence(program, "fixture-id", &[rule()]),
+            RuleEvidence::Present
+        );
+        assert_eq!(
+            rule_evidence(program, "fixture-id", &[]),
+            RuleEvidence::Missing
+        );
         let mut other = rule();
         other.program = r"C:\Other\crosspane-agent.exe".into();
-        assert_eq!(rule_evidence(program, &[other]), RuleEvidence::Missing);
+        assert_eq!(
+            rule_evidence(program, "fixture-id", &[other]),
+            RuleEvidence::Missing
+        );
         let mut wrong = rule();
         wrong.profile = "Private, Public".into();
-        assert_eq!(rule_evidence(program, &[wrong]), RuleEvidence::Mismatch);
+        assert_eq!(
+            rule_evidence(program, "fixture-id", &[wrong]),
+            RuleEvidence::Mismatch
+        );
+        let mut unpackaged = rule();
+        unpackaged.package = String::new();
+        assert_eq!(
+            rule_evidence(program, "fixture-id", &[unpackaged]),
+            RuleEvidence::Present
+        );
+        let mut wrong = rule();
+        wrong.package = "S-1-15-2-1".into();
+        assert_eq!(
+            rule_evidence(program, "fixture-id", &[wrong]),
+            RuleEvidence::Mismatch
+        );
         let mut wrong = rule();
         wrong.override_block = true;
-        assert_eq!(rule_evidence(program, &[wrong]), RuleEvidence::Mismatch);
+        assert_eq!(
+            rule_evidence(program, "fixture-id", &[wrong]),
+            RuleEvidence::Mismatch
+        );
         let mut wrong = rule();
         wrong.group = "Crosspane.someone-else".into();
-        assert_eq!(rule_evidence(program, &[wrong]), RuleEvidence::Mismatch);
         assert_eq!(
-            rule_evidence(program, &[rule(), rule()]),
+            rule_evidence(program, "fixture-id", &[wrong]),
+            RuleEvidence::Mismatch
+        );
+        assert_eq!(
+            rule_evidence(program, "fixture-id", &[rule(), rule()]),
             RuleEvidence::Mismatch
         );
     }
@@ -389,19 +481,28 @@ mod firewall_tests {
         let program = r"C:\Crosspane\crosspane-agent.exe";
         let mut wrong = rule();
         wrong.name = "ForeignRule".into();
-        assert_eq!(rule_evidence(program, &[wrong]), RuleEvidence::Unavailable);
+        assert_eq!(
+            rule_evidence(program, "fixture-id", &[wrong]),
+            RuleEvidence::Unavailable
+        );
         let mut wrong = rule();
         wrong.program = r"%APPDATA%\Crosspane\agent.exe".into();
-        assert_eq!(rule_evidence(program, &[wrong]), RuleEvidence::Mismatch);
+        assert_eq!(
+            rule_evidence(program, "fixture-id", &[wrong]),
+            RuleEvidence::Mismatch
+        );
         let mut wrong = rule();
         wrong.remote_address.push("Any".into());
-        assert_eq!(rule_evidence(program, &[wrong]), RuleEvidence::Mismatch);
         assert_eq!(
-            rule_evidence("relative.exe", &[]),
+            rule_evidence(program, "fixture-id", &[wrong]),
+            RuleEvidence::Mismatch
+        );
+        assert_eq!(
+            rule_evidence("relative.exe", "fixture-id", &[]),
             RuleEvidence::Unavailable
         );
         assert_eq!(
-            rule_evidence(program, &vec![rule(); 129]),
+            rule_evidence(program, "fixture-id", &vec![rule(); 129]),
             RuleEvidence::Unavailable
         );
     }
@@ -419,6 +520,109 @@ mod firewall_tests {
             }])
             .count(),
             1
+        );
+    }
+    fn read(bytes: &[u8]) -> RecordedId {
+        recorded_install_id(Some(bytes))
+    }
+    /// The installer's envelope with a `data` object that carries extra fields.
+    fn record(kind: &str, schema: &str, id: &str) -> Vec<u8> {
+        format!(
+            r#"{{"schema_version":{schema},"kind":"{kind}","data":{{"install_id":"{id}","entries":[]}}}}"#
+        )
+        .into_bytes()
+    }
+    /// A valid record padded with a string to exactly `len` bytes.
+    fn padded_record(len: usize) -> Vec<u8> {
+        let head = |pad: &str| {
+            format!(
+                r#"{{"schema_version":1,"kind":"elevated-setup","data":{{"install_id":"abc","pad":"{pad}"}}}}"#
+            )
+        };
+        head(&"x".repeat(len - head("").len())).into_bytes()
+    }
+    #[test]
+    fn recorded_install_id_absent_is_not_unreadable() {
+        assert_eq!(recorded_install_id(None), RecordedId::Absent);
+    }
+    #[test]
+    fn recorded_install_id_reads_only_the_installer_envelope() {
+        assert_eq!(
+            read(&record("elevated-setup", "1", "fixture-id")),
+            RecordedId::Id("fixture-id".into())
+        );
+        assert_eq!(
+            read(&record("elevated-setup", "1", &"a".repeat(64))),
+            RecordedId::Id("a".repeat(64))
+        );
+        assert_eq!(
+            read(&record("elevated-setup", "1", "0123ABCD-ef")),
+            RecordedId::Id("0123ABCD-ef".into())
+        );
+        assert_eq!(read(b""), RecordedId::Unreadable);
+        assert_eq!(read(b"{not json"), RecordedId::Unreadable);
+        assert_eq!(
+            read(&record("receipt", "1", "fixture-id")),
+            RecordedId::Unreadable
+        );
+        assert_eq!(
+            read(&record("elevated-setup", "2", "fixture-id")),
+            RecordedId::Unreadable
+        );
+        assert_eq!(
+            read(&record("elevated-setup", "\"1\"", "fixture-id")),
+            RecordedId::Unreadable
+        );
+        assert_eq!(
+            read(br#"{"schema_version":1,"kind":"elevated-setup","data":{}}"#),
+            RecordedId::Unreadable
+        );
+        assert_eq!(
+            read(br#"{"schema_version":1,"kind":"elevated-setup","data":[]}"#),
+            RecordedId::Unreadable
+        );
+        let too_long = "a".repeat(65);
+        for id in ["*", "'", "", "fixture*", "a b", "a_b", too_long.as_str()] {
+            assert_eq!(
+                read(&record("elevated-setup", "1", id)),
+                RecordedId::Unreadable,
+                "{id:?}"
+            );
+        }
+    }
+    #[test]
+    fn recorded_install_id_is_bounded_by_the_read_limit() {
+        assert_eq!(
+            read(&padded_record(MAX_RECORD_READ)),
+            RecordedId::Id("abc".into())
+        );
+        assert_eq!(
+            read(&padded_record(MAX_RECORD_READ + 1)),
+            RecordedId::Unreadable
+        );
+    }
+    #[test]
+    fn rule_name_must_be_the_recorded_exact_name() {
+        let program = r"\\?\C:\Crosspane\crosspane-agent.exe";
+        let mut other = rule();
+        other.name = "Crosspane.Agent.UDP.Private.other-id".into();
+        other.group = "Crosspane.other-id".into();
+        // A row under the recorded name is evidence. The same row under another id is not.
+        assert_eq!(
+            rule_evidence(program, "fixture-id", &[rule()]),
+            RuleEvidence::Present
+        );
+        assert_eq!(
+            rule_evidence(program, "other-id", &[rule()]),
+            RuleEvidence::Unavailable
+        );
+        assert_eq!(
+            rule_evidence(program, "fixture-id", std::slice::from_ref(&other)),
+            RuleEvidence::Unavailable
+        );
+        assert_eq!(
+            rule_evidence(program, "other-id", &[other]),
+            RuleEvidence::Present
         );
     }
 }

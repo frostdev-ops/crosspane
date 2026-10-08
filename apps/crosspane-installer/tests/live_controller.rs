@@ -3652,3 +3652,74 @@ fn arrange_then_fresh_final_health_reaches_ready_and_expires_without_new_health(
     h.status_reply();
     assert_eq!(h.summary(), SummaryView::WorkspaceReady);
 }
+
+/// WP-W4.1c2 fix D1 (L13): the Windows install step's preview carries the administrator block, a
+/// line that starts with the elevated `PREVIEW_HEADER`, after its own text. Setup has started and
+/// the screen is automatic, yet that block is never taken by itself: the step asks, with its
+/// preview in front of the person, and the person's click is the consent.
+#[test]
+fn an_install_step_with_an_administrator_block_is_never_taken_without_the_person() {
+    let header = crosspane_installer_core::elevated::step::PREVIEW_HEADER;
+    let mut h = H::new();
+    h.tick();
+    h.next();
+    h.pass(SUPPORT);
+    let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
+    h.report(&detect, NativeOutcome::Detected { needs_action: true });
+    let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
+    let preview = format!(
+        "Ask Windows once for administrator approval to add the firewall rule\n\n{header}\n\
+         Add the firewall rule for Crosspane"
+    );
+    h.report(&plan, NativeOutcome::Planned { preview });
+    for _ in 0..10 {
+        h.advance(300);
+        h.tick();
+    }
+    assert!(
+        h.take_jobs().is_empty(),
+        "an administrator block is never taken by itself"
+    );
+    assert_eq!(h.view().screen, ScreenId::InstallPlan);
+    assert_eq!(h.row(PAYLOAD).state, RowState::NeedsAction);
+    assert!(h.view().message.contains(header));
+    assert!(
+        h.view()
+            .message
+            .contains("Add the firewall rule for Crosspane")
+    );
+    assert!(h.view().message.contains("This waits for you."));
+    assert_eq!(
+        h.button(ids::consent(PAYLOAD)).map(|b| b.kind),
+        Some(ButtonKind::Primary)
+    );
+    // The person's click is the consent, bound to this exact plan.
+    h.click(ids::consent(PAYLOAD));
+    let (apply, consent) = h.job(PAYLOAD, JobStage::Apply);
+    assert_eq!(consent.map(|c| c.plan), Some(plan.operation));
+    assert_eq!(apply.step, PAYLOAD);
+}
+
+/// The regression guard for fix D1: the same install step with an ordinary preview, and no
+/// administrator block, still goes ahead by itself once setup has started.
+#[test]
+fn an_install_step_without_an_administrator_block_still_goes_ahead_by_itself() {
+    let mut h = H::new();
+    h.tick();
+    h.next();
+    h.pass(SUPPORT);
+    let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
+    h.report(&detect, NativeOutcome::Detected { needs_action: true });
+    let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
+    h.report(
+        &plan,
+        NativeOutcome::Planned {
+            preview: "Copy 4 files into ~/.local".into(),
+        },
+    );
+    // No click: the start of setup is the consent, recorded against exactly this plan.
+    let (apply, consent) = h.job(PAYLOAD, JobStage::Apply);
+    assert_eq!(consent.map(|c| c.plan), Some(plan.operation));
+    assert_eq!(apply.step, PAYLOAD);
+    assert!(h.button(ids::consent(PAYLOAD)).is_none());
+}

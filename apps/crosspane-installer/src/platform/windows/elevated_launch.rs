@@ -4,7 +4,7 @@
 
 use super::native_io::{NativeError, NativeResult};
 use crosspane_installer_core::elevated::{
-    HELPER_IMAGE, Outcome, RuleScope, Verb, command_line, render_arguments,
+    HELPER_IMAGE, Outcome, RuleScope, Verb, command_line, is_local_drive_path, render_arguments,
     status::{
         Consent, ElevatedJournal, MAX_STATUS_BYTES, StatusReport, intent_entry, outcome_entry,
     },
@@ -60,13 +60,21 @@ pub enum LaunchOutcome {
         outcome: Option<Outcome>,
         after: Option<StatusReport>,
     },
+    /// A combined verb ran once: each part's own outcome, in run order, and the state after.
+    Parts {
+        outcomes: Vec<(Verb, Option<Outcome>)>,
+        after: Option<StatusReport>,
+    },
 }
 
 impl ElevatedHelper {
-    /// Accepts an absolute path whose leaf is `HELPER_IMAGE` and that names a regular file, not a
-    /// symlink or other reparse point.
+    /// Accepts an absolute local drive path (`is_local_drive_path`) whose leaf is `HELPER_IMAGE`
+    /// and that names a regular file, not a symlink or other reparse point.
     pub fn locate(image: PathBuf) -> NativeResult<Self> {
-        if !image.is_absolute() || image.file_name() != Some(OsStr::new(HELPER_IMAGE)) {
+        if !image.is_absolute()
+            || image.file_name() != Some(OsStr::new(HELPER_IMAGE))
+            || !image.to_str().is_some_and(is_local_drive_path)
+        {
             return Err(NativeError::Invalid);
         }
         let metadata = std::fs::symlink_metadata(&image).map_err(|error| {
@@ -131,34 +139,52 @@ impl ElevatedHelper {
     }
 
     /// Runs one mutating `verb` elevated, after the user consented to exactly its lines. The Intent
-    /// is journaled before anything runs, and the Outcome after the wait. The elevated child is
-    /// never killed.
+    /// of each part is journaled before anything runs, and the Outcome of each part after the wait.
+    /// A combined verb runs all its parts under one elevation. The elevated child is never killed.
     pub fn run(
         &self,
         verb: &Verb,
         consent: &Consent,
         journal: &mut dyn ElevatedJournal,
     ) -> NativeResult<LaunchOutcome> {
-        if consent.verb() != verb.name() || !verb.mutates() {
+        if consent.action() != verb || !verb.mutates() {
             return Err(NativeError::Invalid);
         }
+        let parts = verb.parts();
         let before = self.status(verb.scope())?;
-        journal
-            .record(&intent_entry(verb, Some(&before)))
-            .map_err(|_| NativeError::Unavailable)?;
+        for part in &parts {
+            journal
+                .record(&intent_entry(part, Some(&before)))
+                .map_err(|_| NativeError::Unavailable)?;
+        }
         let (exit, declined) = match shell_run_as(&self.image, verb) {
             Launch::Child(process) => (process.wait(ELEVATED_WAIT), false),
             Launch::Declined => (None, true),
             Launch::Unknown => (None, false),
         };
         let after = self.status(verb.scope()).ok();
-        let outcome = exit.and_then(Outcome::from_exit_code);
-        journal
-            .record(&outcome_entry(verb, outcome, after.as_ref()))
-            .map_err(|_| NativeError::OutcomeUnknown)?;
+        // A combined verb's exit code names both parts; a single verb's exit code names itself.
+        let outcomes: Vec<Option<Outcome>> = if verb.is_combined() {
+            let pair = exit.and_then(Outcome::split_pair_exit_code);
+            vec![pair.map(|(first, _)| first), pair.map(|(_, second)| second)]
+        } else {
+            vec![exit.and_then(Outcome::from_exit_code)]
+        };
+        for (part, outcome) in parts.iter().zip(&outcomes) {
+            journal
+                .record(&outcome_entry(part, *outcome, after.as_ref()))
+                .map_err(|_| NativeError::OutcomeUnknown)?;
+        }
         if declined {
             return Ok(LaunchOutcome::Declined);
         }
+        if verb.is_combined() {
+            return Ok(LaunchOutcome::Parts {
+                outcomes: parts.into_iter().zip(outcomes).collect(),
+                after,
+            });
+        }
+        let outcome = exit.and_then(Outcome::from_exit_code);
         Ok(match (outcome, after) {
             (Some(outcome), Some(after)) => LaunchOutcome::Verified { outcome, after },
             (outcome, after) => LaunchOutcome::Unverified { outcome, after },

@@ -287,3 +287,104 @@ fn record_encoding_caps_the_writer_before_allocating_or_appending_excess() {
         Some(NativeError::Oversize)
     );
 }
+
+/// The rule scope of the elevated install under test, the same fixture as the core journal tests.
+#[allow(clippy::unwrap_used)] // Fixed fixture values; the parsers accept them by construction.
+fn elevated_scope() -> crosspane_installer_core::elevated::RuleScope {
+    use crosspane_installer_core::elevated::{AgentProgram, InstallId, RuleScope};
+    RuleScope {
+        id: InstallId::parse("w41c-vm-1").unwrap(),
+        program: AgentProgram::parse(
+            r"C:\Users\user\AppData\Local\Programs\Crosspane\crosspane-agent.exe",
+        )
+        .unwrap(),
+    }
+}
+
+/// A real core journal with one Intent: the body the elevated store publishes.
+#[allow(clippy::unwrap_used)] // Fixed fixture: an empty record accepts one journaled Intent.
+fn elevated_record() -> crosspane_installer_core::elevated::journal::ElevatedRecord {
+    use crosspane_installer_core::elevated::Verb;
+    use crosspane_installer_core::elevated::journal::ElevatedRecord;
+    use crosspane_installer_core::elevated::status::intent_entry;
+    let scope = elevated_scope();
+    let mut record = ElevatedRecord::new(&scope);
+    record
+        .append(&intent_entry(&Verb::AddFirewall(scope), None))
+        .unwrap();
+    record
+}
+
+#[test]
+fn elevated_setup_name_is_the_journal_leaf_and_writes_the_elevated_kind() {
+    use crosspane_installer_core::elevated::journal::RECORD_LEAF;
+    let name = RecordName::ElevatedSetup;
+    assert_eq!(name.file_name().unwrap().as_str(), "elevated-setup.json");
+    assert_eq!(name.file_name().unwrap().as_str(), RECORD_LEAF);
+    // `RecordName::kind` is private to `records`, so the kind is read from the envelope it sets.
+    let bytes = encode_record(&name, serde_json::json!({})).unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(envelope["kind"], serde_json::json!("elevated-setup"));
+    assert_eq!(validate_for(&name, &bytes), Ok(()));
+}
+
+#[test]
+fn elevated_setup_kind_is_the_journal_kind_and_round_trips() {
+    use crosspane_installer_core::elevated::journal::RECORD_KIND;
+    let kind = RecordKind::ElevatedSetup;
+    let wire = serde_json::to_value(kind).unwrap();
+    assert_eq!(wire, serde_json::json!("elevated-setup"));
+    assert_eq!(wire, serde_json::json!(RECORD_KIND));
+    assert_eq!(serde_json::from_value::<RecordKind>(wire).unwrap(), kind);
+    // The kebab-case name is exact; near misses are not this kind.
+    for near in ["elevated_setup", "ElevatedSetup"] {
+        assert!(serde_json::from_value::<RecordKind>(serde_json::json!(near)).is_err());
+    }
+}
+
+#[test]
+fn elevated_setup_record_round_trips_through_encode_and_decode() {
+    use crosspane_installer_core::elevated::journal::ElevatedRecord;
+    let record = elevated_record();
+    let value = serde_json::to_value(&record).unwrap();
+    let bytes = encode_record(&RecordName::ElevatedSetup, value).unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(envelope["schema_version"], serde_json::json!(1));
+    assert_eq!(envelope["kind"], serde_json::json!("elevated-setup"));
+    assert!(envelope.get("operation").is_none());
+    assert_eq!(validate_for(&RecordName::ElevatedSetup, &bytes), Ok(()));
+    let back: ElevatedRecord = record_data(&RecordName::ElevatedSetup, &bytes).unwrap();
+    assert_eq!(back, record);
+    assert_eq!(back.validate(), Ok(()));
+}
+
+#[test]
+fn elevated_setup_kind_must_match_its_name_in_both_directions() {
+    use crosspane_installer_core::elevated::journal::ElevatedRecord;
+    let value = serde_json::to_value(elevated_record()).unwrap();
+    let elevated = encode_record(&RecordName::ElevatedSetup, value.clone()).unwrap();
+    let receipt = encode_record(&RecordName::Receipt, value).unwrap();
+    assert_eq!(
+        validate_for(&RecordName::Receipt, &elevated),
+        Err(NativeError::Invalid)
+    );
+    assert_eq!(
+        validate_for(&RecordName::ElevatedSetup, &receipt),
+        Err(NativeError::Invalid)
+    );
+    assert_eq!(
+        record_data::<ElevatedRecord>(&RecordName::Receipt, &elevated),
+        Err(NativeError::Invalid)
+    );
+    assert_eq!(
+        record_data::<ElevatedRecord>(&RecordName::ElevatedSetup, &receipt),
+        Err(NativeError::Invalid)
+    );
+    // An envelope whose kind is a near miss of "elevated-setup" is not this record either.
+    let near = br#"{"schema_version":1,"kind":"elevated_setup","data":{}}"#;
+    assert_eq!(validate_record(near), Err(NativeError::Invalid));
+    assert_eq!(
+        validate_for(&RecordName::ElevatedSetup, near),
+        Err(NativeError::Invalid)
+    );
+}

@@ -335,3 +335,227 @@ fn deserialization_applies_the_same_id_and_program_rules() {
     let json = serde_json::to_string(r"\\?\C:\Programs\Crosspane\crosspane-agent.exe").unwrap();
     assert!(serde_json::from_str::<AgentProgram>(&json).is_err());
 }
+
+const OUTCOMES: [Outcome; 7] = [
+    Outcome::Done,
+    Outcome::AlreadyDone,
+    Outcome::RebootRequired,
+    Outcome::Refused,
+    Outcome::NotElevated,
+    Outcome::Mismatch,
+    Outcome::Failed,
+];
+
+#[test]
+fn setup_and_teardown_round_trip_through_parse_render_and_command_line() {
+    let cases: [(Verb, &[&str]); 4] = [
+        (
+            Verb::Setup(rule_scope(PROGRAM)),
+            &["setup", "--install-id", ID, "--program", PROGRAM],
+        ),
+        (
+            Verb::Teardown(rule_scope(PROGRAM)),
+            &["teardown", "--install-id", ID, "--program", PROGRAM],
+        ),
+        (
+            Verb::Setup(rule_scope(SPACED)),
+            &["setup", "--install-id", ID, "--program", SPACED],
+        ),
+        (
+            Verb::Teardown(rule_scope(SPACED)),
+            &["teardown", "--install-id", ID, "--program", SPACED],
+        ),
+    ];
+    for (verb, tokens) in cases {
+        assert_eq!(parse_arguments(tokens), Ok(verb.clone()), "{tokens:?}");
+        assert_eq!(render_arguments(&verb), tokens, "{verb:?}");
+        let rendered = render_arguments(&verb);
+        let refs: Vec<&str> = rendered.iter().map(String::as_str).collect();
+        assert_eq!(parse_arguments(&refs), Ok(verb.clone()), "{refs:?}");
+        // The program is the last token; the command line quotes it, as `add-firewall` does.
+        let line = format!(
+            r#"{} --install-id {ID} --program "{}""#,
+            tokens[0], tokens[4]
+        );
+        assert_eq!(command_line(&verb), line, "{verb:?}");
+    }
+}
+
+#[test]
+fn setup_and_teardown_with_missing_reordered_or_extra_tokens_are_arguments() {
+    // Each tail follows the verb. None of them is the complete `--install-id <ID> --program <P>`.
+    let tails: &[&[&str]] = &[
+        &[],
+        &[""],
+        &["--install-id", ID],
+        &["--install-id", ID, "--program"],
+        &["--install-id", "--program", PROGRAM],
+        &["--install-id=w41c-vm-1", "--program", PROGRAM],
+        &["--id", ID, "--program", PROGRAM],
+        &["--program", PROGRAM],
+        &["--program", PROGRAM, "--install-id", ID],
+        &["--install-id", ID, "--program", PROGRAM, ""],
+        &["--install-id", ID, "--program", PROGRAM, "extra"],
+        &["--install-id", ID, "--install-id", ID, "--program", PROGRAM],
+        &[
+            "--install-id",
+            ID,
+            "--program",
+            PROGRAM,
+            "--program",
+            PROGRAM,
+        ],
+    ];
+    for verb in ["setup", "teardown"] {
+        for tail in tails {
+            let mut arguments = vec![verb];
+            arguments.extend_from_slice(tail);
+            assert_eq!(
+                parse_arguments(&arguments),
+                Err(ElevatedError::Arguments),
+                "{arguments:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_pair_code_is_in_128_to_182_and_splits_back_to_its_pair() {
+    assert_eq!(Outcome::pair_exit_code(Outcome::Done, Outcome::Done), 128);
+    assert_eq!(
+        Outcome::pair_exit_code(Outcome::Failed, Outcome::Failed),
+        182
+    );
+    for first in OUTCOMES {
+        for second in OUTCOMES {
+            let code = Outcome::pair_exit_code(first, second);
+            assert!(
+                (128..=182).contains(&code),
+                "{first:?} {second:?} -> {code}"
+            );
+            let unsigned = u32::try_from(code).unwrap();
+            assert_eq!(
+                Outcome::split_pair_exit_code(unsigned),
+                Some((first, second)),
+                "{first:?} {second:?} -> {code}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_single_verb_code_splits_to_the_same_outcome_twice() {
+    for outcome in OUTCOMES {
+        let code = u32::try_from(outcome.exit_code()).unwrap();
+        assert_eq!(
+            Outcome::split_pair_exit_code(code),
+            Some((outcome, outcome)),
+            "{outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn only_single_and_pair_codes_split_and_101_and_300_are_none() {
+    let mut valid: Vec<u32> = OUTCOMES
+        .iter()
+        .map(|outcome| u32::try_from(outcome.exit_code()).unwrap())
+        .collect();
+    for first in OUTCOMES {
+        for second in OUTCOMES {
+            valid.push(u32::try_from(Outcome::pair_exit_code(first, second)).unwrap());
+        }
+    }
+    // Every code from 0 to 300 that is neither a single-verb code nor a pair code is `None`.
+    for code in 0..=300_u32 {
+        assert_eq!(
+            Outcome::split_pair_exit_code(code).is_some(),
+            valid.contains(&code),
+            "{code}"
+        );
+    }
+    assert_eq!(Outcome::split_pair_exit_code(101), None);
+    assert_eq!(Outcome::split_pair_exit_code(300), None);
+}
+
+#[test]
+fn from_random_gives_thirty_two_lowercase_hex_digits_and_a_valid_install_id() {
+    let random: [u8; 16] = [
+        0x00, 0x01, 0x0f, 0x10, 0x7f, 0x80, 0xab, 0xcd, 0xef, 0xf0, 0xfe, 0xff, 0x09, 0x9a, 0xa0,
+        0x5c,
+    ];
+    let id = InstallId::from_random(random);
+    let text = id.as_str();
+    assert_eq!(text, "00010f107f80abcdeff0feff099aa05c");
+    assert_eq!(text.len(), 32);
+    assert!(
+        text.bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{text:?}"
+    );
+    assert_eq!(InstallId::parse(text), Ok(id.clone()));
+    assert_eq!(
+        id.rule_name(),
+        format!("Crosspane.Agent.UDP.Private.{text}")
+    );
+    assert_eq!(InstallId::from_random([0; 16]).as_str(), "0".repeat(32));
+}
+
+#[test]
+fn local_drive_paths_are_accepted_and_unc_device_share_and_relative_text_are_refused() {
+    let accepted = [
+        r"C:\Users\jame\AppData\Local\Programs\Crosspane\crosspane-agent.exe",
+        r"d:\Programs\Crosspane\crosspane-agent.exe",
+        r"\\?\C:\Users\jame\AppData\Local\Programs\Crosspane\crosspane-agent.exe",
+        r"\\?\z:\Programs",
+    ];
+    for text in accepted {
+        assert!(is_local_drive_path(text), "{text:?}");
+    }
+    let refused = [
+        r"\\server\share",
+        r"\\server\share\Programs\Crosspane\crosspane-agent.exe",
+        r"\\?\UNC\server\share\Programs\Crosspane\crosspane-agent.exe",
+        r"\\.\C:\Users\jame\AppData\Local\Programs\Crosspane\crosspane-agent.exe",
+        r"\\?\",
+        r"\\?\C:",
+        r"Programs\Crosspane\crosspane-agent.exe",
+        r"..\Programs\Crosspane\crosspane-agent.exe",
+        r"C:Programs\Crosspane\crosspane-agent.exe",
+        r"C:/Users/jame/AppData/Local/Programs/Crosspane/crosspane-agent.exe",
+        r"1:\Programs\Crosspane\crosspane-agent.exe",
+        "é:\\Programs",
+        "C:",
+        "",
+    ];
+    for text in refused {
+        assert!(!is_local_drive_path(text), "{text:?}");
+    }
+}
+
+#[test]
+fn combined_verbs_run_their_parts_in_the_frozen_order() {
+    let scope = rule_scope(PROGRAM);
+    assert_eq!(
+        Verb::Setup(scope.clone()).parts(),
+        vec![Verb::AddFirewall(scope.clone()), Verb::InstallDriver]
+    );
+    assert_eq!(
+        Verb::Teardown(scope.clone()).parts(),
+        vec![Verb::RemoveDriver, Verb::RemoveFirewall(scope.clone())]
+    );
+    assert!(Verb::Setup(scope.clone()).is_combined());
+    assert!(Verb::Teardown(scope.clone()).is_combined());
+    // Every other verb is its own single part.
+    let single = [
+        Verb::Status(None),
+        Verb::InstallDriver,
+        Verb::RemoveDriver,
+        Verb::AddFirewall(scope.clone()),
+        Verb::RemoveFirewall(scope),
+    ];
+    for verb in single {
+        assert_eq!(verb.parts(), vec![verb.clone()], "{verb:?}");
+        assert!(!verb.is_combined(), "{verb:?}");
+    }
+}

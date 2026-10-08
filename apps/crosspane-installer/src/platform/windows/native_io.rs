@@ -19055,6 +19055,7 @@ mod adapter {
                             | "first-install-history-index.json"
                             | "first-install-history-intent.json"
                             | "task-activation.json"
+                            | crosspane_installer_core::elevated::journal::RECORD_LEAF
                     ) {
                         continue;
                     }

@@ -2,7 +2,10 @@
 //! state values. OS-free; the native helper and the unelevated launcher live in the Windows crates.
 pub mod driver;
 pub mod firewall;
+pub mod journal;
+pub mod kit;
 pub mod status;
+pub mod step;
 use serde::{Deserialize, Serialize};
 
 pub const HELPER_IMAGE: &str = "crosspane-elevated-setup.exe";
@@ -13,6 +16,8 @@ pub const RULE_PREFIX: &str = "Crosspane.Agent.UDP.Private.";
 pub const GROUP_PREFIX: &str = "Crosspane.";
 pub const MAX_INSTALL_ID: usize = 64;
 pub const MAX_PROGRAM: usize = 32_767;
+/// The exit code of a combined verb is `PAIR_EXIT_BASE` + 8 × index(first) + index(second).
+pub const PAIR_EXIT_BASE: i32 = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ElevatedError {
@@ -28,6 +33,10 @@ pub enum ElevatedError {
     Consent,
     #[error("elevated setup journal unavailable")]
     Journal,
+    #[error("invalid elevated setup kit inventory")]
+    Kit,
+    #[error("invalid elevated setup record")]
+    Record,
 }
 
 /// `^[A-Za-z0-9-]{1,64}$`.
@@ -42,6 +51,11 @@ impl InstallId {
         } else {
             Err(ElevatedError::InstallId)
         }
+    }
+
+    /// The 32 lowercase hex digits of `random` (W1.8: ASCII alphanumeric, at most 64 bytes).
+    pub fn from_random(random: [u8; 16]) -> Self {
+        Self(random.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
     pub fn as_str(&self) -> &str {
@@ -135,6 +149,16 @@ fn is_path_component(component: &str) -> bool {
         && !component.ends_with(' ')
 }
 
+/// `X:\…` or `\\?\X:\…` (ASCII drive letter) only. `\\server\share`, `\\?\UNC\…`, `\\.\…` and
+/// relative text are refused. Text only; nothing is opened.
+pub fn is_local_drive_path(text: &str) -> bool {
+    let drive = text.strip_prefix(r"\\?\").unwrap_or(text);
+    matches!(
+        drive.as_bytes(),
+        [letter, b':', b'\\', ..] if letter.is_ascii_alphabetic()
+    )
+}
+
 impl TryFrom<String> for AgentProgram {
     type Error = ElevatedError;
 
@@ -166,6 +190,8 @@ pub enum Verb {
     RemoveDriver,
     AddFirewall(RuleScope),
     RemoveFirewall(RuleScope),
+    Setup(RuleScope),
+    Teardown(RuleScope),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +202,8 @@ pub enum VerbName {
     RemoveDriver,
     AddFirewall,
     RemoveFirewall,
+    Setup,
+    Teardown,
 }
 
 impl VerbName {
@@ -186,6 +214,8 @@ impl VerbName {
             Self::RemoveDriver => "remove-driver",
             Self::AddFirewall => "add-firewall",
             Self::RemoveFirewall => "remove-firewall",
+            Self::Setup => "setup",
+            Self::Teardown => "teardown",
         }
     }
 }
@@ -198,6 +228,8 @@ impl Verb {
             Self::RemoveDriver => VerbName::RemoveDriver,
             Self::AddFirewall(_) => VerbName::AddFirewall,
             Self::RemoveFirewall(_) => VerbName::RemoveFirewall,
+            Self::Setup(_) => VerbName::Setup,
+            Self::Teardown(_) => VerbName::Teardown,
         }
     }
 
@@ -209,9 +241,27 @@ impl Verb {
     pub fn scope(&self) -> Option<&RuleScope> {
         match self {
             Self::Status(scope) => scope.as_ref(),
-            Self::AddFirewall(scope) | Self::RemoveFirewall(scope) => Some(scope),
+            Self::AddFirewall(scope)
+            | Self::RemoveFirewall(scope)
+            | Self::Setup(scope)
+            | Self::Teardown(scope) => Some(scope),
             Self::InstallDriver | Self::RemoveDriver => None,
         }
+    }
+
+    /// Run order of the parts: `Setup` → [AddFirewall, InstallDriver]; `Teardown` →
+    /// [RemoveDriver, RemoveFirewall]. Every other verb is its own single part.
+    pub fn parts(&self) -> Vec<Verb> {
+        match self {
+            Self::Setup(scope) => vec![Self::AddFirewall(scope.clone()), Self::InstallDriver],
+            Self::Teardown(scope) => vec![Self::RemoveDriver, Self::RemoveFirewall(scope.clone())],
+            _ => vec![self.clone()],
+        }
+    }
+
+    /// Whether this verb runs as several parts under one elevation (`Setup` and `Teardown`).
+    pub fn is_combined(&self) -> bool {
+        matches!(self, Self::Setup(_) | Self::Teardown(_))
     }
 }
 
@@ -230,6 +280,10 @@ pub fn parse_arguments(arguments: &[&str]) -> Result<Verb, ElevatedError> {
         }
         ["remove-firewall", "--install-id", id, "--program", program] => {
             Ok(Verb::RemoveFirewall(scope(id, program)?))
+        }
+        ["setup", "--install-id", id, "--program", program] => Ok(Verb::Setup(scope(id, program)?)),
+        ["teardown", "--install-id", id, "--program", program] => {
+            Ok(Verb::Teardown(scope(id, program)?))
         }
         _ => Err(ElevatedError::Arguments),
     }
@@ -326,6 +380,52 @@ impl Outcome {
 
     pub fn succeeded(self) -> bool {
         matches!(self, Self::Done | Self::AlreadyDone | Self::RebootRequired)
+    }
+
+    /// The exit code of a combined verb whose parts ended with `first` and `second`:
+    /// `PAIR_EXIT_BASE` + 8 × index(first) + index(second), index in declaration order
+    /// (Done 0 … Failed 6). The codes are 128..=182, never 101.
+    pub fn pair_exit_code(first: Self, second: Self) -> i32 {
+        PAIR_EXIT_BASE + 8 * first.pair_index() + second.pair_index()
+    }
+
+    /// The inverse of `pair_exit_code` for a combined verb. A single-verb code (a refusal before
+    /// either part ran) applies to both parts. Every other code, including 101, is `None`.
+    /// `from_exit_code` is unchanged.
+    pub fn split_pair_exit_code(code: u32) -> Option<(Self, Self)> {
+        if let Some(outcome) = Self::from_exit_code(code) {
+            return Some((outcome, outcome));
+        }
+        let offset = code.checked_sub(u32::try_from(PAIR_EXIT_BASE).ok()?)?;
+        let first = Self::from_pair_index(offset / 8)?;
+        let second = Self::from_pair_index(offset % 8)?;
+        Some((first, second))
+    }
+
+    fn pair_index(self) -> i32 {
+        match self {
+            Self::Done => 0,
+            Self::AlreadyDone => 1,
+            Self::RebootRequired => 2,
+            Self::Refused => 3,
+            Self::NotElevated => 4,
+            Self::Mismatch => 5,
+            Self::Failed => 6,
+        }
+    }
+
+    /// The inverse of `pair_index`; `None` for every index past `Failed`.
+    fn from_pair_index(index: u32) -> Option<Self> {
+        const PAIR_ORDER: [Outcome; 7] = [
+            Outcome::Done,
+            Outcome::AlreadyDone,
+            Outcome::RebootRequired,
+            Outcome::Refused,
+            Outcome::NotElevated,
+            Outcome::Mismatch,
+            Outcome::Failed,
+        ];
+        PAIR_ORDER.get(usize::try_from(index).ok()?).copied()
     }
 }
 

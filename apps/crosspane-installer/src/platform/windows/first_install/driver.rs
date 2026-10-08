@@ -49,6 +49,12 @@ pub(crate) trait FirstInstallPort {
         role: PayloadRole,
     ) -> NativeResult<Option<ImageObservation>>;
     fn verify_files(&mut self, record: &FirstInstallRecord) -> NativeResult<()>;
+    /// W4.1c2. After FilesVerified is durable and before TaskIntent; at most once per forward
+    /// Apply; never on a reopen. Ok: the install continues whatever the elevated result. Err:
+    /// install Unknown.
+    fn elevated(&mut self, _record: &FirstInstallRecord) -> NativeResult<()> {
+        Ok(())
+    }
     /// The actual a3 adapter publishes TaskRegistered and RunIntent before their corresponding
     /// effects. This returns its freshly reread first record, including the genuine Run result.
     fn activate(&mut self, record: &FirstInstallRecord) -> NativeResult<FirstInstallRecord>;
@@ -169,6 +175,10 @@ fn drive<P: FirstInstallPort>(
     port.verify_files(record)?;
     if record.phase().rank() < Phase::FilesVerified.rank() {
         phase(port, record, Phase::FilesVerified)?;
+    }
+    // Forward Apply only. A reopen never repeats the elevated step.
+    if !reopening && record.phase() == Phase::FilesVerified {
+        port.elevated(record)?;
     }
     if record.phase().rank() < Phase::RunObserved.rank() {
         if reopening && record.phase().rank() >= Phase::TaskIntent.rank() {

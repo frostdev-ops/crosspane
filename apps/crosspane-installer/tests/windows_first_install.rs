@@ -68,6 +68,9 @@ struct Fake {
     events: Vec<String>,
     cut: Option<usize>,
     steps: usize,
+    elevated_calls: usize,
+    elevated_phase: Option<Phase>,
+    elevated_error: Option<NativeError>,
 }
 impl Default for Fake {
     fn default() -> Self {
@@ -85,6 +88,9 @@ impl Default for Fake {
             events: vec![],
             cut: None,
             steps: 0,
+            elevated_calls: 0,
+            elevated_phase: None,
+            elevated_error: None,
         }
     }
 }
@@ -190,6 +196,15 @@ impl FirstInstallPort for Fake {
             return Err(NativeError::Foreign);
         }
         self.point("verify-files")
+    }
+    fn elevated(&mut self, _r: &FirstInstallRecord) -> NativeResult<()> {
+        self.elevated_calls += 1;
+        self.elevated_phase = self.saved.as_ref().map(FirstInstallRecord::phase);
+        self.point("elevated")?;
+        match self.elevated_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
     fn activate(&mut self, record: &FirstInstallRecord) -> NativeResult<FirstInstallRecord> {
         self.point("register-before")?;
@@ -1559,4 +1574,368 @@ fn a8b_stale_absence_retirement_each_cut_never_resets_or_runs_claim() {
     );
     assert_eq!(fake.effects, 0);
     assert_eq!(fake.retired, 0);
+}
+
+/// Every role staged, published and original-missing, persisted at FilesVerified.
+fn verified_record() -> FirstInstallRecord {
+    let mut r = record();
+    for role in PayloadRole::ALL {
+        let value = r.role_mut(role).unwrap();
+        value.original = OriginalLeaf::Missing;
+        value.staged = Some(image(role));
+        value.published = Some(image(role));
+    }
+    r.advance(Phase::FilesVerified).unwrap();
+    r
+}
+#[test]
+fn elevated_runs_after_files_verified_is_durable_and_before_task_intent() {
+    let mut port = Fake::default();
+    let mut r = record();
+    apply(&mut port, &mut r).unwrap();
+    assert_eq!(r.phase(), Phase::Complete);
+    let position = |value: &str| port.events.iter().position(|e| e == value).unwrap();
+    let verified = position("verify-files");
+    let persisted = position("intent-after:FilesVerified");
+    let elevated = position("elevated");
+    let task = position("intent-before:TaskIntent");
+    let register = position("register-before");
+    assert!(verified < persisted);
+    assert!(persisted < elevated);
+    assert!(elevated < task);
+    assert!(task < register);
+    // The hook runs after the FilesVerified record is the persisted one.
+    assert_eq!(port.elevated_phase, Some(Phase::FilesVerified));
+}
+#[test]
+fn elevated_is_called_exactly_once_per_forward_apply() {
+    let mut port = Fake::default();
+    apply(&mut port, &mut record()).unwrap();
+    assert_eq!(port.elevated_calls, 1);
+    // A forward Apply restarted from Intent under a fresh logon is still one forward Apply.
+    let old = context_record(&token(20, 1));
+    let mut next = match reopen(&old, &token(20, 2)).unwrap() {
+        Reopen::Restart(next) => next,
+        _ => panic!("Intent must restart"),
+    };
+    let mut port = Fake::default();
+    apply(&mut port, &mut next).unwrap();
+    assert_eq!(next.phase(), Phase::Complete);
+    assert_eq!(port.elevated_calls, 1);
+}
+#[test]
+fn elevated_is_never_called_when_a_reopen_resumes_or_observes() {
+    // A record already at FilesVerified resumes without the administrator step.
+    let mut verified = verified_record();
+    let mut port = Fake {
+        saved: Some(verified.clone()),
+        fixed: PayloadRole::ALL.map(|role| Some(image(role))),
+        ..Fake::default()
+    };
+    resume(&mut port, &mut verified).unwrap();
+    assert_eq!(verified.phase(), Phase::Complete);
+    assert_eq!(port.elevated_calls, 0);
+    assert_eq!((port.register, port.runs), (1, 1));
+    // Observe-only states after the Run never reach the hook either.
+    for phase in [
+        Phase::RunIntent,
+        Phase::RunObserved,
+        Phase::Ready,
+        Phase::PruneIntent,
+    ] {
+        let mut old = context_record(&token(20, 1));
+        for role in PayloadRole::ALL {
+            let value = old.role_mut(role).unwrap();
+            value.staged = Some(image(role));
+            value.published = Some(image(role));
+            value.original = OriginalLeaf::Missing;
+        }
+        if phase.rank() >= Phase::Ready.rank() {
+            old.ready(99).unwrap();
+        }
+        old.advance(phase).unwrap();
+        let mut observed = match reopen(&old, &token(20, 2)).unwrap() {
+            Reopen::Observe(value) => value,
+            _ => panic!("post-Run is observe-only"),
+        };
+        let mut port = Fake {
+            saved: Some(old.clone()),
+            fixed: PayloadRole::ALL.map(|role| Some(image(role))),
+            register: 1,
+            runs: 1,
+            ready: true,
+            running: true,
+            ..Fake::default()
+        };
+        resume(&mut port, &mut observed).unwrap();
+        assert_eq!(observed.phase(), Phase::Complete);
+        assert_eq!(port.elevated_calls, 0, "elevated on Observe from {phase:?}");
+    }
+}
+#[test]
+fn elevated_is_called_at_most_once_across_every_interruption_and_never_on_reopen() {
+    let mut reference = Fake::default();
+    apply(&mut reference, &mut record()).unwrap();
+    assert_eq!(reference.elevated_calls, 1);
+    for cut in 1..=reference.steps {
+        let mut port = Fake {
+            cut: Some(cut),
+            ..Fake::default()
+        };
+        let _ = apply(&mut port, &mut record());
+        let forward = port.elevated_calls;
+        assert!(forward <= 1, "elevated repeated at boundary {cut}");
+        if let Some(saved) = port.saved.clone() {
+            let mut reopened = FirstInstallRecord::decode(&saved.encode().unwrap()).unwrap();
+            port.cut = None;
+            let _ = resume(&mut port, &mut reopened);
+            assert_eq!(
+                port.elevated_calls, forward,
+                "elevated on reopen at boundary {cut}"
+            );
+        }
+    }
+}
+#[test]
+fn elevated_error_ends_the_install_before_any_registration_or_run() {
+    for error in [NativeError::OutcomeUnknown, NativeError::Foreign] {
+        let mut port = Fake {
+            elevated_error: Some(error),
+            ..Fake::default()
+        };
+        let mut r = record();
+        assert_eq!(apply(&mut port, &mut r), Err(error));
+        assert_eq!(port.elevated_calls, 1);
+        assert_eq!((port.register, port.runs), (0, 0));
+        assert!(!port.ready && !port.running);
+        assert!(!port.events.iter().any(|e| {
+            e == "intent-before:TaskIntent"
+                || e.starts_with("register-")
+                || e.starts_with("run-")
+                || e.starts_with("observe-")
+                || e == "retention-observe"
+        }));
+        // The durable record stops at FilesVerified; no later phase was persisted.
+        assert_eq!(r.phase(), Phase::FilesVerified);
+        assert_eq!(
+            port.saved.as_ref().map(FirstInstallRecord::phase),
+            Some(Phase::FilesVerified)
+        );
+    }
+}
+#[test]
+fn classifier_ignores_the_elevated_record_in_every_branch() {
+    use FirstInstallDisposition as D;
+    use crosspane_installer_core::elevated::journal::RECORD_LEAF;
+    use removal::RemovalCursor as R;
+    use service::journal::Phase as Journal;
+    assert_eq!(RECORD_LEAF, "elevated-setup.json");
+    type Branch = (
+        &'static [&'static str],
+        Option<R>,
+        Option<Phase>,
+        Option<Journal>,
+        bool,
+        bool,
+        D,
+    );
+    let branches: &[Branch] = &[
+        // Fresh and eligible.
+        (&[], None, None, None, false, false, D::Eligible),
+        (
+            &["install.lock"],
+            None,
+            None,
+            None,
+            false,
+            false,
+            D::Eligible,
+        ),
+        // Partial and foreign or unknown names.
+        (
+            &["unexpected.json"],
+            None,
+            None,
+            None,
+            false,
+            false,
+            D::Partial,
+        ),
+        (
+            &["task-activation.json"],
+            None,
+            None,
+            None,
+            false,
+            false,
+            D::Partial,
+        ),
+        // Completed removal, by the removal cursor.
+        (
+            &[],
+            Some(R::Retired),
+            None,
+            None,
+            false,
+            false,
+            D::CompletedRemoval,
+        ),
+        (
+            &["removal.json"],
+            Some(R::Complete {
+                retained_copy: None,
+            }),
+            None,
+            None,
+            false,
+            false,
+            D::CompletedRemoval,
+        ),
+        (
+            &["removal.json"],
+            Some(R::Selected),
+            None,
+            None,
+            false,
+            false,
+            D::Partial,
+        ),
+        // Stale supervisor epochs, a finished journal, a logon or a claimed activation.
+        (
+            &["supervisor-epoch-0.json"],
+            None,
+            None,
+            None,
+            false,
+            false,
+            D::CompletedRemoval,
+        ),
+        (
+            &["supervisor-epoch-2.json"],
+            None,
+            None,
+            None,
+            false,
+            false,
+            D::CompletedRemoval,
+        ),
+        (
+            &[],
+            None,
+            None,
+            Some(Journal::Finished),
+            false,
+            false,
+            D::CompletedRemoval,
+        ),
+        (&[], None, None, None, true, false, D::CompletedRemoval),
+        (&[], None, None, None, false, true, D::CompletedRemoval),
+        // First-install records at each phase family.
+        (
+            &["first-install.json"],
+            None,
+            Some(Phase::Intent),
+            None,
+            false,
+            false,
+            D::Resume,
+        ),
+        (
+            &["install.lock", "first-install.json"],
+            None,
+            Some(Phase::Intent),
+            None,
+            false,
+            false,
+            D::Resume,
+        ),
+        (
+            &["first-install.json", "unexpected.json"],
+            None,
+            Some(Phase::Intent),
+            None,
+            false,
+            false,
+            D::Partial,
+        ),
+        (
+            &[
+                "first-install.json",
+                "task-activation.json",
+                "supervisor.json",
+            ],
+            None,
+            Some(Phase::RunObserved),
+            Some(Journal::Running),
+            true,
+            true,
+            D::Resume,
+        ),
+        (
+            &["first-install.json", "supervisor-epoch-1.json"],
+            None,
+            Some(Phase::Ready),
+            None,
+            false,
+            false,
+            D::Resume,
+        ),
+        (
+            &["removal.json"],
+            None,
+            Some(Phase::RunObserved),
+            None,
+            false,
+            false,
+            D::Partial,
+        ),
+        (
+            &["first-install.json"],
+            None,
+            Some(Phase::Complete),
+            None,
+            false,
+            false,
+            D::Existing,
+        ),
+        (
+            &["first-install.json"],
+            None,
+            Some(Phase::Unknown),
+            None,
+            false,
+            false,
+            D::Unknown,
+        ),
+        (
+            &["first-install.json"],
+            None,
+            Some(Phase::StageIntent(PayloadRole::Agent)),
+            None,
+            false,
+            false,
+            D::Partial,
+        ),
+    ];
+    for &(names, removal, first, journal, logon, claimed_activation, expected) in branches {
+        let without: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+        let mut with = without.clone();
+        with.push(RECORD_LEAF.to_owned());
+        let classify = |history: &[String]| {
+            classify_history(DecodedHistory {
+                removal,
+                first,
+                journal,
+                logon,
+                claimed_activation,
+                names: history,
+            })
+        };
+        assert_eq!(
+            classify(&without),
+            expected,
+            "without the record: {names:?}"
+        );
+        assert_eq!(classify(&with), expected, "with the record: {names:?}");
+    }
 }

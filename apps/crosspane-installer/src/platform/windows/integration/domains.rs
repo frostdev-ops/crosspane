@@ -1,13 +1,37 @@
 //! Typed integration observations are never native ownership or executable approval.
 use crosspane_installer_core::ObservationSource;
+use crosspane_installer_core::elevated::step::ElevatedPlan;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Operation {
     Install,
     Upgrade,
-    Removal { erase_identity: bool },
+    Removal {
+        erase_identity: bool,
+    },
     MetadataRepair,
     PayloadRepair,
+    /// The administrator step alone (ADMIN).
+    Elevated,
+}
+/// Setup or teardown of the firewall rule and display driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ElevatedRequest {
+    Setup,
+    Teardown,
+}
+/// The administrator step's planning result; `Planned` carries the consent-bound plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ElevatedPlanning {
+    Planned(ElevatedPlan),
+    Unavailable(&'static str),
+    NotNeeded,
+}
+/// Read-only detection of the firewall rule and display driver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ElevatedDetection {
+    pub configured: bool,
+    pub detail: String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum State {
@@ -74,6 +98,7 @@ impl Snapshot {
                     && self.agent == State::Missing
                     && !self.unsettled
             }
+            Operation::Elevated => self.healthy(),
             _ => self.healthy(),
         }
     }
@@ -116,6 +141,9 @@ impl Snapshot {
         if !self.supported || !self.inventory || self.unsettled {
             return false;
         }
+        if matches!(op, Operation::Elevated) {
+            return self.cold == Cold::Existing && self.payload == State::Healthy;
+        }
         if matches!(op, Operation::Install) {
             return self.sources
                 && match self.cold {
@@ -138,7 +166,7 @@ impl Snapshot {
             Operation::MetadataRepair => {
                 self.payload == State::Healthy && self.agent == State::Healthy
             }
-            Operation::Install => false,
+            Operation::Install | Operation::Elevated => false,
         }
     }
 }
@@ -223,6 +251,26 @@ pub(crate) trait Domains: Send {
     fn take_first_refusal(&mut self) -> Option<&'static str> {
         None
     }
+    /// Plans the administrator step for one request; by default there is nothing to ask.
+    fn elevated_plan(&mut self, _r: ElevatedRequest) -> Result<ElevatedPlanning, Failure> {
+        Ok(ElevatedPlanning::NotNeeded)
+    }
+    /// Read-only check of the firewall rule and display driver; by default it is not submitted.
+    fn elevated_detect(&mut self) -> Result<ElevatedDetection, Failure> {
+        Err(Failure::NotSubmitted)
+    }
+    /// Applies with the consent-bound plan when there is one; by default it is the plain apply.
+    fn apply_elevated(
+        &mut self,
+        op: Operation,
+        _e: Option<&ElevatedPlan>,
+    ) -> Result<Dispatch, Failure> {
+        self.apply(op)
+    }
+    /// Lines for the outcome detail after the administrator step; by default there are none.
+    fn take_elevated_report(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,7 +304,7 @@ pub(crate) fn settle_artifacts<P: ArtifactSettlement>(
 
 pub(crate) const DEFERRED: &[&str] = &[
     "Windows practice and UI verification (W4.1b)",
-    "Firewall and display driver (W4.1c)",
+    "Windows Firewall rule and display driver",
     "Signing and distribution (W4.2)",
     "Attended Windows checks (W6.2/W6.4)",
 ];
@@ -276,7 +324,25 @@ pub(crate) mod native {
         service,
     };
     use super::*;
+    use crosspane_installer_core::elevated::step::{
+        Gate, INSTALL_WITHOUT_SETUP, PartResult, REMOVAL_NOT_STARTED, StepResult, admin_gate,
+        removal_gate, report_lines,
+    };
     use std::{path::PathBuf, sync::Arc};
+    // Frozen administrator-step planning reasons (WP-W4.1c2 lead ruling L7), shown verbatim.
+    const NO_KIT: &str = "This installer doesn't include the administrator setup kit, so the firewall rule and display driver are left as they are.";
+    const RECORD_UNREADABLE: &str = "The record of earlier administrator steps can't be read, so the firewall rule and display driver are left as they are.";
+    const NO_SOURCES: &str = "The administrator setup kit isn't installed. Run the installer with --payload set to this release's folder to set up the firewall rule and display driver.";
+    const TOO_LONG: &str = "The administrator step is too long to show, so it isn't offered.";
+    // NotRun reasons of a step that never reached the helper (the frozen N3 wording of elevated_step.rs).
+    const KIT_NOT_RUN: &str =
+        "the administrator setup kit isn't available or doesn't match this installer";
+    const RECORD_NOT_RUN: &str =
+        "the administrator setup record can't be read or belongs to another install";
+    // Detect wording when the firewall rule and display driver are not checked (WP-W4.1c2 lead ruling L16).
+    const NOT_CHECKED: &str = "Firewall rule: not checked. Display driver: not checked.";
+    // The core status_summary pending note, repeated here because the core keeps it private (L16).
+    const PENDING_NOTE: &str = " An earlier administrator step was interrupted; it is checked again before the next one runs.";
     pub(crate) struct NativeDomains {
         folder: Option<PathBuf>,
         previous: Option<RepairObservation>,
@@ -285,6 +351,8 @@ pub(crate) mod native {
         first_refusal: Option<&'static str>,
         /// Set by an explicit first-install recovery; verification then uses its settled predicate.
         recovered: bool,
+        /// Outcome lines of the administrator step, filled by `apply_elevated` and taken by the ADMIN outcome.
+        elevated_report: Vec<String>,
     }
     enum Continuation {
         Upgrade(service::KeeperContinuation),
@@ -320,6 +388,7 @@ pub(crate) mod native {
                 held: None,
                 first_refusal: None,
                 recovered: false,
+                elevated_report: Vec::new(),
             }
         }
         fn inputs(&self) -> Result<[Box<dyn std::io::Read + Send>; 3], Failure> {
@@ -517,6 +586,14 @@ pub(crate) mod native {
                     aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &bytes).as_ref(),
                 );
             }
+            // Correlation only: an absent record adds nothing, and an unreadable one adds a fixed
+            // marker instead of failing the observation.
+            use super::super::super::elevated_store;
+            match elevated_store::read(io, &budget) {
+                Ok(Some((_, sha))) => correlation.extend_from_slice(&sha),
+                Ok(None) => {}
+                Err(_) => correlation.extend_from_slice(&[0xEE; 32]),
+            }
         }
         if [actual.task().diagnostic(), actual.agent(), actual.payload()]
             .contains(&Diagnostic::AccessDenied)
@@ -546,6 +623,119 @@ pub(crate) mod native {
         };
         Ok((snapshot, actual.clone()))
     }
+    impl NativeDomains {
+        /// The first-install outcome mapping, shared by the plain and the administrator-step Install.
+        fn first_install_dispatch(
+            &mut self,
+            outcome: service::FirstInstallOutcome,
+        ) -> Result<Dispatch, Failure> {
+            match outcome {
+                service::FirstInstallOutcome::Complete => Ok(Dispatch {
+                    handoff: Handoff::NotCommitted,
+                    complete: true,
+                }),
+                service::FirstInstallOutcome::NotSubmitted(reason) => {
+                    self.first_refusal = Some(reason);
+                    Err(Failure::NotSubmitted)
+                }
+                service::FirstInstallOutcome::Unknown => Err(Failure::Unknown),
+            }
+        }
+        /// Install with the administrator step between FilesVerified and TaskIntent (N5). Without the
+        /// kit the install runs alone and the report says so.
+        fn apply_first_install_elevated(
+            &mut self,
+            plan: &ElevatedPlan,
+        ) -> Result<Dispatch, Failure> {
+            use super::super::super::elevated_kit;
+            self.first_refusal = None;
+            self.recovered = false;
+            let Some(manifest) = elevated_kit::embedded() else {
+                let (outcome, _) = service::begin_first_install_elevated(
+                    self.inputs()?,
+                    None,
+                    &deadline(120_000)?,
+                )
+                .map_err(|_| Failure::Unknown)?;
+                let dispatch = self.first_install_dispatch(outcome);
+                let mut lines = report_lines(&StepResult::not_run(plan.verb(), KIT_NOT_RUN));
+                // L16: "installed without them" is said only when the install itself completed.
+                if matches!(dispatch, Ok(Dispatch { complete: true, .. })) {
+                    lines.push(INSTALL_WITHOUT_SETUP.to_owned());
+                }
+                self.elevated_report = lines;
+                return dispatch;
+            };
+            // An unreadable source folder counts as no sources, and the placed kit is used instead.
+            let sources = self
+                .folder
+                .as_deref()
+                .and_then(|folder| elevated_kit::read_sources(folder, &manifest).ok());
+            let elevated = service::ElevatedInstall {
+                plan: plan.clone(),
+                manifest,
+                sources,
+            };
+            let (outcome, step) = service::begin_first_install_elevated(
+                self.inputs()?,
+                Some(elevated),
+                &deadline(120_000)?,
+            )
+            .map_err(|_| Failure::Unknown)?;
+            let dispatch = self.first_install_dispatch(outcome);
+            // The step's report is kept whatever the install's own outcome; the outcome is never changed by it.
+            if let Some(step) = step {
+                let mut lines = report_lines(&step);
+                // L16: "installed without them" is said only when the install completed, no part
+                // waits for a restart, and the step is not fully verified.
+                let completed = matches!(dispatch, Ok(Dispatch { complete: true, .. }));
+                let restart = step
+                    .parts
+                    .iter()
+                    .any(|(_, part)| *part == PartResult::RebootRequired);
+                if completed && !restart && !step.all_verified() {
+                    lines.push(INSTALL_WITHOUT_SETUP.to_owned());
+                }
+                self.elevated_report = lines;
+            }
+            dispatch
+        }
+        /// Runs one consented administrator step with the journal's own per-write lock. Nothing is held
+        /// across it. Any failure before the launch is `NotRun`, so nothing elevated has happened.
+        fn run_elevated_step(&self, plan: &ElevatedPlan) -> StepResult {
+            use super::super::super::{
+                elevated_kit,
+                elevated_step::{self, ElevatedRun},
+                elevated_store::LockSource,
+            };
+            let verb = plan.verb();
+            let Some(manifest) = elevated_kit::embedded() else {
+                return StepResult::not_run(verb, KIT_NOT_RUN);
+            };
+            let sources = self
+                .folder
+                .as_deref()
+                .and_then(|folder| elevated_kit::read_sources(folder, &manifest).ok());
+            let Ok(budget) = deadline(30_000) else {
+                return StepResult::not_run(verb, RECORD_NOT_RUN);
+            };
+            let Ok(probe) =
+                WindowsNativeIo::probe_repair(Arc::new(MonotonicClock::default()), &budget)
+            else {
+                return StepResult::not_run(verb, RECORD_NOT_RUN);
+            };
+            let Some(io) = probe.io() else {
+                return StepResult::not_run(verb, RECORD_NOT_RUN);
+            };
+            elevated_step::run(ElevatedRun {
+                io,
+                lock: LockSource::PerWrite,
+                plan,
+                manifest: &manifest,
+                sources: sources.as_ref(),
+            })
+        }
+    }
     impl Domains for NativeDomains {
         fn observe(&mut self) -> Result<Snapshot, Failure> {
             let (mut snapshot, actual) = read_observation()?;
@@ -560,7 +750,7 @@ pub(crate) mod native {
             Ok(snapshot)
         }
         fn settle(&mut self, op: Operation) -> Result<bool, Failure> {
-            if op == Operation::Install
+            if matches!(op, Operation::Install | Operation::Elevated)
                 || matches!(read_observation()?.0.cold, Cold::Partial | Cold::Stale)
             {
                 return Ok(false);
@@ -572,19 +762,9 @@ pub(crate) mod native {
             self.first_refusal = None;
             self.recovered = false;
             if op == Operation::Install {
-                return match service::begin_first_install(self.inputs()?, &deadline(120_000)?)
-                    .map_err(|_| Failure::Unknown)?
-                {
-                    service::FirstInstallOutcome::Complete => Ok(Dispatch {
-                        handoff: Handoff::NotCommitted,
-                        complete: true,
-                    }),
-                    service::FirstInstallOutcome::NotSubmitted(reason) => {
-                        self.first_refusal = Some(reason);
-                        Err(Failure::NotSubmitted)
-                    }
-                    service::FirstInstallOutcome::Unknown => Err(Failure::Unknown),
-                };
+                let outcome = service::begin_first_install(self.inputs()?, &deadline(120_000)?)
+                    .map_err(|_| Failure::Unknown)?;
+                return self.first_install_dispatch(outcome);
             }
             let cold = read_observation()?.0.cold;
             if matches!(cold, Cold::Partial | Cold::Stale) {
@@ -606,6 +786,23 @@ pub(crate) mod native {
                 };
                 let budget = deadline(120_000)?;
                 self.recovered = true;
+                // L17: a partial first install cut after FilesVerified can leave the placed elevated kit in the
+                // install root, and the recovery's removal never deletes a non-empty root. The plain kit files
+                // and the then-empty driver directory go first. Any error may follow a removal, so it is Unknown.
+                if matches!(mode, M::Remove) {
+                    let probe_budget = deadline(30_000)?;
+                    let probe = WindowsNativeIo::probe_repair(
+                        Arc::new(MonotonicClock::default()),
+                        &probe_budget,
+                    )
+                    .map_err(|_| Failure::NotSubmitted)?;
+                    let io = probe.io().ok_or(Failure::NotSubmitted)?;
+                    let install_text = io.target().paths().install();
+                    let install = std::path::Path::new(install_text);
+                    if super::super::super::elevated_kit::remove_placed(install).is_err() {
+                        return Err(Failure::Unknown);
+                    }
+                }
                 let outcome = match service::recover_first_install(mode, &budget) {
                     Ok(outcome) => outcome,
                     // Pre: refused before any recovery effect, so nothing was submitted.
@@ -640,7 +837,7 @@ pub(crate) mod native {
                 Operation::PayloadRepair => Continuation::Repair(
                     service::begin_payload_repair(self.inputs()?).map_err(|_| Failure::Unknown)?,
                 ),
-                Operation::Install | Operation::MetadataRepair => {
+                Operation::Install | Operation::MetadataRepair | Operation::Elevated => {
                     return Err(Failure::NotSubmitted);
                 }
             };
@@ -660,7 +857,178 @@ pub(crate) mod native {
         fn take_first_refusal(&mut self) -> Option<&'static str> {
             self.first_refusal.take()
         }
+        /// Applies with the consent-bound administrator step when there is one (N5). The step runs
+        /// first; a removal proceeds only when its gate allows, and the report is kept for the outcome.
+        fn apply_elevated(
+            &mut self,
+            op: Operation,
+            e: Option<&ElevatedPlan>,
+        ) -> Result<Dispatch, Failure> {
+            self.elevated_report.clear();
+            let Some(plan) = e else {
+                return self.apply(op);
+            };
+            match op {
+                Operation::Install => self.apply_first_install_elevated(plan),
+                Operation::Removal { .. } => {
+                    let step = self.run_elevated_step(plan);
+                    self.elevated_report = report_lines(&step);
+                    match removal_gate(&step) {
+                        Gate::Proceed => self.apply(op),
+                        Gate::NotSubmitted => {
+                            self.elevated_report.push(REMOVAL_NOT_STARTED.to_owned());
+                            Err(Failure::NotSubmitted)
+                        }
+                        Gate::Unknown => Err(Failure::Unknown),
+                    }
+                }
+                Operation::Elevated => {
+                    let step = self.run_elevated_step(plan);
+                    self.elevated_report = report_lines(&step);
+                    match admin_gate(&step) {
+                        Gate::Proceed => Ok(Dispatch {
+                            handoff: Handoff::NotCommitted,
+                            complete: step.all_verified(),
+                        }),
+                        Gate::NotSubmitted => Err(Failure::NotSubmitted),
+                        Gate::Unknown => Err(Failure::Unknown),
+                    }
+                }
+                Operation::Upgrade | Operation::MetadataRepair | Operation::PayloadRepair => {
+                    self.apply(op)
+                }
+            }
+        }
+        /// The outcome lines of the last administrator step, taken once.
+        fn take_elevated_report(&mut self) -> Vec<String> {
+            std::mem::take(&mut self.elevated_report)
+        }
+        /// Read-only planning. The record is only read, the kit is only verified or read, and
+        /// nothing is elevated or placed here.
+        fn elevated_plan(&mut self, r: ElevatedRequest) -> Result<ElevatedPlanning, Failure> {
+            use super::super::super::{elevated_kit, elevated_step, elevated_store};
+            use crosspane_installer_core::elevated::{
+                AgentProgram, DriverState, FirewallState, InstallId, RuleScope, Verb,
+            };
+            let Some(manifest) = elevated_kit::embedded() else {
+                return Ok(ElevatedPlanning::Unavailable(NO_KIT));
+            };
+            let budget = deadline(30_000)?;
+            let probe = WindowsNativeIo::probe_repair(Arc::new(MonotonicClock::default()), &budget)
+                .map_err(|_| Failure::NotSubmitted)?;
+            // Without a supported target the record cannot be read, so it is never overwritten.
+            let Some(io) = probe.io() else {
+                return Ok(ElevatedPlanning::Unavailable(RECORD_UNREADABLE));
+            };
+            let record = match elevated_store::read(io, &budget) {
+                Ok(record) => record.map(|(record, _)| record),
+                Err(_) => return Ok(ElevatedPlanning::Unavailable(RECORD_UNREADABLE)),
+            };
+            let install_text = io.target().paths().install();
+            let install = std::path::Path::new(install_text);
+            let placed = elevated_kit::verify_placed(install, &manifest).is_ok();
+            // An unreadable source folder counts as no sources.
+            let sources = self
+                .folder
+                .as_deref()
+                .is_some_and(|folder| elevated_kit::read_sources(folder, &manifest).is_ok());
+            let verb = match r {
+                ElevatedRequest::Setup => {
+                    if !placed && !sources {
+                        return Ok(ElevatedPlanning::Unavailable(NO_SOURCES));
+                    }
+                    let scope = match &record {
+                        Some(record) => record.scope(),
+                        // No record: the install id is fresh, so no earlier rule is named.
+                        None => {
+                            let mut random = [0; 16];
+                            aws_lc_rs::rand::fill(&mut random)
+                                .map_err(|_| Failure::NotSubmitted)?;
+                            RuleScope {
+                                id: InstallId::from_random(random),
+                                program: AgentProgram::parse(&format!(
+                                    r"{install_text}\crosspane-agent.exe"
+                                ))
+                                .map_err(|_| Failure::NotSubmitted)?,
+                            }
+                        }
+                    };
+                    Verb::Setup(scope)
+                }
+                ElevatedRequest::Teardown => {
+                    // Without a record there is nothing this install set up to remove.
+                    let Some(record) = record else {
+                        return Ok(ElevatedPlanning::NotNeeded);
+                    };
+                    let scope = record.scope();
+                    let absent = placed
+                        && elevated_step::observe(io, &manifest, &scope).is_ok_and(|report| {
+                            report.firewall.state == FirewallState::Missing
+                                && report.driver.state == DriverState::Absent
+                        });
+                    if absent {
+                        return Ok(ElevatedPlanning::NotNeeded);
+                    }
+                    if !placed && !sources {
+                        return Ok(ElevatedPlanning::Unavailable(NO_SOURCES));
+                    }
+                    Verb::Teardown(scope)
+                }
+            };
+            Ok(match ElevatedPlan::new(verb) {
+                Ok(plan) => ElevatedPlanning::Planned(plan),
+                Err(_) => ElevatedPlanning::Unavailable(TOO_LONG),
+            })
+        }
+        /// Read-only detection. With a record it is the record's scope; without one the firewall
+        /// rule is not checked, and only the placed helper's unscoped status is read.
+        fn elevated_detect(&mut self) -> Result<ElevatedDetection, Failure> {
+            use super::super::super::{
+                elevated_kit, elevated_launch::ElevatedHelper, elevated_step, elevated_store,
+            };
+            use crosspane_installer_core::elevated::step::status_summary;
+            let manifest = elevated_kit::embedded().ok_or(Failure::NotSubmitted)?;
+            let budget = deadline(30_000)?;
+            let probe = WindowsNativeIo::probe_repair(Arc::new(MonotonicClock::default()), &budget)
+                .map_err(|_| Failure::NotSubmitted)?;
+            let io = probe.io().ok_or(Failure::NotSubmitted)?;
+            let record = elevated_store::read(io, &budget).map_err(|_| Failure::NotSubmitted)?;
+            let Some((record, _)) = record else {
+                let install_text = io.target().paths().install();
+                let Ok(image) =
+                    elevated_kit::verify_placed(std::path::Path::new(install_text), &manifest)
+                else {
+                    return Ok(ElevatedDetection {
+                        configured: false,
+                        detail: NOT_CHECKED.to_owned(),
+                    });
+                };
+                let report = ElevatedHelper::locate(image)
+                    .and_then(|helper| helper.status(None))
+                    .map_err(|_| Failure::NotSubmitted)?;
+                let (configured, detail) = status_summary(&report, false);
+                return Ok(ElevatedDetection { configured, detail });
+            };
+            let pending = !record.pending().is_empty();
+            // L16: a placed kit that can't be verified is reported as not checked, not refused, so
+            // Detect stays available and Plan can place the kit from --payload sources.
+            let Ok(report) = elevated_step::observe(io, &manifest, &record.scope()) else {
+                let mut detail = NOT_CHECKED.to_owned();
+                if pending {
+                    detail.push_str(PENDING_NOTE);
+                }
+                return Ok(ElevatedDetection {
+                    configured: false,
+                    detail,
+                });
+            };
+            let (configured, detail) = status_summary(&report, pending);
+            Ok(ElevatedDetection { configured, detail })
+        }
         fn verify(&mut self, op: Operation) -> Result<bool, Failure> {
+            if op == Operation::Elevated {
+                return self.elevated_detect().map(|check| check.configured);
+            }
             let observed = self.observe()?;
             if self.recovered && op == Operation::MetadataRepair {
                 return Ok(observed.first_recovery_settled());

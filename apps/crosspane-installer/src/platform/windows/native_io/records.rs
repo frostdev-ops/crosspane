@@ -1,5 +1,6 @@
 use super::{NativeError, NativeResult, files::MAX_RECORD_BYTES, files::check_read_size};
 use aws_lc_rs::digest::{SHA256, digest};
+use crosspane_installer_core::elevated::journal;
 use serde::{Deserialize, Serialize};
 
 /// Content expectations alone confer no namespace or mutation authority. A fresh support proof
@@ -93,6 +94,7 @@ pub enum RecordKind {
     TaskActivation,
     SupervisorLogon,
     SupervisorArchiveIntent,
+    ElevatedSetup,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordName {
@@ -119,6 +121,7 @@ pub enum RecordName {
     SupervisorLogon,
     SupervisorEpoch(u8),
     SupervisorArchiveIntent,
+    ElevatedSetup,
 }
 impl RecordName {
     pub fn file_name(&self) -> NativeResult<super::files::PrivateName> {
@@ -163,6 +166,7 @@ impl RecordName {
             Self::SupervisorArchiveIntent => {
                 super::files::PrivateName::new("supervisor-archive-intent.json")
             }
+            Self::ElevatedSetup => super::files::PrivateName::new(journal::RECORD_LEAF),
             Self::Operation(id) if *id != [0; 16] => {
                 super::files::PrivateName::new(&format!("operation-{}.json", hex(id)))
             }
@@ -194,6 +198,7 @@ impl RecordName {
             Self::SupervisorLogon => RecordKind::SupervisorLogon,
             Self::SupervisorEpoch(_) => RecordKind::Supervisor,
             Self::SupervisorArchiveIntent => RecordKind::SupervisorArchiveIntent,
+            Self::ElevatedSetup => RecordKind::ElevatedSetup,
         }
     }
     fn operation(&self) -> Option<[u8; 16]> {

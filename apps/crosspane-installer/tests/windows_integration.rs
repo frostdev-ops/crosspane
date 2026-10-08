@@ -4,10 +4,14 @@ use crosspane_installer::{agent_contract, gui, live, view};
 #[allow(dead_code)]
 mod integration;
 use crosspane_installer_core::ObservationSource;
+use crosspane_installer_core::elevated::step::{
+    ElevatedPlan, INSTALL_DECLINE_NOTE, PREVIEW_HEADER,
+};
+use crosspane_installer_core::elevated::{AgentProgram, InstallId, RuleScope, Verb};
 use domains::*;
 use integration::{domains, ports, worker};
 use std::sync::{
-    Arc,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -28,6 +32,20 @@ fn snapshot() -> Snapshot {
         source: ObservationSource::Live,
     }
 }
+/// The elevated calls the worker made. `run` takes the fake by value, so tests keep a clone of
+/// `Fake::elevated` and read this log once the worker thread has finished.
+#[derive(Default)]
+struct ElevatedLog {
+    requests: Vec<ElevatedRequest>,
+    detects: usize,
+    applied: Vec<(Operation, Option<ElevatedPlan>)>,
+    verified: Vec<Operation>,
+}
+fn locked(shared: &Mutex<ElevatedLog>) -> MutexGuard<'_, ElevatedLog> {
+    shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 struct Fake {
     observed: Snapshot,
     applications: usize,
@@ -44,6 +62,15 @@ struct Fake {
     archive_full: bool,
     verify_failure: Option<Failure>,
     first_refusal: Option<&'static str>,
+    /// Shared with the test; see `ElevatedLog`.
+    elevated: Arc<Mutex<ElevatedLog>>,
+    /// Configured `elevated_plan` results; a request without one is `NotNeeded`.
+    elevated_plans: Vec<(ElevatedRequest, Result<ElevatedPlanning, Failure>)>,
+    elevated_detection: Result<ElevatedDetection, Failure>,
+    /// Returned once by `apply_elevated` in place of the plain apply.
+    elevated_apply: Option<Result<Dispatch, Failure>>,
+    /// Returned once by `take_elevated_report`.
+    elevated_report: Vec<String>,
 }
 impl Fake {
     fn new() -> Self {
@@ -63,6 +90,11 @@ impl Fake {
             archive_full: false,
             verify_failure: None,
             first_refusal: None,
+            elevated: Arc::default(),
+            elevated_plans: Vec::new(),
+            elevated_detection: Err(Failure::NotSubmitted),
+            elevated_apply: None,
+            elevated_report: Vec::new(),
         }
     }
 }
@@ -125,10 +157,40 @@ impl Domains for Fake {
         self.first_refusal.take()
     }
     fn verify(&mut self, op: Operation) -> Result<bool, Failure> {
+        locked(&self.elevated).verified.push(op);
         if let Some(failure) = self.verify_failure {
             return Err(failure);
         }
         Ok(self.observed.verified(op))
+    }
+    fn elevated_plan(&mut self, request: ElevatedRequest) -> Result<ElevatedPlanning, Failure> {
+        locked(&self.elevated).requests.push(request);
+        self.elevated_plans
+            .iter()
+            .find(|(configured, _)| *configured == request)
+            .map_or(Ok(ElevatedPlanning::NotNeeded), |(_, result)| {
+                result.clone()
+            })
+    }
+    fn elevated_detect(&mut self) -> Result<ElevatedDetection, Failure> {
+        locked(&self.elevated).detects += 1;
+        self.elevated_detection.clone()
+    }
+    fn apply_elevated(
+        &mut self,
+        operation: Operation,
+        elevated: Option<&ElevatedPlan>,
+    ) -> Result<Dispatch, Failure> {
+        locked(&self.elevated)
+            .applied
+            .push((operation, elevated.cloned()));
+        match self.elevated_apply.take() {
+            Some(result) => result,
+            None => self.apply(operation),
+        }
+    }
+    fn take_elevated_report(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.elevated_report)
     }
 }
 impl ArtifactSettlement for Fake {
@@ -1220,4 +1282,783 @@ fn a8b_stale_routing_is_observation_only_and_completion_reprobes_fresh_facts() {
     assert_eq!(result.outcome, Outcome::Submitted);
     assert_eq!(result.handoff, Handoff::NotCommitted);
     assert_eq!(c.verify(Operation::MetadataRepair), Outcome::Verified);
+}
+
+/// A configured `elevated_plan` answer for one request.
+type PlanningAnswer = Result<ElevatedPlanning, Failure>;
+/// The removal choice 2 the Inspect report should show: checked, enabled and its label; `None`
+/// when the choice must be absent.
+type TeardownChoice = Option<(bool, bool, String)>;
+/// One PlanUninstall case: the teardown answer, the removal choices, the expected preview and the
+/// teardown requests the worker must make.
+type UninstallCase = (
+    PlanningAnswer,
+    Vec<(u16, bool)>,
+    String,
+    Vec<ElevatedRequest>,
+);
+/// The administrator step's rule scope; the core consent path accepts it.
+#[allow(clippy::unwrap_used)] // Test-only fixture; an invalid scope should fail the fixture.
+fn rule_scope() -> RuleScope {
+    RuleScope {
+        id: InstallId::parse("w41c-vm-1").unwrap(),
+        program: AgentProgram::parse(
+            r"C:\Users\jame\AppData\Local\Programs\Crosspane\crosspane-agent.exe",
+        )
+        .unwrap(),
+    }
+}
+/// The consent-bound plan the real core builds for the firewall rule and display driver.
+#[allow(clippy::unwrap_used)] // Test-only fixture; the core consent path must accept the scope.
+fn setup_plan() -> ElevatedPlan {
+    ElevatedPlan::new(Verb::Setup(rule_scope())).unwrap()
+}
+/// The consent-bound plan the real core builds for the firewall rule and driver removal.
+#[allow(clippy::unwrap_used)] // Test-only fixture; the core consent path must accept the scope.
+fn teardown_plan() -> ElevatedPlan {
+    ElevatedPlan::new(Verb::Teardown(rule_scope())).unwrap()
+}
+/// A first-install candidate with nothing installed, in the cold state `cold`.
+fn fresh(cold: Cold) -> Fake {
+    let mut fake = Fake::new();
+    fake.observed.payload = State::Missing;
+    fake.observed.task = State::Missing;
+    fake.observed.agent = State::Missing;
+    fake.observed.cold = cold;
+    fake
+}
+/// Runs `jobs` through the production worker, in order. Each job gets its own fence, selected to
+/// the job's ticket, so one job's selection cannot change another job's admission.
+#[allow(clippy::unwrap_used)] // Test-only harness; a failed send or join should fail the test.
+fn run_jobs(fake: Fake, jobs: Vec<(u64, live::NativeJob)>) -> Vec<live::NativeReport> {
+    let (tx, commands) = mpsc::sync_channel(32);
+    let (reports, rx) = mpsc::sync_channel(32);
+    let (agents, _agent_rx) = mpsc::sync_channel(32);
+    let thread = std::thread::spawn(move || {
+        integration::run(
+            fake,
+            commands,
+            reports,
+            agents,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(ports::CloseState::default()),
+            Arc::new(|| 1),
+        )
+    });
+    for (ticket, job) in jobs {
+        let fence = Fence::default();
+        fence.select(ticket);
+        tx.send(ports::Command::Job { job, fence }).unwrap();
+    }
+    drop(tx); // The worker answers everything queued, then returns on disconnect.
+    let mut sent = Vec::new();
+    while let Ok(report) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        sent.push(report);
+    }
+    thread.join().unwrap();
+    sent
+}
+fn step_of(report: &live::NativeReport) -> &live::StepReport {
+    match report {
+        live::NativeReport::Step(step) => step,
+        _ => panic!("step report expected"),
+    }
+}
+fn maintenance_of(report: &live::NativeReport) -> &live::MaintenanceReport {
+    match report {
+        live::NativeReport::Maintenance(report) => report,
+        _ => panic!("maintenance report expected"),
+    }
+}
+fn planned_preview(report: &live::NativeReport) -> String {
+    match maintenance_of(report) {
+        live::MaintenanceReport::Planned { preview, .. } => preview.clone(),
+        _ => panic!("planned maintenance report expected"),
+    }
+}
+fn step_job(
+    step: u16,
+    operation: u64,
+    stage: crosspane_installer_core::JobStage,
+    consent: Option<live::Consent>,
+) -> live::NativeJob {
+    live::NativeJob::Step {
+        job: crosspane_installer_core::JobIntent {
+            step: crosspane_installer_core::StepId(step),
+            operation: crosspane_installer_core::OperationId(operation),
+            stage,
+        },
+        consent,
+        status: None,
+    }
+}
+/// The consent an Apply carries: the plan ticket it previews, on view revision 1.
+fn consent_for(plan: u64, operation: u64) -> live::Consent {
+    live::Consent {
+        plan: crosspane_installer_core::OperationId(plan),
+        operation: crosspane_installer_core::OperationId(operation),
+        revision: 1,
+    }
+}
+fn uninstall_plan(id: u64, choices: Vec<(u16, bool)>) -> live::NativeJob {
+    live::NativeJob::Maintenance(live::MaintenanceRequest::PlanUninstall {
+        id: live::MaintenanceId(id),
+        choices,
+        status: None,
+    })
+}
+fn confirm_uninstall(id: u64) -> live::NativeJob {
+    live::NativeJob::Maintenance(live::MaintenanceRequest::ConfirmUninstall {
+        id: live::MaintenanceId(id),
+        revision: 1,
+        status: None,
+    })
+}
+#[test]
+fn elevated_install_preview_carries_the_core_block_and_the_same_plan_reaches_apply() {
+    use crosspane_installer_core::JobStage;
+    for cold in [Cold::Eligible, Cold::CompletedRemoval] {
+        let plan = setup_plan();
+        let mut fake = fresh(cold);
+        fake.elevated_plans.push((
+            ElevatedRequest::Setup,
+            Ok(ElevatedPlanning::Planned(plan.clone())),
+        ));
+        let elevated = fake.elevated.clone();
+        let reports = run_jobs(
+            fake,
+            vec![
+                (1, step_job(20, 1, JobStage::Plan, None)),
+                (2, step_job(20, 2, JobStage::Apply, Some(consent_for(1, 2)))),
+            ],
+        );
+        assert_eq!(
+            reports.len(),
+            3,
+            "plan, then Progress, then the apply result"
+        );
+        let expected = format!(
+            "{}\n\n{}\n{INSTALL_DECLINE_NOTE}",
+            integration::install_preview(cold),
+            plan.preview_block()
+        );
+        assert_eq!(
+            step_of(&reports[0]).outcome,
+            live::NativeOutcome::Planned { preview: expected }
+        );
+        let progress = step_of(&reports[1]);
+        assert_eq!(progress.outcome, live::NativeOutcome::Progress);
+        assert_eq!(progress.detail, integration::ELEVATED_WAITING);
+        assert_eq!(
+            step_of(&reports[2]).outcome,
+            live::NativeOutcome::Applied(crosspane_installer_core::ApplyOutcome::Applied)
+        );
+        let seen = locked(&elevated);
+        assert_eq!(seen.requests, vec![ElevatedRequest::Setup]);
+        assert_eq!(seen.applied, vec![(Operation::Install, Some(plan))]);
+    }
+}
+#[test]
+fn elevated_unavailable_install_previews_the_reason_and_gives_apply_none() {
+    use crosspane_installer_core::JobStage;
+    // A planning failure is the same Unavailable state, with the worker's own reason.
+    let cases: [(Result<ElevatedPlanning, Failure>, &str); 2] = [
+        (
+            Ok(ElevatedPlanning::Unavailable(
+                "Windows Defender Firewall is turned off.",
+            )),
+            "Windows Defender Firewall is turned off.",
+        ),
+        (Err(Failure::Unknown), ELEVATED_UNCHECKED),
+    ];
+    for (planning, reason) in cases {
+        let mut fake = fresh(Cold::Eligible);
+        fake.elevated_plans.push((ElevatedRequest::Setup, planning));
+        let elevated = fake.elevated.clone();
+        let reports = run_jobs(
+            fake,
+            vec![
+                (1, step_job(20, 1, JobStage::Plan, None)),
+                (2, step_job(20, 2, JobStage::Apply, Some(consent_for(1, 2)))),
+            ],
+        );
+        // Nothing is planned, so there is no Progress report and the decline note is not added.
+        assert_eq!(reports.len(), 2);
+        assert_eq!(
+            step_of(&reports[0]).outcome,
+            live::NativeOutcome::Planned {
+                preview: format!(
+                    "{}\n\n{reason}",
+                    integration::install_preview(Cold::Eligible)
+                ),
+            }
+        );
+        assert_eq!(
+            step_of(&reports[1]).outcome,
+            live::NativeOutcome::Applied(crosspane_installer_core::ApplyOutcome::Applied)
+        );
+        let seen = locked(&elevated);
+        assert_eq!(seen.requests, vec![ElevatedRequest::Setup]);
+        assert_eq!(seen.applied, vec![(Operation::Install, None)]);
+    }
+}
+#[test]
+fn elevated_is_never_requested_for_upgrade_or_a_non_eligible_install() {
+    use crosspane_installer_core::JobStage;
+    let plan_and_apply = || {
+        vec![
+            (1, step_job(20, 1, JobStage::Plan, None)),
+            (2, step_job(20, 2, JobStage::Apply, Some(consent_for(1, 2)))),
+        ]
+    };
+    // An existing, healthy install is an upgrade: no administrator step is planned.
+    let upgrade = Fake::new();
+    let elevated = upgrade.elevated.clone();
+    let reports = run_jobs(upgrade, plan_and_apply());
+    assert_eq!(
+        reports.len(),
+        2,
+        "no Progress without a planned administrator step"
+    );
+    assert_eq!(
+        step_of(&reports[0]).outcome,
+        live::NativeOutcome::Planned {
+            preview: "Verify the supplied release, settle completed artifacts, and transfer this update to an owned keeper".into(),
+        }
+    );
+    assert_eq!(
+        step_of(&reports[1]).outcome,
+        live::NativeOutcome::Applied(crosspane_installer_core::ApplyOutcome::Applied)
+    );
+    {
+        let seen = locked(&elevated);
+        assert!(seen.requests.is_empty());
+        assert_eq!(seen.applied, vec![(Operation::Upgrade, None)]);
+    }
+    // Observation-only first install: admitted, but no administrator step is planned.
+    let mut observe = Fake::new();
+    observe.observed.cold = Cold::Observe;
+    let elevated = observe.elevated.clone();
+    let reports = run_jobs(observe, plan_and_apply());
+    assert_eq!(reports.len(), 2);
+    assert_eq!(
+        step_of(&reports[0]).outcome,
+        live::NativeOutcome::Planned {
+            preview: integration::install_preview(Cold::Observe).to_owned(),
+        }
+    );
+    assert_eq!(
+        step_of(&reports[1]).outcome,
+        live::NativeOutcome::Applied(crosspane_installer_core::ApplyOutcome::Applied)
+    );
+    {
+        let seen = locked(&elevated);
+        assert!(seen.requests.is_empty());
+        assert_eq!(seen.applied, vec![(Operation::Install, None)]);
+    }
+    // An Install operation on an existing installation is not eligible: nothing is planned and
+    // Apply is not admitted, so no administrator step is ever requested.
+    let mut existing = Fake::new();
+    existing.observed.payload = State::Missing;
+    let elevated = existing.elevated.clone();
+    let reports = run_jobs(existing, plan_and_apply());
+    assert_eq!(reports.len(), 2);
+    assert_eq!(
+        step_of(&reports[0]).outcome,
+        live::NativeOutcome::Planned {
+            preview: integration::install_preview(Cold::Existing).to_owned(),
+        }
+    );
+    assert_eq!(
+        step_of(&reports[1]).outcome,
+        live::NativeOutcome::NotSubmitted
+    );
+    {
+        let seen = locked(&elevated);
+        assert!(seen.requests.is_empty());
+        assert!(seen.applied.is_empty());
+    }
+    // Recovery and unknown admissions are planned without the administrator step.
+    for cold in [
+        Cold::Partial,
+        Cold::Stale,
+        Cold::Unknown,
+        Cold::AccessDenied,
+    ] {
+        let mut fake = Fake::new();
+        fake.observed.cold = cold;
+        let elevated = fake.elevated.clone();
+        let reports = run_jobs(fake, vec![(1, step_job(20, 1, JobStage::Plan, None))]);
+        let expected = match cold {
+            Cold::Partial => "Roll back / remove the partial first install".to_owned(),
+            Cold::Stale => "Settle the stale first-install record".to_owned(),
+            _ => integration::install_preview(cold).to_owned(),
+        };
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            step_of(&reports[0]).outcome,
+            live::NativeOutcome::Planned { preview: expected }
+        );
+        assert!(locked(&elevated).requests.is_empty());
+    }
+}
+#[test]
+fn admin_step_detects_plans_applies_and_verifies_on_the_elevated_routes() {
+    use crosspane_installer_core::JobStage;
+    let plan = setup_plan();
+    let mut fake = Fake::new();
+    fake.elevated_detection = Ok(ElevatedDetection {
+        configured: false,
+        detail: "The firewall rule and display driver are not set up.".to_owned(),
+    });
+    fake.elevated_plans.push((
+        ElevatedRequest::Setup,
+        Ok(ElevatedPlanning::Planned(plan.clone())),
+    ));
+    let elevated = fake.elevated.clone();
+    let reports = run_jobs(
+        fake,
+        vec![
+            (1, step_job(55, 1, JobStage::Detect, None)),
+            (1, step_job(55, 1, JobStage::Plan, None)),
+            (2, step_job(55, 2, JobStage::Apply, Some(consent_for(1, 2)))),
+            (2, step_job(55, 2, JobStage::Verify, None)),
+        ],
+    );
+    assert_eq!(reports.len(), 5, "detect, plan, progress, apply, verify");
+    let detected = step_of(&reports[0]);
+    assert_eq!(
+        detected.outcome,
+        live::NativeOutcome::Detected { needs_action: true }
+    );
+    assert_eq!(
+        detected.detail,
+        "The firewall rule and display driver are not set up."
+    );
+    let planned = match &step_of(&reports[1]).outcome {
+        live::NativeOutcome::Planned { preview } => preview.clone(),
+        _ => panic!("planned outcome expected"),
+    };
+    assert_eq!(
+        planned,
+        format!(
+            "Ask Windows once for administrator approval to add the firewall rule and the display driver\n\n{}",
+            plan.preview_block()
+        )
+    );
+    assert!(!planned.contains(INSTALL_DECLINE_NOTE));
+    assert!(planned.starts_with("Ask Windows once"));
+    assert!(planned.contains(PREVIEW_HEADER));
+    let progress = step_of(&reports[2]);
+    assert_eq!(progress.outcome, live::NativeOutcome::Progress);
+    assert_eq!(progress.detail, integration::ELEVATED_WAITING);
+    assert_eq!(
+        step_of(&reports[3]).outcome,
+        live::NativeOutcome::Applied(crosspane_installer_core::ApplyOutcome::Applied)
+    );
+    assert!(matches!(
+        step_of(&reports[4]).outcome,
+        live::NativeOutcome::Verified { .. }
+    ));
+    assert!(
+        reports
+            .iter()
+            .all(|report| step_of(report).outcome != live::NativeOutcome::Unsupported)
+    );
+    let seen = locked(&elevated);
+    assert_eq!(seen.detects, 1);
+    assert_eq!(seen.requests, vec![ElevatedRequest::Setup]);
+    assert_eq!(seen.applied, vec![(Operation::Elevated, Some(plan))]);
+    assert_eq!(seen.verified, vec![Operation::Elevated]);
+}
+#[test]
+fn admin_detect_needs_action_only_when_the_step_is_not_configured() {
+    use crosspane_installer_core::JobStage;
+    for configured in [false, true] {
+        let mut fake = Fake::new();
+        fake.elevated_detection = Ok(ElevatedDetection {
+            configured,
+            detail: "Firewall rule checked.".to_owned(),
+        });
+        let reports = run_jobs(fake, vec![(1, step_job(55, 1, JobStage::Detect, None))]);
+        assert_eq!(reports.len(), 1);
+        let detected = step_of(&reports[0]);
+        assert_eq!(
+            detected.outcome,
+            live::NativeOutcome::Detected {
+                needs_action: !configured
+            }
+        );
+        assert_eq!(detected.detail, "Firewall rule checked.");
+    }
+}
+#[test]
+fn elevated_report_lines_join_the_apply_detail_only_when_present() {
+    use crosspane_installer_core::JobStage;
+    let base = "Windows operation checked; deferred capabilities remain unavailable";
+    for (lines, expected) in [
+        (Vec::new(), base.to_owned()),
+        (
+            vec![
+                "Windows Defender Firewall rule added.".to_owned(),
+                "Display driver verified.".to_owned(),
+            ],
+            format!("{base} Windows Defender Firewall rule added. Display driver verified."),
+        ),
+    ] {
+        let mut fake = Fake::new();
+        fake.elevated_plans.push((
+            ElevatedRequest::Setup,
+            Ok(ElevatedPlanning::Planned(setup_plan())),
+        ));
+        fake.elevated_report = lines;
+        let reports = run_jobs(
+            fake,
+            vec![
+                (1, step_job(55, 1, JobStage::Plan, None)),
+                (2, step_job(55, 2, JobStage::Apply, Some(consent_for(1, 2)))),
+            ],
+        );
+        let applied = step_of(reports.last().unwrap());
+        assert_eq!(
+            applied.outcome,
+            live::NativeOutcome::Applied(crosspane_installer_core::ApplyOutcome::Applied)
+        );
+        assert_eq!(applied.detail, expected);
+    }
+}
+#[test]
+fn removal_inspect_offers_the_teardown_choice_only_when_it_applies() {
+    let reason = "Windows Defender is turned off.";
+    let base_label = integration::TEARDOWN_LABEL;
+    let cases: [(PlanningAnswer, TeardownChoice); 4] = [
+        (
+            Ok(ElevatedPlanning::Planned(teardown_plan())),
+            Some((true, true, base_label.to_owned())),
+        ),
+        (
+            Ok(ElevatedPlanning::Unavailable(reason)),
+            Some((false, false, format!("{base_label} — {reason}"))),
+        ),
+        (Ok(ElevatedPlanning::NotNeeded), None),
+        (
+            Err(Failure::Unknown),
+            Some((false, false, format!("{base_label} — {ELEVATED_UNCHECKED}"))),
+        ),
+    ];
+    for (planning, expected) in cases {
+        let mut fake = Fake::new();
+        fake.elevated_plans
+            .push((ElevatedRequest::Teardown, planning));
+        let elevated = fake.elevated.clone();
+        let reports = run_jobs(
+            fake,
+            vec![(
+                1,
+                live::NativeJob::Maintenance(live::MaintenanceRequest::Inspect {
+                    id: live::MaintenanceId(1),
+                }),
+            )],
+        );
+        assert_eq!(reports.len(), 1);
+        let choices = match maintenance_of(&reports[0]) {
+            live::MaintenanceReport::Inspected { choices, .. } => choices.clone(),
+            _ => panic!("inspected report expected"),
+        };
+        assert_eq!(choices[0].id, 1, "the identity choice stays first");
+        let teardown = choices.iter().find(|choice| choice.id == 2);
+        match expected {
+            None => assert!(teardown.is_none(), "NotNeeded offers no teardown choice"),
+            Some((checked, enabled, label)) => {
+                let teardown = teardown.unwrap();
+                assert_eq!(
+                    (teardown.checked, teardown.enabled, teardown.role),
+                    (checked, enabled, view::ToggleRole::Grant)
+                );
+                assert_eq!(teardown.label, label);
+            }
+        }
+        assert_eq!(locked(&elevated).requests, vec![ElevatedRequest::Teardown]);
+    }
+}
+#[test]
+fn removal_plan_asks_for_the_teardown_only_when_the_choice_is_on() {
+    let base = "Stop Crosspane cleanly and remove only owned installation files; preserve identity and user state";
+    let cases: [UninstallCase; 3] = [
+        // Choice 2 on and planned: the teardown block follows the removal preview.
+        (
+            Ok(ElevatedPlanning::Planned(teardown_plan())),
+            vec![(1, false), (2, true)],
+            format!("{base}\n\n{}", teardown_plan().preview_block()),
+            vec![ElevatedRequest::Teardown],
+        ),
+        // Choice 2 on and unavailable: the reason follows the removal preview.
+        (
+            Ok(ElevatedPlanning::Unavailable(
+                "Windows Defender is turned off.",
+            )),
+            vec![(1, false), (2, true)],
+            format!("{base}\n\nWindows Defender is turned off."),
+            vec![ElevatedRequest::Teardown],
+        ),
+        // Choice 2 off: the teardown is never planned.
+        (
+            Ok(ElevatedPlanning::Planned(teardown_plan())),
+            vec![(1, false), (2, false)],
+            base.to_owned(),
+            Vec::new(),
+        ),
+    ];
+    for (planning, choices, expected, requests) in cases {
+        let mut fake = Fake::new();
+        fake.elevated_plans
+            .push((ElevatedRequest::Teardown, planning));
+        let elevated = fake.elevated.clone();
+        let reports = run_jobs(fake, vec![(1, uninstall_plan(1, choices))]);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(planned_preview(&reports[0]), expected);
+        assert_eq!(locked(&elevated).requests, requests);
+    }
+}
+#[test]
+fn teardown_not_submitted_refunds_keeps_the_report_lines_and_a_fresh_removal_still_applies() {
+    let mut fake = Fake::new();
+    fake.elevated_plans.push((
+        ElevatedRequest::Teardown,
+        Ok(ElevatedPlanning::Planned(teardown_plan())),
+    ));
+    fake.elevated_apply = Some(Err(Failure::NotSubmitted));
+    fake.elevated_report = vec!["Windows did not start the firewall teardown.".to_owned()];
+    let elevated = fake.elevated.clone();
+    let reports = run_jobs(
+        fake,
+        vec![
+            (1, uninstall_plan(1, vec![(1, false), (2, true)])),
+            (1, confirm_uninstall(1)),
+            (2, uninstall_plan(2, vec![(1, false), (2, true)])),
+            (2, confirm_uninstall(2)),
+        ],
+    );
+    assert_eq!(reports.len(), 4);
+    assert!(matches!(
+        maintenance_of(&reports[0]),
+        live::MaintenanceReport::Planned { .. }
+    ));
+    // The refused teardown is refunded: NotSubmitted, with the worker's report lines after it.
+    match maintenance_of(&reports[1]) {
+        live::MaintenanceReport::Finished { id, outcome, lines } => {
+            assert_eq!(*id, live::MaintenanceId(1));
+            assert_eq!(*outcome, live::MaintenanceOutcome::Refused);
+            assert_eq!(
+                lines,
+                &vec![
+                    "Removal submission: NotSubmitted; completion is independently verified"
+                        .to_owned(),
+                    "Windows did not start the firewall teardown.".to_owned(),
+                ]
+            );
+        }
+        _ => panic!("finished report expected"),
+    }
+    assert!(matches!(
+        maintenance_of(&reports[2]),
+        live::MaintenanceReport::Planned { .. }
+    ));
+    // A fresh removal is planned and applied: nothing stayed dispatched or uncertain.
+    match maintenance_of(&reports[3]) {
+        live::MaintenanceReport::Finished { outcome, lines, .. } => {
+            assert_eq!(*outcome, live::MaintenanceOutcome::Partial);
+            assert_eq!(
+                lines,
+                &vec![
+                    "Removal submission: Submitted; completion is independently verified"
+                        .to_owned()
+                ]
+            );
+        }
+        _ => panic!("finished report expected"),
+    }
+    let removal = Operation::Removal {
+        erase_identity: false,
+    };
+    let seen = locked(&elevated);
+    assert_eq!(
+        seen.applied,
+        vec![
+            (removal, Some(teardown_plan())),
+            (removal, Some(teardown_plan())),
+        ]
+    );
+    assert_eq!(
+        seen.requests,
+        vec![ElevatedRequest::Teardown, ElevatedRequest::Teardown]
+    );
+}
+#[test]
+fn elevated_report_survives_verify_until_the_next_detect_or_plan_clears_it() {
+    use crosspane_installer_core::{JobStage, WaitKind};
+    let base = "Windows operation checked; deferred capabilities remain unavailable";
+    let lines = || {
+        vec![
+            "Windows Defender Firewall rule added.".to_owned(),
+            "Display driver verified.".to_owned(),
+        ]
+    };
+    let joined = format!("{base} Windows Defender Firewall rule added. Display driver verified.");
+    // Apply reports the lines and Verify shows them; a Detect forgets them before the next Verify.
+    let mut fake = Fake::new();
+    fake.elevated_plans.push((
+        ElevatedRequest::Setup,
+        Ok(ElevatedPlanning::Planned(setup_plan())),
+    ));
+    fake.elevated_detection = Ok(ElevatedDetection {
+        configured: true,
+        detail: "Firewall rule checked.".to_owned(),
+    });
+    fake.elevated_report = lines();
+    let reports = run_jobs(
+        fake,
+        vec![
+            (1, step_job(55, 1, JobStage::Plan, None)),
+            (2, step_job(55, 2, JobStage::Apply, Some(consent_for(1, 2)))),
+            (2, step_job(55, 2, JobStage::Verify, None)),
+            (3, step_job(55, 3, JobStage::Detect, None)),
+            (4, step_job(55, 4, JobStage::Verify, None)),
+        ],
+    );
+    assert_eq!(
+        reports.len(),
+        6,
+        "plan, progress, apply, verify, detect, verify"
+    );
+    let verified = step_of(&reports[3]);
+    assert!(matches!(
+        verified.outcome,
+        live::NativeOutcome::Verified { .. }
+    ));
+    assert_eq!(verified.detail, joined);
+    assert_eq!(
+        step_of(&reports[4]).outcome,
+        live::NativeOutcome::Detected {
+            needs_action: false
+        }
+    );
+    let reverified = step_of(&reports[5]);
+    assert!(matches!(
+        reverified.outcome,
+        live::NativeOutcome::Verified { .. }
+    ));
+    assert_eq!(reverified.detail, base);
+    // While Verify still waits, the lines stay on it; a fresh Plan forgets them.
+    let mut fake = Fake::new();
+    fake.elevated_plans.push((
+        ElevatedRequest::Setup,
+        Ok(ElevatedPlanning::Planned(setup_plan())),
+    ));
+    fake.elevated_report = lines();
+    fake.verify_failure = Some(Failure::Unknown);
+    let reports = run_jobs(
+        fake,
+        vec![
+            (1, step_job(55, 1, JobStage::Plan, None)),
+            (2, step_job(55, 2, JobStage::Apply, Some(consent_for(1, 2)))),
+            (2, step_job(55, 2, JobStage::Verify, None)),
+            (3, step_job(55, 3, JobStage::Plan, None)),
+            (4, step_job(55, 4, JobStage::Verify, None)),
+        ],
+    );
+    assert_eq!(
+        reports.len(),
+        6,
+        "plan, progress, apply, verify, plan, verify"
+    );
+    let waiting = step_of(&reports[3]);
+    assert_eq!(
+        waiting.outcome,
+        live::NativeOutcome::Waiting(WaitKind::Contract)
+    );
+    assert_eq!(waiting.detail, joined);
+    assert!(matches!(
+        step_of(&reports[4]).outcome,
+        live::NativeOutcome::Planned { .. }
+    ));
+    let waiting_again = step_of(&reports[5]);
+    assert_eq!(
+        waiting_again.outcome,
+        live::NativeOutcome::Waiting(WaitKind::Contract)
+    );
+    assert_eq!(waiting_again.detail, base);
+}
+#[test]
+fn refused_teardown_refunds_even_when_settle_archived_metadata() {
+    let mut fake = Fake::new();
+    fake.elevated_plans.push((
+        ElevatedRequest::Teardown,
+        Ok(ElevatedPlanning::Planned(teardown_plan())),
+    ));
+    // The first settle returns true (an earlier terminal record was archived); the teardown gate
+    // then declines before any other effect.
+    fake.settlement = 1;
+    fake.elevated_apply = Some(Err(Failure::NotSubmitted));
+    fake.elevated_report = vec!["Windows did not start the firewall teardown.".to_owned()];
+    let elevated = fake.elevated.clone();
+    let reports = run_jobs(
+        fake,
+        vec![
+            (1, uninstall_plan(1, vec![(1, false), (2, true)])),
+            (1, confirm_uninstall(1)),
+            (2, uninstall_plan(2, vec![(1, false), (2, true)])),
+            (2, confirm_uninstall(2)),
+        ],
+    );
+    assert_eq!(reports.len(), 4);
+    // The declined teardown is refunded: Refused, with the worker's report lines after it.
+    match maintenance_of(&reports[1]) {
+        live::MaintenanceReport::Finished { id, outcome, lines } => {
+            assert_eq!(*id, live::MaintenanceId(1));
+            assert_eq!(*outcome, live::MaintenanceOutcome::Refused);
+            assert_eq!(
+                lines,
+                &vec![
+                    "Removal submission: NotSubmitted; completion is independently verified"
+                        .to_owned(),
+                    "Windows did not start the firewall teardown.".to_owned(),
+                ]
+            );
+        }
+        _ => panic!("finished report expected"),
+    }
+    // A fresh removal is planned and applied: nothing stayed dispatched or uncertain.
+    assert!(matches!(
+        maintenance_of(&reports[2]),
+        live::MaintenanceReport::Planned { .. }
+    ));
+    match maintenance_of(&reports[3]) {
+        live::MaintenanceReport::Finished { outcome, lines, .. } => {
+            assert_eq!(*outcome, live::MaintenanceOutcome::Partial);
+            assert_eq!(
+                lines,
+                &vec![
+                    "Removal submission: Submitted; completion is independently verified"
+                        .to_owned()
+                ]
+            );
+        }
+        _ => panic!("finished report expected"),
+    }
+    let removal = Operation::Removal {
+        erase_identity: false,
+    };
+    let seen = locked(&elevated);
+    assert_eq!(
+        seen.applied,
+        vec![
+            (removal, Some(teardown_plan())),
+            (removal, Some(teardown_plan())),
+        ]
+    );
+    assert_eq!(
+        seen.requests,
+        vec![ElevatedRequest::Teardown, ElevatedRequest::Teardown]
+    );
 }
