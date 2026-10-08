@@ -2,6 +2,8 @@
 
 mod agent;
 mod audio;
+#[cfg(any(windows, test))]
+mod bounded_call;
 mod clipboard;
 mod config;
 mod ctl;

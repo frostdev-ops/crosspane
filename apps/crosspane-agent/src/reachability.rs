@@ -1,4 +1,9 @@
 //! Pure Windows discovery selection facts. No socket, firewall or OS observation happens here.
+use crosspane_installer_core::elevated::firewall::ComRule;
+use crosspane_installer_core::elevated::firewall::{MAX_FAMILY, firewall_state};
+use crosspane_installer_core::elevated::{
+    AgentProgram, FirewallState, InstallId, RuleScope, is_local_drive_path,
+};
 use crosspane_platform::{Interface, LinkClass};
 use crosspane_transport::discovery::DiscoveryInterface;
 use std::{
@@ -106,104 +111,6 @@ impl RuleEvidence {
     }
 }
 
-/// Narrow DTO emitted only for the owned Crosspane firewall-name family. No foreign rule scan.
-#[derive(Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FirewallRule {
-    pub name: String,
-    pub group: String,
-    pub program: String,
-    pub enabled: String,
-    pub direction: String,
-    pub action: String,
-    pub profile: String,
-    pub edge: String,
-    pub protocol: String,
-    pub local_port: Vec<String>,
-    pub remote_port: Vec<String>,
-    pub local_address: Vec<String>,
-    pub remote_address: Vec<String>,
-    pub interface_type: Vec<String>,
-    pub interface_alias: Vec<String>,
-    pub service: String,
-    pub package: String,
-    pub authentication: String,
-    pub encryption: String,
-    pub override_block: bool,
-    pub local_user: String,
-    pub remote_user: String,
-    pub remote_machine: String,
-    pub dynamic_target: String,
-    pub loose_source_mapping: bool,
-    pub local_only_mapping: bool,
-}
-pub(crate) const RULE_PREFIX: &str = "Crosspane.Agent.UDP.Private.";
-
-/// Compare canonical DOS/UNC text without resolving or opening another program's path. The
-/// installer records the canonical program path; only our current executable is canonicalized.
-/// Non-ASCII case differences conservatively mismatch instead of inventing a Windows fold.
-fn program_text(path: &str) -> Option<String> {
-    let path = path
-        .strip_prefix(r"\\?\UNC\")
-        .map(|tail| format!(r"\\{tail}"))
-        .unwrap_or_else(|| path.strip_prefix(r"\\?\").unwrap_or(path).to_owned());
-    let absolute_drive = path.as_bytes().get(1..3) == Some(b":\\")
-        && path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic);
-    let absolute_unc = path.starts_with(r"\\")
-        && path[2..]
-            .split('\\')
-            .take(2)
-            .filter(|part| !part.is_empty())
-            .count()
-            == 2;
-    if path.len() > 32_768
-        || !(absolute_drive || absolute_unc)
-        || path.contains(['\0', '/', '"', '%', '*', '?'])
-        || path.split('\\').any(|part| part == "." || part == "..")
-    {
-        return None;
-    }
-    Some(path)
-}
-fn one(values: &[String], expected: &str) -> bool {
-    values.len() == 1 && values[0] == expected
-}
-impl FirewallRule {
-    fn matches_spec(&self) -> bool {
-        let Some(id) = self.name.strip_prefix(RULE_PREFIX) else {
-            return false;
-        };
-        !id.is_empty()
-            && id.len() <= 64
-            && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
-            && self.group == format!("Crosspane.{id}")
-            && self.enabled == "True"
-            && self.direction == "Inbound"
-            && self.action == "Allow"
-            && self.profile == "Private"
-            && self.edge == "Block"
-            && matches!(self.protocol.as_str(), "UDP" | "17")
-            && one(&self.local_port, "Any")
-            && one(&self.remote_port, "Any")
-            && one(&self.local_address, "Any")
-            && one(&self.remote_address, "LocalSubnet")
-            && one(&self.interface_type, "Any")
-            && one(&self.interface_alias, "Any")
-            && self.service == "Any"
-            // A rule with no package condition reads as "" through the COM-created filter (VM, W4.1c2 V5).
-            && matches!(self.package.as_str(), "Any" | "")
-            && self.authentication == "NotRequired"
-            && self.encryption == "NotRequired"
-            && !self.override_block
-            && self.local_user == "Any"
-            && self.remote_user == "Any"
-            && self.remote_machine == "Any"
-            && self.dynamic_target == "Any"
-            && !self.loose_source_mapping
-            && !self.local_only_mapping
-    }
-}
-
 /// Largest `Installer\elevated-setup.json` the agent reads. A larger file is `Unreadable`.
 pub(crate) const MAX_RECORD_READ: usize = 64 * 1024;
 
@@ -257,48 +164,36 @@ pub(crate) fn recorded_install_id(bytes: Option<&[u8]>) -> RecordedId {
     RecordedId::Id(id)
 }
 
-/// Presence of the exact recorded rule name for `program`. A row under any other name is
-/// unexpected query output, so it gives `Unavailable`.
-pub(crate) fn rule_evidence(
+/// The elevated helper's verify predicate (`firewall_state`) over the same COM family.
+/// `program`: the canonicalized current executable. An invalid install id, or a program that is
+/// not a local-drive path → Unavailable. A local-drive path that `AgentProgram::parse` refuses →
+/// Missing. Otherwise the FirewallState maps 1:1, and NotRequested → Unavailable.
+pub(crate) fn com_rule_evidence(
     program: &str,
     install_id: &str,
-    rules: &[FirewallRule],
+    family: &[ComRule],
 ) -> RuleEvidence {
-    let Some(program) = program_text(program) else {
+    // `firewall_state` would call a larger family Mismatch. The frozen error table says
+    // Unavailable, so the cap is checked here first, whatever the reader did.
+    if family.len() > MAX_FAMILY {
+        return RuleEvidence::Unavailable;
+    }
+    let Ok(id) = InstallId::parse(install_id) else {
         return RuleEvidence::Unavailable;
     };
-    if rules.len() > 128 {
+    // `canonicalize` returns a verbatim `\\?\` path. `AgentProgram` takes the plain DOS form.
+    let text = program.strip_prefix(r"\\?\").unwrap_or(program);
+    if !is_local_drive_path(text) {
         return RuleEvidence::Unavailable;
     }
-    let mut matching = 0;
-    let mut mismatch = false;
-    for rule in rules {
-        // The query is exact-name scoped. Treat unexpected/oversized output as query failure.
-        if rule.name.strip_prefix(RULE_PREFIX) != Some(install_id)
-            || rule.name.len() > 1024
-            || rule.group.len() > 1024
-        {
-            return RuleEvidence::Unavailable;
-        }
-        let Some(candidate) = program_text(&rule.program) else {
-            mismatch = true;
-            continue;
-        };
-        if !candidate.eq_ignore_ascii_case(&program) {
-            continue;
-        }
-        if rule.matches_spec() {
-            matching += 1;
-        } else {
-            mismatch = true;
-        }
-    }
-    if mismatch || matching > 1 {
-        RuleEvidence::Mismatch
-    } else if matching == 1 {
-        RuleEvidence::Present
-    } else {
-        RuleEvidence::Missing
+    let Ok(agent) = AgentProgram::parse(text) else {
+        return RuleEvidence::Missing;
+    };
+    match firewall_state(family, Some(&RuleScope { id, program: agent })) {
+        FirewallState::Present => RuleEvidence::Present,
+        FirewallState::Missing => RuleEvidence::Missing,
+        FirewallState::Mismatch => RuleEvidence::Mismatch,
+        FirewallState::Unavailable | FirewallState::NotRequested => RuleEvidence::Unavailable,
     }
 }
 
@@ -412,98 +307,109 @@ mod tests {
 #[cfg(test)]
 mod firewall_tests {
     use super::*;
-    fn rule() -> FirewallRule {
-        serde_json::from_value(serde_json::json!({
-            "name":"Crosspane.Agent.UDP.Private.fixture-id", "group":"Crosspane.fixture-id",
-            "program":r"C:\Crosspane\crosspane-agent.exe", "enabled":"True", "direction":"Inbound",
-            "action":"Allow", "profile":"Private", "edge":"Block", "protocol":"UDP",
-            "local_port":["Any"], "remote_port":["Any"], "local_address":["Any"],
-            "remote_address":["LocalSubnet"], "interface_type":["Any"], "interface_alias":["Any"],
-            "service":"Any", "package":"Any", "authentication":"NotRequired", "encryption":"NotRequired",
-            "override_block":false, "local_user":"Any", "remote_user":"Any", "remote_machine":"Any",
-            "dynamic_target":"Any", "loose_source_mapping":false, "local_only_mapping":false
-        })).unwrap()
+    use crosspane_installer_core::elevated::firewall::desired_rule;
+
+    const PROGRAM: &str = r"C:\Users\x\AppData\Local\Programs\Crosspane\crosspane-agent.exe";
+    const VERBATIM: &str = r"\\?\C:\Users\x\AppData\Local\Programs\Crosspane\crosspane-agent.exe";
+    const OTHER_PROGRAM: &str = r"D:\Other\Programs\Crosspane\crosspane-agent.exe";
+    const DEV_PROGRAM: &str = r"C:\src\target\debug\crosspane-agent.exe";
+
+    /// One single-field change to the exact rule.
+    type Perturb = fn(&mut ComRule);
+
+    fn scope_for(id: &str, program: &str) -> RuleScope {
+        RuleScope {
+            id: InstallId::parse(id).unwrap(),
+            program: AgentProgram::parse(program).unwrap(),
+        }
+    }
+    /// The exact rule the helper creates for the fixture install ID and `PROGRAM`.
+    fn exact() -> ComRule {
+        desired_rule(&scope_for("fixture-id", PROGRAM))
+    }
+    fn evidence(family: &[ComRule]) -> RuleEvidence {
+        com_rule_evidence(VERBATIM, "fixture-id", family)
     }
     #[test]
-    fn rule_presence_is_exact_program_and_full_spec_only() {
-        let program = r"\\?\C:\Crosspane\crosspane-agent.exe";
+    fn exact_rule_is_present_for_the_verbatim_program() {
+        assert_eq!(evidence(&[exact()]), RuleEvidence::Present);
         assert_eq!(
-            rule_evidence(program, "fixture-id", &[rule()]),
+            com_rule_evidence(PROGRAM, "fixture-id", &[exact()]),
             RuleEvidence::Present
-        );
-        assert_eq!(
-            rule_evidence(program, "fixture-id", &[]),
-            RuleEvidence::Missing
-        );
-        let mut other = rule();
-        other.program = r"C:\Other\crosspane-agent.exe".into();
-        assert_eq!(
-            rule_evidence(program, "fixture-id", &[other]),
-            RuleEvidence::Missing
-        );
-        let mut wrong = rule();
-        wrong.profile = "Private, Public".into();
-        assert_eq!(
-            rule_evidence(program, "fixture-id", &[wrong]),
-            RuleEvidence::Mismatch
-        );
-        let mut unpackaged = rule();
-        unpackaged.package = String::new();
-        assert_eq!(
-            rule_evidence(program, "fixture-id", &[unpackaged]),
-            RuleEvidence::Present
-        );
-        let mut wrong = rule();
-        wrong.package = "S-1-15-2-1".into();
-        assert_eq!(
-            rule_evidence(program, "fixture-id", &[wrong]),
-            RuleEvidence::Mismatch
-        );
-        let mut wrong = rule();
-        wrong.override_block = true;
-        assert_eq!(
-            rule_evidence(program, "fixture-id", &[wrong]),
-            RuleEvidence::Mismatch
-        );
-        let mut wrong = rule();
-        wrong.group = "Crosspane.someone-else".into();
-        assert_eq!(
-            rule_evidence(program, "fixture-id", &[wrong]),
-            RuleEvidence::Mismatch
-        );
-        assert_eq!(
-            rule_evidence(program, "fixture-id", &[rule(), rule()]),
-            RuleEvidence::Mismatch
         );
     }
     #[test]
-    fn malformed_or_unscoped_query_cannot_claim_presence() {
-        let program = r"C:\Crosspane\crosspane-agent.exe";
-        let mut wrong = rule();
-        wrong.name = "ForeignRule".into();
+    fn empty_package_id_is_present_and_a_package_condition_is_a_mismatch() {
+        let mut rule = exact();
+        rule.local_app_package_id = String::new();
+        assert_eq!(evidence(&[rule]), RuleEvidence::Present);
+        let mut packaged = exact();
+        packaged.local_app_package_id = "S-1-15-2-1".into();
+        assert_eq!(evidence(&[packaged]), RuleEvidence::Mismatch);
+    }
+    #[test]
+    fn empty_family_and_unrelated_install_are_missing() {
+        assert_eq!(evidence(&[]), RuleEvidence::Missing);
+        let other_install = desired_rule(&scope_for("other-id", OTHER_PROGRAM));
+        assert_eq!(evidence(&[other_install]), RuleEvidence::Missing);
+    }
+    #[test]
+    fn any_differing_field_or_a_duplicate_is_a_mismatch() {
+        let cases: [(&str, Perturb); 5] = [
+            ("profiles", |rule| rule.profiles = 6),
+            ("secure flags", |rule| rule.secure_flags = 1),
+            ("remote user list", |rule| {
+                rule.remote_user_authorized_list = "S-1-5-1".into();
+            }),
+            ("interfaces any", |rule| rule.interfaces_any = false),
+            ("edge traversal", |rule| rule.edge_traversal = true),
+        ];
+        for (field, perturb) in cases {
+            let mut rule = exact();
+            perturb(&mut rule);
+            assert_eq!(evidence(&[rule]), RuleEvidence::Mismatch, "{field}");
+        }
+        assert_eq!(evidence(&[exact(), exact()]), RuleEvidence::Mismatch);
+    }
+    #[test]
+    fn bad_id_non_local_or_oversized_input_is_unavailable() {
+        let rule = exact();
+        for id in ["", "a b"] {
+            assert_eq!(
+                com_rule_evidence(VERBATIM, id, std::slice::from_ref(&rule)),
+                RuleEvidence::Unavailable,
+                "{id:?}"
+            );
+        }
+        for program in [
+            r"\\server\share\Programs\Crosspane\crosspane-agent.exe",
+            r"Programs\Crosspane\crosspane-agent.exe",
+        ] {
+            assert_eq!(
+                com_rule_evidence(program, "fixture-id", std::slice::from_ref(&rule)),
+                RuleEvidence::Unavailable,
+                "{program}"
+            );
+        }
+        assert_eq!(evidence(&vec![rule; 129]), RuleEvidence::Unavailable);
+    }
+    #[test]
+    fn dev_build_is_missing_even_with_the_exact_rule_present() {
+        let dev_rule = ComRule {
+            application_name: DEV_PROGRAM.into(),
+            ..exact()
+        };
         assert_eq!(
-            rule_evidence(program, "fixture-id", &[wrong]),
-            RuleEvidence::Unavailable
+            com_rule_evidence(DEV_PROGRAM, "fixture-id", std::slice::from_ref(&dev_rule)),
+            RuleEvidence::Missing
         );
-        let mut wrong = rule();
-        wrong.program = r"%APPDATA%\Crosspane\agent.exe".into();
         assert_eq!(
-            rule_evidence(program, "fixture-id", &[wrong]),
-            RuleEvidence::Mismatch
-        );
-        let mut wrong = rule();
-        wrong.remote_address.push("Any".into());
-        assert_eq!(
-            rule_evidence(program, "fixture-id", &[wrong]),
-            RuleEvidence::Mismatch
-        );
-        assert_eq!(
-            rule_evidence("relative.exe", "fixture-id", &[]),
-            RuleEvidence::Unavailable
-        );
-        assert_eq!(
-            rule_evidence(program, "fixture-id", &vec![rule(); 129]),
-            RuleEvidence::Unavailable
+            com_rule_evidence(
+                r"\\?\C:\src\target\debug\crosspane-agent.exe",
+                "fixture-id",
+                &[dev_rule]
+            ),
+            RuleEvidence::Missing
         );
     }
     #[test]
@@ -602,27 +508,16 @@ mod firewall_tests {
         );
     }
     #[test]
-    fn rule_name_must_be_the_recorded_exact_name() {
-        let program = r"\\?\C:\Crosspane\crosspane-agent.exe";
-        let mut other = rule();
-        other.name = "Crosspane.Agent.UDP.Private.other-id".into();
-        other.group = "Crosspane.other-id".into();
-        // A row under the recorded name is evidence. The same row under another id is not.
-        assert_eq!(
-            rule_evidence(program, "fixture-id", &[rule()]),
-            RuleEvidence::Present
-        );
-        assert_eq!(
-            rule_evidence(program, "other-id", &[rule()]),
-            RuleEvidence::Unavailable
-        );
-        assert_eq!(
-            rule_evidence(program, "fixture-id", std::slice::from_ref(&other)),
-            RuleEvidence::Unavailable
-        );
-        assert_eq!(
-            rule_evidence(program, "other-id", &[other]),
-            RuleEvidence::Present
-        );
+    fn rule_name_is_matched_exactly_per_install_id() {
+        let mut variant = exact();
+        variant.name = "crosspane.agent.udp.private.fixture-id".into();
+        assert_eq!(evidence(&[variant]), RuleEvidence::Mismatch);
+        // Another install ID under the same program covers this agent, so it is Mismatch.
+        let covering = desired_rule(&scope_for("other-id", PROGRAM));
+        assert_eq!(evidence(&[covering]), RuleEvidence::Mismatch);
+        // The exact name under another program is a different rule, so it is Mismatch.
+        let mut elsewhere = exact();
+        elsewhere.application_name = OTHER_PROGRAM.into();
+        assert_eq!(evidence(&[elsewhere]), RuleEvidence::Mismatch);
     }
 }
