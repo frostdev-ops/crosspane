@@ -21,6 +21,8 @@ pub(super) struct InputState {
     arm_until: Option<Instant>,
     up_until: Option<Instant>,
     closing: bool,
+    #[cfg(any(target_os = "windows", test))]
+    focused: bool,
 }
 
 /// Called only on the host thread. Failed/nonblocking acknowledgement retires the arm.
@@ -79,6 +81,40 @@ impl InputState {
         } else {
             false
         }
+    }
+
+    /// Windows callbacks describe observable transitions, not an atomic OS focus fence.
+    /// Releases run before the dedupe, because mouse buttons are not focus-gated and can be held
+    /// while the window is already unfocused. `release` is idempotent.
+    #[cfg(any(target_os = "windows", test))]
+    pub(super) fn windows_focus(
+        &mut self,
+        id: u64,
+        focused: bool,
+        events: &mut dyn FnMut(HostEvent),
+    ) {
+        if !focused {
+            self.release(id, events);
+        }
+        if (self.closing && focused) || self.focused == focused {
+            return;
+        }
+        self.focused = focused;
+        events(HostEvent::Focus { id, focused });
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    pub(super) fn admit_windows_key(
+        &mut self,
+        id: u64,
+        native_focused: bool,
+        minimized: Option<bool>,
+        events: &mut dyn FnMut(HostEvent),
+    ) -> bool {
+        if !native_focused || minimized == Some(true) {
+            self.windows_focus(id, false, events);
+        }
+        self.focused && !self.closing && native_focused && minimized != Some(true)
     }
 
     pub(super) fn key(&mut self, usage: HidUsage, state: ElementState) {
@@ -367,6 +403,206 @@ mod tests {
                 2.0,
             );
             assert_eq!(zero.phase, phase);
+        }
+    }
+
+    #[test]
+    fn windows_focus_transitions_are_deduplicated_from_initial_inactive_state() {
+        let mut state = InputState::default();
+        let mut events = Vec::new();
+        for focused in [false, true, true, false, false, true] {
+            state.windows_focus(7, focused, &mut |event| events.push(event));
+        }
+        assert_eq!(
+            events,
+            vec![
+                HostEvent::Focus {
+                    id: 7,
+                    focused: true
+                },
+                HostEvent::Focus {
+                    id: 7,
+                    focused: false
+                },
+                HostEvent::Focus {
+                    id: 7,
+                    focused: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_focus_loss_releases_held_inputs_before_one_false() {
+        let mut state = InputState::default();
+        state.windows_focus(7, true, &mut |_| {});
+        state.key(HidUsage::keyboard(4), ElementState::Pressed);
+        state.button(MouseButton::PRIMARY, ElementState::Pressed);
+        let mut events = Vec::new();
+        assert!(!state.admit_windows_key(7, false, Some(false), &mut |event| events.push(event)));
+        state.windows_focus(7, false, &mut |event| events.push(event));
+        assert_eq!(
+            events,
+            vec![
+                HostEvent::Key {
+                    id: 7,
+                    usage: HidUsage::keyboard(4),
+                    down: false
+                },
+                HostEvent::Button {
+                    id: 7,
+                    button: MouseButton::PRIMARY,
+                    down: false,
+                    position: PointDevice::zero()
+                },
+                HostEvent::Focus {
+                    id: 7,
+                    focused: false
+                },
+            ]
+        );
+        assert!(state.keys.is_empty() && state.buttons.is_empty());
+    }
+
+    #[test]
+    fn windows_held_button_is_released_once_by_a_deduplicated_focus_loss() {
+        let mut state = InputState::default();
+        state.windows_focus(7, true, &mut |_| {});
+        state.windows_focus(7, false, &mut |_| {});
+        // Buttons are not focus-gated, so a press can be held while the window is unfocused.
+        state.button(MouseButton::PRIMARY, ElementState::Pressed);
+        let mut events = Vec::new();
+        state.windows_focus(7, false, &mut |event| events.push(event));
+        assert_eq!(
+            events,
+            vec![HostEvent::Button {
+                id: 7,
+                button: MouseButton::PRIMARY,
+                down: false,
+                position: PointDevice::zero()
+            }]
+        );
+        // The release is not repeated, and the deduplicated loss emits no Focus event.
+        state.windows_focus(7, false, &mut |_| panic!("already released and unfocused"));
+        assert!(state.buttons.is_empty());
+    }
+
+    #[test]
+    fn windows_focus_gained_while_iconic_is_rederived_on_restore() {
+        let mut state = InputState::default();
+        let mut events = Vec::new();
+        state.windows_focus(7, true, &mut |event| events.push(event));
+        // Minimised: the key guard reports the window as lost.
+        assert!(!state.admit_windows_key(7, true, Some(true), &mut |event| events.push(event)));
+        assert_eq!(
+            events,
+            vec![
+                HostEvent::Focus {
+                    id: 7,
+                    focused: true
+                },
+                HostEvent::Focus {
+                    id: 7,
+                    focused: false
+                },
+            ]
+        );
+        // Restore: native focus is gained while iconic, and the Resized arm resamples has_focus.
+        // Until that resample, keys stay refused.
+        assert!(!state.admit_windows_key(7, true, Some(false), &mut |_| {}));
+        let mut restored = Vec::new();
+        state.windows_focus(7, true, &mut |event| restored.push(event));
+        assert_eq!(
+            restored,
+            vec![HostEvent::Focus {
+                id: 7,
+                focused: true
+            }]
+        );
+        // A repeated resample emits nothing, and keys are admitted afterwards.
+        state.windows_focus(7, true, &mut |_| panic!("deduplicated"));
+        assert!(state.admit_windows_key(7, true, Some(false), &mut |_| panic!("no event")));
+    }
+
+    #[test]
+    fn windows_queued_keys_require_observed_native_focus_and_open_state() {
+        let mut state = InputState::default();
+        assert!(!state.admit_windows_key(7, true, Some(false), &mut |_| {}));
+        state.windows_focus(7, true, &mut |_| {});
+        assert!(state.admit_windows_key(7, true, Some(false), &mut |_| {}));
+        assert!(!state.admit_windows_key(7, true, Some(true), &mut |_| {}));
+        assert!(!state.admit_windows_key(7, true, Some(false), &mut |_| {}));
+        state.windows_focus(7, true, &mut |_| {});
+        state.close();
+        state.windows_focus(7, true, &mut |_| panic!("close cannot regain focus"));
+        assert!(!state.admit_windows_key(7, true, Some(false), &mut |_| {}));
+    }
+
+    #[test]
+    fn windows_bounded_focus_key_close_sequences_preserve_guard_and_release_invariants() {
+        // Exhaust all length-five sequences of focus gain/loss, key down/up and close.
+        for mut sequence in 0usize..5usize.pow(5) {
+            let mut state = InputState::default();
+            let mut observed = false;
+            let mut closing = false;
+            for _ in 0..5 {
+                let step = sequence % 5;
+                sequence /= 5;
+                let mut events = Vec::new();
+                match step {
+                    0 | 1 => {
+                        let focused = step == 0;
+                        state.windows_focus(7, focused, &mut |event| events.push(event));
+                        let changes = events
+                            .iter()
+                            .filter(|e| matches!(e, HostEvent::Focus { .. }))
+                            .count();
+                        assert_eq!(
+                            changes,
+                            usize::from(observed != focused && !(closing && focused))
+                        );
+                        if !(closing && focused) {
+                            observed = focused;
+                        }
+                    }
+                    2 | 3 => {
+                        let allowed =
+                            state.admit_windows_key(7, observed, Some(false), &mut |event| {
+                                events.push(event)
+                            });
+                        assert_eq!(allowed, observed && !closing);
+                        if allowed {
+                            state.key(
+                                HidUsage::keyboard(4),
+                                if step == 2 {
+                                    ElementState::Pressed
+                                } else {
+                                    ElementState::Released
+                                },
+                            );
+                        }
+                    }
+                    _ => {
+                        state.close();
+                        state.release(7, &mut |event| events.push(event));
+                        closing = true;
+                    }
+                }
+                if !observed || closing {
+                    assert!(state.keys.is_empty());
+                }
+                if let Some(i) = events
+                    .iter()
+                    .position(|e| matches!(e, HostEvent::Focus { focused: false, .. }))
+                {
+                    assert!(
+                        events[i + 1..].iter().all(|e| !matches!(
+                            e,
+                            HostEvent::Key { .. } | HostEvent::Button { .. }
+                        ))
+                    );
+                }
+            }
         }
     }
 

@@ -53,7 +53,7 @@ crosspane-platform-macos = { workspace = true, features = ["gpu"] }
 [target.'cfg(windows)'.dependencies]
 crosspane-platform-windows = { workspace = true, features = ["gpu"] }
 tokio = { workspace = true, features = ["io-util"] }
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 crosspanectl = { path = "../crosspanectl" }

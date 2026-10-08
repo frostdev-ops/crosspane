@@ -15,6 +15,8 @@ use tracing::{Event, Metadata, Subscriber, span::{Attributes, Id, Record}};
 
 type Handle = *mut c_void;
 #[repr(C)] struct NativePoint { x: i32, y: i32 }
+#[repr(C)] #[derive(Clone, Copy)] struct RawDevice { page: u16, usage: u16, flags: u32, target: Handle }
+impl Default for RawDevice { fn default() -> Self { Self { page: 0, usage: 0, flags: 0, target: std::ptr::null_mut() } } }
 #[repr(C)] #[derive(Default)] struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
 #[repr(C)] struct MonitorInfo { size: u32, monitor: Rect, work: Rect, flags: u32, name: [u16; 32] }
 #[repr(C)] struct BitmapInfo {
@@ -35,6 +37,11 @@ unsafe extern "system" {
     fn SetWindowPos(window: Handle, after: Handle, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
     fn ShowWindow(window: Handle, command: i32) -> i32;
     fn SetForegroundWindow(window: Handle) -> i32;
+    fn GetForegroundWindow() -> Handle;
+    fn IsWindow(window: Handle) -> i32;
+    fn IsIconic(window: Handle) -> i32;
+    fn IsZoomed(window: Handle) -> i32;
+    fn GetRegisteredRawInputDevices(devices: *mut RawDevice, count: *mut u32, size: u32) -> u32;
     fn PostMessageW(window: Handle, message: u32, wparam: usize, lparam: isize) -> i32;
     fn SendMessageW(window: Handle, message: u32, wparam: usize, lparam: isize) -> isize;
     fn MonitorFromWindow(window: Handle, flags: u32) -> Handle;
@@ -44,7 +51,16 @@ unsafe extern "system" {
     fn PrintWindow(window: Handle, dc: Handle, flags: u32) -> i32;
 }
 #[link(name = "kernel32")]
-unsafe extern "system" { fn GetCurrentThreadId() -> u32; }
+unsafe extern "system" {
+    fn GetCurrentThreadId() -> u32;
+    fn GetCurrentProcess() -> Handle;
+    fn CloseHandle(handle: Handle) -> i32;
+}
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
+    fn GetTokenInformation(token: Handle, class: u32, value: *mut c_void, bytes: u32, returned: *mut u32) -> i32;
+}
 #[link(name = "gdi32")]
 unsafe extern "system" {
     fn CreateCompatibleDC(dc: Handle) -> Handle;
@@ -85,7 +101,12 @@ unsafe extern "system" fn find_proxy(window: Handle, data: isize) -> i32 {
     let len = unsafe { GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) };
     if len > 0 && String::from_utf16_lossy(&class[..len as usize]) == "CrosspaneProxy" {
         // SAFETY: data is the live Vec passed synchronously to EnumThreadWindows below.
-        unsafe { (&mut *(data as *mut Vec<isize>)).push(window as isize); }
+        unsafe {
+            let windows = &mut *(data as *mut Vec<isize>);
+            // The seventeenth own match is the bounded refusal sentinel; never inspect more.
+            windows.push(window as isize);
+            if windows.len() > 16 { return 0; }
+        }
     }
     1
 }
@@ -107,10 +128,17 @@ fn on_host<T: Send + 'static>(handle: &HostHandle, action: impl FnOnce() -> T + 
     handle.send(HostCommand::Run(Box::new(move || { let _ = send.send(action()); }))).expect("host action");
     recv.recv_timeout(Duration::from_secs(15)).expect("host action result")
 }
-fn wait(events: &mpsc::Receiver<HostEvent>, mut accept: impl FnMut(&HostEvent) -> bool) -> HostEvent {
-    let deadline = Instant::now() + Duration::from_secs(15);
+fn wait(events: &mpsc::Receiver<HostEvent>, accept: impl FnMut(&HostEvent) -> bool) -> HostEvent {
+    try_wait(events, Instant::now() + Duration::from_secs(15), accept).expect("event deadline")
+}
+// Returns None at `until`; only the caller knows whether that is a failure.
+fn try_wait(events: &mpsc::Receiver<HostEvent>, until: Instant, mut accept: impl FnMut(&HostEvent) -> bool) -> Option<HostEvent> {
     loop {
-        let event = events.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("event deadline");
+        let event = match events.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            Ok(event) => event,
+            Err(mpsc::RecvTimeoutError::Timeout) => return None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!("host event channel closed"),
+        };
         match &event {
             HostEvent::OpenFailed { error, .. } => panic!("open failed: {error}"),
             HostEvent::Lost { .. } => panic!("fixture proxy lost"),
@@ -121,7 +149,7 @@ fn wait(events: &mpsc::Receiver<HostEvent>, mut accept: impl FnMut(&HostEvent) -
             HostEvent::Presented { frames, .. } => eprintln!("presented: {frames}"),
             _ => {} // Never log keys, text, pointer contents, or foreign window data.
         }
-        if accept(&event) { return event; }
+        if accept(&event) { return Some(event); }
     }
 }
 fn screenshot(window: isize, output: PathBuf) {
@@ -358,26 +386,36 @@ fn check(handle: &HostHandle, events: &mpsc::Receiver<HostEvent>, adapter: &Adap
     handle.send(HostCommand::SetCursor { id: ID, size: PixelSize::new(16, 16), hotspot: (2, 3),
         pixels: Arc::from([0, 0, 255, 255].repeat(256)) }).expect("custom cursor");
     handle.send(HostCommand::DefaultCursor { id: ID }).expect("default cursor");
-    on_host(handle, move || {
+    // Proxies open passively, so one refusal-tolerant foreground request comes before the minimise.
+    let requested = on_host(handle, move || {
         let hwnd = window as Handle; verify_owned(hwnd);
-        // SAFETY: minimize only fixture HWND; no injection or foreign focus target.
-        unsafe { ShowWindow(hwnd, 6); }
+        // SAFETY: one foreground request for the retained fixture HWND only; refusal is tolerated.
+        unsafe { SetForegroundWindow(hwnd) != 0 }
     });
-    let (mut focus_lost, mut hidden) = (false, false);
-    wait(events, |event| {
-        focus_lost |= matches!(event, HostEvent::Focus { focused: false, .. });
-        hidden |= matches!(event, HostEvent::Placed { visible: false, .. });
-        focus_lost && hidden
-    });
-    let focused = on_host(handle, move || {
-        let hwnd = window as Handle; verify_owned(hwnd);
-        // SAFETY: restore and request focus only for the retained fixture HWND.
-        unsafe { ShowWindow(hwnd, 9); SetForegroundWindow(hwnd) != 0 }
-    });
-    if focused {
-        wait(events, |e| matches!(e, HostEvent::Focus { focused: true, .. }));
+    let gained = requested && try_wait(events, Instant::now() + Duration::from_secs(15),
+        |e| matches!(e, HostEvent::Focus { id: ID, focused: true })).is_some();
+    if gained {
+        on_host(handle, move || {
+            let hwnd = window as Handle; verify_owned(hwnd);
+            // SAFETY: minimize only fixture HWND; no injection or foreign focus target.
+            unsafe { ShowWindow(hwnd, 6); }
+        });
+        let (mut focus_lost, mut hidden) = (false, false);
+        wait(events, |event| {
+            focus_lost |= matches!(event, HostEvent::Focus { focused: false, .. });
+            hidden |= matches!(event, HostEvent::Placed { visible: false, .. });
+            focus_lost && hidden
+        });
+        on_host(handle, move || {
+            let hwnd = window as Handle; verify_owned(hwnd);
+            // SAFETY: restore only the retained fixture HWND; no further focus request.
+            unsafe { ShowWindow(hwnd, 9); }
+        });
+        eprintln!("focus gained; minimise then produced focus loss and hidden placement");
     } else {
-        eprintln!("restore focus: OS refused SetForegroundWindow; initial focus and minimize loss verified");
+        // The minimise is skipped here: its only check is the focus loss it would have to produce.
+        eprintln!("[U] foreground refused; minimise-loss not observed");
+        if requested { eprintln!("no focus-true within the deadline after an accepted request"); }
     }
     on_host(handle, move || {
         let hwnd = window as Handle; verify_owned(hwnd);
@@ -402,9 +440,272 @@ fn check(handle: &HostHandle, events: &mpsc::Receiver<HostEvent>, adapter: &Adap
     }
     eprintln!("owned Windows proxy probe: passed");
 }
+
+#[derive(Default)] struct RowEvents {
+    focus: [bool; 3], gains: [u32; 3], losses: [u32; 3],
+    down: [u32; 3], up: [u32; 3], sizes: [Option<PixelSize>; 3], count: u32,
+}
+impl RowEvents {
+    fn observe(&mut self, event: HostEvent) {
+        self.count += 1;
+        assert!(self.count <= 512, "fixed own row event cap");
+        match event {
+            HostEvent::Opened { id, size, .. } | HostEvent::Resized { id, size, .. } => {
+                assert!((1..=2).contains(&id)); self.sizes[id as usize] = Some(size);
+            }
+            HostEvent::Focus { id, focused } => {
+                assert!((1..=2).contains(&id)); let i = id as usize;
+                assert_ne!(self.focus[i], focused, "one observed focus event per transition");
+                if !focused { assert_eq!(self.down[i], self.up[i], "held key releases precede focus false"); }
+                self.focus[i] = focused;
+                if focused { self.gains[i] += 1; } else { self.losses[i] += 1; }
+            }
+            HostEvent::Key { id, down, .. } => {
+                assert!((1..=2).contains(&id)); let i = id as usize;
+                if down { assert!(self.focus[i], "key down requires observed focus"); self.down[i] += 1; }
+                else { self.up[i] += 1; }
+            }
+            HostEvent::OpenFailed { .. } | HostEvent::Lost { .. } | HostEvent::CloseRequested { .. } => panic!("owned row backend/interference failure"),
+            _ => {} // No usage/text/pointer or unknown native strings are emitted.
+        }
+    }
+}
+fn row_host<T: Send + 'static>(handle: &HostHandle, until: Instant, action: impl FnOnce() -> T + Send + 'static) -> T {
+    assert!(Instant::now() < until, "row deadline before admission");
+    let (send, recv) = mpsc::sync_channel(1);
+    handle.send(HostCommand::Run(Box::new(move || { let _ = send.send(action()); }))).expect("own row host action");
+    recv.recv_timeout(until.saturating_duration_since(Instant::now())).expect("own row action deadline")
+}
+fn row_wait(events: &mpsc::Receiver<HostEvent>, stats: &mut RowEvents, until: Instant, mut ready: impl FnMut(&RowEvents) -> bool) {
+    loop {
+        if ready(stats) { return; }
+        let event = events.recv_timeout(until.saturating_duration_since(Instant::now())).expect("own row event deadline");
+        stats.observe(event);
+    }
+}
+fn row_drain(events: &mpsc::Receiver<HostEvent>, stats: &mut RowEvents, until: Instant) {
+    let quiet = (Instant::now() + Duration::from_millis(150)).min(until);
+    loop {
+        assert!(Instant::now() < until, "own row deadline");
+        match events.recv_timeout(quiet.saturating_duration_since(Instant::now())) {
+            Ok(event) => stats.observe(event),
+            Err(mpsc::RecvTimeoutError::Timeout) => return,
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!("own host disconnected"),
+        }
+        if Instant::now() >= quiet { return; }
+    }
+}
+fn row_windows() -> Vec<isize> {
+    let mut windows = Vec::new();
+    // SAFETY: only the current owning host thread; the initialized Vec outlives synchronous callback.
+    unsafe { EnumThreadWindows(GetCurrentThreadId(), find_proxy, &mut windows as *mut _ as isize); }
+    assert!(windows.len() <= 16, "own-thread enumeration cap"); windows
+}
+fn row_verify(window: isize) {
+    let hwnd = window as Handle; let mut pid = 0;
+    // SAFETY: handle identity query only, initialized writable PID; no foreign metadata read.
+    let tid = unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    assert!(pid == std::process::id(), "own PID identity refused");
+    // SAFETY: current owning host thread pseudo identity and authenticated own HWND only.
+    unsafe { assert!(tid == GetCurrentThreadId(), "own TID identity refused"); assert_ne!(IsWindow(hwnd), 0); }
+    let mut class = [0u16; 64];
+    // SAFETY: only after exact own PID/thread/liveness proof; fixed writable class buffer.
+    let len = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
+    assert!(len > 0 && len < class.len() as i32);
+    assert!(&class[..len as usize] == "CrosspaneProxy".encode_utf16().collect::<Vec<_>>().as_slice(), "own class identity refused");
+}
+fn row_open(handle: &HostHandle, events: &mpsc::Receiver<HostEvent>, stats: &mut RowEvents, until: Instant, id: u64) -> isize {
+    let before = row_host(handle, until, row_windows);
+    handle.send(HostCommand::Open { id, title: "Owned W2.4c fixture".into(), size: PixelSize::new(320, 240),
+        accent: [40, 120, 200], place: Some(HostPlace { content: LogicalPosition::new(100.0 + id as f64 * 40.0, 100.0) }) }).expect("own row open");
+    row_wait(events, stats, until, |s| s.sizes[id as usize].is_some());
+    row_host(handle, until, move || {
+        let after = row_windows(); let created: Vec<_> = after.into_iter().filter(|h| !before.contains(h)).collect();
+        assert_eq!(created.len(), 1, "unique newly created own HWND"); row_verify(created[0]); created[0]
+    })
+}
+fn row_activate(handle: &HostHandle, until: Instant, hwnd: isize) -> bool {
+    row_host(handle, until, move || {
+        row_verify(hwnd);
+        // SAFETY: one documented activation attempt only on this host's freshly corroborated own HWND.
+        let requested = unsafe { SetForegroundWindow(hwnd as Handle) } != 0;
+        // SAFETY: opaque foreground equality only; no metadata is read from any foreign HWND.
+        requested && unsafe { GetForegroundWindow() } == hwnd as Handle
+    })
+}
+fn row_foreground(handle: &HostHandle, until: Instant, hwnd: isize) {
+    row_host(handle, until, move || {
+        row_verify(hwnd);
+        // SAFETY: only opaque equality with the authenticated own HWND; no foreign metadata.
+        assert!((unsafe { GetForegroundWindow() }) == hwnd as Handle, "own foreground changed");
+    });
+}
+fn row_show(handle: &HostHandle, until: Instant, hwnd: isize, command: i32) {
+    row_host(handle, until, move || {
+        row_verify(hwnd);
+        // SAFETY: fixed own fixture action; return value describes previous visibility, not success.
+        unsafe { ShowWindow(hwnd as Handle, command); }
+    });
+}
+fn row_client(handle: &HostHandle, until: Instant, hwnd: isize) -> (PixelSize, bool, bool) {
+    row_host(handle, until, move || {
+        row_verify(hwnd); let mut rect = Rect::default();
+        // SAFETY: exact own HWND after identity proof and correctly sized initialized output.
+        unsafe { assert_ne!(GetClientRect(hwnd as Handle, &mut rect), 0); }
+        assert!(rect.right >= rect.left && rect.bottom >= rect.top);
+        let size = PixelSize::new((rect.right - rect.left) as u32, (rect.bottom - rect.top) as u32);
+        // SAFETY: state reads only from the authenticated own fixture HWND.
+        (size, unsafe { IsZoomed(hwnd as Handle) } != 0, unsafe { IsIconic(hwnd as Handle) } != 0)
+    })
+}
+fn row_key(handle: &HostHandle, until: Instant, hwnd: isize, down: bool) {
+    row_host(handle, until, move || {
+        row_verify(hwnd);
+        // SAFETY: fixed test-owned key/scancode message only to our own HWND, never physical input.
+        assert_ne!(unsafe { PostMessageW(hwnd as Handle, if down { 0x0100 } else { 0x0101 }, 0x41,
+            (1isize | (0x1eisize << 16)) | if down { 0 } else { (1isize << 30) | (1isize << 31) }) }, 0);
+    });
+}
+fn row_close(handle: &HostHandle, until: Instant, hwnd: isize, id: u64) {
+    row_host(handle, until, move || row_verify(hwnd));
+    handle.send(HostCommand::Close { id }).expect("own row close");
+    loop {
+        let gone = row_host(handle, until, move || {
+            // SAFETY: existence only for the exact previously retained own HWND; no adoption or metadata.
+            (unsafe { IsWindow(hwnd as Handle) }) == 0
+        });
+        if gone { break; }
+        assert!(Instant::now() < until, "own HWND retirement deadline");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+fn fixed_row(handle: &HostHandle, events: &mpsc::Receiver<HostEvent>, row: &str) -> bool {
+    let until = Instant::now() + Duration::from_secs(30); let mut stats = RowEvents::default();
+    let a = row_open(handle, events, &mut stats, until, 1);
+    if !row_activate(handle, until, a) { row_close(handle, until, a, 1); println!("W24C_ROW_U code=1"); return false; }
+    row_wait(events, &mut stats, until, |s| s.focus[1]);
+    let b = row_open(handle, events, &mut stats, until, 2);
+    row_drain(events, &mut stats, until); row_foreground(handle, until, a);
+    assert!(!stats.focus[2], "passive second proxy never activates");
+    if row == "focus" {
+        row_key(handle, until, a, true); row_wait(events, &mut stats, until, |s| s.down[1] == 1);
+        if !row_activate(handle, until, b) { row_close(handle, until, b, 2); row_close(handle, until, a, 1); println!("W24C_ROW_U code=1"); return false; }
+        row_wait(events, &mut stats, until, |s| !s.focus[1] && s.focus[2]);
+        assert_eq!(stats.up[1], 1, "held release precedes loss");
+        row_key(handle, until, a, true); row_key(handle, until, a, false); row_drain(events, &mut stats, until);
+        assert_eq!(stats.down[1], 1, "unfocused queued key refused");
+        row_show(handle, until, b, 6); row_wait(events, &mut stats, until, |s| !s.focus[2]);
+        row_key(handle, until, b, true); row_key(handle, until, b, false); row_drain(events, &mut stats, until);
+        assert_eq!(stats.down[2], 0, "minimized queued key refused");
+        row_show(handle, until, b, 9);
+        if !row_activate(handle, until, b) { row_close(handle, until, b, 2); row_close(handle, until, a, 1); println!("W24C_ROW_U code=1"); return false; }
+        row_wait(events, &mut stats, until, |s| s.focus[2]);
+        assert_eq!((stats.gains[2], stats.losses[2]), (2, 1));
+        assert_eq!(stats.gains[1], stats.losses[1] + u32::from(stats.focus[1]), "all observed own A transitions balance");
+    } else {
+        assert_eq!(row, "no-theft");
+        let normal = PixelSize::new(360, 260);
+        handle.send(HostCommand::SetContentSize { id: 2, size: normal }).expect("own normal resize");
+        row_wait(events, &mut stats, until, |s| s.sizes[2] == Some(normal)); row_foreground(handle, until, a);
+        row_show(handle, until, b, 3); row_drain(events, &mut stats, until);
+        let maximized = row_client(handle, until, b); assert!(maximized.1 && !maximized.2);
+        if !row_activate(handle, until, a) { row_close(handle, until, b, 2); row_close(handle, until, a, 1); println!("W24C_ROW_U code=1"); return false; }
+        handle.send(HostCommand::SetContentSize { id: 2, size: PixelSize::new(720, 380) }).expect("ignored maximized resize");
+        assert_eq!(row_client(handle, until, b), maximized); row_drain(events, &mut stats, until); row_foreground(handle, until, a);
+        assert_eq!(stats.sizes[2], Some(maximized.0), "reported maximized geometry is actual");
+        row_show(handle, until, b, 6); row_drain(events, &mut stats, until);
+        let minimized = row_client(handle, until, b); assert!(minimized.2);
+        handle.send(HostCommand::SetContentSize { id: 2, size: PixelSize::new(740, 400) }).expect("ignored minimized resize");
+        assert_eq!(row_client(handle, until, b), minimized); row_drain(events, &mut stats, until); row_foreground(handle, until, a);
+        assert_eq!(stats.sizes[2], Some(minimized.0), "reported minimized geometry is actual");
+        row_show(handle, until, b, 9); row_drain(events, &mut stats, until);
+        // Restoring a minimized maximized window may first restore maximized state.
+        if row_client(handle, until, b).1 { row_show(handle, until, b, 9); }
+        row_wait(events, &mut stats, until, |s| s.sizes[2] == Some(normal));
+        let restored = row_client(handle, until, b); assert_eq!(restored, (normal, false, false));
+        if !row_activate(handle, until, a) { row_close(handle, until, b, 2); row_close(handle, until, a, 1); println!("W24C_ROW_U code=1"); return false; }
+        let final_size = PixelSize::new(380, 280);
+        handle.send(HostCommand::SetContentSize { id: 2, size: final_size }).expect("own final normal resize");
+        row_wait(events, &mut stats, until, |s| s.sizes[2] == Some(final_size)); row_foreground(handle, until, a);
+        assert_eq!(row_client(handle, until, b).0, final_size);
+    }
+    row_close(handle, until, b, 2); row_close(handle, until, a, 1); row_drain(events, &mut stats, until);
+    println!("W24C_ROW_PASS row={} gains_a={} losses_a={} gains_b={} losses_b={} downs_a={} ups_a={} downs_b={} ups_b={} events={} hwnd_retired=2",
+        row, stats.gains[1], stats.losses[1], stats.gains[2], stats.losses[2], stats.down[1], stats.up[1], stats.down[2], stats.up[2], stats.count);
+    true
+}
+fn row_limited() {
+    let mut token = std::ptr::null_mut();
+    // SAFETY: current borrowed process pseudo-handle and initialized token output; query rights only.
+    assert_ne!(unsafe { OpenProcessToken(GetCurrentProcess(), 8, &mut token) }, 0);
+    struct Token(Handle);
+    impl Drop for Token { fn drop(&mut self) {
+        // SAFETY: exactly one owned valid token handle, never a pseudo-handle.
+        unsafe { CloseHandle(self.0); }
+    } }
+    let token = Token(token);
+    // Exact generated TOKEN_INFORMATION_CLASS constants: Elevation=20, UIAccess=26.
+    // 27 is TokenMandatoryPolicy and does not measure UIAccess.
+    for class in [20u32, 26u32] {
+        let mut value = 1u32; let mut returned = 0u32;
+        // SAFETY: fixed DWORD TokenElevation/TokenUIAccess layout and exact writable size.
+        assert_ne!(unsafe { GetTokenInformation(token.0, class, (&mut value as *mut u32).cast(), 4, &mut returned) }, 0);
+        assert_eq!(returned, 4); assert_eq!(value, 0, "non-elevated/non-UIAccess fixture required");
+    }
+}
+fn row_no_raw_registration() {
+    // RAWINPUTDEVICE is two WORDs, one DWORD and one HWND, naturally aligned under repr(C).
+    assert_eq!(std::mem::size_of::<RawDevice>(), if cfg!(target_pointer_width = "64") { 16 } else { 12 });
+    let mut count = 0u32;
+    // SAFETY: own-process registration metadata only; documented null-buffer size query.
+    let result = unsafe { GetRegisteredRawInputDevices(std::ptr::null_mut(), &mut count, std::mem::size_of::<RawDevice>() as u32) };
+    assert_ne!(result, u32::MAX); assert!(count <= 16, "own registration count cap");
+    if count != 0 {
+        let mut devices = vec![RawDevice::default(); count as usize];
+        // SAFETY: exactly count initialized generated-equivalent repr(C) registration entries;
+        // own-process metadata only, no raw packet/device name/owner process is queried.
+        let copied = unsafe { GetRegisteredRawInputDevices(devices.as_mut_ptr(), &mut count, std::mem::size_of::<RawDevice>() as u32) };
+        assert_ne!(copied, u32::MAX); assert!(copied as usize <= devices.len());
+        assert!(devices[..copied as usize].iter().all(|d| d.page != 1 || !matches!(d.usage, 0 | 2 | 6)), "host Never must remove keyboard/mouse registrations before dispatch");
+    }
+    println!("W24C_NO_RAW keyboard=0 mouse=0");
+}
+fn run_row(row: String, nonce: String) {
+    assert!(matches!(row.as_str(), "focus" | "no-theft"));
+    assert!(nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    row_limited();
+    let (finished, done) = mpsc::sync_channel(1);
+    let watchdog = std::thread::spawn(move || {
+        if done.recv_timeout(Duration::from_secs(60)).is_err() { std::process::exit(2); }
+    });
+    use std::io::Read;
+    let mut start = Vec::new(); std::io::stdin().lock().take(7).read_to_end(&mut start).expect("private START pipe");
+    assert_eq!(start, b"START\n", "created inherited private protocol only");
+    let (host, handle) = ProxyHost::new().expect("owned main-thread row host");
+    row_no_raw_registration(); // BEFORE run/dispatch or any visible fixture window.
+    let (send, events) = mpsc::sync_channel(512);
+    let worker = std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fixed_row(&handle, &events, &row)));
+        let _ = handle.send(HostCommand::Shutdown); result
+    });
+    let queue_failed = Arc::new(std::sync::atomic::AtomicBool::new(false)); let callback_failed = queue_failed.clone();
+    host.run(Box::new(move |event| {
+        if send.try_send(event).is_err() { callback_failed.store(true, std::sync::atomic::Ordering::Release); }
+    })).expect("owned row host loop");
+    let result = worker.join().expect("owned row worker");
+    assert!(!queue_failed.load(std::sync::atomic::Ordering::Acquire), "bounded own event queue");
+    finished.send(()).expect("own watchdog retirement"); watchdog.join().expect("joined own watchdog");
+    match result { Ok(true) => {}, Ok(false) => std::process::exit(3), Err(_) => std::process::exit(1) }
+}
+
 fn main() {
     if std::env::var("CROSSPANE_WINDOWS_PROXY_GUI").as_deref() != Ok("1") {
         eprintln!("SKIP: run only through limited win-gui.sh with CROSSPANE_WINDOWS_PROXY_GUI=1"); return;
+    }
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|s| s == "--row") {
+        assert!(args.len() == 4 && args[2] == "--run", "fixed own row selectors");
+        run_row(args[1].clone(), args[3].clone()); return;
     }
     let output = std::env::args_os().nth(1).map(PathBuf::from).expect("owned screenshot output path");
     let adapter = AdapterLog(Arc::new(Mutex::new(None)));

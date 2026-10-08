@@ -190,6 +190,7 @@ impl App {
             // The frozen Open describes an independent, decorated toplevel, with no owner
             // or popup relation. Winit supplies the normal resizable overlapped style.
             let attributes = attributes
+                .with_active(false)
                 .with_class_name("CrosspaneProxy")
                 .with_skip_taskbar(false)
                 .with_drag_and_drop(false);
@@ -525,6 +526,20 @@ impl App {
                     #[cfg(target_os = "windows")]
                     {
                         window.dpi_correction = None;
+                        if window.window.is_maximized()
+                            || window.window.is_minimized() == Some(true)
+                        {
+                            // Winit's resize can restore a maximized window and activate it.
+                            // Destination state wins: report actual geometry, retain no request.
+                            let actual = window.window.inner_size();
+                            let scale = window.window.scale_factor();
+                            tracing::debug!(
+                                id,
+                                "source resize ignored while proxy is max/minimized"
+                            );
+                            self.resized(id, actual, scale);
+                            return;
+                        }
                     }
                     // The source's size is exact: no opening fit and no logical rounding, or the
                     // window system's answer would differ from it and be sent back as a resize.
@@ -873,6 +888,15 @@ impl ApplicationHandler<HostCommand> for App {
         }
         match event {
             WindowEvent::KeyboardInput { event, .. } if !event.repeat => {
+                #[cfg(target_os = "windows")]
+                if !window.input.admit_windows_key(
+                    id,
+                    window.window.has_focus(),
+                    window.window.is_minimized(),
+                    self.events.as_mut(),
+                ) {
+                    return;
+                }
                 if let PhysicalKey::Code(code) = event.physical_key
                     && let Some(usage) = keycode_to_hid(code)
                 {
@@ -915,10 +939,21 @@ impl ApplicationHandler<HostCommand> for App {
                 });
             }
             WindowEvent::Focused(focused) => {
-                if !focused {
-                    window.input.release(id, self.events.as_mut());
+                #[cfg(target_os = "windows")]
+                let focused = focused
+                    && window.window.has_focus()
+                    && window.window.is_minimized() != Some(true);
+                #[cfg(target_os = "windows")]
+                window
+                    .input
+                    .windows_focus(id, focused, self.events.as_mut());
+                #[cfg(not(target_os = "windows"))]
+                {
+                    if !focused {
+                        window.input.release(id, self.events.as_mut());
+                    }
+                    (self.events)(HostEvent::Focus { id, focused });
                 }
-                (self.events)(HostEvent::Focus { id, focused });
                 // A window that was deminiaturised becomes key again after AppKit's last
                 // occlusion event, which can still have seen it as minimised.
                 if focused {
@@ -929,6 +964,19 @@ impl ApplicationHandler<HostCommand> for App {
             // macOS `Resized` is a frame snapshot taken when the event was queued, and delivery
             // can come after later native changes.
             WindowEvent::Resized(size) => {
+                #[cfg(target_os = "windows")]
+                match window.window.is_minimized() {
+                    Some(true) => window.input.windows_focus(id, false, self.events.as_mut()),
+                    // Restore re-derives focus from native state. A gain observed while iconic
+                    // was reported as lost, and nothing else would re-derive it.
+                    Some(false) => {
+                        let focused = window.window.has_focus();
+                        window
+                            .input
+                            .windows_focus(id, focused, self.events.as_mut());
+                    }
+                    None => {}
+                }
                 #[cfg(target_os = "macos")]
                 {
                     FullscreenPoll::after_resize(&mut window.fullscreen_poll, Instant::now());
@@ -998,6 +1046,8 @@ impl ApplicationHandler<HostCommand> for App {
             }
             WindowEvent::CloseRequested => {
                 window.input.close();
+                #[cfg(target_os = "windows")]
+                window.input.release(id, self.events.as_mut());
                 self.cancel_pending_arm(id);
                 (self.events)(HostEvent::CloseRequested { id });
             }
