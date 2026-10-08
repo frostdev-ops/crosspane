@@ -71,6 +71,7 @@ pub fn recover(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RecordKind {
+    FirstInstall,
     Receipt,
     StageCatalog,
     OuterUpgrade,
@@ -92,6 +93,7 @@ pub enum RecordKind {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordName {
+    FirstInstall,
     Receipt,
     StageCatalog,
     OuterUpgrade,
@@ -115,6 +117,7 @@ pub enum RecordName {
 impl RecordName {
     pub fn file_name(&self) -> NativeResult<super::files::PrivateName> {
         match self {
+            Self::FirstInstall => super::files::PrivateName::new("first-install.json"),
             Self::Receipt => super::files::PrivateName::new("receipt.json"),
             Self::StageCatalog => super::files::PrivateName::new("stage-catalog.json"),
             Self::OuterUpgrade => super::files::PrivateName::new("outer-upgrade.json"),
@@ -153,6 +156,7 @@ impl RecordName {
     }
     fn kind(&self) -> RecordKind {
         match self {
+            Self::FirstInstall => RecordKind::FirstInstall,
             Self::Receipt => RecordKind::Receipt,
             Self::StageCatalog => RecordKind::StageCatalog,
             Self::OuterUpgrade => RecordKind::OuterUpgrade,

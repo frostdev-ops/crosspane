@@ -189,6 +189,118 @@ mod native {
     // At most one uncertain task dispatch in this process. Keep its genuine image/context pins;
     // a timed-out delivery never turns into permission to replace an unknown running image.
     static UNCERTAIN: OnceLock<Arc<NativeImages>> = OnceLock::new();
+    static UNCERTAIN_FIRST: OnceLock<Arc<FirstInstallTaskSelection>> = OnceLock::new();
+    /// Actual verified first payload plus retained original absence reservation. No facts factory.
+    #[derive(Clone)]
+    pub(crate) struct FirstInstallTaskSelection {
+        io: Arc<WindowsNativeIo>,
+        payload: Arc<VerifiedPayload>,
+        reservation: native_io::FirstInstallReservation,
+        selected: super::super::super::first_install::record::FirstInstallRecord,
+        released: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl FirstInstallTaskSelection {
+        fn reverify(&self, deadline: &Deadline) -> NativeResult<()> {
+            use super::super::super::first_install::record::Phase as FirstPhase;
+            let proof = self.io.admit_support(deadline)?;
+            self.payload.reverify(&self.io, &proof, deadline)?;
+            if !self.released.load(std::sync::atomic::Ordering::Acquire) {
+                self.reservation.reverify(&self.io, &proof, deadline)?;
+            }
+            let actual = self
+                .io
+                .read_first_install(&proof, deadline)?
+                .ok_or(NativeError::Missing)?;
+            if !actual.same_selection(&self.selected)
+                || actual.phase().rank() < FirstPhase::TaskIntent.rank()
+                || actual.phase().rank() > FirstPhase::RunObserved.rank()
+            {
+                return Err(NativeError::Foreign);
+            }
+            for role in super::super::super::payload::inventory::PayloadRole::ALL {
+                if actual.role(role)? != self.selected.role(role)?
+                    || actual.role(role)?.approved != *self.payload.pin(role)?.facts()
+                {
+                    return Err(NativeError::Foreign);
+                }
+            }
+            deadline.check()
+        }
+        fn checkpoint(
+            &self,
+            lock: &InstallerLock,
+            phase: super::super::super::first_install::record::Phase,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.reverify(deadline)?;
+            let proof = self.io.admit_support(deadline)?;
+            self.io.verify_first_lock(&proof, lock, deadline)?;
+            let mut actual = self
+                .io
+                .read_first_install(&proof, deadline)?
+                .ok_or(NativeError::Missing)?;
+            actual.advance(phase)?;
+            if self.released.load(std::sync::atomic::Ordering::Acquire) {
+                // Only this actual prepared/consumed activation can publish the Run result.
+                let publication = self.io.publish_record(
+                    &proof,
+                    lock,
+                    native_io::records::RecordName::FirstInstall,
+                    &actual.encode()?,
+                    deadline,
+                )?;
+                if publication.native_failure.is_some()
+                    || publication.state != native_io::records::PublicationRecovery::NewPublished
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+            } else {
+                self.io.publish_first_install(
+                    &proof,
+                    lock,
+                    &self.reservation,
+                    &actual,
+                    deadline,
+                )?;
+            }
+            Ok(())
+        }
+        fn release(&self, deadline: &Deadline) -> NativeResult<()> {
+            self.reverify(deadline)?;
+            let proof = self.io.admit_support(deadline)?;
+            self.reservation.release(&proof, deadline)?;
+            self.released
+                .store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        }
+    }
+    pub(in super::super) fn prepare_first_install(
+        io: Arc<WindowsNativeIo>,
+        payload: Arc<VerifiedPayload>,
+        reservation: native_io::FirstInstallReservation,
+        deadline: &Deadline,
+    ) -> NativeResult<FirstInstallTaskSelection> {
+        use super::super::super::first_install::record::Phase as FirstPhase;
+        let proof = io.admit_support(deadline)?;
+        payload.reverify(&io, &proof, deadline)?;
+        reservation.reverify(&io, &proof, deadline)?;
+        let selected = io
+            .read_first_install(&proof, deadline)?
+            .ok_or(NativeError::Missing)?;
+        if selected.phase() != FirstPhase::TaskIntent || selected.operation() != payload.operation()
+        {
+            return Err(NativeError::Foreign);
+        }
+        let value = FirstInstallTaskSelection {
+            io,
+            payload,
+            reservation,
+            selected,
+            released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        value.reverify(deadline)?;
+        Ok(value)
+    }
     pub(crate) struct UpgradeTaskSelection {
         io: Arc<WindowsNativeIo>,
         operation: [u8; 16],
@@ -358,6 +470,7 @@ mod native {
         images: Arc<NativeImages>,
         upgrade: Option<UpgradeTaskSelection>,
         repair: Option<RepairTaskSelection>,
+        first: Option<FirstInstallTaskSelection>,
         deadline: Deadline,
     }
     impl Binding {
@@ -372,10 +485,41 @@ mod native {
             if let Some(repair) = &self.repair {
                 repair.matches_images(&self.images, &self.deadline)?;
             }
+            if let Some(first) = &self.first {
+                first.reverify(&self.deadline)?;
+                for (role, image) in [
+                    (
+                        super::super::super::payload::inventory::PayloadRole::Installer,
+                        &self.images.installer,
+                    ),
+                    (
+                        super::super::super::payload::inventory::PayloadRole::Agent,
+                        &self.images.agent,
+                    ),
+                    (
+                        super::super::super::payload::inventory::PayloadRole::Ui,
+                        &self.images.ui,
+                    ),
+                ] {
+                    if Some(image.identity().into())
+                        != first
+                            .selected
+                            .role(role)?
+                            .published
+                            .as_ref()
+                            .map(|r| r.identity)
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                }
+            }
             self.deadline.check()
         }
         fn io(&self) -> &WindowsNativeIo {
-            &self.images.io
+            match &self.first {
+                Some(first) => &first.io,
+                None => &self.images.io,
+            }
         }
         fn user(&self) -> String {
             self.io().target().identity().user.sddl()
@@ -421,6 +565,9 @@ mod native {
                 return Err(NativeError::OutcomeUnknown);
             }
             let actual = self.scheduler.inspect(&|| self.binding.check())?;
+            if self.binding.first.is_some() && self.record.is_none() && actual.is_some() {
+                return Err(NativeError::Foreign);
+            }
             if let Some(repair) = &self.binding.repair {
                 repair.matches_task(actual.as_ref())?;
             }
@@ -459,6 +606,13 @@ mod native {
             record.registered()?;
             self.publish(&record)?;
             self.record = Some(record);
+            if let Some(first) = &self.binding.first {
+                first.checkpoint(
+                    self.lock.as_ref().ok_or(NativeError::Foreign)?,
+                    super::super::super::first_install::record::Phase::TaskRegistered,
+                    &self.binding.deadline,
+                )?;
+            }
             Ok(())
         }
         fn retire(&mut self) {
@@ -502,10 +656,20 @@ mod native {
             record.run_intent()?;
             self.publish(&record)?;
             self.record = Some(record);
+            if let Some(first) = &self.binding.first {
+                first.checkpoint(
+                    self.lock.as_ref().ok_or(NativeError::Foreign)?,
+                    super::super::super::first_install::record::Phase::RunIntent,
+                    &self.binding.deadline,
+                )?;
+            }
             Ok(())
         }
         fn release_lock(&mut self) -> NativeResult<()> {
             self.binding.check()?;
+            if let Some(first) = &self.binding.first {
+                first.release(&self.binding.deadline)?;
+            }
             drop(self.lock.take().ok_or(NativeError::Foreign)?);
             Ok(())
         }
@@ -550,6 +714,13 @@ mod native {
             )?;
             record.run_observed(submission.guid().to_owned())?;
             self.publish(&record)?;
+            if let Some(first) = &self.binding.first {
+                first.checkpoint(
+                    self.lock.as_ref().ok_or(NativeError::Foreign)?,
+                    super::super::super::first_install::record::Phase::RunObserved,
+                    &self.binding.deadline,
+                )?;
+            }
             Ok(())
         }
     }
@@ -575,25 +746,43 @@ mod native {
         repair: Option<RepairTaskSelection>,
         deadline: &Deadline,
     ) -> NativeResult<TaskRunEvidence> {
+        start_selected(images, upgrade, repair, None, deadline)
+    }
+    fn start_selected(
+        images: Arc<NativeImages>,
+        upgrade: Option<UpgradeTaskSelection>,
+        repair: Option<RepairTaskSelection>,
+        first: Option<FirstInstallTaskSelection>,
+        deadline: &Deadline,
+    ) -> NativeResult<TaskRunEvidence> {
+        if first.is_some() && (upgrade.is_some() || repair.is_some()) {
+            return Err(NativeError::Foreign);
+        }
         let operation = match (&upgrade, &repair) {
             (Some(_), Some(_)) => return Err(NativeError::Foreign),
             (None, Some(value)) => value.operation,
             (Some(value), None) => value.operation,
             (None, None) => {
-                let mut id = [0; 16];
-                aws_lc_rs::rand::fill(&mut id).map_err(|_| NativeError::Unavailable)?;
-                if id == [0; 16] {
-                    return Err(NativeError::Unavailable);
+                if let Some(first) = &first {
+                    first.selected.operation()
+                } else {
+                    let mut id = [0; 16];
+                    aws_lc_rs::rand::fill(&mut id).map_err(|_| NativeError::Unavailable)?;
+                    if id == [0; 16] {
+                        return Err(NativeError::Unavailable);
+                    }
+                    id
                 }
-                id
             }
         };
         let retained = images.clone();
         let retained_repair = repair.clone();
+        let retained_first = first.clone();
         let binding = Binding {
             images,
             upgrade,
             repair,
+            first,
             deadline: deadline.clone(),
         };
         binding.check()?;
@@ -626,6 +815,9 @@ mod native {
             if let Some(selection) = retained_repair {
                 let _ = UNCERTAIN_REPAIR.set(Arc::new(selection));
             }
+            if let Some(selection) = retained_first {
+                let _ = UNCERTAIN_FIRST.set(Arc::new(selection));
+            }
         }
         result
     }
@@ -633,6 +825,20 @@ mod native {
         let clock: Arc<dyn native_io::Clock> = Arc::new(MonotonicClock::default());
         let deadline = Deadline::new(30_000, clock, Cancellation::default())?;
         start(trusted._native.clone(), None, None, &deadline).map(|_| ())
+    }
+    pub(in super::super) fn start_first_install(
+        trusted: &TrustedImages,
+        selection: FirstInstallTaskSelection,
+        deadline: &Deadline,
+    ) -> NativeResult<TaskRunEvidence> {
+        selection.reverify(deadline)?;
+        start_selected(
+            trusted._native.clone(),
+            None,
+            None,
+            Some(selection),
+            deadline,
+        )
     }
     pub(in super::super) fn start_upgrade(
         trusted: &TrustedImages,
@@ -858,7 +1064,8 @@ mod native {
 pub(crate) use native::TaskRunPermit;
 #[cfg(all(windows, not(test)))]
 pub(super) use native::{
-    TaskRunEvidence, claim_supervisor, prepare_repair, prepare_upgrade, start_repair, start_upgrade,
+    TaskRunEvidence, claim_supervisor, prepare_first_install, prepare_repair, prepare_upgrade,
+    start_first_install, start_repair, start_upgrade,
 };
 
 // A6 repair is separate from activation: registration-only, no TaskActivation claim or Run.

@@ -15,6 +15,7 @@ fn read_only_report_has_no_mutation_capability() {
         payload: domains::State::Missing,
         task: domains::State::Disabled,
         agent: domains::State::Unknown,
+        cold: domains::Cold::Existing,
         terminal_history: true,
         unsettled: true,
         correlation: vec![1, 2, 3],

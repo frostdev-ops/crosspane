@@ -5,6 +5,137 @@ use super::super::service::supervisor::Generation;
 use super::{NativeError, NativeResult};
 use serde::{Deserialize, Serialize};
 
+/// A8 reserves the existing fixed supervisor name without creating an owner/job or admitting
+/// requests. Its constructor accepts only the original-IO parent admission, never a caller path.
+#[cfg(all(windows, not(test)))]
+mod first_namespace {
+    use super::super::{ColdNamespaceAdmission, Deadline, SupportProof};
+    use super::{NativeError, NativeResult};
+    use std::{os::windows::io::AsRawHandle, sync::Arc};
+    use tokio::{
+        net::windows::named_pipe::{NamedPipeServer, ServerOptions},
+        runtime::Runtime,
+    };
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            },
+            SECURITY_ATTRIBUTES,
+        },
+        System::Pipes::{GetNamedPipeInfo, PIPE_SERVER_END},
+    };
+    struct Descriptor(*mut std::ffi::c_void);
+    impl Drop for Descriptor {
+        fn drop(&mut self) {
+            // SAFETY: exactly the owned LocalAlloc output of SDDL conversion.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+    pub(crate) struct FirstInstallNamespace {
+        admission: Arc<ColdNamespaceAdmission>,
+        pipe: NamedPipeServer,
+        // Pipe drops before its own runtime. No listener/task/client is ever created.
+        _runtime: Runtime,
+    }
+    impl FirstInstallNamespace {
+        pub(crate) fn reserve(
+            admission: Arc<ColdNamespaceAdmission>,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<Self> {
+            admission.reverify(proof, deadline)?;
+            let token = admission.token();
+            let user = token.user.sddl();
+            let logon = token.logon.sddl();
+            let text = super::super::files::native::wide(&format!(
+                "O:{user}G:{user}D:P(A;;GA;;;{user})(A;;GRGW;;;{logon})"
+            ))?;
+            let mut raw = std::ptr::null_mut();
+            // SAFETY: protected descriptor containing only admitted user/logon SIDs, owned output.
+            if unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut raw,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(NativeError::Unavailable);
+            }
+            let descriptor = Descriptor(raw);
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor.0,
+                bInheritHandle: 0,
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| NativeError::Unavailable)?;
+            let pipe = {
+                let _entered = runtime.enter();
+                admission.reverify(proof, deadline)?;
+                // SAFETY: sole fixed first instance, local clients only, no handle inheritance;
+                // descriptor/attributes remain alive throughout creation, Tokio owns the result.
+                unsafe {
+                    ServerOptions::new()
+                        .first_pipe_instance(true)
+                        .reject_remote_clients(true)
+                        .max_instances(1)
+                        .create_with_security_attributes_raw(
+                            admission.endpoint(),
+                            (&attributes as *const SECURITY_ATTRIBUTES)
+                                .cast_mut()
+                                .cast(),
+                        )
+                }
+                .map_err(|_| NativeError::Busy)?
+            };
+            let value = Self {
+                admission,
+                pipe,
+                _runtime: runtime,
+            };
+            value.reverify(proof, deadline)?;
+            Ok(value)
+        }
+        pub(crate) fn reverify(
+            &self,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.admission.reverify(proof, deadline)?;
+            self.reverify_native(deadline)
+        }
+        pub(crate) fn reverify_native(&self, deadline: &Deadline) -> NativeResult<()> {
+            self.admission.reverify_native(deadline)?;
+            let mut flags = 0;
+            // SAFETY: retained actual own server handle and initialized bounded flags output.
+            if unsafe {
+                GetNamedPipeInfo(
+                    self.pipe.as_raw_handle(),
+                    &mut flags,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            } == 0
+                || flags & PIPE_SERVER_END == 0
+            {
+                return Err(NativeError::Unavailable);
+            }
+            deadline.check()
+        }
+    }
+}
+#[cfg(all(windows, not(test)))]
+pub(crate) use first_namespace::FirstInstallNamespace;
+#[cfg(all(windows, not(test)))]
+pub(crate) use native::{FirstInstallReady, observe_first_ready};
+
 pub(crate) const MAX_OWNER_FRAME: usize = 2048;
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -5221,6 +5352,106 @@ mod native {
         AdmittedRemovalOwner, RemovalControlPeer, admit_removal_keeper_peer,
         admit_removal_source_peer, probe_removal_support,
     };
+
+    /// Kernel-peer selected, read-only first readiness; no Request or handle export.
+    #[cfg(not(test))]
+    pub(crate) struct FirstInstallReady {
+        root: Arc<BrokerAdmission>,
+        peer: Peer,
+        agent: Arc<AgentObservation>,
+        operation: [u8; 16],
+        instance: u64,
+    }
+    #[cfg(not(test))]
+    impl FirstInstallReady {
+        pub(crate) fn instance(&self) -> u64 {
+            self.instance
+        }
+        pub(crate) fn reverify(&self, deadline: &Deadline) -> NativeResult<()> {
+            use super::super::super::service::journal::{Journal, Phase};
+            let io = self.root.io();
+            let proof = io.admit_support(deadline)?;
+            self.peer.reverify(&self.root, deadline)?;
+            self.agent.revalidate(io, &proof, deadline)?;
+            let journal = Journal::read(io, &proof, deadline)?.ok_or(NativeError::Missing)?;
+            if journal.operation != self.operation
+                || journal.clock_epoch != self.peer.created
+                || journal.current != Some(io.agent_generation(&self.agent, &proof, deadline)?)
+                || self.agent.bootstrap().instance_id != self.instance
+            {
+                return Err(NativeError::Foreign);
+            }
+            if journal.phase != Phase::Running {
+                return Err(if journal.phase == Phase::StartRequested {
+                    NativeError::Busy
+                } else {
+                    NativeError::Foreign
+                });
+            }
+            deadline.check()
+        }
+    }
+    #[cfg(not(test))]
+    pub(crate) fn observe_first_ready(
+        io: Arc<WindowsNativeIo>,
+        operation: [u8; 16],
+        agent: Arc<AgentObservation>,
+        deadline: &Deadline,
+    ) -> NativeResult<FirstInstallReady> {
+        use super::super::{
+            activation::{Phase, TaskActivationRecord},
+            files::MAX_RECORD_BYTES,
+            records::RecordName,
+        };
+        let proof = io.admit_support(deadline)?;
+        let root = io.broker_admission(&proof, deadline)?;
+        let activation = io
+            .read_record(
+                &proof,
+                RecordName::TaskActivation,
+                MAX_RECORD_BYTES,
+                deadline,
+            )?
+            .ok_or(NativeError::Missing)?;
+        let activation = TaskActivationRecord::decode(activation.bytes())?;
+        activation.bind(
+            operation,
+            &io.target().identity().user.sddl(),
+            root.installer_identity(),
+        )?;
+        // A caller may die after the one Run but before publishing its result. The genuine
+        // retained kernel peer and matching claim/Running evidence can settle that intent;
+        // this read-only observer never writes the activation record or replays Run.
+        if !matches!(activation.phase(), Phase::RunIntent | Phase::RunObserved) {
+            return Err(NativeError::Busy);
+        }
+        let claim = activation.claim().ok_or(NativeError::Busy)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| NativeError::Unavailable)?;
+        let peer = runtime.block_on(async {
+            let pipe = ClientOptions::new()
+                .open(root.endpoint())
+                .map_err(|_| NativeError::Busy)?;
+            let peer = Peer::admit(pipe.as_raw_handle(), true, &root, deadline)?;
+            if peer.pid != claim.pid || peer.created != claim.creation {
+                return Err(NativeError::Foreign);
+            }
+            drop(pipe); // No pending IO or endpoint alias escapes this observation.
+            Ok(peer)
+        })?;
+        let instance = agent.bootstrap().instance_id;
+        let ready = FirstInstallReady {
+            root,
+            peer,
+            agent,
+            operation,
+            instance,
+        };
+        ready.reverify(deadline)?;
+        Ok(ready)
+    }
 
     #[cfg(test)]
     mod polling_tests {

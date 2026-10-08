@@ -349,6 +349,27 @@ pub(crate) mod native {
         }
     }
     impl Descriptor {
+        /// Agent windows/security.rs requires exactly one protected user ACE for this leaf.
+        fn agent_lock(user: &Sid) -> NativeResult<Self> {
+            let sddl = wide(&format!("O:{}D:P(A;;FA;;;{})", user.sddl(), user.sddl()))?;
+            let mut descriptor = std::ptr::null_mut();
+            // SAFETY: fixed user-only SDDL uses an admitted SID; the returned allocation is owned.
+            if unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            if descriptor.is_null() {
+                return Err(NativeError::Unavailable);
+            }
+            Ok(Self(descriptor))
+        }
         fn private(user: &Sid) -> NativeResult<Self> {
             let sddl = wide(&format!(
                 "O:{}D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)",
@@ -1004,6 +1025,94 @@ pub(crate) mod native {
             if facts.identity.volume != self.identity()?.volume {
                 return Err(NativeError::OutcomeUnknown);
             }
+            Ok(file)
+        }
+        /// Literal state-root agent.lock only. Its writable std File is locked with the same
+        /// File::try_lock used by the agent; no serialized owner/PID contents are read.
+        #[cfg_attr(test, allow(dead_code))]
+        pub(crate) fn first_install_agent_lock(
+            &self,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<File> {
+            self.revalidate(security, true, deadline)?;
+            let name = ComponentName::new("agent.lock")?;
+            let existing = open_component(
+                self.file()?,
+                &name,
+                ObjectKind::File,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                deadline,
+            )?;
+            let file = match existing {
+                Some(file) => file,
+                None => {
+                    let descriptor = Descriptor::agent_lock(&security.user)?;
+                    relative_component(
+                        &NativeComponentIo {
+                            access: GENERIC_WRITE,
+                            sharing: FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            descriptor: Some(&descriptor),
+                        },
+                        self.file()?,
+                        &name,
+                        ObjectKind::File,
+                        true,
+                        deadline,
+                    )?
+                    .ok_or(NativeError::OutcomeUnknown)?
+                }
+            };
+            let facts = observe(&file, "agent.lock", security)?;
+            admit_component(&facts, Admission::PrivateFile)?;
+            // Do not repair an existing DACL. Match the agent's one-user full-access contract.
+            if facts.identity.volume != self.identity()?.volume
+                || facts.acl.entries.len() != 1
+                || facts.acl.entries[0].principal != Principal::User
+                || facts.acl.entries[0].mask != 0x001f01ff
+                || facts.acl.entries[0].inherit_only
+            {
+                return Err(NativeError::Foreign);
+            }
+            let mut dacl = std::ptr::null_mut();
+            let mut descriptor = std::ptr::null_mut();
+            // SAFETY: query-only retained admitted agent.lock with READ_CONTROL. The owned
+            // descriptor below retains the DACL and ACE for this exact file, never a path reopen.
+            let code = unsafe {
+                GetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut dacl,
+                    std::ptr::null_mut(),
+                    &mut descriptor,
+                )
+            };
+            if code != ERROR_SUCCESS {
+                return Err(error(code));
+            }
+            let descriptor = Descriptor(descriptor);
+            if descriptor.0.is_null() || dacl.is_null() {
+                return Err(NativeError::Foreign);
+            }
+            // SAFETY: successful GetSecurityInfo owns the live ACL header through descriptor.
+            if unsafe { (*dacl).AceCount } != 1 {
+                return Err(NativeError::Foreign);
+            }
+            let mut pointer = std::ptr::null_mut();
+            // SAFETY: the same retained DACL has exactly one ACE; this queries index zero only.
+            if unsafe { GetAce(dacl, 0, &mut pointer) } == 0 || pointer.is_null() {
+                return Err(last_error());
+            }
+            // SAFETY: successful GetAce yields a complete ACE header retained by descriptor.
+            let header = unsafe { pointer.cast::<ACE_HEADER>().read_unaligned() };
+            if header.AceSize < std::mem::size_of::<ACE_HEADER>() as u16 || header.AceFlags != 0 {
+                return Err(NativeError::Foreign);
+            }
+            deadline.check()?;
             Ok(file)
         }
         pub(crate) fn read_private(

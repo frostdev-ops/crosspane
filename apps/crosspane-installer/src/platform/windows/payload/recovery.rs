@@ -1070,6 +1070,8 @@ mod native {
         deadline: &Deadline,
     ) -> NativeResult<MutationPermit> {
         record.validate()?;
+        #[cfg(not(test))]
+        io.reject_active_first_install(proof, deadline)?;
         let mut current = catalog(&io, proof, deadline)?;
         if current.active.is_some_and(|id| id != record.operation()) {
             return Err(NativeError::Busy);

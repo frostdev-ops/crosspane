@@ -18,6 +18,17 @@ pub(crate) enum State {
     Unavailable,
     Unknown,
 }
+/// Read-only routing hint, renewed by the cold native facade under the actual lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cold {
+    Eligible,
+    Observe,
+    Partial,
+    CompletedRemoval,
+    Existing,
+    AccessDenied,
+    Unknown,
+}
 pub(crate) fn publication_unsettled(healthy: bool, proven_capacity_only: bool) -> bool {
     !healthy && !proven_capacity_only
 }
@@ -29,6 +40,7 @@ pub(crate) struct Snapshot {
     pub payload: State,
     pub task: State,
     pub agent: State,
+    pub cold: Cold,
     pub terminal_history: bool,
     pub unsettled: bool,
     /// Private exact diagnostic correlation; never displayed or interpreted as ownership.
@@ -44,6 +56,7 @@ impl Snapshot {
     pub fn healthy(&self) -> bool {
         self.supported
             && self.inventory
+            && self.cold == Cold::Existing
             && self.payload == State::Healthy
             && self.task == State::Healthy
             && self.agent == State::Healthy
@@ -64,7 +77,7 @@ impl Snapshot {
         }
     }
     pub fn install_operation(&self) -> Operation {
-        if self.payload == State::Missing {
+        if self.cold != Cold::Existing || self.payload == State::Missing {
             Operation::Install
         } else {
             Operation::Upgrade
@@ -82,8 +95,13 @@ impl Snapshot {
             return false;
         }
         if matches!(op, Operation::Install) {
-            return false;
-        } // W4.1a8, no native cold seal.
+            return self.sources
+                && match self.cold {
+                    Cold::Eligible => self.task == State::Missing && self.agent == State::Missing,
+                    Cold::Observe => self.task == State::Healthy && self.agent == State::Healthy,
+                    _ => false,
+                };
+        }
         if matches!(
             self.task,
             State::Disabled | State::Mismatch | State::Unknown | State::Unavailable
@@ -177,6 +195,10 @@ pub(crate) trait Domains: Send {
     fn settle(&mut self, operation: Operation) -> Result<bool, Failure>;
     fn apply(&mut self, operation: Operation) -> Result<Dispatch, Failure>;
     fn verify(&mut self, operation: Operation) -> Result<bool, Failure>;
+    /// Static first-install refusal detail only; consent/submission accounting is unchanged.
+    fn take_first_refusal(&mut self) -> Option<&'static str> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,6 +258,7 @@ pub(crate) mod native {
         previous: Option<RepairObservation>,
         version: u64,
         held: Option<Continuation>,
+        first_refusal: Option<&'static str>,
     }
     enum Continuation {
         Upgrade(service::KeeperContinuation),
@@ -269,6 +292,7 @@ pub(crate) mod native {
                 previous: None,
                 version: 0,
                 held: None,
+                first_refusal: None,
             }
         }
         fn inputs(&self) -> Result<[Box<dyn std::io::Read + Send>; 3], Failure> {
@@ -328,6 +352,8 @@ pub(crate) mod native {
         let mut outer_terminal = false;
         let mut repair_terminal = false;
         let mut capacity_only = false;
+        let mut cold = Cold::Unknown;
+        let mut correlation = Vec::new();
         if let Some(io) = probe.io() {
             let proof = io
                 .admit_support(&budget)
@@ -343,6 +369,88 @@ pub(crate) mod native {
             if let Ok(Some(r)) = io.read_payload_repair(&proof, &budget) {
                 repair_terminal = r.phase() == PayloadRepairPhase::Complete;
             }
+            use super::super::super::first_install::{
+                self, FirstInstallDisposition as Disposition, FirstInstallFacts, History, Presence,
+            };
+            let observed = io.preview_first_install(&proof, &budget);
+            let first = io.read_first_install(&proof, &budget);
+            let active_first = first.as_ref().map_or(true, |r| {
+                r.as_ref().is_some_and(|r| {
+                    r.phase() != super::super::super::first_install::record::Phase::Complete
+                })
+            });
+            let history = match observed {
+                Ok(Disposition::Eligible) => History::None,
+                Ok(Disposition::Resume) => History::FirstInstall,
+                Ok(Disposition::CompletedRemoval) => History::CompletedRemoval,
+                Ok(Disposition::Partial) => History::Partial,
+                Ok(Disposition::Existing) => History::Other,
+                _ => History::Unknown,
+            };
+            let presence = |d| match d {
+                Diagnostic::Missing => Presence::Missing,
+                Diagnostic::Healthy | Diagnostic::Disabled | Diagnostic::Mismatch => {
+                    Presence::Present
+                }
+                Diagnostic::AccessDenied => Presence::AccessDenied,
+                _ => Presence::Unknown,
+            };
+            cold = match first_install::preview(FirstInstallFacts {
+                task: presence(actual.task().diagnostic()),
+                agent: presence(actual.agent()),
+                supervisor: if matches!(observed, Ok(Disposition::Existing)) {
+                    Presence::Present
+                } else {
+                    Presence::Missing
+                },
+                history,
+            }) {
+                Disposition::Eligible => Cold::Eligible,
+                Disposition::CompletedRemoval => Cold::CompletedRemoval,
+                Disposition::Resume => match first
+                    .as_ref()
+                    .ok()
+                    .and_then(|r| r.as_ref())
+                    .and_then(|r| first_install::reopen(r, io.target().identity()).ok())
+                {
+                    Some(first_install::Reopen::Restart(_)) => Cold::Eligible,
+                    Some(first_install::Reopen::Observe(_)) => Cold::Observe,
+                    None => Cold::Partial,
+                },
+                Disposition::Partial => Cold::Partial,
+                Disposition::Existing => Cold::Existing,
+                Disposition::AccessDenied => Cold::AccessDenied,
+                _ => Cold::Unknown,
+            };
+            if !active_first
+                && (actual.task().diagnostic() != Diagnostic::Missing
+                    || actual.agent() != Diagnostic::Missing)
+            {
+                if matches!(
+                    actual.task().diagnostic(),
+                    Diagnostic::Healthy | Diagnostic::Disabled
+                ) || actual.agent() == Diagnostic::Healthy
+                {
+                    cold = Cold::Existing;
+                } else if actual.task().diagnostic() == Diagnostic::AccessDenied
+                    || actual.agent() == Diagnostic::AccessDenied
+                {
+                    cold = Cold::AccessDenied;
+                } else {
+                    cold = Cold::Unknown;
+                }
+            }
+            if let Ok(Some(record)) = first {
+                let bytes = record.encode().map_err(|_| Failure::NotSubmitted)?;
+                correlation.extend_from_slice(
+                    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &bytes).as_ref(),
+                );
+            }
+        }
+        if [actual.task().diagnostic(), actual.agent(), actual.payload()]
+            .contains(&Diagnostic::AccessDenied)
+        {
+            cold = Cold::AccessDenied;
         }
         let terminal_history = outer_terminal
             || repair_terminal
@@ -359,9 +467,10 @@ pub(crate) mod native {
             payload: state(actual.payload()),
             task: state(actual.task().diagnostic()),
             agent: state(actual.agent()),
+            cold,
             terminal_history,
             unsettled,
-            correlation: Vec::new(),
+            correlation,
             source: ObservationSource::Live,
         };
         Ok((snapshot, actual.clone()))
@@ -373,17 +482,35 @@ pub(crate) mod native {
                 self.version = self.version.saturating_add(1);
                 self.previous = Some(actual);
             }
-            snapshot.correlation = self.version.to_le_bytes().to_vec();
+            snapshot
+                .correlation
+                .extend_from_slice(&self.version.to_le_bytes());
             snapshot.sources = self.folder.is_some();
             Ok(snapshot)
         }
         fn settle(&mut self, op: Operation) -> Result<bool, Failure> {
+            if op == Operation::Install {
+                return Ok(false);
+            }
             service::settle_operation_artifacts(op, &deadline(30_000)?)
                 .map_err(|_| Failure::Unknown)
         }
         fn apply(&mut self, op: Operation) -> Result<Dispatch, Failure> {
+            self.first_refusal = None;
             if op == Operation::Install {
-                return Err(Failure::NotSubmitted);
+                return match service::begin_first_install(self.inputs()?, &deadline(120_000)?)
+                    .map_err(|_| Failure::Unknown)?
+                {
+                    service::FirstInstallOutcome::Complete => Ok(Dispatch {
+                        handoff: Handoff::NotCommitted,
+                        complete: true,
+                    }),
+                    service::FirstInstallOutcome::NotSubmitted(reason) => {
+                        self.first_refusal = Some(reason);
+                        Err(Failure::NotSubmitted)
+                    }
+                    service::FirstInstallOutcome::Unknown => Err(Failure::Unknown),
+                };
             }
             if matches!(op, Operation::MetadataRepair) {
                 let complete = service::integration_metadata_repair(&deadline(30_000)?)
@@ -419,6 +546,9 @@ pub(crate) mod native {
                 handoff,
                 complete: handoff == Handoff::Complete,
             })
+        }
+        fn take_first_refusal(&mut self) -> Option<&'static str> {
+            self.first_refusal.take()
         }
         fn verify(&mut self, op: Operation) -> Result<bool, Failure> {
             let observed = self.observe()?;

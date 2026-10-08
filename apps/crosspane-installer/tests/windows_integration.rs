@@ -21,6 +21,7 @@ fn snapshot() -> Snapshot {
         payload: State::Healthy,
         task: State::Healthy,
         agent: State::Healthy,
+        cold: Cold::Existing,
         terminal_history: false,
         unsettled: false,
         correlation: vec![1],
@@ -42,6 +43,7 @@ struct Fake {
     archives: usize,
     archive_full: bool,
     verify_failure: Option<Failure>,
+    first_refusal: Option<&'static str>,
 }
 impl Fake {
     fn new() -> Self {
@@ -60,6 +62,7 @@ impl Fake {
             archives: 0,
             archive_full: false,
             verify_failure: None,
+            first_refusal: None,
         }
     }
 }
@@ -97,7 +100,10 @@ impl Domains for Fake {
         ) {
             self.stops += 1;
         }
-        if matches!(op, Operation::Upgrade | Operation::PayloadRepair) {
+        if matches!(
+            op,
+            Operation::Install | Operation::Upgrade | Operation::PayloadRepair
+        ) {
             self.starts += 1;
         }
         self.observed = snapshot();
@@ -107,9 +113,16 @@ impl Domains for Fake {
             self.observed.agent = State::Missing;
         }
         Ok(Dispatch {
-            handoff: self.handoff,
-            complete: false,
+            handoff: if op == Operation::Install {
+                Handoff::NotCommitted
+            } else {
+                self.handoff
+            },
+            complete: op == Operation::Install,
         })
+    }
+    fn take_first_refusal(&mut self) -> Option<&'static str> {
+        self.first_refusal.take()
     }
     fn verify(&mut self, op: Operation) -> Result<bool, Failure> {
         if let Some(failure) = self.verify_failure {
@@ -723,4 +736,189 @@ fn healthy_detect_and_deferred_features_never_claim_mutation_or_ready() {
         c.domains.observed.task = state;
         assert!(!c.detect().unwrap().healthy());
     }
+}
+
+#[test]
+fn first_install_apply_uses_worker_consent_fresh_verify_and_keeps_parent_open() {
+    let mut fake = Fake::new();
+    fake.observed.payload = State::Missing;
+    fake.observed.task = State::Missing;
+    fake.observed.agent = State::Missing;
+    fake.observed.cold = Cold::Eligible;
+    let mut coordinator = Coordinator::new(fake);
+    let applied = apply(&mut coordinator, Operation::Install);
+    assert_eq!(applied.outcome, Outcome::Submitted);
+    assert!(applied.complete);
+    assert_eq!(applied.handoff, Handoff::NotCommitted);
+    assert!(!applied.handoff.permits_exit());
+    assert_eq!(
+        (
+            coordinator.domains.applications,
+            coordinator.domains.stops,
+            coordinator.domains.starts
+        ),
+        (1, 0, 1)
+    );
+    coordinator.domains.observed.source = ObservationSource::Demo;
+    assert_ne!(coordinator.verify(Operation::Install), Outcome::Verified);
+}
+#[test]
+fn first_install_partial_and_removal_history_refuse_before_effects() {
+    for (cold, reason) in [
+        (Cold::Partial, "Partial first install"),
+        (
+            Cold::CompletedRemoval,
+            "reinstall after removal: WP-W4.1a8b",
+        ),
+        (Cold::Unknown, "admission is unknown"),
+        (Cold::AccessDenied, "access denied"),
+    ] {
+        let mut fake = Fake::new();
+        fake.observed.task = State::Missing;
+        fake.observed.agent = State::Missing;
+        fake.observed.cold = cold;
+        // Some published leaves must not turn this first operation into upgrade.
+        assert_eq!(fake.observed.install_operation(), Operation::Install);
+        fake.observed.task = State::Healthy;
+        fake.observed.agent = State::Healthy;
+        assert_eq!(fake.observed.install_operation(), Operation::Install);
+        assert!(!fake.observed.healthy());
+
+        assert!(integration::install_preview(cold).contains(reason));
+        let mut coordinator = Coordinator::new(fake);
+        assert_eq!(
+            apply(&mut coordinator, Operation::Install).outcome,
+            Outcome::NotSubmitted
+        );
+        assert_eq!(
+            (
+                coordinator.domains.applications,
+                coordinator.domains.mutations,
+                coordinator.domains.stops,
+                coordinator.domains.starts
+            ),
+            (0, 0, 0, 0)
+        );
+    }
+}
+#[test]
+fn first_install_stale_cold_revision_cancel_and_live_task_have_no_dispatch() {
+    let mut fake = Fake::new();
+    fake.observed.payload = State::Missing;
+    fake.observed.task = State::Missing;
+    fake.observed.agent = State::Missing;
+    fake.observed.cold = Cold::Eligible;
+    let mut coordinator = Coordinator::new(fake);
+    coordinator.plan(1, 1, Operation::Install).unwrap();
+    let fence = Fence::default();
+    fence.select(2);
+    coordinator.domains.observed.correlation.push(9);
+    assert_eq!(
+        coordinator.apply(1, 2, 1, 4, &fence).outcome,
+        Outcome::NotSubmitted
+    );
+    coordinator.plan(1, 1, Operation::Install).unwrap();
+    fence.cancel();
+    assert_eq!(
+        coordinator.apply(1, 2, 1, 4, &fence).outcome,
+        Outcome::NotSubmitted
+    );
+    coordinator.domains.observed.cold = Cold::Existing;
+    coordinator.domains.observed.task = State::Healthy;
+    coordinator.domains.observed.payload = State::Healthy;
+    assert_eq!(
+        coordinator.domains.observed.install_operation(),
+        Operation::Upgrade
+    );
+    assert!(!coordinator.domains.observed.allowed(Operation::Install));
+    assert_eq!(coordinator.domains.applications, 0);
+}
+
+#[test]
+fn first_install_observation_only_reopen_is_install_until_fresh_completion() {
+    let mut fake = Fake::new();
+    fake.observed.cold = Cold::Observe;
+    assert_eq!(fake.observed.install_operation(), Operation::Install);
+    assert!(fake.observed.allowed(Operation::Install));
+    assert!(!fake.observed.healthy());
+    assert!(integration::install_preview(Cold::Observe).contains("no registration or launch"));
+    let mut coordinator = Coordinator::new(fake);
+    let applied = apply(&mut coordinator, Operation::Install);
+    assert!(applied.complete);
+    assert_eq!(applied.handoff, Handoff::NotCommitted);
+}
+#[test]
+fn first_install_not_submitted_reason_survives_the_production_report_path() {
+    use crosspane_installer_core::{JobIntent, JobStage, OperationId, StepId};
+    let mut fake = Fake::new();
+    fake.observed.payload = State::Missing;
+    fake.observed.task = State::Missing;
+    fake.observed.agent = State::Missing;
+    fake.observed.cold = Cold::Eligible;
+    fake.failure = Some(Failure::NotSubmitted);
+    fake.first_refusal = Some("first install access denied; permissions unchanged");
+    let (tx, commands) = mpsc::sync_channel(32);
+    let (reports, rx) = mpsc::sync_channel(32);
+    let (agents, _agent_rx) = mpsc::sync_channel(32);
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let thread = std::thread::spawn(move || {
+        integration::run(
+            fake,
+            commands,
+            reports,
+            agents,
+            thread_stop,
+            Arc::new(ports::CloseState::default()),
+            Arc::new(|| 1),
+        )
+    });
+    let fence = Fence::default();
+    fence.select(1);
+    tx.send(ports::Command::Job {
+        fence: fence.clone(),
+        job: live::NativeJob::Step {
+            job: JobIntent {
+                step: StepId(20),
+                operation: OperationId(1),
+                stage: JobStage::Plan,
+            },
+            consent: None,
+            status: None,
+        },
+    })
+    .unwrap();
+    rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    fence.select(2);
+    tx.send(ports::Command::Job {
+        fence,
+        job: live::NativeJob::Step {
+            job: JobIntent {
+                step: StepId(20),
+                operation: OperationId(2),
+                stage: JobStage::Apply,
+            },
+            consent: Some(live::Consent {
+                plan: OperationId(1),
+                operation: OperationId(2),
+                revision: 1,
+            }),
+            status: None,
+        },
+    })
+    .unwrap();
+    let report = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    match report {
+        live::NativeReport::Step(report) => {
+            assert_eq!(report.outcome, live::NativeOutcome::NotSubmitted);
+            assert_eq!(
+                report.detail,
+                "first install access denied; permissions unchanged"
+            );
+        }
+        _ => panic!("step report expected"),
+    }
+    stop.store(true, Ordering::Release);
+    drop(tx);
+    thread.join().unwrap();
 }

@@ -11,6 +11,572 @@ pub mod task;
 
 use super::native_io::{NativeError, NativeResult};
 
+#[cfg(all(windows, not(test)))]
+pub(crate) enum FirstInstallOutcome {
+    Complete,
+    NotSubmitted(&'static str),
+    Unknown,
+}
+/// Additive cold facade. No Stop, keeper, parent-exit or old-tree capability is involved.
+#[cfg(all(windows, not(test)))]
+pub(crate) fn begin_first_install(
+    sources: [Box<dyn std::io::Read + Send>; 3],
+    deadline: &super::native_io::Deadline,
+) -> NativeResult<FirstInstallOutcome> {
+    first_native::begin(sources, deadline)
+}
+
+#[cfg(all(windows, not(test)))]
+mod first_native {
+    use super::super::{
+        first_install::{
+            self,
+            driver::{self, FirstInstallPort},
+            record::FirstInstallRecord,
+        },
+        native_io::{
+            self, Deadline, FirstInstallMutationPermit, FirstInstallReservation, InstallerLock,
+            PayloadRoot, StagedPe, WindowsNativeIo,
+            records::{PublicationRecovery, RecordName},
+            supervisor_owner::{FirstInstallReady, observe_first_ready},
+        },
+        payload::{
+            self, PayloadInput,
+            health::VerifiedPayload,
+            inventory::{ApprovedInventory, ApprovedPe, PayloadRole},
+            recovery::{FileStamp, ImageObservation, OriginalLeaf},
+        },
+        repair::RepairDiagnostic as Diagnostic,
+    };
+    use super::*;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static UNKNOWN: OnceLock<Mutex<Option<Port>>> = OnceLock::new();
+    struct Port {
+        io: Arc<WindowsNativeIo>,
+        deadline: Deadline,
+        lock: Option<InstallerLock>,
+        root: PayloadRoot,
+        reservation: Option<FirstInstallReservation>,
+        permit: Option<FirstInstallMutationPermit>,
+        inventory: ApprovedInventory,
+        installer: ApprovedPe,
+        inputs: Vec<PayloadInput>,
+        staged: Vec<StagedPe>,
+        verified: Option<Arc<VerifiedPayload>>,
+        ready: Option<FirstInstallReady>,
+        launched: bool,
+    }
+    impl Port {
+        fn lock(&self) -> NativeResult<&InstallerLock> {
+            self.lock.as_ref().ok_or(NativeError::OutcomeUnknown)
+        }
+        fn pin(&self, role: PayloadRole) -> NativeResult<&ApprovedPe> {
+            if role == PayloadRole::Installer {
+                Ok(&self.installer)
+            } else {
+                self.inventory.role(role)
+            }
+        }
+        fn reservation(&self) -> NativeResult<&FirstInstallReservation> {
+            self.reservation.as_ref().ok_or(NativeError::Foreign)
+        }
+        fn acquire_lock(&mut self) -> NativeResult<()> {
+            if self.lock.is_none() {
+                self.lock = Some(first_install::retry_busy(
+                    &self.deadline,
+                    || {
+                        let proof = self.io.admit_support(&self.deadline)?;
+                        self.io.acquire_installer_lock(&proof, &self.deadline)
+                    },
+                    |ms| std::thread::sleep(std::time::Duration::from_millis(ms)),
+                )?);
+            }
+            Ok(())
+        }
+        fn permit(&self) -> NativeResult<&FirstInstallMutationPermit> {
+            self.permit.as_ref().ok_or(NativeError::Foreign)
+        }
+        fn current(&self, record: &FirstInstallRecord) -> NativeResult<()> {
+            let proof = self.io.admit_support(&self.deadline)?;
+            let actual = self
+                .io
+                .read_first_install(&proof, &self.deadline)?
+                .ok_or(NativeError::Missing)?;
+            if actual != *record {
+                return Err(NativeError::Foreign);
+            }
+            Ok(())
+        }
+    }
+    impl FirstInstallPort for Port {
+        fn renew(&mut self, record: &FirstInstallRecord) -> NativeResult<()> {
+            self.deadline.check()?;
+            let proof = self.io.admit_support(&self.deadline)?;
+            if self.launched {
+                self.ready
+                    .as_ref()
+                    .ok_or(NativeError::OutcomeUnknown)?
+                    .reverify(&self.deadline)?;
+                self.verified
+                    .as_ref()
+                    .ok_or(NativeError::Foreign)?
+                    .reverify(&self.io, &proof, &self.deadline)?;
+                self.acquire_lock()?;
+            } else {
+                self.reservation()?
+                    .reverify(&self.io, &proof, &self.deadline)?;
+            }
+            let proof = self.io.admit_support(&self.deadline)?;
+            self.io
+                .verify_first_lock(&proof, self.lock()?, &self.deadline)?;
+            self.current(record)
+        }
+        fn persist(&mut self, record: &FirstInstallRecord) -> NativeResult<()> {
+            let proof = self.io.admit_support(&self.deadline)?;
+            if self.launched {
+                self.ready
+                    .as_ref()
+                    .ok_or(NativeError::OutcomeUnknown)?
+                    .reverify(&self.deadline)?;
+                let actual = self
+                    .io
+                    .read_first_install(&proof, &self.deadline)?
+                    .ok_or(NativeError::Missing)?;
+                if !record.same_selection(&actual)
+                    || record.phase().rank() < actual.phase().rank()
+                    || record.instance()
+                        != Some(self.ready.as_ref().ok_or(NativeError::Foreign)?.instance())
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let published = self.io.publish_record(
+                    &proof,
+                    self.lock()?,
+                    RecordName::FirstInstall,
+                    &record.encode()?,
+                    &self.deadline,
+                )?;
+                if published.native_failure.is_some()
+                    || published.state != PublicationRecovery::NewPublished
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+            } else {
+                self.permit = Some(self.io.publish_first_install(
+                    &proof,
+                    self.lock()?,
+                    self.reservation()?,
+                    record,
+                    &self.deadline,
+                )?);
+            }
+            Ok(())
+        }
+        fn stage(
+            &mut self,
+            record: &FirstInstallRecord,
+            role: PayloadRole,
+        ) -> NativeResult<ImageObservation> {
+            self.renew(record)?;
+            let index = self
+                .inputs
+                .iter()
+                .position(|p| p.role == role)
+                .ok_or(NativeError::Missing)?;
+            let input = self.inputs.remove(index);
+            let proof = self.io.admit_support(&self.deadline)?;
+            let staged = self.io.stage_first_install(
+                &proof,
+                self.lock()?,
+                self.permit()?,
+                role,
+                input.content,
+                self.pin(role)?,
+                &self.deadline,
+            )?;
+            let observed = staged.observation();
+            self.staged.push(staged);
+            Ok(observed)
+        }
+        fn observe_stage(
+            &mut self,
+            record: &FirstInstallRecord,
+            role: PayloadRole,
+        ) -> NativeResult<Option<ImageObservation>> {
+            let proof = self.io.admit_support(&self.deadline)?;
+            self.io.observe_first_stage(
+                &proof,
+                self.lock()?,
+                record,
+                role,
+                self.pin(role)?,
+                &self.deadline,
+            )
+        }
+        fn original(
+            &mut self,
+            _: &FirstInstallRecord,
+            role: PayloadRole,
+        ) -> NativeResult<OriginalLeaf> {
+            let proof = self.io.admit_support(&self.deadline)?;
+            Ok(self
+                .root
+                .observe_opaque(&self.io, &proof, role, &self.deadline)?
+                .map_or(OriginalLeaf::Missing, |s| {
+                    OriginalLeaf::Present(s.identity().into())
+                }))
+        }
+        fn backup(
+            &mut self,
+            record: &FirstInstallRecord,
+            role: PayloadRole,
+        ) -> NativeResult<Option<FileStamp>> {
+            self.renew(record)?;
+            let proof = self.io.admit_support(&self.deadline)?;
+            self.io
+                .backup_first_install(&proof, self.lock()?, self.permit()?, role, &self.deadline)
+        }
+        fn observe_backup(
+            &mut self,
+            record: &FirstInstallRecord,
+            role: PayloadRole,
+        ) -> NativeResult<Option<FileStamp>> {
+            let proof = self.io.admit_support(&self.deadline)?;
+            self.io
+                .observe_first_backup(&proof, self.lock()?, record, role, &self.deadline)
+        }
+        fn publish(
+            &mut self,
+            record: &FirstInstallRecord,
+            role: PayloadRole,
+        ) -> NativeResult<ImageObservation> {
+            self.renew(record)?;
+            let index = self
+                .staged
+                .iter()
+                .position(|s| s.role() == role)
+                .ok_or(NativeError::Missing)?;
+            let staged = self.staged.remove(index);
+            let proof = self.io.admit_support(&self.deadline)?;
+            let published = self.io.publish_first_image(
+                &proof,
+                self.lock()?,
+                self.permit()?,
+                staged,
+                &self.deadline,
+            )?;
+            Ok(ImageObservation {
+                identity: published.identity().into(),
+                facts: published.approved().facts().clone(),
+            })
+        }
+        fn observe_fixed(
+            &mut self,
+            _: &FirstInstallRecord,
+            role: PayloadRole,
+        ) -> NativeResult<Option<ImageObservation>> {
+            let proof = self.io.admit_support(&self.deadline)?;
+            match self
+                .root
+                .open_approved(&self.io, &proof, role, self.pin(role)?, &self.deadline)
+            {
+                Ok(image) => Ok(Some(ImageObservation {
+                    identity: image.identity().into(),
+                    facts: image.approved().facts().clone(),
+                })),
+                Err(NativeError::Missing) => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+        fn verify_files(&mut self, record: &FirstInstallRecord) -> NativeResult<()> {
+            let proof = self.io.admit_support(&self.deadline)?;
+            let verified = Arc::new(VerifiedPayload::open(
+                record.operation(),
+                &self.io,
+                &proof,
+                &self.root,
+                &self.inventory,
+                &self.installer,
+                &self.deadline,
+            )?);
+            for role in PayloadRole::ALL {
+                if self.observe_fixed(record, role)?.as_ref()
+                    != record.role(role)?.published.as_ref()
+                {
+                    return Err(NativeError::Foreign);
+                }
+            }
+            self.verified = Some(verified);
+            Ok(())
+        }
+        fn activate(&mut self, record: &FirstInstallRecord) -> NativeResult<FirstInstallRecord> {
+            self.renew(record)?;
+            let payload = self
+                .verified
+                .as_ref()
+                .cloned()
+                .ok_or(NativeError::Foreign)?;
+            let selection = task::prepare_first_install(
+                self.io.clone(),
+                payload,
+                self.reservation()?.clone(),
+                &self.deadline,
+            )?;
+            if !self.io.native_idle() {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            self.permit.take();
+            drop(self.lock.take().ok_or(NativeError::Foreign)?);
+            // All original mutation/lock aliases settled; the unchanged constructor uses its own lock.
+            let trusted = TrustedImages::current()?;
+            self.launched = true; // A failed call is never replayed, even if it failed before Run.
+            let evidence = task::start_first_install(&trusted, selection, &self.deadline)?;
+            if evidence.operation() != record.operation() {
+                return Err(NativeError::Foreign);
+            }
+            let proof = self.io.admit_support(&self.deadline)?;
+            self.io
+                .read_first_install(&proof, &self.deadline)?
+                .ok_or(NativeError::Missing)
+        }
+        fn observe_running(&mut self, record: &FirstInstallRecord) -> NativeResult<Option<u64>> {
+            loop {
+                self.deadline.check()?;
+                let proof = self.io.admit_support(&self.deadline)?;
+                let result = (|| {
+                    let agent = self.io.observe_agent(&proof, &self.deadline)?;
+                    if !new_ready_candidate(
+                        &agent.bootstrap().phase,
+                        agent.bootstrap().instance_id,
+                        None,
+                    )? {
+                        return Err(NativeError::Busy);
+                    }
+                    if record
+                        .instance()
+                        .is_some_and(|id| id != agent.bootstrap().instance_id)
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    if self.io.agent_identity(&agent, &proof, &self.deadline)?
+                        != self
+                            .verified
+                            .as_ref()
+                            .ok_or(NativeError::Foreign)?
+                            .agent_identity()?
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    super::upgrade::first_ready_status(&self.io, &agent, &self.deadline)?;
+                    let retained = self.io.clone_agent(&agent, &proof, &self.deadline)?;
+                    let ready = observe_first_ready(
+                        self.io.clone(),
+                        record.operation(),
+                        Arc::new(retained),
+                        &self.deadline,
+                    )?;
+                    Ok(ready)
+                })();
+                match result {
+                    Ok(ready) => {
+                        let id = ready.instance();
+                        self.ready = Some(ready);
+                        return Ok(Some(id));
+                    }
+                    Err(error)
+                        if pending_start_observation(error) || error == NativeError::Busy =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(20))
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        fn prune(&mut self, record: &FirstInstallRecord) -> NativeResult<bool> {
+            self.renew(record)?;
+            let proof = self.io.admit_support(&self.deadline)?;
+            self.io
+                .first_retention_complete(&proof, self.lock()?, record, &self.deadline)
+        }
+    }
+    pub(super) fn begin(
+        sources: [Box<dyn std::io::Read + Send>; 3],
+        deadline: &Deadline,
+    ) -> NativeResult<FirstInstallOutcome> {
+        if UNKNOWN
+            .get()
+            .is_some_and(|s| s.lock().map_or(true, |s| s.is_some()))
+        {
+            return Ok(FirstInstallOutcome::Unknown);
+        }
+        let prepared: NativeResult<Result<_, &'static str>> = (|| {
+            let inventory = ApprovedInventory::embedded()?;
+            let probe = WindowsNativeIo::probe_repair(
+                Arc::new(native_io::MonotonicClock::default()),
+                deadline,
+            )?;
+            if [
+                probe.observation().task().diagnostic(),
+                probe.observation().agent(),
+                probe.observation().payload(),
+            ]
+            .contains(&Diagnostic::AccessDenied)
+            {
+                return Ok(Err("first install access denied; permissions unchanged"));
+            }
+            let io = probe.io().cloned().ok_or(NativeError::Unsupported)?;
+            let proof = io.admit_support(deadline)?;
+            let disposition = io.preview_first_install(&proof, deadline)?;
+            // This production gate precedes every lock-foundation call below.
+            first_install::before_foundation(disposition, || {
+                let reopened = io.read_first_install(&proof, deadline)?;
+                let observing = match &reopened {
+                    Some(record) => matches!(
+                        first_install::reopen(record, io.target().identity())?,
+                        first_install::Reopen::Observe(_)
+                    ),
+                    None => false,
+                };
+                if !observing
+                    && (probe.observation().task().diagnostic() != Diagnostic::Missing
+                        || probe.observation().agent() != Diagnostic::Missing)
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let module = io.self_image(&proof, deadline)?;
+                let installer = ApprovedPe::own_image(&module)?;
+                // An observation-only reopen consumes no staging source and cannot dispatch Run.
+                let inputs = if observing {
+                    Vec::new()
+                } else {
+                    let inputs = [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl]
+                        .into_iter()
+                        .zip(sources)
+                        .map(|(role, content)| PayloadInput { role, content })
+                        .collect();
+                    let buffered =
+                        payload::buffer_outer_sources(inputs, &inventory, &installer, deadline)?;
+                    let mut inputs = buffered.inputs();
+                    inputs.push(PayloadInput {
+                        role: PayloadRole::Installer,
+                        content: io.self_image_reader(&module, &proof, deadline)?,
+                    });
+                    inputs
+                };
+                Ok((io, inventory, installer, inputs, reopened))
+            })
+        })();
+        let (io, inventory, installer, inputs, reopened) = match prepared {
+            Ok(Ok(values)) => values,
+            Ok(Err(reason)) => return Ok(FirstInstallOutcome::NotSubmitted(reason)),
+            Err(NativeError::OutcomeUnknown) => return Ok(FirstInstallOutcome::Unknown),
+            Err(_) => {
+                return Ok(FirstInstallOutcome::NotSubmitted(
+                    "first-install admission unavailable",
+                ));
+            }
+        };
+        // From here the lock foundation may have changed. No failure refunds submission.
+        let effect = (|| {
+            let lock = first_install::retry_busy(
+                deadline,
+                || {
+                    let proof = io.admit_support(deadline)?;
+                    io.acquire_installer_lock(&proof, deadline)
+                },
+                |ms| std::thread::sleep(std::time::Duration::from_millis(ms)),
+            )?;
+            let proof = io.admit_support(deadline)?;
+            if io.read_first_install(&proof, deadline)? != reopened {
+                return Err(NativeError::Foreign);
+            }
+            let reopen = reopened
+                .as_ref()
+                .map(|r| first_install::reopen(r, io.target().identity()))
+                .transpose()?;
+            let observing = matches!(reopen, Some(first_install::Reopen::Observe(_)));
+            let reservation = if observing {
+                None
+            } else {
+                Some(io.reserve_first_install(&proof, &lock, deadline)?)
+            };
+            let root = io.payload_root(&proof, &lock, deadline)?;
+            let mut operation = [0; 16];
+            aws_lc_rs::rand::fill(&mut operation).map_err(|_| NativeError::Unavailable)?;
+            let pins = PayloadRole::ALL.map(|role| {
+                if role == PayloadRole::Installer {
+                    Ok(installer.facts().clone())
+                } else {
+                    inventory.role(role).map(|p| p.facts().clone())
+                }
+            });
+            let mut pins = pins.into_iter().collect::<NativeResult<Vec<_>>>()?;
+            let pins = [
+                pins.remove(0),
+                pins.remove(0),
+                pins.remove(0),
+                pins.remove(0),
+            ];
+            let expected = FirstInstallRecord::new(operation, io.first_install_context()?, pins)?;
+            let mut record = match reopen {
+                Some(first_install::Reopen::Restart(r) | first_install::Reopen::Observe(r)) => {
+                    for role in PayloadRole::ALL {
+                        if r.role(role)?.approved != expected.role(role)?.approved {
+                            return Err(NativeError::Foreign);
+                        }
+                    }
+                    r
+                }
+                None => expected,
+            };
+            let mut port = Port {
+                io,
+                deadline: deadline.clone(),
+                lock: Some(lock),
+                root,
+                reservation,
+                permit: None,
+                inventory,
+                installer,
+                inputs,
+                staged: Vec::new(),
+                verified: None,
+                ready: None,
+                launched: observing,
+            };
+            let result = (|| {
+                if observing {
+                    port.verify_files(&record)?;
+                    // Running publication may need this same lock. No lock is held while waiting
+                    // for the actual A2/kernel-peer/claim/Running observations.
+                    drop(port.lock.take());
+                    port.observe_running(&record)?
+                        .ok_or(NativeError::OutcomeUnknown)?;
+                    driver::resume(&mut port, &mut record)
+                } else {
+                    // A stale Intent is republished in the current context under genuine absence.
+                    driver::apply(&mut port, &mut record)
+                }
+            })();
+            if result.is_err() {
+                if port.launched {
+                    port.permit.take();
+                    drop(port.lock.take()); // Never starve a running supervisor while Unknown is retained.
+                }
+                let slot = UNKNOWN.get_or_init(|| Mutex::new(None));
+                *slot.lock().map_err(|_| NativeError::OutcomeUnknown)? = Some(port);
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(())
+        })();
+        Ok(if effect.is_ok() {
+            FirstInstallOutcome::Complete
+        } else {
+            FirstInstallOutcome::Unknown
+        })
+    }
+}
+
 /// Only genuine fixed-role approval can construct the production image capability.
 struct TrustedImages {
     _sealed: (),
@@ -840,6 +1406,14 @@ mod upgrade {
         fn submit(&mut self) -> NativeResult<()> {
             supervisor::StopPort::submit_stop(&mut self.native, self.selected.instance)
         }
+    }
+    /// Additive read-only sibling for cold readiness; existing A2 adapter and checks unchanged.
+    pub(super) fn first_ready_status(
+        io: &Arc<WindowsNativeIo>,
+        agent: &AgentObservation,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        ready_status(io, agent, deadline)
     }
     fn ready_status(
         io: &Arc<WindowsNativeIo>,

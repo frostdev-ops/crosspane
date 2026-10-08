@@ -318,6 +318,9 @@ pub(crate) fn run<D: Domains>(
             Ok(Command::Job { job, fence }) => {
                 let result = match job {
                     NativeJob::Step { job, consent, .. } => {
+                        let mut detail =
+                            "Windows operation checked; deferred capabilities remain unavailable"
+                                .to_owned();
                         let slot = job.step.0;
                         let outcome = if !fence.admits(job.operation.0) {
                             NativeOutcome::NotSubmitted
@@ -360,7 +363,11 @@ pub(crate) fn run<D: Domains>(
                                     coordinator.plan(slot, job.operation.0, v.install_operation())
                                 }) {
                                     Ok(v) => NativeOutcome::Planned {
-                                        preview: preview(v.operation),
+                                        preview: if v.operation == Operation::Install {
+                                            install_preview(v.snapshot.cold).into()
+                                        } else {
+                                            preview(v.operation)
+                                        },
                                     },
                                     Err(_) => NativeOutcome::Unsupported,
                                 },
@@ -380,6 +387,12 @@ pub(crate) fn run<D: Domains>(
                                             if v.handoff.permits_exit() {
                                                 close.handed_off.store(true, Ordering::Release);
                                             }
+                                            if v.outcome == Outcome::NotSubmitted
+                                                && let Some(reason) =
+                                                    coordinator.domains.take_first_refusal()
+                                            {
+                                                detail = reason.into();
+                                            }
                                             native_outcome(v.outcome, (clock)())
                                         }
                                         None => NativeOutcome::NotSubmitted,
@@ -394,7 +407,11 @@ pub(crate) fn run<D: Domains>(
                                 },
                             }
                         };
-                        NativeReport::Step(StepReport { job, outcome, detail: "Windows operation checked; deferred capabilities remain unavailable".into() })
+                        NativeReport::Step(StepReport {
+                            job,
+                            outcome,
+                            detail,
+                        })
                     }
                     NativeJob::Maintenance(req) => {
                         let id = maintenance_id(&req);
@@ -606,12 +623,29 @@ fn native_outcome(outcome: Outcome, now: u64) -> NativeOutcome {
 }
 fn preview(operation: Operation) -> String {
     match operation {
-        Operation::Install => "Fresh Windows install is not available yet (W4.1a8); nothing will be changed".into(),
+        Operation::Install => install_preview(domains::Cold::Eligible).into(),
         Operation::Upgrade => "Verify the supplied release, settle completed artifacts, and transfer this update to an owned keeper".into(),
         Operation::Removal { erase_identity:false } => "Stop Crosspane cleanly and remove only owned installation files; preserve identity and user state".into(),
         Operation::Removal { erase_identity:true } => "Stop Crosspane cleanly, erase its identity once, and remove owned installation files".into(),
         Operation::MetadataRepair => "Repair the exact task or archive settled metadata; preserve a user-disabled task".into(),
         Operation::PayloadRepair => "Verify the supplied release, transfer repair to an owned keeper, stop cleanly, replace and verify the files".into(),
+    }
+}
+pub(crate) fn install_preview(cold: domains::Cold) -> &'static str {
+    match cold {
+        domains::Cold::Eligible => {
+            "Verify the supplied release, install Crosspane, and wait for its agent to be ready"
+        }
+        domains::Cold::Observe => {
+            "Observe the earlier first install; no registration or launch will be replayed"
+        }
+        domains::Cold::CompletedRemoval => "reinstall after removal: WP-W4.1a8b",
+        domains::Cold::Partial => {
+            "Partial first install: reinstall required; no operation will be replayed"
+        }
+        domains::Cold::Unknown => "First-install admission is unknown; nothing will be submitted",
+        domains::Cold::AccessDenied => "First install access denied; nothing will be submitted",
+        domains::Cold::Existing => "An existing installation requires an update",
     }
 }
 #[cfg(all(windows, not(test)))]

@@ -77,6 +77,10 @@ pub(crate) use adapter::SelectedOuterOperation;
 pub(crate) use adapter::scratch::{FixtureLock, ScratchFixture, scratch_current};
 #[cfg(windows)]
 pub(crate) use adapter::{BrokerAdmission, JobAdmission, PeerRolePin, StopLockLease};
+#[cfg(all(windows, not(test)))]
+pub(crate) use adapter::{
+    ColdNamespaceAdmission, FirstInstallMutationPermit, FirstInstallReservation,
+};
 #[cfg(windows)]
 #[allow(unused_imports)]
 // A4b/A5 consumers retain these sealed native return capabilities.
@@ -8068,6 +8072,7 @@ mod adapter {
                 budget: &Deadline,
             ) -> NativeResult<Arc<NativePayloadRepairSelection>> {
                 self.verify_stop_lock(proof, lock, budget)?;
+                self.reject_active_first_install(proof, budget)?;
                 let actual = self.observe_payload_repair(proof, budget)?;
                 if actual != *observed
                     || controller::classify(&actual)? != PayloadRepairDecision::Eligible
@@ -9888,6 +9893,7 @@ mod adapter {
                 deadline: &Deadline,
             ) -> NativeResult<RemovalMutationPermit> {
                 self.verify_stop_lock(proof, lock, deadline)?;
+                self.reject_active_first_install(proof, deadline)?;
                 record.validate()?;
                 context_matches(record, self.target().identity())?;
                 let context = self.context.clone();
@@ -12084,6 +12090,815 @@ mod adapter {
     #[cfg(not(test))]
     pub(crate) use keeper::FileRecoveryKeeperAbsent;
 
+    // A8's original-context first-install siblings. None can mint an old-tree completion.
+    #[cfg(not(test))]
+    mod first_install_io {
+        use super::super::super::{
+            first_install::{
+                FirstInstallDisposition as Disposition,
+                record::{FirstInstallRecord, Phase as FirstPhase},
+            },
+            payload::recovery::{FileStamp, ImageObservation},
+        };
+        use super::*;
+        pub(crate) struct ColdNamespaceAdmission {
+            io: Arc<WindowsNativeIo>,
+            parent: Arc<Anchor>,
+            endpoint: String,
+        }
+        impl ColdNamespaceAdmission {
+            pub(crate) fn token(&self) -> &TokenFacts {
+                &self.io.context.target.identity
+            }
+            pub(crate) fn endpoint(&self) -> &str {
+                &self.endpoint
+            }
+            pub(crate) fn reverify(
+                &self,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                proof.check(&self.io, deadline)?;
+                self.parent
+                    .revalidate(&self.io.context.security, true, deadline)?;
+                self.io.admit_support(deadline)?;
+                deadline.check()
+            }
+            pub(crate) fn reverify_native(&self, deadline: &Deadline) -> NativeResult<()> {
+                self.io.context.validate(deadline)?;
+                self.parent
+                    .revalidate(&self.io.context.security, true, deadline)
+            }
+        }
+        struct ReservationData {
+            io: Arc<WindowsNativeIo>,
+            parent: Arc<Anchor>,
+            agent_identity: FileIdentity,
+            agent: Mutex<Option<Arc<File>>>,
+            namespace: Mutex<Option<super::super::supervisor_owner::FirstInstallNamespace>>,
+            active: AtomicBool,
+        }
+        #[derive(Clone)]
+        pub(crate) struct FirstInstallReservation(Arc<ReservationData>);
+        impl FirstInstallReservation {
+            fn renew_native(&self, context: &Context, deadline: &Deadline) -> NativeResult<()> {
+                if !std::ptr::eq(context, self.0.io.context.as_ref())
+                    || context.target.nonce != self.0.io.context.target.nonce
+                    || !self.0.active.load(Ordering::Acquire)
+                {
+                    return Err(NativeError::Foreign);
+                }
+                context.validate(deadline)?;
+                self.0
+                    .parent
+                    .revalidate(&context.security, true, deadline)?;
+                let agent = self
+                    .0
+                    .agent
+                    .lock()
+                    .map_err(|_| NativeError::Unavailable)?
+                    .as_ref()
+                    .cloned()
+                    .ok_or(NativeError::Foreign)?;
+                let facts = native::observe(&agent, "agent.lock", &context.security)?;
+                files::admit_component(&facts, Admission::PrivateFile)?;
+                if facts.identity != self.0.agent_identity {
+                    return Err(NativeError::Foreign);
+                }
+                self.0
+                    .namespace
+                    .lock()
+                    .map_err(|_| NativeError::Unavailable)?
+                    .as_ref()
+                    .ok_or(NativeError::Foreign)?
+                    .reverify_native(deadline)?;
+                deadline.check()
+            }
+            pub(crate) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.0.io.as_ref()) || !self.0.active.load(Ordering::Acquire) {
+                    return Err(NativeError::Foreign);
+                }
+                proof.check(io, deadline)?;
+                self.0
+                    .parent
+                    .revalidate(&io.context.security, true, deadline)?;
+                let agent = self
+                    .0
+                    .agent
+                    .lock()
+                    .map_err(|_| NativeError::Unavailable)?
+                    .as_ref()
+                    .cloned()
+                    .ok_or(NativeError::Foreign)?;
+                let facts = native::observe(&agent, "agent.lock", &io.context.security)?;
+                files::admit_component(&facts, Admission::PrivateFile)?;
+                if facts.identity != self.0.agent_identity {
+                    return Err(NativeError::Foreign);
+                }
+                self.0
+                    .namespace
+                    .lock()
+                    .map_err(|_| NativeError::Unavailable)?
+                    .as_ref()
+                    .ok_or(NativeError::Foreign)?
+                    .reverify(proof, deadline)?;
+                deadline.check()
+            }
+            /// Called only by the prepared task's actual lock-release boundary. An in-flight
+            /// original worker keeps the reservation; neither elapsed time nor a record releases it.
+            pub(crate) fn release(
+                &self,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                self.reverify(&self.0.io, proof, deadline)?;
+                if !self.0.io.native_idle() {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                self.0.active.store(false, Ordering::Release);
+                self.0
+                    .namespace
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                    .take();
+                self.0
+                    .agent
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                    .take();
+                deadline.check().map_err(|_| NativeError::OutcomeUnknown)
+            }
+        }
+        pub(crate) struct FirstInstallMutationPermit {
+            io: Arc<WindowsNativeIo>,
+            reservation: FirstInstallReservation,
+            bytes: Vec<u8>,
+        }
+        impl FirstInstallMutationPermit {
+            fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<FirstInstallRecord> {
+                if !std::ptr::eq(io, self.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                io.verify_stop_lock(proof, lock, deadline)?;
+                self.reservation.reverify(io, proof, deadline)?;
+                let record = io
+                    .read_first_install(proof, deadline)?
+                    .ok_or(NativeError::Missing)?;
+                if record.encode()? != self.bytes {
+                    return Err(NativeError::Foreign);
+                }
+                record_matches_context(io, &record)?;
+                Ok(record)
+            }
+        }
+        fn renew_intent(
+            context: &Context,
+            lease: &LockState,
+            reservation: &FirstInstallReservation,
+            bytes: &[u8],
+            deadline: &Deadline,
+        ) -> NativeResult<FirstInstallRecord> {
+            validate_payload_lock(context, lease, deadline)?;
+            reservation.renew_native(context, deadline)?;
+            let (_, actual) = lease
+                .parent
+                .read_private(
+                    &PrivateName::new("first-install.json")?,
+                    &context.security,
+                    files::MAX_RECORD_BYTES,
+                    deadline,
+                )?
+                .ok_or(NativeError::Missing)?;
+            if actual != bytes {
+                return Err(NativeError::Foreign);
+            }
+            FirstInstallRecord::decode(&actual)
+        }
+        fn context_bytes(io: &WindowsNativeIo) -> NativeResult<Vec<u8>> {
+            serde_json::to_vec(
+                &super::super::super::payload::recovery::OuterContextCorrelation::new(
+                    io.target().identity(),
+                )?,
+            )
+            .map_err(|_| NativeError::Invalid)
+        }
+        fn record_matches_context(
+            io: &WindowsNativeIo,
+            record: &FirstInstallRecord,
+        ) -> NativeResult<()> {
+            if record.context() != context_bytes(io)? {
+                return Err(NativeError::Foreign);
+            }
+            record.validate()
+        }
+        fn record_matches_user(
+            io: &WindowsNativeIo,
+            record: &FirstInstallRecord,
+        ) -> NativeResult<()> {
+            let old: super::super::super::payload::recovery::OuterContextCorrelation =
+                serde_json::from_slice(record.context()).map_err(|_| NativeError::Invalid)?;
+            old.same_user(io.target().identity())?;
+            record.validate()
+        }
+        impl WindowsNativeIo {
+            /// Additive original-lock validation for the first-only service sibling.
+            pub(crate) fn verify_first_lock(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                self.verify_stop_lock(proof, lock, deadline)
+            }
+
+            pub(crate) fn first_install_context(&self) -> NativeResult<Vec<u8>> {
+                context_bytes(self)
+            }
+            pub(crate) fn read_first_install(
+                &self,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<Option<FirstInstallRecord>> {
+                self.read_record(
+                    proof,
+                    records::RecordName::FirstInstall,
+                    files::MAX_RECORD_BYTES,
+                    deadline,
+                )?
+                .map(|r| FirstInstallRecord::decode(r.bytes()))
+                .transpose()
+            }
+            /// Fixed private record inventory only. Preview has no lock, namespace or effect.
+            pub(crate) fn preview_first_install(
+                &self,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<Disposition> {
+                use super::super::super::{
+                    first_install::{DecodedHistory, classify_history},
+                    service::journal::Journal,
+                };
+                let removal = self.read_removal(proof, deadline)?;
+                let first = self.read_first_install(proof, deadline)?;
+                if let Some(removal) = removal.as_ref() {
+                    return Ok(classify_history(DecodedHistory {
+                        removal: Some(removal.cursor()),
+                        first: first.as_ref().map(|r| r.phase()),
+                        journal: None,
+                        logon: false,
+                        claimed_activation: false,
+                        names: &[],
+                    }));
+                }
+                if first
+                    .as_ref()
+                    .is_some_and(|r| r.phase() == FirstPhase::Complete)
+                {
+                    return Ok(Disposition::Existing);
+                }
+                if let Some(record) = &first {
+                    record_matches_user(self, record)?;
+                }
+                let journal = Journal::read(self, proof, deadline)?;
+                let logon =
+                    super::super::activation::SupervisorLogonRecord::read(self, proof, deadline)?;
+                let task = self
+                    .read_record(
+                        proof,
+                        records::RecordName::TaskActivation,
+                        files::MAX_RECORD_BYTES,
+                        deadline,
+                    )?
+                    .map(|r| super::super::activation::TaskActivationRecord::decode(r.bytes()))
+                    .transpose()?;
+                // Epoch names are diagnostic lineage only, but malformed epoch bytes still refuse.
+                for slot in 0..3 {
+                    if let Some(epoch) = self.read_record(
+                        proof,
+                        records::RecordName::SupervisorEpoch(slot),
+                        files::MAX_RECORD_BYTES,
+                        deadline,
+                    )? {
+                        Journal::decode(epoch.bytes())?;
+                    }
+                }
+                let context = self.context.clone();
+                let budget = proof.budget(self, deadline)?;
+                let names = self.owner.run(Dispatch::Observation, deadline, move || {
+                    context.validate(&budget)?;
+                    match Anchor::open(
+                        context.target.paths.installer(),
+                        &context.security,
+                        true,
+                        &budget,
+                    )? {
+                        Some(parent) => parent.entry_names(&context.security, &budget),
+                        None => Ok(Vec::new()),
+                    }
+                })?;
+                Ok(classify_history(DecodedHistory {
+                    removal: removal.as_ref().map(|r| r.cursor()),
+                    first: first.as_ref().map(|r| r.phase()),
+                    journal: journal.as_ref().map(|j| j.phase),
+                    logon: logon.is_some(),
+                    claimed_activation: task.as_ref().is_some_and(|t| t.claim().is_some()),
+                    names: &names,
+                }))
+            }
+            pub(crate) fn reject_active_first_install(
+                &self,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if self
+                    .read_first_install(proof, deadline)?
+                    .is_some_and(|r| r.phase() != FirstPhase::Complete)
+                {
+                    return Err(NativeError::Busy);
+                }
+                Ok(())
+            }
+            /// A fresh operation owns at most one backup generation. Unknown older material
+            /// is retained and reported incomplete, never adopted as a prune capability.
+            pub(crate) fn first_retention_complete(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                record: &FirstInstallRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<bool> {
+                self.verify_stop_lock(proof, lock, deadline)?;
+                record_matches_user(self, record)?;
+                if record.phase() != FirstPhase::PruneIntent
+                    || self.read_first_install(proof, deadline)?.as_ref() != Some(record)
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let root = self.payload_root(proof, lock, deadline)?.0;
+                let context = self.context.clone();
+                let operation = record.operation();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    let root = PayloadRoot(root)
+                        .check(&context, &budget)?
+                        .ok_or(NativeError::Missing)?;
+                    let Some(backups) =
+                        root.child("first-install-backups", &context.security, &budget)?
+                    else {
+                        return Ok(true);
+                    };
+                    let names = backups.entry_names(&context.security, &budget)?;
+                    Ok(names.iter().all(|name| name == &records::hex(&operation)))
+                })
+            }
+            pub(crate) fn reserve_first_install(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<FirstInstallReservation> {
+                self.verify_stop_lock(proof, lock, deadline)?;
+                if !matches!(
+                    self.preview_first_install(proof, deadline)?,
+                    Disposition::Eligible | Disposition::Resume
+                ) {
+                    return Err(NativeError::Unsupported);
+                }
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let budget = proof.budget(self, deadline)?;
+                let (parent, agent, agent_identity, endpoint) =
+                    self.owner.run(Dispatch::Mutation, deadline, move || {
+                        let change = Change::new();
+                        change.finish((|| {
+                            validate_payload_lock(&context, &lease, &budget)?;
+                            let check = || context.validate(&budget);
+                            let scheduler = super::super::task::Scheduler::connect_repair(&check)
+                                .map_err(|_| NativeError::Unavailable)?;
+                            if scheduler
+                                .repair_snapshot(&check)
+                                .map_err(|_| NativeError::Unavailable)?
+                                .is_some()
+                            {
+                                return Err(NativeError::Foreign);
+                            }
+                            let parent = Arc::new(
+                                Anchor::open(
+                                    &format!("{}\\Crosspane", context.target.paths.local()),
+                                    &context.security,
+                                    true,
+                                    &budget,
+                                )?
+                                .ok_or(NativeError::Missing)?,
+                            );
+                            let canonical =
+                                parent.canonical_dos_path(&context.security, &budget)?;
+                            let runtime = format!(
+                                "{}\\runtime",
+                                canonical.to_str().ok_or(NativeError::Unsupported)?
+                            );
+                            let mut key = runtime.as_bytes().to_vec();
+                            key.extend_from_slice(context.target.identity.user.bytes());
+                            key.extend_from_slice(context.target.identity.logon.bytes());
+                            key.extend_from_slice(&context.target.identity.session.to_le_bytes());
+                            let endpoint = format!(
+                                r"\\.\pipe\Crosspane.Installer.Supervisor.{:016x}",
+                                xxhash_rust::xxh3::xxh3_64(&key)
+                            );
+                            change.reached();
+                            let agent =
+                                parent.first_install_agent_lock(&context.security, &budget)?;
+                            agent.try_lock().map_err(|error| match error {
+                                std::fs::TryLockError::WouldBlock => NativeError::Busy,
+                                _ => NativeError::Unavailable,
+                            })?;
+                            let facts = native::observe(&agent, "agent.lock", &context.security)?;
+                            files::admit_component(&facts, Admission::PrivateFile)?;
+                            budget.check()?;
+                            Ok((parent, Arc::new(agent), facts.identity, endpoint))
+                        })())
+                    })?;
+                let admission = Arc::new(ColdNamespaceAdmission {
+                    io: self.clone(),
+                    parent: parent.clone(),
+                    endpoint,
+                });
+                let namespace = super::super::supervisor_owner::FirstInstallNamespace::reserve(
+                    admission, proof, deadline,
+                )?;
+                let reservation = FirstInstallReservation(Arc::new(ReservationData {
+                    io: self.clone(),
+                    parent,
+                    agent_identity,
+                    agent: Mutex::new(Some(agent)),
+                    namespace: Mutex::new(Some(namespace)),
+                    active: AtomicBool::new(true),
+                }));
+                reservation.reverify(self, proof, deadline)?;
+                Ok(reservation)
+            }
+            pub(crate) fn publish_first_install(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                reservation: &FirstInstallReservation,
+                record: &FirstInstallRecord,
+                deadline: &Deadline,
+            ) -> NativeResult<FirstInstallMutationPermit> {
+                self.verify_stop_lock(proof, lock, deadline)?;
+                reservation.reverify(self, proof, deadline)?;
+                record_matches_context(self, record)?;
+                if let Some(old) = self.read_first_install(proof, deadline)? {
+                    if !record.same_selection(&old) {
+                        match super::super::super::first_install::reopen(
+                            &old,
+                            self.target().identity(),
+                        )? {
+                            super::super::super::first_install::Reopen::Restart(expected)
+                                if expected == *record => {}
+                            _ => return Err(NativeError::Foreign),
+                        }
+                    }
+                    if record.phase().rank() < old.phase().rank()
+                        || old.phase() == FirstPhase::Unknown
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                } else if record.phase() != FirstPhase::Intent {
+                    return Err(NativeError::Foreign);
+                }
+                let bytes = record.encode()?;
+                let publication = self.publish_record(
+                    proof,
+                    lock,
+                    records::RecordName::FirstInstall,
+                    &bytes,
+                    deadline,
+                )?;
+                if publication.native_failure.is_some()
+                    || publication.state != records::PublicationRecovery::NewPublished
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                Ok(FirstInstallMutationPermit {
+                    io: self.clone(),
+                    reservation: reservation.clone(),
+                    bytes,
+                })
+            }
+            #[allow(clippy::too_many_arguments)] // Separate genuine context, lock, intent and pin.
+            pub(crate) fn stage_first_install(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &FirstInstallMutationPermit,
+                role: PayloadRole,
+                input: Box<dyn std::io::Read + Send>,
+                expected: &ApprovedPe,
+                deadline: &Deadline,
+            ) -> NativeResult<StagedPe> {
+                let record = permit.reverify(self, proof, lock, deadline)?;
+                if record.phase() != FirstPhase::StageIntent(role)
+                    || expected.role() != role
+                    || expected.facts() != &record.role(role)?.approved
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let root = self.payload_root(proof, lock, deadline)?.0;
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let reservation = permit.reservation.clone();
+                let bytes = permit.bytes.clone();
+                let expected = expected.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Mutation, deadline, move || {
+                    let change = Change::new();
+                    change.finish((|| {
+                        let record = renew_intent(&context, &lease, &reservation, &bytes, &budget)?;
+                        let root = PayloadRoot(root).ensure(&context, &budget, &change)?;
+                        let stages = ensure_payload_child(
+                            &root,
+                            "first-install-stage",
+                            &context,
+                            &budget,
+                            &change,
+                        )?;
+                        let parent = Arc::new(ensure_payload_child(
+                            &stages,
+                            &records::hex(&record.operation()),
+                            &context,
+                            &budget,
+                            &change,
+                        )?);
+                        change.reached();
+                        let image = parent.stage_image(
+                            role.leaf(),
+                            input,
+                            &expected,
+                            &context.security,
+                            &budget,
+                        )?;
+                        reservation.renew_native(&context, &budget)?;
+                        Ok(StagedPe {
+                            target: context.target.nonce,
+                            operation: record.operation(),
+                            role,
+                            parent,
+                            image,
+                            expected,
+                        })
+                    })())
+                })
+            }
+            pub(crate) fn observe_first_stage(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                record: &FirstInstallRecord,
+                role: PayloadRole,
+                expected: &ApprovedPe,
+                deadline: &Deadline,
+            ) -> NativeResult<Option<ImageObservation>> {
+                self.verify_stop_lock(proof, lock, deadline)?;
+                record_matches_context(self, record)?;
+                let root = self.payload_root(proof, lock, deadline)?.0;
+                let context = self.context.clone();
+                let operation = record.operation();
+                let expected = expected.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    let Some(root) = PayloadRoot(root).check(&context, &budget)? else {
+                        return Ok(None);
+                    };
+                    let Some(stages) =
+                        root.child("first-install-stage", &context.security, &budget)?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(parent) =
+                        stages.child(&records::hex(&operation), &context.security, &budget)?
+                    else {
+                        return Ok(None);
+                    };
+                    if parent
+                        .opaque(role.leaf(), false, &context.security, &budget)?
+                        .is_none()
+                    {
+                        return Ok(None);
+                    }
+                    let image = parent.open_image(
+                        role.leaf(),
+                        true,
+                        expected.version(),
+                        &context.security,
+                        &budget,
+                    )?;
+                    if image.facts != *expected.facts() {
+                        return Err(NativeError::Foreign);
+                    }
+                    Ok(Some(ImageObservation {
+                        identity: image.identity.into(),
+                        facts: image.facts,
+                    }))
+                })
+            }
+            pub(crate) fn backup_first_install(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &FirstInstallMutationPermit,
+                role: PayloadRole,
+                deadline: &Deadline,
+            ) -> NativeResult<Option<FileStamp>> {
+                let record = permit.reverify(self, proof, lock, deadline)?;
+                if record.phase() != FirstPhase::BackupIntent(role) {
+                    return Err(NativeError::Foreign);
+                }
+                let root = self.payload_root(proof, lock, deadline)?.0;
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes.clone();
+                let reservation = permit.reservation.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Mutation, deadline, move || {
+                    let change = Change::new();
+                    change.finish((|| {
+                        let record = renew_intent(&context, &lease, &reservation, &bytes, &budget)?;
+                        let root = PayloadRoot(root)
+                            .check(&context, &budget)?
+                            .ok_or(NativeError::Missing)?;
+                        let actual = root.opaque(role.leaf(), true, &context.security, &budget)?;
+                        match (record.role(role)?.original, actual) {
+                            (
+                                super::super::super::payload::recovery::OriginalLeaf::Missing,
+                                None,
+                            ) => Ok(None),
+                            (
+                                super::super::super::payload::recovery::OriginalLeaf::Present(id),
+                                Some(actual),
+                            ) if FileStamp::from(actual.identity) == id => {
+                                let backups = ensure_payload_child(
+                                    &root,
+                                    "first-install-backups",
+                                    &context,
+                                    &budget,
+                                    &change,
+                                )?;
+                                let parent = ensure_payload_child(
+                                    &backups,
+                                    &records::hex(&record.operation()),
+                                    &context,
+                                    &budget,
+                                    &change,
+                                )?;
+                                change.reached();
+                                let moved = root.move_opaque(
+                                    actual,
+                                    &parent,
+                                    role.leaf(),
+                                    &context.security,
+                                    &budget,
+                                )?;
+                                let seen = parent
+                                    .opaque(role.leaf(), false, &context.security, &budget)?
+                                    .ok_or(NativeError::OutcomeUnknown)?;
+                                if seen.identity != moved
+                                    || root
+                                        .opaque(role.leaf(), false, &context.security, &budget)?
+                                        .is_some()
+                                {
+                                    return Err(NativeError::OutcomeUnknown);
+                                }
+                                Ok(Some(moved.into()))
+                            }
+                            _ => Err(NativeError::Foreign),
+                        }
+                    })())
+                })
+            }
+            pub(crate) fn observe_first_backup(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                record: &FirstInstallRecord,
+                role: PayloadRole,
+                deadline: &Deadline,
+            ) -> NativeResult<Option<FileStamp>> {
+                self.verify_stop_lock(proof, lock, deadline)?;
+                record_matches_context(self, record)?;
+                let root = self.payload_root(proof, lock, deadline)?.0;
+                let context = self.context.clone();
+                let operation = record.operation();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    let Some(root) = PayloadRoot(root).check(&context, &budget)? else {
+                        return Ok(None);
+                    };
+                    let Some(backups) =
+                        root.child("first-install-backups", &context.security, &budget)?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(parent) =
+                        backups.child(&records::hex(&operation), &context.security, &budget)?
+                    else {
+                        return Ok(None);
+                    };
+                    Ok(parent
+                        .opaque(role.leaf(), false, &context.security, &budget)?
+                        .map(|leaf| leaf.identity.into()))
+                })
+            }
+            pub(crate) fn publish_first_image(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                permit: &FirstInstallMutationPermit,
+                staged: StagedPe,
+                deadline: &Deadline,
+            ) -> NativeResult<OpenedPe> {
+                let record = permit.reverify(self, proof, lock, deadline)?;
+                if record.phase() != FirstPhase::PublishIntent(staged.role)
+                    || staged.operation != record.operation()
+                    || staged.target != self.context.target.nonce
+                    || record.role(staged.role)?.staged.as_ref() != Some(&staged.observation())
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let root = self.payload_root(proof, lock, deadline)?.0;
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let bytes = permit.bytes.clone();
+                let reservation = permit.reservation.clone();
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Mutation, deadline, move || {
+                    let change = Change::new();
+                    change.finish((|| {
+                        renew_intent(&context, &lease, &reservation, &bytes, &budget)?;
+                        let root = PayloadRoot(root)
+                            .check(&context, &budget)?
+                            .ok_or(NativeError::Missing)?;
+                        let fresh = native::measure_image(
+                            staged.image.file.clone(),
+                            staged.expected.version(),
+                            &budget,
+                        )?;
+                        if fresh.identity != staged.image.identity
+                            || fresh.facts != *staged.expected.facts()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                        drop(fresh);
+                        change.reached();
+                        staged.parent.publish_image(
+                            &staged.image,
+                            &root,
+                            staged.role.leaf(),
+                            &context.security,
+                            &budget,
+                        )?;
+                        let identity = staged.image.identity;
+                        let expected = staged.expected;
+                        let role = staged.role;
+                        drop(staged.image);
+                        let image = root.open_image(
+                            role.leaf(),
+                            true,
+                            expected.version(),
+                            &context.security,
+                            &budget,
+                        )?;
+                        if image.identity != identity || image.facts != *expected.facts() {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                        Ok(OpenedPe(Arc::new(ApprovedImage {
+                            target: context.target.nonce,
+                            parent: root,
+                            leaf: role.leaf().into(),
+                            image,
+                            expected,
+                        })))
+                    })())
+                })
+            }
+        }
+    }
+    #[cfg(not(test))]
+    pub(crate) use first_install_io::{
+        ColdNamespaceAdmission, FirstInstallMutationPermit, FirstInstallReservation,
+    };
+
     /// Shared bounded exact-LUID worker. Inputs are supplied only by freshly matched native
     /// supervisor/file lineage; this observation never constructs a tree or start capability.
     #[cfg(not(test))]
@@ -13165,6 +13980,20 @@ mod adapter {
             let selected =
                 super::super::payload::recovery::selected_operation(self, proof, deadline)?;
             let Some(source) = source else {
+                // A present cold record is correlation only. The genuine task claim and
+                // kernel-exclusive owner above remain the sole fresh launch admission.
+                #[cfg(not(test))]
+                if let Some(first) = self.read_first_install(proof, deadline)? {
+                    use super::super::first_install::record::Phase as FirstPhase;
+                    if first.operation() != permit.operation()
+                        || !matches!(
+                            first.phase(),
+                            FirstPhase::RunIntent | FirstPhase::RunObserved
+                        )
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                }
                 if read_archive_intent(self, proof, deadline)?.is_some()
                     || selected.is_some()
                     || super::activation::SupervisorLogonRecord::read(self, proof, deadline)?
@@ -13491,6 +14320,7 @@ mod adapter {
                 },
             };
             self.verify_stop_lock(proof, lock, deadline)?;
+            self.reject_active_first_install(proof, deadline)?;
             self.refuse_unsettled_repair(proof, lock, deadline)?;
             let module = self.self_image(proof, deadline)?;
             let own = self.own_process_identity(proof, deadline)?;
