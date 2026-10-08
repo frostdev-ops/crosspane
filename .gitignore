@@ -29,3 +29,16 @@ perf.data*
 .vscode/
 *.swp
 *~
+/target/wp-notes/
+
+# Machine-local Rimewire harness registrations (project board config stays tracked).
+/.codex/config.toml
+/.codex/rimewire-install.json
+/.agents/skills/rimewire-setup/
+/.opencode/
+/opencode.json
+/.pi/
+/.claude/settings.local.json
+
+# Python bytecode from lead tooling.
+__pycache__/

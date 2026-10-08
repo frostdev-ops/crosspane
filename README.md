@@ -20,10 +20,6 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-89cbd5" alt="GPL-3.0-or-later"></a>
 </p>
 
-<p align="center">
-  <img src="assets/brand/crosspane-hero.jpg" alt="Crosspane's crystalline crossing emblem in an arctic landscape; brand artwork" width="960">
-</p>
-
 ## Make the whole desk yours
 
 Your Mac has one application. Your Linux desktop has another. Crosspane brings them into the same working space: move your pointer across the edge of a display and keep typing on the next computer, or bring a single application window over to the screen where you want it.
