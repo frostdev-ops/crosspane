@@ -83,7 +83,9 @@ pub enum CaptureEvent {
     /// While not capturing: a local window move (DRAG-v0 D-2) is pressing against `portal`.
     /// `position` runs from 0.0 at the portal's `from` to 1.0 at its `to`. `window` is the moved
     /// window: a `WindowSource` id, or the proxy's own window id when a proxy is moved. `grab` is the
-    /// pointer's offset inside that window's content, in device pixels of the display it is on.
+    /// pointer's offset from the top-left of that window's visible frame, in device pixels of the
+    /// display it is on. The visible frame is the same rectangle as the offer size: the DWM
+    /// extended-frame bounds on Windows, the window frame on macOS.
     /// Repeats while the pointer keeps pushing; `EdgeReleased` ends it.
     DragAtEdge {
         portal: PortalId,
@@ -104,8 +106,9 @@ pub enum CaptureEvent {
     },
     /// While not capturing: a native window move is in progress under the pointer, reported
     /// without any edge test (DRAG v0-b; the seat decides). `window`: a `WindowSource` id, or the
-    /// proxy's own window id when a proxy is moved. `grab`: the pointer's offset inside that
-    /// window's content, in device pixels of the display it is on; `size`: the content size.
+    /// proxy's own window id when a proxy is moved. `grab`: the pointer's offset from the top-left
+    /// of that window's visible frame, in device pixels of the display it is on. `size`: the size
+    /// of that same frame (the offer-size rectangle).
     /// Backends report it for injected input too (the E1 target case) and at most every 20 ms.
     NativeMove {
         window: WindowId,

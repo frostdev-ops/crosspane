@@ -26,6 +26,11 @@ fn fact(pointer: (i32, i32)) -> WindowFact {
             point2(pointer.0 - 50, pointer.1 + 20),
             point2(pointer.0 + 150, pointer.1 + 170),
         ),
+        // DWM frame: 7 px side and bottom borders, 31 px title bar above the content.
+        frame: PixelRect::new(
+            point2(pointer.0 - 57, pointer.1 - 11),
+            point2(pointer.0 + 157, pointer.1 + 177),
+        ),
     }
 }
 
@@ -86,7 +91,7 @@ fn native_move_plus_stable_content_and_outward_primary_detects_all_four_edges() 
                 portal: PortalId(1),
                 position: 1.0 / 3.0,
                 window: WindowId(77),
-                grab: PointDevice::new(50.0, -20.0),
+                grab: PointDevice::new(57.0, 11.0),
                 at: at(20),
             }]
         );
@@ -258,7 +263,7 @@ fn portal_removal_releases_and_invalid_replacement_preserves_old_portal() {
 }
 
 #[test]
-fn negative_virtual_desktop_coordinates_keep_content_grab_without_clamping() {
+fn negative_virtual_desktop_coordinates_keep_frame_grab_without_clamping() {
     let mut p = portal(Edge::Left);
     p.1 = PixelRect::new(point2(-1000, -400), point2(-999, -100));
     let mut detector = Detector::default();
@@ -274,6 +279,6 @@ fn negative_virtual_desktop_coordinates_keep_content_grab_without_clamping() {
     assert!(matches!(
         events.as_slice(),
         [CaptureEvent::DragAtEdge { grab, position, .. }]
-            if *grab == PointDevice::new(50.0, -20.0) && *position == 1.0 / 3.0
+            if *grab == PointDevice::new(57.0, 11.0) && *position == 1.0 / 3.0
     ));
 }

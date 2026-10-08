@@ -1,4 +1,6 @@
-//! Pure DRAG-v0 move classification; no hook, injection ledger or parking authority.
+//! Pure DRAG-v0 move classification and placed return (D-6); no hook, injection ledger or parking
+//! authority of its own. `PlacedRestore` reaches parking only through the injected
+//! [`WindowParking`], and places a window only after that backend has restored it.
 //! `[E]` MOVESIZESTART/END identify a move OR resize, not a button or a title-bar drag:
 //! <https://learn.microsoft.com/en-us/windows/win32/winauto/event-constants>.
 //! `[P]` A fresh admitted identity, primary-only physical state, stable client extent/offset,
@@ -25,12 +27,15 @@ pub const EVENT_SYSTEM_MOVESIZESTART: u32 = 0x000a;
 pub const EVENT_SYSTEM_MOVESIZEEND: u32 = 0x000b;
 
 /// `[P]` Content is a PMv2 global physical rectangle, never an outer-window/title-bar rectangle.
+/// `frame` is the DWM extended-frame (visible) rectangle. `grab` is relative to its top-left, the
+/// origin `restore_at` places (D8, parity with the Mac). Classification still uses `content`.
 /// Identity and WindowId come from the existing WindowSource/WindowResolver, not HWND encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowFact {
     pub window: WindowId,
     pub identity: Identity,
     pub content: PixelRect,
+    pub frame: PixelRect,
 }
 
 impl WindowFact {
@@ -53,8 +58,8 @@ impl WindowFact {
     fn grab(self, point: (i32, i32)) -> PointDevice {
         // Widen before subtraction: negative virtual-screen origins are ordinary observations.
         PointDevice::new(
-            (i64::from(point.0) - i64::from(self.content.min.x)) as f64,
-            (i64::from(point.1) - i64::from(self.content.min.y)) as f64,
+            (i64::from(point.0) - i64::from(self.frame.min.x)) as f64,
+            (i64::from(point.1) - i64::from(self.frame.min.y)) as f64,
         )
     }
 }
@@ -262,5 +267,173 @@ impl Detector {
             .into_keys()
             .map(|portal| CaptureEvent::EdgeReleased { portal, at })
             .collect()
+    }
+}
+
+use super::geometry::{self, DisplayIds, MonitorProbe};
+use crosspane_platform::{Parked, WindowParking};
+use crosspane_types::{geom::PixelSize, id::DisplayId};
+use std::time::Instant;
+
+/// DRAG-v0 D-6: total budget for `restore` plus placement (the platform 2 s call bound).
+pub const RESTORE_AT_BOUND: Duration = Duration::from_secs(2);
+
+/// Outer-rectangle move that puts a restored window's visible (DWM extended-frame) top-left at
+/// the clamped request. PMv2 global physical pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placement {
+    /// `SetWindowPos(.., SWP_NOSIZE ..)` x, y for the outer (`GetWindowRect`) rectangle.
+    pub outer: (i32, i32),
+    /// The visible top-left the native read-back must observe.
+    pub visible: (i32, i32),
+}
+
+/// The unique non-twin probe whose retained-allocator id is `display`.
+pub fn placement_monitor(
+    display: DisplayId,
+    probes: &[MonitorProbe],
+    ids: &mut DisplayIds,
+) -> Result<MonitorProbe, PlatformError> {
+    geometry::displays(probes, ids)
+        .map_err(|_| PlatformError::Backend("placement display layout".into()))?;
+    let mut matching = probes
+        .iter()
+        .filter(|probe| !probe.twin && ids.assign(&probe.device_path) == Ok(display));
+    let probe = matching.next().ok_or(PlatformError::NotFound)?;
+    if matching.next().is_some() {
+        return Err(PlatformError::Backend("ambiguous placement display".into()));
+    }
+    Ok(probe.clone())
+}
+
+/// `origin`: requested visible top-left, device pixels relative to `monitor.rc_monitor`'s
+/// top-left. `outer`/`visible`: the restored window's current GetWindowRect and DWM bounds.
+pub fn placed_origin(
+    outer: [i32; 4],
+    visible: [i32; 4],
+    origin: PointDevice,
+    monitor: &MonitorProbe,
+) -> Result<Placement, PlatformError> {
+    let invalid = || PlatformError::Backend("invalid placement geometry".into());
+    let size = rect_pixel_size(visible).ok_or_else(invalid)?;
+    if rect_pixel_size(outer).is_none() || !origin.x.is_finite() || !origin.y.is_finite() {
+        return Err(invalid());
+    }
+    let clamped = geometry::work_area_clamp(origin, size, monitor.rc_work, monitor.rc_monitor)
+        .map_err(|_| invalid())?;
+    let to_i32 = |value: i64| i32::try_from(value).map_err(|_| invalid());
+    // Whole device pixels. `clamped` lies inside `rc_monitor`, so the sums below stay in i64.
+    let x = i64::from(monitor.rc_monitor[0]) + clamped.x.round() as i64;
+    let y = i64::from(monitor.rc_monitor[1]) + clamped.y.round() as i64;
+    // The outer rectangle keeps the frame offset it had before the move.
+    let dx = i64::from(visible[0]) - i64::from(outer[0]);
+    let dy = i64::from(visible[1]) - i64::from(outer[1]);
+    Ok(Placement {
+        outer: (to_i32(x - dx)?, to_i32(y - dy)?),
+        visible: (to_i32(x)?, to_i32(y)?),
+    })
+}
+
+/// Size of a non-empty `[left, top, right, bottom]` rectangle; `None` when it is empty or inverted.
+fn rect_pixel_size(rect: [i32; 4]) -> Option<PixelSize> {
+    let width = u32::try_from(i64::from(rect[2]) - i64::from(rect[0])).ok()?;
+    let height = u32::try_from(i64::from(rect[3]) - i64::from(rect[1])).ok()?;
+    (width > 0 && height > 0).then(|| PixelSize::new(width, height))
+}
+
+/// Native placement of an already restored window. Never parks, restores or journals.
+pub trait RestorePlacer: Send {
+    /// Moves the window's visible top-left to `origin` and reads it back until `deadline`.
+    fn place(
+        &mut self,
+        window: WindowId,
+        display: DisplayId,
+        origin: PointDevice,
+        deadline: Instant,
+    ) -> Result<(), PlatformError>;
+}
+
+/// DRAG-v0 placed return over any `WindowParking` (M1 now, M2 after W3.2).
+pub struct PlacedRestore<P, L> {
+    inner: P,
+    placer: L,
+    report: Box<dyn Fn(&PlatformError) + Send>,
+}
+
+impl<P, L> std::fmt::Debug for PlacedRestore<P, L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlacedRestore").finish_non_exhaustive()
+    }
+}
+
+impl<P: WindowParking, L: RestorePlacer> PlacedRestore<P, L> {
+    /// `report` receives a placement failure; the restore it follows is still `Ok`.
+    pub fn new(inner: P, placer: L, report: Box<dyn Fn(&PlatformError) + Send>) -> Self {
+        Self {
+            inner,
+            placer,
+            report,
+        }
+    }
+
+    pub fn inner(&self) -> &P {
+        &self.inner
+    }
+
+    pub fn inner_mut(&mut self) -> &mut P {
+        &mut self.inner
+    }
+}
+
+impl<P: WindowParking, L: RestorePlacer> WindowParking for PlacedRestore<P, L> {
+    fn park(
+        &mut self,
+        window: WindowId,
+        size: PixelSize,
+        scale: f64,
+    ) -> Result<Parked, PlatformError> {
+        self.inner.park(window, size, scale)
+    }
+
+    fn resize(
+        &mut self,
+        window: WindowId,
+        size: PixelSize,
+        scale: f64,
+    ) -> Result<Parked, PlatformError> {
+        self.inner.resize(window, size, scale)
+    }
+
+    fn set_fullscreen(&mut self, window: WindowId, fullscreen: bool) -> Result<(), PlatformError> {
+        self.inner.set_fullscreen(window, fullscreen)
+    }
+
+    fn geometry(&self, window: WindowId) -> Result<Parked, PlatformError> {
+        self.inner.geometry(window)
+    }
+
+    fn restore(&mut self, window: WindowId) -> Result<(), PlatformError> {
+        self.inner.restore(window)
+    }
+
+    // The placer runs only after the backend's `restore` has returned `Ok`, so the parking
+    // entry is already retired. A crash before the placement leaves the window at its original
+    // place, unparked, and nothing is lost.
+    fn restore_at(
+        &mut self,
+        window: WindowId,
+        display: DisplayId,
+        origin: PointDevice,
+    ) -> Result<(), PlatformError> {
+        let deadline = Instant::now() + RESTORE_AT_BOUND;
+        self.inner.restore(window)?;
+        if let Err(error) = self.placer.place(window, display, origin, deadline) {
+            (self.report)(&error);
+        }
+        Ok(())
+    }
+
+    fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+        self.inner.recover()
     }
 }

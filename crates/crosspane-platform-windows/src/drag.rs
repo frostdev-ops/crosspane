@@ -3,7 +3,7 @@
 //! geometry following a primary-only physical gesture. No OLE, title or text acquisition.
 //! `[P]` Genuine cached WindowIds are resolved by the existing WindowSource, never allocated here.
 //! `[U]` WinEvent delivery/native queries can lag. Settlement requires a matching actual END;
-//! one accepted SendInput UP alone is insufficient. Native parking/restore_at remain Unsupported.
+//! one accepted SendInput UP alone is insufficient. The D-6 placer only moves restored windows.
 
 #![allow(unsafe_code)]
 
@@ -106,6 +106,8 @@ impl DragConfig {
             {
                 return None;
             }
+            // Read before the revalidation so the DWM frame is covered by the same identity check.
+            let frame = visible_bounds(hwnd).ok()?;
             if self.resolve(id) != Some(original) {
                 return None;
             }
@@ -120,6 +122,10 @@ impl DragConfig {
                 content: PixelRect::new(
                     crosspane_types::geom::euclid::point2(points[0].x, points[0].y),
                     crosspane_types::geom::euclid::point2(points[1].x, points[1].y),
+                ),
+                frame: PixelRect::new(
+                    crosspane_types::geom::euclid::point2(frame[0], frame[1]),
+                    crosspane_types::geom::euclid::point2(frame[2], frame[3]),
                 ),
             })
         }
@@ -294,6 +300,219 @@ impl Drop for Observer {
         }
         EVENTS.with(|e| *e.borrow_mut() = Events::default());
     }
+}
+
+use crate::{
+    model::{
+        drag::{RestorePlacer, placed_origin, placement_monitor},
+        geometry::DisplayIds,
+    },
+    window::MonitorReader,
+};
+use crosspane_types::{geom::PointDevice, id::DisplayId};
+use std::{
+    mem::size_of,
+    thread,
+    time::{Duration, Instant},
+};
+use windows_sys::Win32::{
+    Graphics::{
+        Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
+        Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow},
+    },
+    UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        SetThreadDpiAwarenessContext,
+    },
+};
+
+/// Poll interval for the DWM read-back of a placed window (D-6).
+const PLACE_POLL: Duration = Duration::from_millis(10);
+
+/// Native DRAG-v0 D-6 placement of an already restored window: PMv2-scoped physical geometry,
+/// one asynchronous no-size move, and a bounded DWM read-back. Never parks, restores or journals.
+pub struct WindowsRestorePlacer {
+    resolver: WindowResolver,
+    ids: Arc<Mutex<DisplayIds>>,
+    monitors: MonitorReader,
+}
+impl std::fmt::Debug for WindowsRestorePlacer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WindowsRestorePlacer(..)")
+    }
+}
+impl WindowsRestorePlacer {
+    pub fn new(
+        resolver: WindowResolver,
+        ids: Arc<Mutex<DisplayIds>>,
+        monitors: MonitorReader,
+    ) -> Self {
+        Self {
+            resolver,
+            ids,
+            monitors,
+        }
+    }
+}
+impl RestorePlacer for WindowsRestorePlacer {
+    fn place(
+        &mut self,
+        window: WindowId,
+        display: DisplayId,
+        origin: PointDevice,
+        deadline: Instant,
+    ) -> Result<(), PlatformError> {
+        if Instant::now() >= deadline {
+            return Err(PlatformError::Timeout);
+        }
+        let native = self
+            .resolver
+            .resolve(window)
+            .ok_or(PlatformError::NotFound)?;
+        // The reader runs first; the identity lock is taken afterwards and never held across it.
+        let probes = (self.monitors)()?;
+        let monitor = {
+            let mut ids = self
+                .ids
+                .lock()
+                .map_err(|_| PlatformError::Backend("placement display identities".into()))?;
+            placement_monitor(display, &probes, &mut ids)?
+        };
+        if Instant::now() >= deadline {
+            return Err(PlatformError::Timeout);
+        }
+        let _dpi = DpiScope::new()?;
+        let hwnd = native.hwnd as HWND;
+        // SAFETY: read-only state queries on the freshly resolved window; no window or system change.
+        let (exists, shown, style) = unsafe {
+            (
+                IsWindow(hwnd) != 0,
+                IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 && IsZoomed(hwnd) == 0,
+                GetWindowLongPtrW(hwnd, GWL_STYLE) as u32,
+            )
+        };
+        if !exists {
+            return Err(PlatformError::NotFound);
+        }
+        if !shown {
+            return Err(PlatformError::Unsupported(
+                "placement of a minimized, maximized or hidden window",
+            ));
+        }
+        let mut window_rect = RECT::default();
+        // SAFETY: exact RECT output buffer for the resolved window, under PMv2.
+        if unsafe { GetWindowRect(hwnd, &mut window_rect) } == 0 {
+            return Err(PlatformError::Backend("placement geometry unknown".into()));
+        }
+        let outer = corners(window_rect);
+        let visible = visible_bounds(hwnd)?;
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: read-only facts of the window's current monitor, into an exact output structure.
+        let monitor_read = unsafe {
+            GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info)
+        };
+        if monitor_read == 0 {
+            return Err(PlatformError::Backend("placement monitor unknown".into()));
+        }
+        if visible == corners(info.rcMonitor) && (style & WS_CAPTION) == 0 {
+            return Err(PlatformError::Unsupported(
+                "placement of a fullscreen window",
+            ));
+        }
+        if self.resolver.resolve(window) != Some(native) {
+            return Err(PlatformError::NotFound);
+        }
+        let target = placed_origin(outer, visible, origin, &monitor)?;
+        if near((visible[0], visible[1]), target.visible) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(PlatformError::Timeout);
+        }
+        // SAFETY: the freshly resolved, PMv2-scoped window only. The asynchronous move is posted to
+        // its owning thread and changes no size, z-order, owner, activation or show state.
+        let moved = unsafe {
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                target.outer.0,
+                target.outer.1,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS,
+            )
+        };
+        if moved == 0 {
+            return Err(PlatformError::Backend("placement refused".into()));
+        }
+        loop {
+            if self.resolver.resolve(window) != Some(native) {
+                return Err(PlatformError::NotFound);
+            }
+            let now_visible = visible_bounds(hwnd)?;
+            if near((now_visible[0], now_visible[1]), target.visible) {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(PlatformError::Timeout);
+            }
+            thread::sleep(PLACE_POLL.min(deadline.saturating_duration_since(now)));
+        }
+    }
+}
+
+/// PMv2 for one native call; the thread's previous context is restored on every exit.
+struct DpiScope(DPI_AWARENESS_CONTEXT);
+impl DpiScope {
+    fn new() -> Result<Self, PlatformError> {
+        // SAFETY: affects only this call's thread; the prior context is retained for Drop.
+        let previous =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if previous.is_null() {
+            return Err(PlatformError::Backend(
+                "placement PMv2 context unavailable".into(),
+            ));
+        }
+        Ok(Self(previous))
+    }
+}
+impl Drop for DpiScope {
+    fn drop(&mut self) {
+        // SAFETY: restores exactly the context captured by the successful setter, on this thread.
+        unsafe { SetThreadDpiAwarenessContext(self.0) };
+    }
+}
+
+/// DWM extended-frame bounds (the visible rectangle) of a freshly resolved window.
+fn visible_bounds(hwnd: HWND) -> Result<[i32; 4], PlatformError> {
+    let mut bounds = RECT::default();
+    // SAFETY: exact RECT output buffer for the same freshly resolved window.
+    let status = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+            (&mut bounds as *mut RECT).cast(),
+            size_of::<RECT>() as u32,
+        )
+    };
+    if status < 0 {
+        return Err(PlatformError::Backend("placement geometry unknown".into()));
+    }
+    Ok(corners(bounds))
+}
+
+fn corners(rect: RECT) -> [i32; 4] {
+    [rect.left, rect.top, rect.right, rect.bottom]
+}
+
+/// Within one device pixel on both axes: the D-6 read-back tolerance.
+fn near(actual: (i32, i32), target: (i32, i32)) -> bool {
+    (i64::from(actual.0) - i64::from(target.0)).abs() <= 1
+        && (i64::from(actual.1) - i64::from(target.1)).abs() <= 1
 }
 
 #[cfg(test)]
@@ -711,6 +930,7 @@ mod probe {
                     points
                 };
                 assert!(source.resolver().resolve(id).is_some());
+                let frame = super::super::visible_bounds(fixture.window).unwrap();
                 let fact = crate::model::drag::WindowFact {
                     window: id,
                     identity,
@@ -718,6 +938,7 @@ mod probe {
                         point2(points[0].x, points[0].y),
                         point2(points[1].x, points[1].y),
                     ),
+                    frame: PixelRect::new(point2(frame[0], frame[1]), point2(frame[2], frame[3])),
                 };
                 let mut detector = crate::model::drag::Detector::default();
                 let portal = PortalId(1);
