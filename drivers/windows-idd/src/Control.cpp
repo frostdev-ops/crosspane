@@ -91,6 +91,19 @@ std::size_t response_size(Operation operation) {
 _Use_decl_annotations_
 void cpd_file_create(WDFDEVICE device, WDFREQUEST request, WDFFILEOBJECT file) {
     auto* owner = device_context(device)->value;
+    // The graphics kernel opens the adapter during adapter start, before the CPD
+    // admission epoch is ready. Only user-mode opens are CPD clients, so a kernel
+    // open gets an inert file (cleaned, no client, no lease, no open count).
+    if (WdfRequestGetRequestorMode(request) == KernelMode) {
+        if (file) {
+            auto* context = file_context(file);
+            context->device = owner;
+            context->client = {};
+            context->cleaned = true;
+        }
+        WdfRequestComplete(request, STATUS_SUCCESS);
+        return;
+    }
     NTSTATUS status = STATUS_DEVICE_NOT_READY;
     if (owner && file) {
         auto* context = file_context(file);

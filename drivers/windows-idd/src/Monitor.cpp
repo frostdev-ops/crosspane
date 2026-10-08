@@ -360,7 +360,6 @@ bool NativeDevice::create_monitor(EffectToken effect, const CPD_MODE& mode,
     if (!state) { status = STATUS_INSUFFICIENT_RESOURCES; return false; }
     WDF_OBJECT_ATTRIBUTES attributes;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, MonitorContext);
-    attributes.ExecutionLevel = WdfExecutionLevelPassive;
     attributes.SynchronizationScope = WdfSynchronizationScopeNone;
     attributes.EvtCleanupCallback = [](WDFOBJECT object) {
         auto* monitor = monitor_context(object)->value;

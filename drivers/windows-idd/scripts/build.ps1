@@ -2,11 +2,11 @@
 # Default help is inert. No installs, certificates, signing, deployment, restore,
 # acquisition, arbitrary paths/properties/targets, native test or driver execution.
 [CmdletBinding()]
-param([ValidateSet('help', 'preflight', 'build')][string]$Mode = 'help')
+param([ValidateSet('help', 'preflight', 'build', 'package')][string]$Mode = 'help')
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if ($Mode -eq 'help') {
-    Write-Output 'Crosspane IDD: default help launches nothing; -Mode preflight checks fixed local inputs only; explicit -Mode build is for LEAD after ROOT script review and verifies the ROOT-reviewed native source pins.'
+    Write-Output 'Crosspane IDD: default help launches nothing; -Mode preflight checks fixed local inputs only; explicit -Mode build is for LEAD after ROOT script review and verifies the ROOT-reviewed native source pins. -Mode package retains every static gate then generates one unsigned CAT with a separately sealed local Inf2Cat; unsealed tools refuse before build.'
     return
 }
 # LEAD f4d76209: plain foreground only. No internal timeout/process helper.
@@ -30,11 +30,11 @@ if ($DriverRoot -match '[;"%$\r\n]' -or -not $DriverRoot.EndsWith('\drivers\wind
 $NativeSourceReviewed = $true
 $NativePins = [ordered]@{
     'src\Driver.h' = '07093781456ba4f8756005865c51640ba87fc93dc14531501672d0e9f3744862'
-    'src\Driver.cpp' = '63c3a8c5ebbd4a46b5417f6b488358414c730df98a6a99201f9820dcb85cb2b8'
+    'src\Driver.cpp' = '85311896d8cfdd60497ee2d32543a733f12283a2d6fba5ee76deac3359c92366'
     'src\Control.h' = '19a915da28419f86c5fd5565520faea8b5cfd4971bea48aa20cc4da6237a6a34'
-    'src\Control.cpp' = 'ba8ec982cd769afe1f66461f82e435e0b41ce7ef39671a90d725abe3a1676521'
+    'src\Control.cpp' = '3300f11a193bc7b8c543d7fac7f1ba9782818352fb1cd685663ddbcc3276b67f'
     'src\Monitor.h' = 'bcb0d36151b3a28c6aca484594724266a6117a76f64a4d838e02b3b519bc7042'
-    'src\Monitor.cpp' = '475b16dbcc5bfca1b199bf11054b2594f4b96cab6330141dea3ba3f02e69824f'
+    'src\Monitor.cpp' = 'eaf5418abec64ee62c2c2a680b385124a1e0acc12e6b45da1e47116b87034b39'
     'src\Trace.h' = '0f95be57532cf0af5a9cd6ebd73e65dc89fef667ec0f4998d03a85d7e3872650'
 }
 $RequiredNativeRoles = @('src\Driver.cpp','src\Driver.h','src\Control.cpp','src\Control.h','src\Monitor.cpp','src\Monitor.h','src\Trace.h')
@@ -210,6 +210,48 @@ function Require-Hash([string]$Path, [string]$Algorithm, [string]$Expected) {
 # LEAD0ffe2a0a: exact Microsoft-signed static tool from the pinned WDK6584 package.
 $InfVerif = Join-Path $WdkRoot 'tools\10.0.26100.0\x64\infverif.exe'
 $InfVerifSha256 = '859e311fc5fcdbc041750e50f3673258cbf90f46dbb170c27d7f9fc4f2afdf3a'
+# W3.1a2 GO15e53e04: catalog generation is an explicit foreground post-static phase.
+# LEAD b24feb0b: exact staged SHA512-provenanced6584 managed tool and seven-file closure.
+# Internal Microsoft signing reports UnknownError; Valid is NOT required for Inf2Cat.
+# Hash/package identity is the frozen gate; no ambient member or timestamp/network fallback.
+$Inf2CatDirectory = Join-Path $WdkRoot 'bin\10.0.26100.0\x86'
+$Inf2Cat = Join-Path $Inf2CatDirectory 'Inf2Cat.exe'
+$Inf2CatPackageReviewed = $true
+$Inf2CatPackageSha256 = 'b594728d38b271979367abc8060a971b8e42422738009be126710b1f5dd0fcbc'
+$Inf2CatPackageBytes = 34880
+$Inf2CatClosure = @(
+    @('Inf2Cat.exe',34880,'b594728d38b271979367abc8060a971b8e42422738009be126710b1f5dd0fcbc'),
+    @('Microsoft.UniversalStore.HardwareWorkflow.Cabinets.dll',60480,'0e6cffc7b944b1357a7fefe6fce63221462ca06eaef3d4cad73adc6d19f6b290'),
+    @('Microsoft.UniversalStore.HardwareWorkflow.Catalogs.dll',33344,'7117e47751b1847bb7689275877494a1e3f3f89ccbaaba0d8c5f129b33b897d5'),
+    @('Microsoft.UniversalStore.HardwareWorkflow.InfReader.dll',60504,'eb390ce8b00fde9240351de0ad4220885e5f8c0f23ed9e49442dfbee76c27753'),
+    @('Microsoft.UniversalStore.HardwareWorkflow.SubmissionBuilder.dll',144448,'3f3bfa00c54420bd5d4db1e863b13a4029e0b4949c3504e13a9b412ae5842a18'),
+    @('WindowsProtectedFiles.xml',180884,'b6dcf5d577c4eb96a63dba8e8f952cc9a1b6e7c21c6c5784aec82b261abec640'),
+    @('aitstatic.exe',3033432,'9d9b99107d5fa9753ce26cd5b5430a07bc8845d230df952f9825bde5dda5024d')
+)
+$Inf2CatHeld = [Collections.Generic.List[IDisposable]]::new()
+if ($Mode -eq 'package') {
+    if (-not $Inf2CatPackageReviewed -or $PSVersionTable.PSEdition -cne 'Desktop' -or [Environment]::Version.Major -ne 4) { throw 'STOP: reviewed6584/.NET4 catalog runtime unavailable.' }
+    foreach ($entry in $Inf2CatClosure) {
+        $path = Join-Path $Inf2CatDirectory $entry[0]
+        Require-File $path
+        $ancestor = $path
+        while ($ancestor) {
+            if (((Get-Item -LiteralPath $ancestor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Catalog tool reparse ancestor refused.' }
+            $parent = [IO.Directory]::GetParent($ancestor)
+            if ($null -eq $parent) { break }
+            $ancestor = $parent.FullName
+        }
+        $stream = [IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        $digest = [Security.Cryptography.SHA256]::Create()
+        try {
+            if ($stream.Length -ne $entry[1] -or [BitConverter]::ToString($digest.ComputeHash($stream)).Replace('-','').ToLowerInvariant() -cne $entry[2]) { throw 'Catalog tool closure byte identity mismatch.' }
+            $Inf2CatHeld.Add($stream)
+        } catch { $stream.Dispose(); throw }
+        finally { $digest.Dispose() }
+    }
+    # Original deny-write/delete handles stay live through the foreground tool exit.
+    # Any external timeout/drop remains unresolved LEAD cleanup, not child retirement.
+}
 function Verify-Inputs {
     foreach ($archive in $Archives) {
         $path = Join-Path (Join-Path $PackageRoot 'archives') $archive[0]
@@ -404,4 +446,48 @@ foreach ($path in @('properties-command.json','properties-stdout.txt','propertie
 }
 @{mode='unsigned-static-only';sign_mode='Off';catalog_generation=$false;analysis_defects=$analysisDefects;infverif_exit=$infExit;native_execution=$false;artifacts=$evidence} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Attempt 'build-receipt.json') -Encoding UTF8
 Write-Output 'Unsigned static build and explicit InfVerif exited0; five analysis outputs have zero defects. Compiler outputs and receipts are in this checkout target/wp-notes/windows-idd-build. No catalog, driver/client execution, install, signing or load occurred.'
-exit $script:LastMsbuildExit
+if ($Mode -ne 'package') { exit $script:LastMsbuildExit }
+# A new dedicated directory has exactly the final static DLL/INF inputs. The project
+# remains EnableInf2cat=false and SignMode=Off; no MSBuild target/property is bypassed.
+$unsignedPackage = Join-Path $Attempt 'unsigned-package'
+if ([IO.Directory]::Exists($unsignedPackage) -or [IO.File]::Exists($unsignedPackage)) { throw 'Unsigned package output must be fresh.' }
+[void][IO.Directory]::CreateDirectory($unsignedPackage)
+$packageDll = Join-Path $unsignedPackage 'CrosspaneIdd.dll'
+$packageInf = Join-Path $unsignedPackage 'CrosspaneIdd.inf'
+$packageCat = Join-Path $unsignedPackage 'CrosspaneIdd.cat'
+[IO.File]::Copy((Join-Path $Attempt 'bin\CrosspaneIdd.dll'), $packageDll, $false)
+[IO.File]::Copy($builtInf, $packageInf, $false)
+Require-File $packageDll
+Require-File $packageInf
+if ([IO.File]::Exists($packageCat) -or [IO.Directory]::Exists($packageCat)) { throw 'Catalog output collides with existing state.' }
+Require-Hash $Inf2Cat SHA256 $Inf2CatPackageSha256
+if ((Get-Item -LiteralPath $Inf2Cat).Length -ne $Inf2CatPackageBytes) { throw 'Sealed catalog tool length changed.' }
+$catalogArguments = @(('/driver:' + $unsignedPackage), '/os:10_GE_X64', '/verbose')
+$catalogStdout = Join-Path $Attempt 'inf2cat-stdout.txt'
+$catalogStderr = Join-Path $Attempt 'inf2cat-stderr.txt'
+@{phase='inf2cat';exe=$Inf2Cat;exe_sha256=$Inf2CatPackageSha256;arguments=$catalogArguments;working_directory=$unsignedPackage;output_root=$Attempt;system_executor='LEAD';signing=$false} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $Attempt 'inf2cat-command.json') -Encoding UTF8
+$savedErrorPreference = $ErrorActionPreference
+Push-Location -LiteralPath $unsignedPackage
+try {
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = $null
+    & $Inf2Cat @catalogArguments 1> $catalogStdout 2> $catalogStderr
+    $catalogExit = $global:LASTEXITCODE
+} finally { $ErrorActionPreference = $savedErrorPreference; Pop-Location }
+if ($null -eq $catalogExit) { throw 'Inf2Cat returned no native exit receipt; unresolved STOP, cleanup LEAD-only.' }
+@{phase='inf2cat';state='exited';exit=$catalogExit} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Attempt 'inf2cat-exit.json') -Encoding UTF8
+if ($catalogExit -ne 0) { exit $catalogExit }
+Require-File $packageCat
+$expectedPackageNames = @('CrosspaneIdd.cat','CrosspaneIdd.dll','CrosspaneIdd.inf')
+$actualPackageNames = @([IO.Directory]::GetFileSystemEntries($unsignedPackage) | ForEach-Object { [IO.Path]::GetFileName($_) } | Sort-Object)
+if ($actualPackageNames.Count -ne 3 -or (@(Compare-Object $expectedPackageNames $actualPackageNames).Count -ne 0)) { throw 'Catalog tool produced unexpected owned package members; retain exact output and STOP.' }
+Verify-Inputs
+foreach ($role in $RequiredNativeRoles) { Require-Hash (Join-Path $DriverRoot $role) SHA256 $NativePins[$role] }
+$packageEvidence = @()
+foreach ($file in @($packageInf,$packageDll,$packageCat)) {
+    Require-File $file
+    $packageEvidence += @{name=[IO.Path]::GetFileName($file);bytes=(Get-Item -LiteralPath $file).Length;sha256=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash}
+}
+@{mode='unsigned-package';static_receipt_sha256=(Get-FileHash -LiteralPath (Join-Path $Attempt 'build-receipt.json') -Algorithm SHA256).Hash;sign_mode='Off';enable_inf2cat_effective=$false;catalog_tool_exit=$catalogExit;catalog_tool_sha256=$Inf2CatPackageSha256;catalog_os='10_GE_X64';signature_policy='unsigned-only-no-sign-operation';install=$false;native_execution=$false;package=$unsignedPackage;artifacts=$packageEvidence} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Attempt 'package-receipt.json') -Encoding UTF8
+Write-Output ('PACKAGE unsigned CAT generated only after static gates; exact package ' + $unsignedPackage + '; no signing, install or driver/client execution occurred.')
+exit $catalogExit

@@ -101,6 +101,23 @@ EVT_WDF_DEVICE_D0_EXIT cpd_d0_exit;
 EVT_WDF_DEVICE_RELEASE_HARDWARE cpd_release_hardware;
 
 namespace {
+// Diagnostic breadcrumb: last NTSTATUS of a named step, written as a REG_DWORD under the
+// device's WDF-writable hardware subkey (Enum\<id>\Device Parameters\WDF). Numeric only;
+// failures to record are ignored.
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void cpd_record_status(_In_ WDFDEVICE device, _In_z_ PCWSTR name, NTSTATUS status) noexcept {
+    if (!device || !name) return;
+    WDFKEY key = nullptr;
+    if (!NT_SUCCESS(WdfDeviceOpenRegistryKey(device, PLUGPLAY_REGKEY_DEVICE | WDF_REGKEY_DEVICE_SUBKEY,
+            KEY_READ | KEY_SET_VALUE, WDF_NO_OBJECT_ATTRIBUTES, &key))) {
+        return;
+    }
+    UNICODE_STRING value_name{};
+    RtlInitUnicodeString(&value_name, name);
+    // Result ignored by contract: a failed breadcrumb must never change the start result.
+    (void)WdfRegistryAssignULong(key, &value_name, static_cast<ULONG>(status));
+    WdfRegistryClose(key);
+}
 // Synchronization only, not a global owner/device identity registry. The CRT
 // constructs this existing-runtime mutex before DriverEntry. No C++ mutex is
 // placed into raw, zero-initialized WDF context memory.
@@ -124,6 +141,7 @@ AdapterDelivery claim_adapter_delivery(AdapterContext& context, IDDCX_ADAPTER ad
 }
 void deliver_adapter_result(const AdapterDelivery& delivery) {
     if (!delivery.owner) return;
+    bool publish_failed = false;
     {
         auto* owner = delivery.owner;
         const std::lock_guard<std::mutex> lock(owner->state_lock);
@@ -136,6 +154,7 @@ void deliver_adapter_result(const AdapterDelivery& delivery) {
             owner->initializing = false;
             if (!NT_SUCCESS(delivery.status) || !owner->admission.publish_ready(delivery.generation)) {
                 owner->native_failed = true;
+                publish_failed = true;
                 owner->admission.begin_stop();
                 (void)owner->core.stop(GetTickCount64());
             } else {
@@ -143,6 +162,8 @@ void deliver_adapter_result(const AdapterDelivery& delivery) {
             }
         }
     }
+    // Breadcrumb only after state_lock is released. The claimed reference keeps owner_device alive.
+    if (publish_failed) cpd_record_status(delivery.owner_device, L"CpdPublishFailed", delivery.status);
     // No owner/context access follows this final reference release. Destroy
     // can run before Dereference returns. No mailbox/state lock is held.
     WdfObjectDereference(delivery.owner_device);
@@ -212,7 +233,6 @@ NTSTATUS NativeDevice::start() {
     WDF_OBJECT_ATTRIBUTES attributes;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, AdapterContext);
     attributes.ParentObject = device;
-    attributes.ExecutionLevel = WdfExecutionLevelPassive;
     attributes.SynchronizationScope = WdfSynchronizationScopeNone;
     attributes.EvtCleanupCallback = cleanup_adapter_mailbox;
     IDARG_IN_ADAPTER_INIT input{};
@@ -221,6 +241,7 @@ NTSTATUS NativeDevice::start() {
     input.ObjectAttributes = &attributes;
     IDARG_OUT_ADAPTER_INIT output{};
     const NTSTATUS status = IddCxAdapterInitAsync(&input, &output);
+    cpd_record_status(device, L"CpdAdapterInitAsync", status);
     AdapterDelivery delivery{};
     bool binding_refused = false;
     if (NT_SUCCESS(status)) {
@@ -257,7 +278,9 @@ NTSTATUS NativeDevice::start() {
         in_flight_adapter_epoch = {};
     }
     deliver_adapter_result(delivery);
-    return binding_refused ? STATUS_DEVICE_NOT_READY : status;
+    const NTSTATUS result = binding_refused ? STATUS_DEVICE_NOT_READY : status;
+    cpd_record_status(device, L"CpdStartReturn", result);
+    return result;
 }
 NTSTATUS NativeDevice::stop() {
     {
@@ -302,13 +325,24 @@ _Use_decl_annotations_
 NTSTATUS cpd_adapter_finished(IDDCX_ADAPTER adapter, const IDARG_IN_ADAPTER_INIT_FINISHED* input) {
     if (!input) return STATUS_INVALID_PARAMETER;
     AdapterDelivery delivery{};
+    WDFDEVICE breadcrumb_device = nullptr;
     {
         const std::lock_guard<std::mutex> lock(adapter_mailbox_lock);
         auto* context = adapter_context(adapter);
         if (context->cleaned || context->finished) return STATUS_SUCCESS;
         context->finished_status = input->AdapterInitStatus;
         context->finished = true;
+        if (context->owner_device) {
+            // Same narrow rule as claim_adapter_delivery: nonblocking reference under the
+            // mailbox mutex, released after the breadcrumb is written with no lock held.
+            WdfObjectReference(context->owner_device);
+            breadcrumb_device = context->owner_device;
+        }
         delivery = claim_adapter_delivery(*context, adapter);
+    }
+    if (breadcrumb_device) {
+        cpd_record_status(breadcrumb_device, L"CpdAdapterInitFinished", input->AdapterInitStatus);
+        WdfObjectDereference(breadcrumb_device);
     }
     // Early/unbound notification only records status and acknowledges receipt.
     // Owner publication or a late notification claims delivery exactly once.
@@ -319,7 +353,9 @@ NTSTATUS cpd_adapter_finished(IDDCX_ADAPTER adapter, const IDARG_IN_ADAPTER_INIT
 _Use_decl_annotations_
 NTSTATUS cpd_d0_entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE) {
     auto* owner = device_context(device)->value;
-    return owner ? owner->start() : STATUS_DEVICE_NOT_READY;
+    const NTSTATUS status = owner ? owner->start() : STATUS_DEVICE_NOT_READY;
+    cpd_record_status(device, L"CpdD0Entry", status);
+    return status;
 }
 _Use_decl_annotations_
 NTSTATUS cpd_d0_exit(WDFDEVICE device, WDF_POWER_DEVICE_STATE) {
@@ -344,7 +380,6 @@ NTSTATUS cpd_device_add(WDFDRIVER, PWDFDEVICE_INIT initialization) {
     files.AutoForwardCleanupClose = WdfFalse;
     WDF_OBJECT_ATTRIBUTES file_attributes;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&file_attributes, FileContext);
-    file_attributes.ExecutionLevel = WdfExecutionLevelPassive;
     file_attributes.SynchronizationScope = WdfSynchronizationScopeNone;
     WdfDeviceInitSetFileObjectConfig(initialization, &files, &file_attributes);
     IDD_CX_CLIENT_CONFIG client;
@@ -361,7 +396,6 @@ NTSTATUS cpd_device_add(WDFDRIVER, PWDFDEVICE_INIT initialization) {
     if (!NT_SUCCESS(status)) return status;
     WDF_OBJECT_ATTRIBUTES device_attributes;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&device_attributes, DeviceContext);
-    device_attributes.ExecutionLevel = WdfExecutionLevelPassive;
     device_attributes.SynchronizationScope = WdfSynchronizationScopeNone;
     device_attributes.EvtCleanupCallback = [](WDFOBJECT object) {
         auto* owner = device_context(object)->value;
@@ -388,7 +422,6 @@ NTSTATUS cpd_device_add(WDFDRIVER, PWDFDEVICE_INIT initialization) {
     WDF_OBJECT_ATTRIBUTES child;
     WDF_OBJECT_ATTRIBUTES_INIT(&child);
     child.ParentObject = device;
-    child.ExecutionLevel = WdfExecutionLevelPassive;
     child.SynchronizationScope = WdfSynchronizationScopeNone;
     WDF_WORKITEM_CONFIG management;
     WDF_WORKITEM_CONFIG_INIT(&management, cpd_management);
@@ -402,7 +435,9 @@ NTSTATUS cpd_device_add(WDFDRIVER, PWDFDEVICE_INIT initialization) {
     if (!NT_SUCCESS(status)) return status;
     status = WdfDeviceCreateDeviceInterface(device, &ControlInterface, nullptr);
     if (!NT_SUCCESS(status)) return status;
-    return IddCxDeviceInitialize(device);
+    status = IddCxDeviceInitialize(device);
+    cpd_record_status(device, L"CpdDeviceInitialize", status);
+    return status;
 }
 } // namespace crosspane::idd
 extern "C" DRIVER_INITIALIZE DriverEntry;
