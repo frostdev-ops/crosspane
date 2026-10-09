@@ -1,5 +1,5 @@
 #![cfg(target_os = "macos")]
-#![allow(clippy::unwrap_used, clippy::expect_used)] // AGENTS.md permits assertions in test fixtures.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Assertions may unwrap fixture results.
 use crosspane_installer::gui;
 #[path = "../src/platform/macos/fonts.rs"]
 #[allow(dead_code)]

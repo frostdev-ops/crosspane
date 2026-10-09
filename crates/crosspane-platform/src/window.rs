@@ -1,5 +1,5 @@
 //! E2 source side: the windows a node can project, and where it keeps them while projected
-//! (03 §4.1, §4.3). Frozen by WP-2.1 (docs/wp/E2-v0.md).
+//! on the source machine.
 
 use std::sync::Arc;
 

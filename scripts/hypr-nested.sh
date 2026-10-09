@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Start, inspect and stop a Hyprland instance nested in the owner's live session, for automated
-# platform tests and spikes (docs/wp/WP-0.11.md).
+# platform tests.
 #
 #   scripts/hypr-nested.sh start [--name N] [--width W --height H] [--config FILE]
 #   scripts/hypr-nested.sh env|status|stop [--name N]
 #
-# Safety rules (AGENTS.md, R19):
+# Safety rules:
 # - Every hyprctl call names the nested instance explicitly (-i <signature>) and has a timeout.
 #   The live instance is never addressed by this script.
 # - Only the PID this script started is ever signalled.
@@ -90,7 +90,7 @@ start() {
         echo "hypr-nested: $name is already running" >&2
         exit 1
     fi
-    # Implementer runs (scripts/lead/run-wp.sh) have no WAYLAND_DISPLAY, so nothing they run can
+    # Isolated runs (scripts/test-env.sh) have no WAYLAND_DISPLAY, so nothing they run can
     # reach the live session by accident; only this script gets the parent display, to open the
     # nested instance's window.
     local parent=${WAYLAND_DISPLAY:-${CROSSPANE_PARENT_WAYLAND_DISPLAY:-}}

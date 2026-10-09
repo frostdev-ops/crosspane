@@ -1,5 +1,5 @@
 #![cfg(target_os = "macos")]
-#![allow(clippy::unwrap_used, clippy::expect_used)] // AGENTS.md permits assertions in test fixtures.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Assertions may unwrap fixture results.
 //! WP-4.12a native admission and WP-4.12b bounded transport, with injected observations.
 use crosspane_installer::agent_contract::{
     self, BootstrapPhase, InstanceStatus, ObservationSource,

@@ -2839,7 +2839,7 @@ fn actual_stage_output_is_accepted_by_rust_without_executing_artifacts() {
         0o600,
     );
     let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let status = std::process::Command::new(project.join("scripts/lead/impl-env.sh"))
+    let status = std::process::Command::new(project.join("scripts/test-env.sh"))
         .args([
             "env",
             "DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/crosspane-test-bus",

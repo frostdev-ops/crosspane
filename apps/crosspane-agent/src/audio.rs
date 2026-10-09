@@ -1,4 +1,4 @@
-//! The agent's audio data plane for speakers (speaker v0, WP-3.6c; `docs/wp/WP-3.6c.md`).
+//! The agent's audio data plane for speakers.
 //!
 //! The worker executes the engine's audio [`Output`]s off the engine loop: it encodes a virtual
 //! speaker's PCM to Opus and sends it, and receives, jitter-buffers and decodes a peer's packets
@@ -76,7 +76,7 @@
 //! A worker that dies must never do so silently. The worker dies when the command queue reaches
 //! [`COMMAND_HARD_CAP`], when either of its threads panics or ends for any reason other than a
 //! caller's `shutdown`, or when the platform-event callback panics. The hard cap and the 2.5 s
-//! shutdown bound are lead decisions recorded in `docs/wp/WP-3.6c.md` under "Lead decisions". The
+//! shutdown bound limit queued work and caller wait time. The
 //! context that detects the death (the caller in `submit` for the cap, the dying thread's unwind
 //! guard, the backend thread for the callback; never a stuck thread) then:
 //!

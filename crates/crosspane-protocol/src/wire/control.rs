@@ -1,4 +1,4 @@
-//! Control-stream encoding (protobuf, schema in docs/wp/WP-1.2.md). Implemented in WP-1.2.
+//! Protobuf control-stream encoding.
 
 use crosspane_types::ClipKind;
 use crosspane_types::audio::{AudioKind, AudioStreamId};

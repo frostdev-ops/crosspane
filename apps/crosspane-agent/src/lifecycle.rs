@@ -1091,7 +1091,7 @@ mod tests {
             // child simulates the writer's process lifetime, including descriptor teardown.
             #[cfg(unix)]
             let wrapper =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lead/impl-env.sh");
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/test-env.sh");
             #[cfg(unix)]
             let mut command = {
                 let mut command = Command::new(wrapper);

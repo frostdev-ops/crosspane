@@ -47,7 +47,7 @@ const NOT_PERMITTED: SessionState = SessionState {
     active: None,
 };
 
-// ---- WP-2.43 "home on the twin" (docs/wp/WP-2.43.md §4, amendments A1-A9, B1) ----
+// ---- Home on the twin ----
 /// How long every injector this node owns has to confirm its releases before the entry gives up.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// How long the home bind has to be installed and verified.
@@ -2903,7 +2903,7 @@ impl ControllerE1 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// WP-2.43: home on the twin (docs/wp/WP-2.43.md §2, amendments A1-A9 and B1).
+// Home on the twin.
 //
 // The controller can *go home* into one of this node's own twin-parked windows that the peer it
 // controls shows: it settles every injector this node owns, installs the home bind, releases the

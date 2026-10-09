@@ -1,7 +1,9 @@
 # Nested Hyprland test session
 
 `scripts/hypr-nested.sh` runs a second Hyprland instance inside the owner's live session, so
-automated tests and spikes never touch the live instance (AGENTS.md).
+automated platform tests use a separate instance. Run test commands through
+`scripts/test-env.sh` to remove inherited live-session handles while preserving the parent
+Wayland display for starting the nest.
 
 ```sh
 scripts/hypr-nested.sh start            # prints the instance signature and Wayland socket

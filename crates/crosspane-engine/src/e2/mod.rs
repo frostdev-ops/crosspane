@@ -1,4 +1,4 @@
-//! E2 window projection roles (docs/wp/E2-v0.md): the source side (the window's owner) and the
+//! E2 window projection roles: the source side (the window's owner) and the
 //! destination side (the proxy), side by side. All time is supplied by the caller.
 
 mod destination;

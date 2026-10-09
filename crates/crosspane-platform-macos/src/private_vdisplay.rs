@@ -12,7 +12,7 @@
 //! selects the requested mode before its pixel and logical dimensions are polled.
 //! Parking operations are serialized across native waits and must run on a worker thread,
 //! never the AppKit main thread, which must keep servicing on_main/spawn_on_main.
-//! A window that goes fullscreen on its twin keeps projecting (docs/wp/FULLSCREEN-design.md §6).
+//! A window that goes fullscreen on its twin keeps projecting.
 //! The fullscreen window is the twin itself, or a same-process stand-in that fills it (WebKit's
 //! title-less fullscreen window): AX can't move it, and the page's own window is off-Space, so
 //! the AX lookup misses. A miss never releases the display while the Quartz window exists; only

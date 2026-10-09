@@ -1,4 +1,4 @@
-# Licence policy: docs/plan/09-rust-workspace.md §2, owner decision D5.
+# Dependency licence policy.
 [licenses]
 # The allow list is the full set of GPL-3.0-compatible licences pre-approved under D5,
 # so entries that no current dependency uses are expected.

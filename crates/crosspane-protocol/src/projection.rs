@@ -1,4 +1,4 @@
-//! E2 window projection messages (docs/wp/E2-v0.md). Frozen by WP-2.1; encoded by WP-2.3.
+//! E2 window projection messages.
 //!
 //! - Control: [`ProjectionMessage`], carried in [`crate::msg::ControlMessage::Projection`].
 //! - Input to a projected window: [`ProjInput`], carried as [`crate::msg::InputMessage::Proj`] on

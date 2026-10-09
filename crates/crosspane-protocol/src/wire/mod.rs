@@ -1,4 +1,4 @@
-//! Encodings (frozen formats in docs/wp/WP-1.1.md and docs/wp/WP-1.2.md).
+//! Wire encodings.
 //!
 //! Every message travels in a frame with an 8-byte header:
 //!

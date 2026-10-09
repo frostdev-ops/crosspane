@@ -10,7 +10,7 @@
 <p align="center">
   <a href="docs/running.md">Get started</a> ·
   <a href="#what-you-can-do">Explore the features</a> ·
-  <a href="docs/wp/README.md">Follow development</a> ·
+  <a href="https://github.com/frostdev-ops/crosspane/issues">Follow development</a> ·
   <a href="https://github.com/frostdev-ops/crosspane/issues">Report an issue</a>
 </p>
 
@@ -28,7 +28,7 @@ The application keeps running on its own machine. Its projected window appears o
 
 Crosspane is part of [Frostdev](https://frostdev.io), alongside [Rimeward](https://github.com/frostdev-ops/rimeward) and [Frostsim](https://github.com/frostdev-ops/frostsim).
 
-**Crosspane is in early development.** The current v0 implementation includes shared input, window projection, pairing, a tray / menu-bar control, and a settings app. Start with the [running guide](docs/running.md); the [work-package tracker](docs/wp/README.md) records implementation progress. This repository is ahead of the original Phase 0 introduction, but it is still a developing application.
+**Crosspane is in early development.** The current v0 implementation includes shared input, window projection, pairing, a tray / menu-bar control, and a settings app. Start with the [running guide](docs/running.md); follow development and report problems through [GitHub issues](https://github.com/frostdev-ops/crosspane/issues).
 
 ## What you can do
 
@@ -60,7 +60,7 @@ Each computer runs its own agent in your user session. The settings app talks to
 
 | Platform | Current scope |
 | --- | --- |
-| **Apple Silicon Mac** | macOS 26+ is the MVP target. Requires macOS permissions and a signed agent bundle; see the [Mac setup](docs/setup/mac.md). |
+| **Apple Silicon Mac** | macOS 26+ is the MVP target. Requires macOS permissions and a signed agent bundle; see the [macOS build helpers](scripts/macos/README.md). |
 | **Linux / Hyprland** | Current Linux backend. Requires the graphical session, Wayland and system libraries; see [Running Crosspane](docs/running.md). |
 | **Windows** | Planned for Phase 3. |
 | **GNOME / KDE** | Planned for Phase 4. |
@@ -95,23 +95,22 @@ Replace `macbook` with the name of your paired machine.
 
 Crosspane is being built and tested on Mac and Hyprland. Window capture, parking, cursor shapes, and motion streaming have platform-specific limits. The [known limitations](docs/running.md#known-limitations-v0) cover them, including notifications captured with parked windows, Hyprland cursor capture being off by default, and the bandwidth cost of motion without H.264.
 
-The artwork above is branding, rather than an application screenshot. Performance numbers and future roadmap items are goals until their acceptance checks are recorded. For current progress, use the work-package tracker and spike reports.
+The artwork above is branding, rather than an application screenshot. Performance numbers and future roadmap items are goals until verified. Follow [GitHub issues](https://github.com/frostdev-ops/crosspane/issues) for current development.
 
 ## Built with Rust
 
 Crosspane separates its OS-independent types, protocol, security, input routing, media, and engine from thin platform adapters. QUIC carries the peer connections; winit and wgpu host projected windows; egui / eframe power the settings app. Native adapters handle macOS and Hyprland permissions, capture, input, and window management.
 
-To work on the project, start with [AGENTS.md](AGENTS.md) and the [workspace design](docs/plan/09-rust-workspace.md). Changes to frozen interfaces and work packages follow the project's scoped implementation rules.
+To work on the project, read the [running guide](docs/running.md) and install the pinned Rust toolchain. Before submitting changes, run `cargo fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo nextest run --workspace --locked --no-tests=pass`. The [CI workflow](.github/workflows/ci.yml) lists the remaining checks and system dependencies. Use [scripts/test-env.sh](scripts/test-env.sh) to keep local checks isolated from your desktop session.
 
 ## Documentation
 
 | | Start here |
 | --- | --- |
 | **Install and use** | [Running Crosspane](docs/running.md) |
-| **Prepare a Mac** | [Mac setup](docs/setup/mac.md) |
-| **Understand the design** | [Approved plan](docs/plan/README.md) |
-| **Follow implementation** | [Work-package tracker](docs/wp/README.md) |
-| **Read the experiments** | [Spike reports](docs/spikes/README.md) |
+| **Prepare a Mac** | [macOS build helpers](scripts/macos/README.md) |
+| **Build an installer** | [Tier 1 installer builds](docs/setup/installer-tier1.md) |
+| **Run isolated platform tests** | [Nested Hyprland test session](scripts/hypr-nested/README.md) |
 | **Use the brand assets** | [Brand guide and asset inventory](assets/brand/README.md) |
 
 ## License

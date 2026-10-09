@@ -43,7 +43,6 @@ restore mitigation under W4.2.
 
 Loading, standard-user native IOCTL tests, heartbeat-loss unplug, DPI and kill
 recovery remain owner-gated. Portable model checks and compilation do not
-establish those runtime behaviors. See docs/spikes/W3.1a-driver.md for
-the final evidence report when it is sealed.
+establish those runtime behaviors.
 
 Lead d474f300 accepts the pinned WDK build-tool telemetry under existing owner settings; no suppression property was found. No restore/download or sign/install/deploy effect is admitted. The installed shim resolves the staged NuGet kit; fixed script and first lead-only build are pending.

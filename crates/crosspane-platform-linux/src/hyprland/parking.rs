@@ -1,4 +1,4 @@
-//! M2 twin-output parking on Hyprland (03 §4.3, docs/wp/E2-v0.md decision 4; WP-2.7b, lead).
+//! Twin-output parking on Hyprland.
 //!
 //! A projected window moves alone onto a workspace of its own headless output. The output's mode
 //! holds the destination proxy's content at its scale plus sticky margins. Explicit floating

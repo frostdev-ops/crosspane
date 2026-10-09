@@ -49,7 +49,7 @@ owned_nests=()
 bin=$repo/target/debug
 # Refuse inherited live handles rather than treating them as permission to use the desktop.
 [ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] \
-  && [ -z "${WAYLAND_SOCKET:-}" ] || { echo "run through scripts/lead/impl-env.sh" >&2; exit 97; }
+  && [ -z "${WAYLAND_SOCKET:-}" ] || { echo "run through scripts/test-env.sh" >&2; exit 97; }
 home_desc=crosspane-home-release
 owner_desc=owner-chord
 fail() { echo "FAIL: $*"; exit 1; }

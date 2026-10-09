@@ -2892,16 +2892,8 @@ fn owned_drag_test(test: &str) -> bool {
             rustix::fs::FlockOperation::LockExclusive,
         );
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let wrapper = if native_move {
-            PathBuf::from("/home/jame/Projects/Crosspane/scripts/lead/impl-env.sh")
-        } else {
-            root.join("scripts/lead/impl-env.sh")
-        };
-        let script = if native_move {
-            PathBuf::from("/home/jame/Projects/Crosspane/scripts/hypr-nested.sh")
-        } else {
-            root.join("scripts/hypr-nested.sh")
-        };
+        let wrapper = root.join("scripts/test-env.sh");
+        let script = root.join("scripts/hypr-nested.sh");
         let prefix = if native_move {
             "wp272-native-move"
         } else {

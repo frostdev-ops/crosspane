@@ -4,9 +4,7 @@
 //!
 //! Frozen for Phase 1 by WP-0.6 (2026-10-01): sessions and the I/O gate, displays, permissions,
 //! global hotkeys, input capture, key and pointer injection, key storage, link information and
-//! overlays. The window-projection (E2) traits are added and frozen when Phase 2a starts; their
-//! provisional shape is recorded in `docs/wp/WP-0.6.md`. Changing a frozen trait is its own work
-//! package (11).
+//! overlays, window projection and frame capture.
 //!
 //! # Conventions for every trait
 //!

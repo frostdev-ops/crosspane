@@ -1,5 +1,4 @@
-//! E2 capture of window pixels (03 §4.2). Frozen by WP-2.1 (docs/wp/E2-v0.md); native frames by
-//! WP-2.24 (docs/wp/GPU-v0.md).
+//! E2 capture of window pixels, including native GPU frames.
 //!
 //! A frame is in CPU memory (Hyprland SHM) or stays where the OS put it (an IOSurface on macOS, a
 //! DMA-BUF on Linux) so the GPU can read it without a copy.

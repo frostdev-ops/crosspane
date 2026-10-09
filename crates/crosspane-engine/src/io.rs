@@ -132,7 +132,7 @@ pub enum Command {
     Panic,
     /// Re-arm crossing after a release or panic.
     Rearm,
-    /// E2: project this node's `window` to `to` (docs/wp/E2-v0.md).
+    /// E2: project this node's `window` to `to`.
     Project {
         window: WindowId,
         to: NodeId,
@@ -344,7 +344,7 @@ pub enum Input {
     AudioMicrophoneSupport {
         available: bool,
     },
-    // ---- E2 (docs/wp/E2-v0.md) ----
+    // ---- E2 ----
     /// This node's windows (from `WindowSource`).
     Windows(WindowEvent),
     /// The result of `Output::Park` or `Output::ResizeParked`.
@@ -538,7 +538,7 @@ pub enum Output {
     /// Set the engine side of the I/O gate.
     EngineGate(bool),
     Notice(Notice),
-    // ---- E2 source (docs/wp/E2-v0.md) ----
+    // ---- E2 source ----
     /// `WindowParking::park` with the destination's content size and scale (from `Accepted`);
     /// answer with `Input::Parked`.
     Park {

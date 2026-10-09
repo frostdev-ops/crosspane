@@ -68,7 +68,7 @@ pub enum InputMessage {
         session: SessionId,
         status: TargetStatus,
     },
-    /// E2: destination → source input for a projected window (docs/wp/E2-v0.md).
+    /// E2: destination → source input for a projected window.
     Proj(crate::projection::ProjInput),
 }
 
@@ -187,7 +187,7 @@ pub enum ControlMessage {
     Goodbye {
         message: String,
     },
-    /// E2 window projection (docs/wp/E2-v0.md).
+    /// E2 window projection.
     Projection(crate::projection::ProjectionMessage),
     /// D8: feature-negotiated audio; channels must equal kind.format().channels.
     AudioOpen {

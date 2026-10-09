@@ -500,7 +500,7 @@ pub(crate) fn bounds_equal(a: RectLogical, b: RectLogical) -> bool {
         && (a.size.height - b.size.height).abs() <= BOUNDS_SLACK
 }
 
-/// The state the engine sees (docs/wp/FULLSCREEN-design.md §6): a window that isn't on screen is
+/// The state the engine sees: a window that isn't on screen is
 /// `Hidden` (another Space, minimized, hidden app) and stays in the list; an on-screen window that
 /// fills its display is `Fullscreen`; anything else is `Normal`. A window leaves the list only
 /// when it closes.

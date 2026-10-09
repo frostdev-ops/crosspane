@@ -1,5 +1,5 @@
-//! WP-2.43b: the engine's "home on the twin" state machine (docs/wp/WP-2.43.md §2, amendments
-//! A1-A9 and B1), driven through `Engine` so the E1 controller, the E1 target and both E2 roles
+//! The engine's "home on the twin" state machine, driven through `Engine` so the E1 controller,
+//! the E1 target and both E2 roles
 //! compose. Every test is deterministic: time is an explicit `MonoTime`, nothing sleeps.
 //!
 //! The scenario: node A (the node under test) controls peer B with E1 and projects its windows to
@@ -74,7 +74,7 @@ const OPEN: SessionState = SessionState {
     active: Some(true),
 };
 
-// The constants of the design (docs/wp/WP-2.43.md §4), in milliseconds.
+// State-machine deadlines, in milliseconds.
 const DRAIN_TIMEOUT: u64 = 500;
 const BIND_TIMEOUT: u64 = 1_000;
 const FOCUS_TIMEOUT: u64 = 500;

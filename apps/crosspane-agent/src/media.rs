@@ -1,4 +1,4 @@
-//! The E2 data plane (docs/wp/E2-v0.md). Pixels never pass through the engine:
+//! The E2 data plane. Pixels never pass through the engine:
 //!
 //! - **Source:** capture frames → one encoder thread per node → `Transport::send_media`. A frame
 //!   the transport refuses (`Congested`) is dropped and the next one becomes a key frame, because a
@@ -11,7 +11,7 @@
 //!   - Region video (WP-2.32): when the peer advertised `h264roi`, only the moving rectangle of
 //!     the window goes as video and everything else stays lossless; its tiles are refreshed
 //!     losslessly as soon as motion leaves them.
-//!   - GPU paths (docs/wp/GPU-v0.md): a frame that is in GPU memory (DMA-BUF capture on Linux, an
+//!   - GPU paths: a frame that is in GPU memory (DMA-BUF capture on Linux, an
 //!     SCK IOSurface on the Mac) is hashed on the source GPU. Linux gathers only the tiles that go
 //!     out and writes NV12 straight into NVENC's memory; the Mac reads changed tiles in place and
 //!     hands the captured buffer to VideoToolbox. Any GPU failure falls back to the CPU path.

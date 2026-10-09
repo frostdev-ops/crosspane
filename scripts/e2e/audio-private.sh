@@ -3,8 +3,8 @@
 # server (scripts/audio/private-pipewire.sh), and a 1 kHz tone played into agent A's "B speakers"
 # virtual sink coming out of agent B's playback.
 #
-#   scripts/lead/impl-env.sh scripts/e2e/audio-private.sh
-#   KEEP=1 scripts/lead/impl-env.sh scripts/e2e/audio-private.sh    # keep logs and the work dir
+#   scripts/test-env.sh scripts/e2e/audio-private.sh
+#   KEEP=1 scripts/test-env.sh scripts/e2e/audio-private.sh    # keep logs and the work dir
 #
 # Never touches the owner's PipeWire, Hyprland or deployed agent:
 # - two private servers (A's and B's), no hardware, no session manager; scripts/audio/e2e-tone.py

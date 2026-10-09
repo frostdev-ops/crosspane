@@ -312,7 +312,7 @@ pub struct Platform {
     pub hotkeys: Option<Box<dyn GlobalHotkeys>>,
     pub keystore: Option<Box<dyn KeyStore>>,
     pub permissions: Box<dyn Permissions>,
-    // E2 (docs/wp/E2-v0.md)
+    // E2 window projection
     pub windows: Option<Box<dyn WindowSource>>,
     pub parking: Option<Box<dyn WindowParking>>,
     pub frames: Option<Box<dyn FrameCapture>>,
@@ -346,7 +346,7 @@ pub struct Platform {
     pub host_placement_mapping: Option<crosspane_render::proxy::HostPlacementMapping>,
 }
 
-/// A wgpu device for the source side's GPU work (docs/wp/GPU-v0.md, decision 3).
+/// A wgpu device for the source side's GPU work.
 #[derive(Clone, Debug)]
 pub struct GpuDevice {
     pub device: wgpu::Device,

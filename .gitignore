@@ -5,7 +5,7 @@
 *.profdata
 perf.data*
 
-# Work-package worktrees (one per delegated WP; see docs/plan/11 §Delegation mechanics)
+# Local development worktrees
 /.worktrees/
 
 # Fuzzing (cargo-fuzz)
@@ -14,14 +14,11 @@ perf.data*
 /fuzz/corpus/
 /fuzz/coverage/
 
-# Spikes: build output and raw measurement data. Raw captures (e.g. the P3 frame corpus) live
-# outside the repo in ~/crosspane-data/; spike reports commit only summaries and CSVs.
-/spikes/**/target/
-/spikes/**/out/
-
 # Machine-local configuration (signing identity, Team ID, host names)
 *.local.toml
 .env
+.env.*
+!.env.example
 
 # OS and editor files
 .DS_Store
@@ -29,16 +26,46 @@ perf.data*
 .vscode/
 *.swp
 *~
-/target/wp-notes/
+# Agent instructions, configuration, skills, and session state (at any depth)
+AGENTS.md
+AGENTS.override.md
+CLAUDE.md
+CLAUDE.local.md
+GEMINI.md
+SKILL.md
+.agents/
+.claude/
+.codex/
+.cursor/
+.rimewire/
+.opencode/
+.pi/
+.cursorrules
+.cursorignore
+opencode.json
+/.github/copilot-instructions.md
+/.github/agents/
+/.github/prompts/
 
-# Machine-local Rimewire harness registrations (project board config stays tracked).
-/.codex/config.toml
-/.codex/rimewire-install.json
-/.agents/skills/rimewire-setup/
-/.opencode/
-/opencode.json
-/.pi/
-/.claude/settings.local.json
+# Private plans, work packages, research, and machine handoff notes
+/docs/plan/
+/docs/wp/
+/docs/spikes/
+/docs/upstream/
+/docs/rimewire.md
+/docs/windows-dev.md
+/docs/setup/mac.md
+/docs/setup/apple-entitlement-request.md
+/spikes/
 
-# Python bytecode from lead tooling.
+# Private orchestration and authoring inputs
+/scripts/lead/
+/scripts/wp-board/
+/scripts/rimewire
+/scripts/wp-note
+/scripts/installer/real-check.sh
+/assets/brand/*prompt*.json
+/roundtrip.txt
+
+# Python bytecode
 __pycache__/

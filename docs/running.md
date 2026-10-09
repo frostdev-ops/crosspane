@@ -33,7 +33,7 @@ scripts/macos/bundle.sh --bin target/release/crosspane-agent --id io.frostdev.cr
     --name Crosspane --out target/macos-bundles --ui-element
 ```
 
-For the opt-in virtual-display window hiding on the Mac (D7), build with
+For the opt-in virtual-display window hiding on the Mac, build with
 `--features private-vdisplay` and set `mac_virtual_display = true` (below). Without it, projected
 Mac windows stay visible in place (M1 mirror).
 
@@ -56,7 +56,7 @@ again at any time.
 agent connects.
 
 **Linux**: the firewall must allow UDP 47811 (agent) and 47812 (pairing) from the LAN, e.g.
-`sudo ufw allow from 192.168.4.0/22 to any port 47811:47812 proto udp`.
+`sudo ufw allow from 192.168.1.0/24 to any port 47811:47812 proto udp` (replace the subnet with your LAN).
 
 ## Configuration
 
@@ -68,10 +68,10 @@ name = "desktop"          # what peers see
 port = 47811              # UDP; pairing uses port + 1
 crossing = true           # E1: the pointer may leave this machine's screen edges
 push_to_cross_ms = 0      # hold the pointer at an edge this long before crossing (0–200)
-mac_virtual_display = false   # Mac + private-vdisplay build only: hide projected windows (D7)
+mac_virtual_display = false   # Mac + private-vdisplay build only: hide projected windows
 
 [[peers]]                 # machines to connect to (both directions work; one side is enough)
-addr = "192.168.4.244:47811"
+addr = "192.168.1.20:47811" # replace with your peer's address
 
 [remap]                   # optional: modifier swaps while this machine drives a peer
 macbook = "swap-ctrl-gui" # none | swap-ctrl-gui (Ctrl ↔ ⌘/Super) | swap-alt-gui (Alt ↔ ⌘/Super)
@@ -224,34 +224,13 @@ setting: the shortcut follows the engine's default release chord. The command us
 runtime directory and the `crosspanectl` beside its executable. Paths containing apostrophes,
 control characters or the Lua string terminator are refused for installation.
 
-**Validation for the lead (WP-2.43e).** The nested `scripts/e2e/e1e2-nested.sh` checks twin parking,
-confirmed strips, compositor placements, startup/shutdown ownership and a direct home-bind round
-trip. It also requires a proxy-motion report observed without local capture motion and no home
-notice. The frozen engine API does not expose whether prevalidation or corroboration rejected the
-report. A virtual pointer cannot supply the capture's physical relative motion, so this run cannot
-validate home entry or establish the exact rejection reason. Run it through `scripts/lead/impl-env.sh`, passing the parent display only as
-`CROSSPANE_PARENT_WAYLAND_DISPLAY`; all clients and IPC calls address the named nests. The
-`CROSSPANE_TWIN_BACKEND=wayland` override requires `CROSSPANE_NESTED_HYPR=1` and a nonempty
-monitor list on that IPC endpoint containing only `WAYLAND-*` outputs. Other or unknown outputs
-retain the headless backend; this permits only the first twin stand-in in a nest. The existing
-`e1-nested.sh` changes the outer desktop and remains a lead-run regression check.
-
-The lead's live prerequisite uses one window briefly with a physical mouse and keyboard:
-
-- Entry notice shows the chord.
-- `hyprctl cursorpos` is on the twin.
-- Four strips are on it (`hyprctl layers`).
-- `binds -j` lists the bind.
-- Typing reaches W.
-- Push past an edge: B receives motion, A logs the exit, the bind is gone.
-- Press the chord while home: A warps to the fallback and B reports "control ended".
-- Re-enter.
-- `hyprctl reload` while home: the bind is reinstalled within 1 s.
-
-Record status before, during and after home, the bind verification line and the first placement
-report. Check entry with focus-following enabled and disabled, and check overlapping Mac proxies
-with one not the key window. If the nested twin prerequisite fails, report Mirror-only coverage;
-twin checks then remain live-only. No live check is run by the work-package implementer.
+**Isolated validation.** Run `scripts/test-env.sh scripts/e2e/e1e2-nested.sh` to check twin parking,
+confirmed strips, compositor placements, shortcut ownership and cleanup in two nested Hyprland
+instances. A virtual pointer cannot supply physical relative motion, so the harness does not
+validate home entry; that requires manual use with a physical mouse and keyboard. The
+`CROSSPANE_TWIN_BACKEND=wayland` override requires `CROSSPANE_NESTED_HYPR=1` and an IPC endpoint
+whose monitor list contains only `WAYLAND-*` outputs. See the
+[nested-session guide](../scripts/hypr-nested/README.md) before running platform tests.
 
 **Machines and permissions.**
 - `crosspanectl allow <peer> input|share|browse|present [--off]` grants or withdraws one thing.
@@ -267,7 +246,7 @@ permissions and recent notices.
 
 ## Audio (speakers, v0)
 
-A machine can play its sound on a paired machine's speakers (D8; design in `docs/wp/AUDIO-v0.md`).
+A machine can play its sound on a paired machine's speakers.
 Speakers only: microphones are not shared yet.
 
 - **Use it:** each paired machine that has an audio backend shows a virtual output called
@@ -291,9 +270,9 @@ Speakers only: microphones are not shared yet.
   `scripts/e2e/` that starts agents sets it (and `CROSSPANE_DISCOVERY=0`), except
   `audio-private.sh`, which runs on private audio servers.
 - **Limits (v0):** the Mac resamples the 48 kHz stream to its default output's rate (44.1, 48,
-  88.2, 96, 176.4 or 192 kHz; WP-3.7a/b); the Mac's driver serves one peer at a time;
+  88.2, 96, 176.4 or 192 kHz); the Mac's driver serves one peer at a time;
   an agent whose audio worker died keeps audio refused until it restarts.
-- **Check it without touching your audio:** `scripts/lead/impl-env.sh scripts/e2e/audio-private.sh`
+- **Check it without touching your audio:** `scripts/test-env.sh scripts/e2e/audio-private.sh`
   runs two agents, each on its own private PipeWire server, plays a 1 kHz tone into one's "speakers"
   and records what comes out of the other's output.
 
@@ -354,10 +333,10 @@ The JSON peer fields keep the existing `drag` value and add the bilateral `drag_
 - **Cursor shape:** over a projected window the cursor takes the source app's shape (text beam,
   hand, resize arrows) when the source can see it: on a Mac source (needs Screen Recording).
   Windows from Hyprland show the destination's default arrow: Hyprland 0.56.2's cursor capture
-  crashed the compositor once (02 §3.3), so it is off. `CROSSPANE_HYPR_CURSORS=1` in the agent's
+  crashed the compositor once, so it is off. `CROSSPANE_HYPR_CURSORS=1` in the agent's
   environment turns it on, and even then it only covers apps that draw their own cursor (GTK3,
   Firefox, Xwayland), not GTK4, Qt 6 or Chromium.
-- **GPU paths** (docs/wp/GPU-v0.md) are on by default. On Hyprland, captures go straight into GPU
+- **GPU paths** are on by default. On Hyprland, captures go straight into GPU
   memory (DMA-BUF) and NVENC encodes from it; on the Mac, captured frames are hashed on the GPU and
   VideoToolbox encodes and decodes without CPU copies. `CROSSPANE_GPU=0` in the agent's environment
   turns them off (CPU paths, as before); the agent logs "GPU frame capture on (DMA-BUF)" on Linux.
