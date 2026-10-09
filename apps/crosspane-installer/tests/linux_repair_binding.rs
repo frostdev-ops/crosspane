@@ -232,12 +232,12 @@ fn fixture_package(version: u8) -> Package {
     elf[20] = 1;
     elf[52] = 64;
     elf[63] = version;
-    let data: Vec<Vec<u8>> = (0..10)
+    let data: Vec<Vec<u8>> = (0..FILES.len())
         .map(|i| match i {
-            0..=4 => elf.clone(),
-            5 => include_bytes!("../../../packaging/linux/crosspane-agent.service").to_vec(),
-            6 => include_bytes!("../../../packaging/linux/crosspane-settings.desktop").to_vec(),
-            7 => include_bytes!("../../../packaging/linux/crosspane-installer.desktop").to_vec(),
+            0..=3 => elf.clone(),
+            4 => include_bytes!("../../../packaging/linux/crosspane-agent.service").to_vec(),
+            5 => include_bytes!("../../../packaging/linux/crosspane-settings.desktop").to_vec(),
+            6 => include_bytes!("../../../packaging/linux/crosspane-installer.desktop").to_vec(),
             _ => format!("inert-owned-resource-{i}").into_bytes(),
         })
         .collect();
@@ -399,7 +399,7 @@ impl Fixture {
         repair
     }
     fn manager_properties(&self) {
-        let unit = self.installer.targets()[5].clone();
+        let unit = self.installer.targets()[4].clone();
         *self.runner.unit.lock().unwrap() = unit.clone();
         let mut p: BTreeMap<String, String> = MANAGER_PROPERTIES
             .split(',')
@@ -904,7 +904,7 @@ fn confirm_runs_the_repair_up_to_the_new_agent_and_only_its_health_verifies_it()
             .iter()
             .filter(|l| l.contains("were put back"))
             .collect::<Vec<_>>(),
-        ["5 file(s) were put back."],
+        ["4 file(s) were put back."],
         "one count, of the confirmed delta: {:?}",
         done.lines
     );
@@ -1219,8 +1219,8 @@ fn r2_retirement_refuses_missing_changed_unreadable_foreign_and_pending_install_
         let path = retirement_journal(&f, "stopped");
         let state = f.io.target().paths().state_home.join("crosspane/installer");
         match case {
-            "missing" => fs::remove_file(&f.installer.targets()[9]).unwrap(),
-            "changed" => fs::write(&f.installer.targets()[9], b"user edit").unwrap(),
+            "missing" => fs::remove_file(&f.installer.targets()[FILES.len() - 1]).unwrap(),
+            "changed" => fs::write(&f.installer.targets()[FILES.len() - 1], b"user edit").unwrap(),
             "receipt" => fs::write(state.join("payload-outcome.json"), b"{}").unwrap(),
             "pending" => {
                 f.io.atomic_write(&f.proof(), &state.join("payload-intent.json"), b"{}")
@@ -1340,7 +1340,9 @@ fn r2_retirement_rechecks_journal_and_resources_after_offer() {
             "record_changed" => {
                 retirement_journal(&f, "payload_pending");
             }
-            "resource_changed" => fs::write(&f.installer.targets()[9], b"later edit").unwrap(),
+            "resource_changed" => {
+                fs::write(&f.installer.targets()[FILES.len() - 1], b"later edit").unwrap()
+            }
             "expired" => cancel.cancel(),
             _ => unreachable!(),
         }

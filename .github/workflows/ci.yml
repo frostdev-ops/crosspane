@@ -2,166 +2,130 @@ name: CI
 
 on:
   push:
+    branches: [master]
+  pull_request:
   workflow_dispatch:
-    inputs:
-      hosted_macos:
-        description: Also run on a GitHub-hosted macOS runner (billed minutes)
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Keep cold builds and caches within the standard hosted runners' disk budget.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
-  linux:
+  policy:
+    name: Formatting and policy
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Check out code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned toolchain
-        # With no argument, rustup installs the toolchain (and components) named in rust-toolchain.toml.
+        # Read the toolchain and components from rust-toolchain.toml.
         run: rustup toolchain install
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Check for preinstalled tools
-        id: tools
-        shell: bash
-        run: |
-          if command -v cargo-nextest >/dev/null && command -v cargo-deny >/dev/null; then
-            echo "installed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "installed=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Install check tools
-        if: steps.tools.outputs.installed != 'true'
+        with:
+          key: policy
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install policy tools
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: cargo-nextest,cargo-deny
-      - name: Install system libraries
-        # libxkbcommon for the Hyprland backends; lavapipe for the software-GPU render tests.
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libopus-dev libpipewire-0.3-dev libclang-dev pkg-config cmake mesa-vulkan-drivers
+          tool: cargo-deny@0.20.2,actionlint@1.7.12
       - name: Check formatting
         run: cargo fmt --check
-      - name: Check lints
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Run tests
-        run: cargo nextest run --workspace --locked --no-tests=pass
-        env:
-          CROSSPANE_REQUIRE_GPU: "1"
-      - name: Build documentation
-        run: cargo doc --workspace --no-deps --locked
-        env:
-          RUSTDOCFLAGS: -D warnings
+      - name: Check workflow
+        run: actionlint
       - name: Check dependency policy
-        run: cargo deny check
+        run: cargo deny --locked check
+      - name: Fetch the complete dependency graph
+        # The layering check inspects Linux and macOS graphs with --offline.
+        run: cargo fetch --locked
       - name: Check layering
         run: scripts/check-layering.sh
-      - name: Cross-check Windows skeleton
-        run: |
-          rustup target add x86_64-pc-windows-msvc
-          scripts/check-windows.sh
 
-  macos:
-    if: vars.CROSSPANE_MAC_RUNNER == 'true'
-    runs-on: [self-hosted, macOS, ARM64, crosspane-mac]
+  native:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-24.04
+          - name: macOS
+            runner: macos-15
+          - name: Windows
+            runner: windows-2025
+    env:
+      CROSSPANE_REQUIRE_GPU: "1"
     steps:
       - name: Check out code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned toolchain
-        # With no argument, rustup installs the toolchain (and components) named in rust-toolchain.toml.
         run: rustup toolchain install
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Check for preinstalled tools
-        id: tools
-        shell: bash
-        run: |
-          if command -v cargo-nextest >/dev/null && command -v cargo-deny >/dev/null; then
-            echo "installed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "installed=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Install check tools
-        if: steps.tools.outputs.installed != 'true'
+        with:
+          key: native-${{ matrix.runner }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install test runner
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: cargo-nextest,cargo-deny
-      - name: Locate system Opus
+          tool: cargo-nextest@0.9.148
+      - name: Install Linux libraries and software GPU
+        if: runner.os == 'Linux'
         run: |
-          test -f "$(brew --prefix opus)/lib/libopus.dylib"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxkbcommon-dev libopus-dev libpipewire-0.3-dev libclang-dev pkg-config cmake mesa-vulkan-drivers fonts-dejavu-core
+          mkdir -p "$RUNNER_TEMP/xdg-runtime"
+          chmod 700 "$RUNNER_TEMP/xdg-runtime"
+          echo "XDG_RUNTIME_DIR=$RUNNER_TEMP/xdg-runtime" >> "$GITHUB_ENV"
+          echo "CROSSPANE_TEST_FONT=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf" >> "$GITHUB_ENV"
+      - name: Install macOS libraries
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          brew install opus pkg-config
           echo "OPUS_LIB_DIR=$(brew --prefix opus)" >> "$GITHUB_ENV"
-      - name: Check formatting
-        run: cargo fmt --check
+          test -f /System/Library/Fonts/Supplemental/Arial.ttf
+          echo "CROSSPANE_TEST_FONT=/System/Library/Fonts/Supplemental/Arial.ttf" >> "$GITHUB_ENV"
+          # Hosted VMs do not have a Local Network permission grant.
+          echo "CROSSPANE_NO_MULTICAST=1" >> "$GITHUB_ENV"
+      - name: Configure Windows native builds
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # audiopus_sys builds bundled Opus with the runner's MSVC/CMake tools.
+          "OPUS_STATIC=1" >> $env:GITHUB_ENV
+          "AWS_LC_SYS_PREBUILT_NASM=1" >> $env:GITHUB_ENV
+          $testFont = Join-Path $env:WINDIR 'Fonts\arial.ttf'
+          if (!(Test-Path $testFont)) { throw "Missing system test font: $testFont" }
+          "CROSSPANE_TEST_FONT=$testFont" >> $env:GITHUB_ENV
       - name: Check lints
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run tests
-        run: cargo nextest run --workspace --locked --no-tests=pass
-        env:
-          # The runner is a launchd agent: no Local Network grant, so no LAN multicast (02 §3.2).
-          CROSSPANE_NO_MULTICAST: "1"
-          CROSSPANE_REQUIRE_GPU: "1"
-      - name: Check the opt-in private-API module (D7)
+        run: cargo nextest run --workspace --locked --no-tests=pass --no-fail-fast
+      - name: Check the opt-in macOS virtual-display module
+        if: runner.os == 'macOS'
         run: |
           cargo clippy -p crosspane-platform-macos --all-targets --features private-vdisplay --locked -- -D warnings
-          cargo nextest run -p crosspane-platform-macos --features private-vdisplay --locked --no-tests=pass
+          cargo nextest run -p crosspane-platform-macos --features private-vdisplay --locked --no-tests=pass --no-fail-fast
       - name: Build documentation
         run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
-      - name: Check dependency policy
-        run: cargo deny check
-      - name: Check layering
-        run: scripts/check-layering.sh
-
-  macos-hosted:
-    if: github.event_name == 'workflow_dispatch' && inputs.hosted_macos
-    runs-on: macos-latest
-    steps:
-      - name: Check out code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install pinned toolchain
-        # With no argument, rustup installs the toolchain (and components) named in rust-toolchain.toml.
-        run: rustup toolchain install
-      - name: Restore Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Check for preinstalled tools
-        id: tools
-        shell: bash
-        run: |
-          if command -v cargo-nextest >/dev/null && command -v cargo-deny >/dev/null; then
-            echo "installed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "installed=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Install check tools
-        if: steps.tools.outputs.installed != 'true'
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
-        with:
-          tool: cargo-nextest,cargo-deny
-      - name: Locate system Opus
-        run: |
-          test -f "$(brew --prefix opus)/lib/libopus.dylib"
-          echo "OPUS_LIB_DIR=$(brew --prefix opus)" >> "$GITHUB_ENV"
-      - name: Check formatting
-        run: cargo fmt --check
-      - name: Check lints
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Run tests
-        run: cargo nextest run --workspace --locked --no-tests=pass
-        env:
-          CROSSPANE_REQUIRE_GPU: "1"
-      - name: Build documentation
-        run: cargo doc --workspace --no-deps --locked
-        env:
-          RUSTDOCFLAGS: -D warnings
-      - name: Check dependency policy
-        run: cargo deny check
-      - name: Check layering
-        run: scripts/check-layering.sh

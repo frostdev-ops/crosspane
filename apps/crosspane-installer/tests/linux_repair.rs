@@ -598,7 +598,8 @@ mod uninstall_tests {
             record.progress.stage = CleanupStage::FilesObserved;
             // Simulated crash after this row's durable dispatch intent, before any outcome.
             record.progress.resources[index] = CleanupResult::Unknown;
-            let target = PayloadInstaller::new(f.io.clone()).unwrap().targets()[index].clone();
+            let proof = f.io.admit_cleanup(&deadline()).unwrap();
+            let target = PathBuf::from(&proof.receipt().resources[index].resolved_path);
             let before = f.io.read(&target, 4096, false).unwrap();
             f.io.atomic_write(&f.proof, &path, &record.encode().unwrap())
                 .unwrap();
@@ -626,7 +627,7 @@ mod uninstall_tests {
             );
             assert!(
                 f.io.metadata(Path::new(
-                    &PayloadInstaller::new(f.io.clone()).unwrap().targets()[unattempted]
+                    &proof.receipt().resources[unattempted].resolved_path
                 ))
                 .unwrap()
                 .is_none()
@@ -1051,9 +1052,27 @@ mod uninstall_tests {
         install
             .verify(&f.proof, &p, 19, 100, &f.reply(), &deadline())
             .unwrap();
+        // Identical bytes in new inodes have no authority from the recorded replacements.
+        for path in install.targets() {
+            let bytes = fs::read(path).unwrap();
+            let permissions = fs::metadata(path).unwrap().permissions();
+            fs::rename(path, path.with_extension("unprovenanced-original")).unwrap();
+            fs::write(path, bytes).unwrap();
+            fs::set_permissions(path, permissions).unwrap();
+        }
         let service = known_manager(&f, &p, true);
         let (plan, consent) = planned(&f, RemovalSelection::default(), Some(f.tracked()), 1, 100);
-        assert!(plan.actions().iter().all(|a| *a == ResourceAction::Retain));
+        assert!(
+            plan.actions()
+                .iter()
+                .enumerate()
+                .all(|(index, action)| *action
+                    == if index == 4 {
+                        ResourceAction::AlreadyAbsent
+                    } else {
+                        ResourceAction::Retain
+                    })
+        );
         let mut run = plan.begin(consent, service, &deadline()).unwrap();
         run.disable(&deadline()).unwrap();
         finish(&f, &mut run);
@@ -1062,7 +1081,13 @@ mod uninstall_tests {
                 .progress
                 .resources
                 .iter()
-                .all(|r| *r == CleanupResult::Kept)
+                .enumerate()
+                .all(|(index, result)| *result
+                    == if index == 4 {
+                        CleanupResult::AlreadyAbsent
+                    } else {
+                        CleanupResult::Kept
+                    })
         );
         assert_eq!(run.report().form, UninstallForm::NotClean);
         assert_eq!(f.erase_count(), 0);
@@ -2396,7 +2421,7 @@ mod uninstall_tests {
         assert!(report.recovery_retained);
         assert!(f.io.target().agent_path().exists(), "recovery is kept");
         let installer = PayloadInstaller::new(f.io.clone()).unwrap();
-        for index in [6, 7, 8, 9] {
+        for index in 5..FILES.len() {
             assert!(
                 f.io.metadata(&installer.targets()[index])
                     .unwrap()
@@ -2460,7 +2485,13 @@ mod uninstall_tests {
                 .progress
                 .resources
                 .iter()
-                .all(|r| *r == CleanupResult::Removed)
+                .enumerate()
+                .all(|(index, result)| *result
+                    == if index == 4 {
+                        CleanupResult::AlreadyAbsent // The retired tutorial slot is absent.
+                    } else {
+                        CleanupResult::Removed
+                    })
         );
         assert!(report.empty_directories_retained);
         assert_eq!(f.erase_count(), 0);

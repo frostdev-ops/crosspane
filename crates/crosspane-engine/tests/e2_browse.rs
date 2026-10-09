@@ -442,15 +442,27 @@ fn browse_and_pull_check_connections_and_forward_uncorrelated_answers() {
         destination.handle(control(
             C,
             Message::WindowList {
-                request: u32::MAX,
+                request: 0x7fff_ffff,
                 windows: windows.clone()
             }
         )),
         vec![Output::BrowseResult {
             peer: C,
-            request: u32::MAX,
-            result: Ok(windows)
+            request: 0x7fff_ffff,
+            result: Ok(windows.clone())
         }]
+    );
+    // The high bit identifies engine-owned requests, which never satisfy application waiters.
+    assert!(
+        destination
+            .handle(control(
+                C,
+                Message::WindowList {
+                    request: u32::MAX,
+                    windows
+                }
+            ))
+            .is_empty()
     );
     assert_eq!(
         destination.handle(control(

@@ -1018,7 +1018,7 @@ fn crash_points_redetect_then_resume_and_keep_previous_payload() {
         Interruption::Staged(0),
         Interruption::BackedUp(0),
         Interruption::Replaced(0),
-        Interruption::Replaced(9),
+        Interruption::Replaced(FILES.len() - 1),
         Interruption::Outcome,
     ] {
         let mut f = Fixture::new();
@@ -1637,8 +1637,8 @@ fn exchange_matching_owner_file_is_not_the_admitted_staged_inode_on_resume() {
         .install
         .plan(&f.proof, &p, OperationId(1), MatchingFiles::Preserve)
         .unwrap();
-    let owner_path = f.install.targets()[7].clone();
-    let bytes = installed_contents(&f, 1)[7].clone();
+    let owner_path = f.install.targets()[8].clone();
+    let bytes = installed_contents(&f, 1)[8].clone();
     let stage = f.sibling(1, 8, false);
     let selected = owner_path.clone();
     let matching = bytes.clone();
@@ -1661,7 +1661,7 @@ fn exchange_matching_owner_file_is_not_the_admitted_staged_inode_on_resume() {
     assert_ne!(owner.ino(), recovery.ino());
     let record = fs::read(f.record(true)).unwrap();
     let journal: Value = serde_json::from_slice(&record).unwrap();
-    let admission = &journal["items"][7]["replacement"];
+    let admission = &journal["items"][8]["replacement"];
     let parent = fs::metadata(stage.parent().unwrap()).unwrap();
     assert_eq!(admission["file"], json!([recovery.dev(), recovery.ino()]));
     assert_eq!(admission["parent"], json!([parent.dev(), parent.ino()]));
@@ -1711,7 +1711,7 @@ fn pending_staged_identity_survives_reconstruction_and_retry_interleavings() {
             Err(PayloadError::OutcomeUnknown)
         );
         let stage = f.sibling(1, 8, false);
-        let target = f.install.targets()[7].clone();
+        let target = f.install.targets()[8].clone();
         let preserved = f.root.join("preserved-stage");
         let original = fs::metadata(&stage).unwrap();
         let bytes = fs::read(&stage).unwrap();
@@ -1795,7 +1795,7 @@ fn exchange_retry_final_check_preserves_late_stage_substitution_and_every_backup
         Err(PayloadError::OutcomeUnknown)
     );
     let stage = f.sibling(2, 8, false);
-    let target = f.install.targets()[7].clone();
+    let target = f.install.targets()[8].clone();
     let target_inode = fs::metadata(&target).unwrap().ino();
     let staged_inode = fs::metadata(&stage).unwrap().ino();
     let bytes = fs::read(&stage).unwrap();
@@ -1822,7 +1822,7 @@ fn exchange_retry_final_check_preserves_late_stage_substitution_and_every_backup
     );
     let substitute_inode = fs::metadata(&stage).unwrap().ino();
     assert_ne!(substitute_inode, staged_inode);
-    assert_eq!(fs::read(&target).unwrap(), old[7]);
+    assert_eq!(fs::read(&target).unwrap(), old[8]);
     assert_eq!(fs::metadata(&target).unwrap().ino(), target_inode);
     assert_eq!(fs::read(&preserved).unwrap(), bytes);
     assert_eq!(fs::metadata(&preserved).unwrap().ino(), staged_inode);
@@ -1831,8 +1831,8 @@ fn exchange_retry_final_check_preserves_late_stage_substitution_and_every_backup
     assert_eq!(fs::read(f.record(false)).unwrap(), outcome);
     let previous: Value = serde_json::from_slice(&outcome).unwrap();
     assert_eq!(previous["receipt"]["operation_id"], json!(1));
-    assert!(!f.sibling(2, 9, true).exists());
-    for (i, expected) in old.iter().enumerate().take(9) {
+    assert_eq!(old.len(), FILES.len());
+    for (i, expected) in old.iter().enumerate().take(FILES.len()) {
         assert_eq!(&fs::read(f.sibling(2, i, true)).unwrap(), expected);
     }
     let rebuilt_again = PayloadInstaller::new(f.io.clone()).unwrap();
@@ -1854,10 +1854,10 @@ fn exchange_retry_final_check_preserves_late_stage_substitution_and_every_backup
         Err(PayloadError::Pending)
     ));
     assert_eq!(fs::read(f.record(false)).unwrap(), outcome);
-    assert_eq!(fs::read(&target).unwrap(), old[7]);
+    assert_eq!(fs::read(&target).unwrap(), old[8]);
     assert_eq!(fs::metadata(&target).unwrap().ino(), target_inode);
     assert_eq!(fs::metadata(&stage).unwrap().ino(), substitute_inode);
-    for (i, expected) in old.iter().enumerate().take(9) {
+    for (i, expected) in old.iter().enumerate().take(FILES.len()) {
         assert_eq!(&fs::read(f.sibling(2, i, true)).unwrap(), expected);
     }
 }
@@ -2264,7 +2264,7 @@ fn changed_quarantine_contents_survive_unlink_and_reconstructed_retries() {
         fs::read(&retired).unwrap(),
         b"changed in place before unlink"
     );
-    assert!((1..10).all(|i| f.sibling(2, i, true).exists()));
+    assert!((1..FILES.len()).all(|i| f.sibling(2, i, true).exists()));
 }
 
 /// Actual journal write/file-fsync/rename/parent-fsync failures delegate to WP-4.7a's
@@ -2274,7 +2274,7 @@ fn changed_quarantine_contents_survive_unlink_and_reconstructed_retries() {
 fn journal_publish_checkpoints_reconstruct_every_transition_and_retained_bytes() {
     let mut cases = Vec::new();
     for after in [false, true] {
-        for ordinal in 0..=10 {
+        for ordinal in 0..=FILES.len() as u64 {
             cases.push((true, 0, after, ordinal));
         }
         cases.push((false, 1, after, 0));
@@ -2594,7 +2594,7 @@ fn torn_journals_and_hostile_mutable_leaves_preserve_payload() {
 
 #[test]
 fn mutable_ancestry_replacements_after_plan_and_during_apply_never_escape() {
-    for index in [0, 5, 6, 8, 9] {
+    for index in [0, 4, 5, 7, 8] {
         for during in [false, true] {
             let mut f = Fixture::new();
             f.verified(&package(1), 1);

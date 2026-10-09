@@ -193,11 +193,10 @@ fn explicit_font_is_required_absolute_nonempty_and_bounded() {
 fn fresh_consent_defaults_are_explicit_and_no_animation_completes_checks() {
     let permissions = demo::fixture(ScreenId::Permissions);
     for label in [
-        "Accessibility",
+        "Device Control and Data Access",
         "Input Monitoring",
-        "Screen Recording",
+        "Screen & System Audio Recording",
         "Microphone",
-        "Local Network",
     ] {
         assert!(permissions.rows.iter().any(|row| row.label == label));
     }

@@ -954,11 +954,15 @@ fn switch_releases_old_target_and_drops_later_ups_without_replaying_modifiers() 
         caps_lock: Some(true),
         ..LockKeys::default()
     };
-    f.send(Input::Capture(CaptureEvent::LockKeys(locks)));
+    let lock_update = f.send(Input::Capture(CaptureEvent::LockKeys(locks)));
+    assert!(lock_update.iter().any(|out| matches!(out,
+        Output::SendInput { peer, msg: InputMessage::LockKeys { session: sent, seq: 2, keys } }
+        if *peer == B && *sent == session && *keys == locks
+    )));
     let out = f.raw(1, 2000.0);
     assert_eq!(
         transitions(&out),
-        vec![(B, session, 2, Held::Key(KEY), false)]
+        vec![(B, session, 3, Held::Key(KEY), false)]
     );
     assert_end(&out, B, session, EndReason::Released);
     let (peer, next, display, entry, lock_keys) = start(&out);

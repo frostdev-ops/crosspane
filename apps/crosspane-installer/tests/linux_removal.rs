@@ -745,12 +745,12 @@ fn package() -> Package {
     );
     elf[20] = 1;
     elf[52] = 64;
-    let data: Vec<Vec<u8>> = (0..10)
+    let data: Vec<Vec<u8>> = (0..FILES.len())
         .map(|i| match i {
-            0..=4 => elf.clone(),
-            5 => include_bytes!("../../../packaging/linux/crosspane-agent.service").to_vec(),
-            6 => include_bytes!("../../../packaging/linux/crosspane-settings.desktop").to_vec(),
-            7 => include_bytes!("../../../packaging/linux/crosspane-installer.desktop").to_vec(),
+            0..=3 => elf.clone(),
+            4 => include_bytes!("../../../packaging/linux/crosspane-agent.service").to_vec(),
+            5 => include_bytes!("../../../packaging/linux/crosspane-settings.desktop").to_vec(),
+            6 => include_bytes!("../../../packaging/linux/crosspane-installer.desktop").to_vec(),
             _ => b"inert resource".to_vec(),
         })
         .collect();

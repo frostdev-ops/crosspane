@@ -222,12 +222,12 @@ fn fixture_package(version: u8) -> Package {
     elf[20] = 1;
     elf[52] = 64;
     elf[63] = version;
-    let data: Vec<Vec<u8>> = (0..10)
+    let data: Vec<Vec<u8>> = (0..FILES.len())
         .map(|i| match i {
-            0..=4 => elf.clone(),
-            5 => include_bytes!("../../../packaging/linux/crosspane-agent.service").to_vec(),
-            6 => include_bytes!("../../../packaging/linux/crosspane-settings.desktop").to_vec(),
-            7 => include_bytes!("../../../packaging/linux/crosspane-installer.desktop").to_vec(),
+            0..=3 => elf.clone(),
+            4 => include_bytes!("../../../packaging/linux/crosspane-agent.service").to_vec(),
+            5 => include_bytes!("../../../packaging/linux/crosspane-settings.desktop").to_vec(),
+            6 => include_bytes!("../../../packaging/linux/crosspane-installer.desktop").to_vec(),
             _ => format!("inert-owned-resource-{i}").into_bytes(),
         })
         .collect();
@@ -389,7 +389,7 @@ impl Fixture {
         repair
     }
     fn manager_properties(&self) {
-        let unit = self.installer.targets()[5].clone();
+        let unit = self.installer.targets()[4].clone();
         *self.runner.unit.lock().unwrap() = unit.clone();
         let mut p: BTreeMap<String, String> = MANAGER_PROPERTIES
             .split(',')
@@ -721,7 +721,7 @@ fn clean_stop_payload_start_new_recovered_health_is_the_only_verified_path() {
     let input = repair_input(&proof, &package, &service, Some(&reply), &d);
     let inventory = repair.inventory(&input).unwrap();
     let plan = repair.plan(inventory, 1, OperationId(2)).unwrap();
-    assert_eq!(plan.delta().len(), 5);
+    assert_eq!(plan.delta().len(), 4);
     assert!(plan.preview().contains("Keep this machine"));
     let consent = plan.consent(1, OperationId(2), true).unwrap();
     let current = repair.inventory(&input).unwrap();
@@ -1160,7 +1160,7 @@ fn begin_clean_repair(f: &Fixture, repair: &mut LinuxRepair, input: &RepairInput
     );
 }
 fn backups(f: &Fixture) -> Vec<PathBuf> {
-    f.installer.targets()[..5]
+    f.installer.targets()[..4]
         .iter()
         .enumerate()
         .map(|(i, target)| target.with_file_name(format!(".crosspane-previous-2-{i}")))
@@ -1442,7 +1442,7 @@ fn repair_completion_write_failure_keeps_the_independently_verified_health_fact(
     let io = f.io.clone();
     repair
         .scratch_payload_hook(Some(Arc::new(move |at| {
-            if at == Interruption::Retired(9) {
+            if at == Interruption::Retired(FILES.len() - 1) {
                 // Change only our repair journal, never the frozen private payload record.
                 let path = io
                     .target()

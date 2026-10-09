@@ -1399,10 +1399,12 @@ mod tests {
                 gesture.refuse(PortalId(1), crosspane_types::hid::MouseButton::PRIMARY, now);
             }
             gesture.observe(None, &portals, &monitors, now + Duration::from_millis(1));
+            // An unarmed gesture tolerates one missed poll; two misses release it.
+            gesture.observe(None, &portals, &monitors, now + Duration::from_millis(2));
             gesture.refuse(
                 PortalId(1),
                 crosspane_types::hid::MouseButton::PRIMARY,
-                now + Duration::from_millis(2),
+                now + Duration::from_millis(3),
             );
             assert!(gesture.last.is_none());
             assert!(gesture.watch.is_none());

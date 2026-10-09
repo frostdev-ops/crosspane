@@ -1132,8 +1132,8 @@ fn proxy_placed_unplaced_ignores_a_stale_display_field() {
 
 #[test]
 fn unknown_projection_variant_is_unknown_control() {
-    // 16..=19 are the DRAG-v0 messages; future bodies are still unknown.
-    for variant in [20, 99, 536_870_911] {
+    // 16..=19 are the drag messages and 20 is PullAt; future bodies are still unknown.
+    for variant in [21, 99, 536_870_911] {
         assert_eq!(
             decode_control(&projection_frame(variant, &[])),
             Err(WireError::UnknownControl)

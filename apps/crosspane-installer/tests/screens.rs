@@ -646,13 +646,13 @@ fn keyboard_scrolls_long_content_while_release_and_stop_remain_visible() {
     harness.settle(&view);
     let after = harness.texts();
     assert_ne!(before, after);
-    assert!(harness.rect("Apply permissions").max.y <= 600.0);
+    assert!(harness.rect("Allow all and continue").max.y <= 600.0);
     assert!(harness.rect("Back").max.y <= 600.0);
     assert_eq!(
-        harness.click(&view, "Apply permissions"),
+        harness.click(&view, "Allow all and continue"),
         vec![WizardAction {
             revision: 1,
-            intent: WizardIntent::Button(crosspane_installer::live::ids::GRANTS_APPLY)
+            intent: WizardIntent::Button(crosspane_installer::live::ids::GRANTS_ALL)
         }]
     );
 }
@@ -1039,7 +1039,7 @@ fn overflow_has_a_dormant_solid_track_and_handle_and_keeps_fixed_actions_visible
             (message.top() - body_clip.top()).abs() <= 4.0,
             "Overflow must stay top-aligned: content {message:?}, body {body_clip:?}"
         );
-        for label in ["Apply permissions", "Back"] {
+        for label in ["Allow all and continue", "Back"] {
             let (raw, clip, _) = harness.raw_text(label);
             assert!(clip.contains_rect(raw) && raw.bottom() <= size.y);
         }
@@ -1623,7 +1623,8 @@ fn edge_during_change(
 
 #[test]
 fn pages_slide_in_their_direction_of_travel_reduced_only_fades_and_off_is_instant() {
-    let label = "Both computers will show a number to compare.";
+    let label =
+        "Both computers will show a number to compare.\n\nSkipping Connect also skips Arrange.";
     let rest = edge_during_change(
         ScreenId::Welcome,
         ScreenId::Connect,

@@ -149,7 +149,7 @@ scripts/test-env.sh cargo clippy --workspace --all-targets --locked -- -D warnin
 scripts/test-env.sh cargo nextest run --workspace --locked --no-tests=pass
 ```
 
-The [CI workflow](.github/workflows/ci.yml) also checks Rust documentation, dependency policy, layering and Windows cross-compilation. Native desktop scenarios require separate platform runs. Hyprland compositor tests skip unless the [nested test session](scripts/hypr-nested/README.md) enables them explicitly.
+The [CI workflow](.github/workflows/ci.yml) runs automatically on pull requests and pushes to `master`, using GitHub-hosted Linux, macOS and Windows runners. It checks formatting, Clippy, workspace tests, Rust documentation, dependency policy and layering, including the opt-in macOS virtual-display module. Rust dependencies are cached; Linux offscreen rendering uses Mesa's software GPU. Native desktop scenarios require separate platform runs. Hyprland compositor tests skip unless the [nested test session](scripts/hypr-nested/README.md) enables them explicitly.
 
 ## Documentation
 
