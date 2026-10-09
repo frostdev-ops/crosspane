@@ -72,7 +72,8 @@ Each computer runs its own agent in your desktop session. The settings app talks
 | **Apple Silicon Mac** | Input sharing, projection, clipboard, CoreAudio speaker sharing, menu-bar controls and installer flows are implemented. Requires macOS permissions and signed app bundles; see the [macOS build helpers](scripts/macos/README.md). |
 | **Linux / Hyprland** | Input sharing, projection, window dragging, clipboard, PipeWire speaker sharing, tray controls and installer flows are implemented. Requires a Hyprland graphical session and native libraries. The installer targets a uwsm-managed session. |
 | **Windows** | Development preview: input sharing, projection, dragging, clipboard, WASAPI playback and projected-app audio, tray controls, settings and installer flows are implemented. Signed distribution and broader attended validation are unfinished. |
-| **GNOME / KDE and other Linux desktops** | No platform backend is implemented yet. |
+| **GNOME Wayland** | No backend is implemented yet. GNOME support is being scoped; current Linux builds target Hyprland. |
+| **KDE and other Linux desktops** | No platform backend is implemented yet. |
 
 Windows source and destination fixtures, native smoke scripts and platform models are included in the repository. A successful build or portable model test does not establish that every native desktop scenario works.
 
@@ -149,7 +150,7 @@ scripts/test-env.sh cargo clippy --workspace --all-targets --locked -- -D warnin
 scripts/test-env.sh cargo nextest run --workspace --locked --no-tests=pass
 ```
 
-The [CircleCI pipeline](.circleci/config.yml) runs on pushes, including pull-request branches and `master`, using CircleCI-hosted Linux, macOS and Windows machines. It checks formatting, Clippy, workspace tests, Rust documentation, dependency policy and layering, including the opt-in macOS virtual-display module. Rust dependencies and build output are cached separately for each platform; Linux offscreen rendering uses Mesa's software GPU. Native desktop scenarios require separate platform runs. Hyprland compositor tests skip unless the [nested test session](scripts/hypr-nested/README.md) enables them explicitly.
+The [CircleCI pipeline](.circleci/config.yml) runs on pushes, including pull-request branches and `master`, using CircleCI-hosted Linux, macOS and Windows runners. It checks formatting, Clippy, workspace tests, Rust documentation, dependency policy and layering, including the opt-in macOS virtual-display module. Rust dependencies and build output are cached separately for each platform; Linux offscreen rendering uses Mesa's software GPU. Native desktop scenarios require separate platform runs. Hyprland compositor tests skip unless the [nested test session](scripts/hypr-nested/README.md) enables them explicitly.
 
 ## Documentation
 
