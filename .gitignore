@@ -19,6 +19,7 @@ perf.data*
 .env
 .env.*
 !.env.example
+/.circleci/info.yml
 
 # OS and editor files
 .DS_Store

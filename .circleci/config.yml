@@ -1,0 +1,159 @@
+version: 2.1
+
+commands:
+  restore-rust-cache:
+    parameters:
+      job:
+        type: string
+    steps:
+      - restore_cache:
+          keys:
+            - rust-v1-<< parameters.job >>-{{ arch }}-{{ checksum "rust-toolchain.toml" }}-{{ checksum "Cargo.lock" }}
+      - run:
+          name: Install pinned Rust and CI tools
+          command: .circleci/install-tools.sh << parameters.job >>
+
+  save-rust-cache:
+    parameters:
+      job:
+        type: string
+    steps:
+      - when:
+          condition:
+            equal: [master, << pipeline.git.branch >>]
+          steps:
+            - save_cache:
+                key: rust-v1-<< parameters.job >>-{{ arch }}-{{ checksum "rust-toolchain.toml" }}-{{ checksum "Cargo.lock" }}
+                paths:
+                  - ~/.cargo/registry
+                  - ~/.cargo/git
+                  - target
+
+  native-checks:
+    steps:
+      - run:
+          name: Check lints
+          command: cargo clippy --workspace --all-targets --locked -- -D warnings
+          no_output_timeout: 20m
+      - run:
+          name: Run workspace tests
+          command: cargo nextest run --workspace --locked --no-tests=pass --no-fail-fast
+          no_output_timeout: 20m
+      - run:
+          name: Build documentation
+          command: cargo doc --workspace --no-deps --locked
+          environment:
+            RUSTDOCFLAGS: -D warnings
+
+jobs:
+  policy:
+    docker:
+      - image: cimg/base:2026.10
+    resource_class: medium
+    environment: &rust-environment
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - checkout
+      - restore-rust-cache:
+          job: policy
+      - run:
+          name: Check formatting
+          command: cargo fmt --check
+      - run:
+          name: Check dependency policy
+          command: cargo deny --locked check
+      - run:
+          name: Check layering
+          command: |
+            cargo fetch --locked
+            scripts/check-layering.sh
+      - save-rust-cache:
+          job: policy
+
+  linux:
+    docker:
+      - image: cimg/base:2026.10
+    resource_class: large
+    environment:
+      <<: *rust-environment
+      CROSSPANE_REQUIRE_GPU: "1"
+      CROSSPANE_TEST_FONT: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+    steps:
+      - checkout
+      - run:
+          name: Install Linux libraries and software GPU
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends libxkbcommon-dev libopus-dev libpipewire-0.3-dev libclang-dev pkg-config cmake mesa-vulkan-drivers fonts-dejavu-core
+            mkdir -p /tmp/crosspane-xdg-runtime
+            chmod 700 /tmp/crosspane-xdg-runtime
+            echo 'export XDG_RUNTIME_DIR=/tmp/crosspane-xdg-runtime' >> "$BASH_ENV"
+      - restore-rust-cache:
+          job: linux
+      - native-checks
+      - save-rust-cache:
+          job: linux
+
+  macos:
+    macos:
+      xcode: "16.4.0"
+    resource_class: m4pro.medium
+    environment:
+      <<: *rust-environment
+      CROSSPANE_REQUIRE_GPU: "1"
+      CROSSPANE_TEST_FONT: /System/Library/Fonts/Supplemental/Arial.ttf
+      CROSSPANE_NO_MULTICAST: "1"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - checkout
+      - run:
+          name: Install macOS libraries
+          command: |
+            brew install opus pkg-config
+            printf 'export OPUS_LIB_DIR=%q\n' "$(brew --prefix opus)" >> "$BASH_ENV"
+            test -f "$CROSSPANE_TEST_FONT"
+      - restore-rust-cache:
+          job: macos
+      - native-checks
+      - run:
+          name: Check the opt-in macOS virtual-display module
+          command: |
+            cargo clippy -p crosspane-platform-macos --all-targets --features private-vdisplay --locked -- -D warnings
+            cargo nextest run -p crosspane-platform-macos --features private-vdisplay --locked --no-tests=pass --no-fail-fast
+      - save-rust-cache:
+          job: macos
+
+  windows:
+    machine:
+      image: windows-server-2022-gui:current
+      shell: bash.exe -eo pipefail
+    resource_class: windows.medium
+    environment:
+      <<: *rust-environment
+      CROSSPANE_REQUIRE_GPU: "1"
+      OPUS_STATIC: "1"
+      AWS_LC_SYS_PREBUILT_NASM: "1"
+    steps:
+      - checkout
+      - run:
+          name: Configure Windows native builds
+          command: |
+            test_font="$(cygpath -m "$WINDIR")/Fonts/arial.ttf"
+            test -f "$test_font"
+            printf 'export CROSSPANE_TEST_FONT=%q\n' "$test_font" >> "$BASH_ENV"
+      - restore-rust-cache:
+          job: windows
+      - native-checks
+      - save-rust-cache:
+          job: windows
+
+workflows:
+  ci:
+    jobs:
+      - policy
+      - linux
+      - macos
+      - windows

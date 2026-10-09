@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/frostdev-ops/crosspane/actions/workflows/ci.yml"><img src="https://github.com/frostdev-ops/crosspane/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://app.circleci.com/pipelines/circleci/15VAKL5c22iQHfLjF5ihfq/SzxKb1xbgKiSUFuy7zcH8E"><img src="https://img.shields.io/badge/CI-CircleCI-89cbd5" alt="CircleCI"></a>
   <img src="https://img.shields.io/badge/status-development%20preview-89cbd5" alt="Development preview">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-89cbd5" alt="GPL-3.0-or-later"></a>
 </p>
@@ -149,7 +149,7 @@ scripts/test-env.sh cargo clippy --workspace --all-targets --locked -- -D warnin
 scripts/test-env.sh cargo nextest run --workspace --locked --no-tests=pass
 ```
 
-The [CI workflow](.github/workflows/ci.yml) runs automatically on pull requests and pushes to `master`, using GitHub-hosted Linux, macOS and Windows runners. It checks formatting, Clippy, workspace tests, Rust documentation, dependency policy and layering, including the opt-in macOS virtual-display module. Rust dependencies are cached; Linux offscreen rendering uses Mesa's software GPU. Native desktop scenarios require separate platform runs. Hyprland compositor tests skip unless the [nested test session](scripts/hypr-nested/README.md) enables them explicitly.
+The [CircleCI pipeline](.circleci/config.yml) runs on pushes, including pull-request branches and `master`, using CircleCI-hosted Linux, macOS and Windows machines. It checks formatting, Clippy, workspace tests, Rust documentation, dependency policy and layering, including the opt-in macOS virtual-display module. Rust dependencies and build output are cached separately for each platform; Linux offscreen rendering uses Mesa's software GPU. Native desktop scenarios require separate platform runs. Hyprland compositor tests skip unless the [nested test session](scripts/hypr-nested/README.md) enables them explicitly.
 
 ## Documentation
 
