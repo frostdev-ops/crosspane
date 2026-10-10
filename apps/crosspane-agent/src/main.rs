@@ -577,6 +577,12 @@ fn start_agent(
             host.0.set_importer(Arc::new(
                 crosspane_platform_macos::gpu_import::import_picture,
             ));
+            // No Hyprland placement seat (GNOME, KDE): no compositor IPC places the proxies, so
+            // winit's own events are their only geometry source (WP-G2.1). Hyprland keeps the
+            // default, and its host behaves as before.
+            #[cfg(target_os = "linux")]
+            host.0
+                .set_native_geometry(platform.proxy_placement.is_none());
             Some(host)
         }
         Err(e) => {

@@ -16,7 +16,8 @@ mod input;
 
 /// Where to put a new proxy's content (DRAG-v0 §4): its top-left in the desktop's global logical
 /// coordinates, computed by the agent from the display's origin and scale. macOS places the
-/// frame so that the content lands there; Wayland hosts ignore it (the agent places by IPC).
+/// frame so that the content lands there; Wayland hosts ignore it, because a Wayland client cannot
+/// position itself (on Hyprland the agent places by IPC; on GNOME/KDE the compositor places it).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HostPlace {
     pub content: winit::dpi::LogicalPosition<f64>,
@@ -280,6 +281,13 @@ pub enum HostEvent {
     /// (the platform's native id: the `CGDirectDisplayID` on macOS; `None` where the host can't
     /// tell, e.g. Wayland), `size` device pixels. `visible: false`: minimised or fully occluded.
     /// Sent after `Opened` and whenever any of it changes.
+    ///
+    /// Wayland knows neither the content's position nor its output, so there the report is
+    /// `monitor: None` with a zero `origin` ("can't tell", never a guess) and `size` is the
+    /// content's own size. It is sent after `Opened` and on occlusion, and on every geometry or
+    /// focus change as well once [`ProxyHost::set_native_geometry`] says the toolkit is the only
+    /// geometry source (no compositor IPC supplies the placement, as on GNOME and KDE).
+    /// winit 0.30's Wayland backend never emits `Occluded`, so `visible` stays `true` there.
     Placed {
         id: u64,
         /// The own NSWindow's number on macOS; unavailable on other platforms.
@@ -352,6 +360,7 @@ impl HostHandle {
 pub struct ProxyHost {
     event_loop: EventLoop<HostCommand>,
     importer: Option<PictureImporter>,
+    native_geometry: bool,
     #[cfg(target_os = "windows")]
     placement_mapping: Option<HostPlacementMapping>,
     #[cfg(target_os = "windows")]
@@ -404,6 +413,7 @@ impl ProxyHost {
             Self {
                 event_loop,
                 importer: None,
+                native_geometry: false,
                 #[cfg(target_os = "windows")]
                 placement_mapping: None,
                 #[cfg(target_os = "windows")]
@@ -418,6 +428,21 @@ impl ProxyHost {
     /// Import `VideoNative` pictures with `importer` instead of copying them.
     pub fn set_importer(&mut self, importer: PictureImporter) {
         self.importer = Some(importer);
+    }
+
+    /// Say before `run` that no compositor IPC supplies the proxies' placement, so the toolkit
+    /// (winit) is the only geometry source: the agent passes `true` on a Wayland desktop it has
+    /// no placement seat for (GNOME, KDE) and leaves the default `false` on Hyprland, where its
+    /// own placement producer reads the compositor and the host's behaviour is unchanged.
+    ///
+    /// With `true`, every `Resized`/`ScaleFactorChanged`/`Focused`/`Occluded` the window system
+    /// delivers also re-samples the window for [`HostEvent::Placed`], the way the macOS and
+    /// Windows hosts do. A Wayland host can say the content's size and visibility but not its
+    /// place, so those reports carry `monitor: None` and a zero origin ("can't tell"); nothing is
+    /// invented. Resize, scale, focus, fullscreen and close come from winit whatever this says.
+    /// macOS and Windows already track geometry and ignore it.
+    pub fn set_native_geometry(&mut self, native: bool) {
+        self.native_geometry = native;
     }
 
     /// Install a placement provider before `run`. Only the Windows host consumes it.
@@ -449,6 +474,7 @@ impl ProxyHost {
             self.event_loop.create_proxy(),
             events,
             self.importer,
+            self.native_geometry,
             #[cfg(target_os = "windows")]
             self.placement_mapping,
             #[cfg(target_os = "windows")]
@@ -466,6 +492,7 @@ impl fmt::Debug for ProxyHost {
         f.debug_struct("ProxyHost")
             .field("event_loop", &self.event_loop)
             .field("importer", &self.importer.is_some())
+            .field("native_geometry", &self.native_geometry)
             .finish()
     }
 }

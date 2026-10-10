@@ -335,6 +335,13 @@ pub struct Platform {
     pub own_windows: OwnWindowsRead,
     /// What the startup recovery of parked windows came to (WP-4.5).
     pub startup_recovery: StartupRecovery,
+    /// Whether this node's input injection is authorized *right now* (WP-G1.6). `None` for
+    /// backends whose injectors are usable whenever they exist (Hyprland, macOS, Windows): the
+    /// agent's grants then depend on the injectors' presence alone. The portal backends (GNOME,
+    /// KDE) set it to the EIS source's liveness, so closing the RemoteDesktop session retires
+    /// `InputAccept` on the next housekeeping tick. It is called on the agent's loop and must
+    /// not block.
+    pub input_live: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Proof that the native factory admitted its exact isolated acceptance contract.
     #[cfg(windows)]
     pub(crate) acceptance_scratch: bool,
@@ -344,6 +351,13 @@ pub struct Platform {
     /// Fresh Windows placement rows. The refresh closure is weak; `displays` owns its worker.
     #[cfg(windows)]
     pub host_placement_mapping: Option<crosspane_render::proxy::HostPlacementMapping>,
+    /// The RemoteDesktop portal session of the GNOME/KDE backends, kept for the platform's
+    /// lifetime (WP-G1.6). It is the last field on purpose: fields drop in declaration order, so
+    /// the injectors above release what they hold before the session closes. The status glue
+    /// thread holds it only weakly (see `portal_glue`).
+    #[cfg(target_os = "linux")]
+    pub(crate) portal_session:
+        Option<Arc<crosspane_platform_linux::portal::session::RemoteDesktopSession>>,
 }
 
 /// A wgpu device for the source side's GPU work.
@@ -363,7 +377,8 @@ fn gpu_enabled() -> bool {
 
 impl std::fmt::Debug for Platform {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Platform")
+        let mut debug = f.debug_struct("Platform");
+        debug
             .field("capture", &self.capture.is_some())
             .field("keys", &self.keys.is_some())
             .field("pointer", &self.pointer.is_some())
@@ -376,7 +391,10 @@ impl std::fmt::Debug for Platform {
             .field("tray", &self.tray.is_some())
             .field("gpu", &self.gpu.is_some())
             .field("home", &self.home.is_some())
-            .finish_non_exhaustive()
+            .field("input_live", &self.input_live.as_ref().map(|live| live()));
+        #[cfg(target_os = "linux")]
+        debug.field("portal_session", &self.portal_session.is_some());
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -432,13 +450,23 @@ pub fn audio_host(gate: Arc<IoGate>) -> Option<Box<dyn crosspane_platform::Audio
 /// Called on the process main thread during startup: AppKit construction must not wait on
 /// a main thread blocked in the agent factory. All subsequent host calls belong to the worker.
 pub fn clipboard_host(gate: Arc<IoGate>) -> Option<Box<dyn crosspane_platform::ClipboardHost>> {
+    // The only Linux clipboard backend is Hyprland's (ext-data-control). GNOME and KDE get the
+    // portal clipboard later (GNOME-v0 WP-G3.1); until then they have none rather than a
+    // Hyprland-named backend that was never validated there.
     #[cfg(target_os = "linux")]
-    let host = std::env::var_os("WAYLAND_DISPLAY")
-        .ok_or(PlatformError::NotFound)
-        .and_then(|display| {
-            crosspane_platform_linux::hyprland::clipboard::HyprlandClipboard::new(gate, display)
-        })
-        .map(|host| Box::new(host) as Box<dyn crosspane_platform::ClipboardHost>);
+    let host = if is_hyprland_session() {
+        std::env::var_os("WAYLAND_DISPLAY")
+            .ok_or(PlatformError::NotFound)
+            .and_then(|display| {
+                crosspane_platform_linux::hyprland::clipboard::HyprlandClipboard::new(gate, display)
+            })
+            .map(|host| Box::new(host) as Box<dyn crosspane_platform::ClipboardHost>)
+    } else {
+        let _ = gate;
+        Err(PlatformError::Unsupported(
+            "clipboard on this desktop (portal clipboard not built yet)",
+        ))
+    };
     #[cfg(target_os = "macos")]
     let host = crosspane_platform_macos::clipboard::MacClipboard::new(
         gate,
@@ -1206,6 +1234,7 @@ pub fn create(
         home: None,
         proxy_placement: None,
         startup_recovery: recovered.startup,
+        input_live: None,
         acceptance_scratch: scratch_only,
         acceptance_source: source_only,
         host_placement_mapping,
@@ -1218,8 +1247,15 @@ pub fn create(
 /// graphical session, so the service manager doesn't stop the agent with it: on 2026-10-01 an agent
 /// sat on a dead instance for hours, unable to capture, inject or park. The instance's
 /// `hyprland.lock` names its process; nothing is sent over the compositor's IPC to check it.
+///
+/// A no-op off Hyprland (WP-G1.6): a GNOME or KDE agent has no such instance to watch, and a
+/// Wayland compositor's death there ends the graphical session, which stops the agent's unit.
 #[cfg(target_os = "linux")]
 pub fn watch_compositor(lost: impl FnOnce() + Send + 'static) {
+    if !is_hyprland_session() {
+        tracing::debug!("not on Hyprland: not watching the compositor");
+        return;
+    }
     let (Some(runtime), Ok(signature)) = (
         std::env::var_os("XDG_RUNTIME_DIR"),
         std::env::var("HYPRLAND_INSTANCE_SIGNATURE"),
@@ -1470,8 +1506,309 @@ impl HomeSeat for HyprHomeSeat {
     }
 }
 
+/// This Linux desktop's backends (WP-G1.6). The backend is chosen from the desktop the process
+/// runs in, by `desktop::detect`, and never falls back to another one: an unsupported or
+/// ambiguous desktop is a startup error, not a Hyprland attempt.
 #[cfg(target_os = "linux")]
 pub fn create(
+    state_dir: &std::path::Path,
+    config: &crate::config::Config,
+) -> anyhow::Result<Platform> {
+    use anyhow::Context;
+    use crosspane_platform_linux::desktop::{DesktopEnv, LinuxDesktop, detect};
+
+    let desktop = detect(&DesktopEnv::from_process())
+        .context("Crosspane on Linux needs Hyprland, GNOME or KDE Plasma on Wayland")?;
+    tracing::info!(?desktop, "Linux desktop");
+    match desktop {
+        LinuxDesktop::Hyprland => create_hyprland(state_dir, config),
+        LinuxDesktop::Gnome | LinuxDesktop::Kde => create_portal(state_dir, config, desktop),
+    }
+}
+
+/// Whether this process runs under Hyprland: the decision [`create`] made, from the same
+/// environment. The Hyprland-only pieces outside `create` (the compositor watch, the clipboard
+/// host) ask this instead of assuming it.
+#[cfg(target_os = "linux")]
+fn is_hyprland_session() -> bool {
+    use crosspane_platform_linux::desktop::{DesktopEnv, LinuxDesktop, detect};
+    matches!(
+        detect(&DesktopEnv::from_process()),
+        Ok(LinuxDesktop::Hyprland)
+    )
+}
+
+/// The monotonic clock of [`now`], as the `Clock` the portal backends take.
+#[cfg(target_os = "linux")]
+struct AgentClock;
+
+#[cfg(target_os = "linux")]
+impl crosspane_types::time::Clock for AgentClock {
+    fn now(&self) -> MonoTime {
+        now()
+    }
+}
+
+/// The displays of a portal backend, with the latest snapshot also readable from other threads.
+///
+/// The EIS injectors (absolute-pointer region mapping) and the Shell overlay need the display
+/// geometry from their own threads, while `Platform::displays` owns the backend. This adapter
+/// forwards to it and keeps the newest snapshot in a shared cell: seeded when it is built,
+/// replaced by every subscription event *before* the event is passed on, so a consumer woken by
+/// an event reads that snapshot or a newer one. A lost observation delivers an empty snapshot
+/// (the `Displays` contract), which then makes region lookups fail closed (`NotFound`).
+#[cfg(target_os = "linux")]
+struct CachedDisplays<D> {
+    inner: D,
+    latest: Arc<std::sync::Mutex<Vec<DisplayInfo>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl<D: Displays> CachedDisplays<D> {
+    /// Wrap `inner`, reading its first snapshot. Returns the adapter and the reader closure the
+    /// injectors take.
+    fn new(
+        inner: D,
+    ) -> Result<(Self, crosspane_platform_linux::portal::eis::DisplaysFn), PlatformError> {
+        let latest = Arc::new(std::sync::Mutex::new(inner.displays()?));
+        let reader = latest.clone();
+        let read: crosspane_platform_linux::portal::eis::DisplaysFn = Arc::new(move || {
+            reader
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        });
+        Ok((CachedDisplays { inner, latest }, read))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<D: Displays> Displays for CachedDisplays<D> {
+    fn displays(&self) -> Result<Vec<DisplayInfo>, PlatformError> {
+        self.inner.displays()
+    }
+
+    fn subscribe(
+        &mut self,
+        sink: Arc<dyn crosspane_platform::EventSink<Vec<DisplayInfo>>>,
+    ) -> Result<(), PlatformError> {
+        let latest = self.latest.clone();
+        self.inner
+            .subscribe(Arc::new(move |displays: Vec<DisplayInfo>| {
+                *latest
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = displays.clone();
+                sink.send(displays);
+            }))
+    }
+}
+
+/// Start the RemoteDesktop portal session and tie it to the EIS source (WP-G1.6).
+///
+/// **Threads and ownership.** The session's worker calls the status callback on its own thread,
+/// where it must not block, while `EisSource::attach` can take 2 s. So the callback only queues
+/// each status on a channel, and one "portal-eis" glue thread (`portal_glue`) works the queue in
+/// order: it takes the EIS socket of each new epoch and attaches it, and detaches the source when
+/// the session closes, is denied or is unavailable. Statuses queue from the moment the session
+/// exists, so a fast silent start (a stored restore token) loses nothing before the glue runs.
+///
+/// The session is returned as an `Arc` for the `Platform` to hold; the glue thread holds it only
+/// weakly. That breaks the cycle session worker → callback → channel → glue → session, so dropping
+/// the platform's `Arc` closes the session (bounded join), which drops the callback, which ends the
+/// glue thread's loop (it detaches the source once more on the way out). The glue thread is never
+/// joined: it ends on its own, and shutdown never waits for it.
+///
+/// `None` when the portal session or the glue thread can't be started: the source then never goes
+/// live and the agent never grants `InputAccept`.
+#[cfg(target_os = "linux")]
+fn start_portal_session(
+    state_dir: &std::path::Path,
+    source: crosspane_platform_linux::portal::eis::EisSource,
+) -> Option<Arc<crosspane_platform_linux::portal::session::RemoteDesktopSession>> {
+    use crosspane_platform_linux::portal::session::{
+        RemoteDesktopConfig, RemoteDesktopSession, SessionStatus,
+    };
+
+    let (statuses_tx, statuses) = std::sync::mpsc::channel::<SessionStatus>();
+    let config = RemoteDesktopConfig {
+        token_path: state_dir.join("portal-remote-desktop.token"),
+    };
+    let session = optional(
+        "RemoteDesktop portal session",
+        RemoteDesktopSession::spawn(
+            config,
+            Arc::new(move |status| {
+                // Never blocks; a send after the glue thread ended (shutdown) is dropped.
+                let _ = statuses_tx.send(status);
+            }),
+        ),
+    )?;
+    let session = Arc::new(session);
+    let weak = Arc::downgrade(&session);
+    let glue = std::thread::Builder::new()
+        .name("portal-eis".into())
+        .spawn(move || portal_glue(&source, &weak, &statuses));
+    if let Err(error) = glue {
+        // The session drops here, which closes it: no consent without something to attach it to.
+        tracing::warn!(%error, "could not start the portal input glue: remote input stays off");
+        return None;
+    }
+    Some(session)
+}
+
+/// The body of the "portal-eis" thread: see [`start_portal_session`].
+#[cfg(target_os = "linux")]
+fn portal_glue(
+    source: &crosspane_platform_linux::portal::eis::EisSource,
+    session: &std::sync::Weak<crosspane_platform_linux::portal::session::RemoteDesktopSession>,
+    statuses: &std::sync::mpsc::Receiver<crosspane_platform_linux::portal::session::SessionStatus>,
+) {
+    use crosspane_platform_linux::portal::session::SessionStatus;
+
+    while let Ok(status) = statuses.recv() {
+        match status {
+            SessionStatus::Pending => {}
+            SessionStatus::Active { epoch } => {
+                // The platform dropped the session: nothing can authorize input any more.
+                let Some(session) = session.upgrade() else {
+                    break;
+                };
+                // Each epoch's socket is handed out once and only while that epoch is active, so a
+                // status that was overtaken (the session has since closed, or moved on to a later
+                // epoch whose own status is queued behind this one) finds nothing or the newest.
+                match session.take_eis() {
+                    Some((taken, fd)) => match source.attach(fd) {
+                        Ok(()) => tracing::info!(epoch = taken, "remote input session attached"),
+                        Err(error) => {
+                            tracing::warn!(epoch = taken, %error, "remote input session not attached");
+                            source.detach();
+                        }
+                    },
+                    None => tracing::debug!(epoch, "no EIS socket to take (stale status)"),
+                }
+            }
+            SessionStatus::Closed { epoch } => {
+                tracing::warn!(epoch, "remote input session closed: input is refused");
+                source.detach();
+            }
+            SessionStatus::Denied => {
+                tracing::warn!("remote input was not allowed: input is refused");
+                source.detach();
+            }
+            SessionStatus::Unavailable => {
+                tracing::warn!("no RemoteDesktop portal: remote input is unavailable");
+                source.detach();
+            }
+        }
+    }
+    source.detach();
+}
+
+/// GNOME and KDE (WP-G1.6): E1 target and E2 destination through portals, EIS and public Wayland
+/// protocols, with no compositor-specific control API. Everything the Hyprland backend adds on
+/// top is absent here: input capture (this node cannot control others yet), window source,
+/// parking, frame capture, GPU capture, home on the twin and proxy placement. The agent grants
+/// `InputAccept` only while the portal session is live (`Platform::input_live`).
+#[cfg(target_os = "linux")]
+fn create_portal(
+    state_dir: &std::path::Path,
+    _config: &crate::config::Config,
+    desktop: crosspane_platform_linux::desktop::LinuxDesktop,
+) -> anyhow::Result<Platform> {
+    use anyhow::Context;
+    use crosspane_platform_linux::desktop::LinuxDesktop;
+    use crosspane_platform_linux::gnome::{overlay::GnomeOverlay, shell::ShellBridge};
+    use crosspane_platform_linux::logind::{LockerEvidence, LogindSession};
+    use crosspane_platform_linux::permissions::LinuxPermissions;
+    use crosspane_platform_linux::portal::{eis::EisSource, shortcuts::PortalHotkeys};
+    use crosspane_platform_linux::wayland_outputs::WaylandOutputs;
+
+    let locker = match desktop {
+        LinuxDesktop::Gnome => LockerEvidence::GnomeScreenSaver,
+        LinuxDesktop::Kde => LockerEvidence::FreedesktopScreenSaver,
+        LinuxDesktop::Hyprland => anyhow::bail!("the portal backend does not run on Hyprland"),
+    };
+    let gate = IoGate::new();
+    let session = LogindSession::with_locker(gate.clone(), locker)
+        .context("session lock state (required: Crosspane fails closed without it)")?;
+    let outputs = WaylandOutputs::new().context("Wayland outputs")?;
+    let (displays, displays_fn) =
+        CachedDisplays::new(outputs).context("Wayland outputs: first snapshot")?;
+
+    // lead: portals identify this non-sandboxed process by an app id registered on its bus
+    // connection ("io.frostdev.crosspane.agent", `ashpd::register_host_app`, a warning on failure).
+    // It must happen here, before the portal session and the hotkeys below talk to a portal. The
+    // agent crate has no ashpd/zbus dependency, so the call belongs in `crosspane-platform-linux`
+    // (see the WP-G1.6 report).
+
+    // Injection: one EIS source shared by the keyboard and the pointer. It is live only while the
+    // portal session below is, and the agent reads that through `input_live`.
+    let (source, keys, pointer) = match optional(
+        "injection",
+        EisSource::new(gate.clone(), displays_fn.clone()),
+    ) {
+        Some((source, k, p)) => (
+            Some(source),
+            Some(Box::new(k) as Box<dyn KeyInjector>),
+            Some(Box::new(p) as Box<dyn PointerInjector>),
+        ),
+        None => (None, None, None),
+    };
+    let input_live = source.as_ref().map(|source| {
+        let source = source.clone();
+        Arc::new(move || source.is_live()) as Arc<dyn Fn() -> bool + Send + Sync>
+    });
+    // The consent may be asked now (the first time): this is the startup, off the input path.
+    let portal_session = source.and_then(|source| start_portal_session(state_dir, source));
+
+    // The release chord (panic: holding it for a second ends everything). Without the
+    // GlobalShortcuts portal there is none, and the tray and `crosspanectl` remain.
+    let hotkeys =
+        optional("hotkeys", PortalHotkeys::new(Arc::new(AgentClock))).and_then(|mut hotkeys| {
+            let chord = crosspane_engine::EngineConfig::new(crosspane_types::id::NodeId([0; 32]))
+                .release_chord;
+            optional("release chord", hotkeys.set_chord(&chord)).map(|()| hotkeys)
+        });
+    // The indicator comes from the Crosspane Shell extension, on GNOME only; without it GNOME's
+    // own remote-desktop indicator is the only visible sign. KDE's comes later.
+    let overlay = match desktop {
+        LinuxDesktop::Gnome => optional("Shell bridge", ShellBridge::connect()).map(|bridge| {
+            Box::new(GnomeOverlay::new(bridge, displays_fn.clone())) as Box<dyn OverlayHost>
+        }),
+        LinuxDesktop::Kde | LinuxDesktop::Hyprland => None,
+    };
+    Ok(Platform {
+        gate,
+        session: Box::new(session),
+        displays: Box::new(displays),
+        // Controller capture is deferred (GNOME-v0, G1.7): this node can be controlled, not control.
+        capture: None,
+        keys,
+        pointer,
+        overlay,
+        hotkeys: hotkeys.map(|h| Box::new(h) as Box<dyn GlobalHotkeys>),
+        keystore: keystore(),
+        permissions: Box::new(LinuxPermissions),
+        windows: None,
+        parking: None,
+        frames: None,
+        tray: optional("tray", crosspane_platform_linux::tray::SniTray::new())
+            .map(|t| Box::new(t) as Box<dyn TrayHost>),
+        links: Some(Box::new(
+            crosspane_platform_linux::link::SysfsLinkInfo::new(),
+        )),
+        gpu: None,
+        home: None,
+        proxy_placement: None,
+        // No parking backend, so nothing was recovered (and nothing was left parked).
+        startup_recovery: StartupRecovery::None,
+        input_live,
+        portal_session,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn create_hyprland(
     state_dir: &std::path::Path,
     _config: &crate::config::Config,
 ) -> anyhow::Result<Platform> {
@@ -1598,6 +1935,9 @@ pub fn create(
         tray: optional("tray", crosspane_platform_linux::tray::SniTray::new())
             .map(|t| Box::new(t) as Box<dyn TrayHost>),
         gate,
+        // Hyprland's injectors are usable whenever they exist.
+        input_live: None,
+        portal_session: None,
     })
 }
 
@@ -1712,6 +2052,7 @@ pub fn create(
         // request is answered with an error).
         home: None,
         proxy_placement: None,
+        input_live: None,
         visible_frame: crosspane_platform_macos::displays::visible_frame,
         own_windows: crosspane_platform_macos::windows::own_windows,
         gate,
@@ -1821,6 +2162,116 @@ mod tests {
         assert!(is_executable(&file));
         assert!(!is_executable(&dir), "a directory is not a program");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// The portal backends' shared display snapshot (WP-G1.6).
+#[cfg(all(test, target_os = "linux"))]
+mod cached_displays_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::sync::Mutex;
+
+    use crosspane_platform::EventSink;
+    use crosspane_types::color::ColorSpace;
+    use crosspane_types::geom::{DisplayGeometry, PixelSize, PointLogical, SizeMm};
+
+    use super::*;
+
+    fn display(id: u32, x: f64) -> DisplayInfo {
+        DisplayInfo {
+            id: DisplayId(id),
+            name: format!("D{id}"),
+            geometry: DisplayGeometry {
+                pixel_size: PixelSize::new(1920, 1080),
+                physical_size: SizeMm::new(500.0, 300.0),
+                scale: 1.0,
+                logical_origin: PointLogical::new(x, 0.0),
+            },
+            refresh_millihz: 60000,
+            color_space: ColorSpace::Srgb,
+            hdr: false,
+        }
+    }
+
+    type Subscriber = Arc<dyn EventSink<Vec<DisplayInfo>>>;
+
+    /// A backend whose snapshot is set by the test and which keeps its subscriber.
+    #[derive(Default)]
+    struct Fake {
+        now: Arc<Mutex<Vec<DisplayInfo>>>,
+        sink: Arc<Mutex<Option<Subscriber>>>,
+    }
+
+    impl Displays for Fake {
+        fn displays(&self) -> Result<Vec<DisplayInfo>, PlatformError> {
+            Ok(self.now.lock().unwrap().clone())
+        }
+
+        fn subscribe(
+            &mut self,
+            sink: Arc<dyn EventSink<Vec<DisplayInfo>>>,
+        ) -> Result<(), PlatformError> {
+            *self.sink.lock().unwrap() = Some(sink);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_reader_is_seeded_and_every_event_updates_it_before_it_is_forwarded() {
+        let fake = Fake::default();
+        *fake.now.lock().unwrap() = vec![display(1, 0.0)];
+        let backend_sink = fake.sink.clone();
+        let (mut cached, read) = CachedDisplays::new(fake).unwrap();
+        assert_eq!(
+            read(),
+            vec![display(1, 0.0)],
+            "seeded from the first snapshot"
+        );
+
+        // The forwarded sink reads the shared snapshot, as an injector woken by the event would.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (reader, log) = (read.clone(), seen.clone());
+        cached
+            .subscribe(Arc::new(move |displays: Vec<DisplayInfo>| {
+                log.lock().unwrap().push((displays, reader()));
+            }))
+            .unwrap();
+        let deliver = |displays: Vec<DisplayInfo>| {
+            let sink = backend_sink.lock().unwrap().clone().unwrap();
+            sink.send(displays);
+        };
+        deliver(vec![display(1, 0.0), display(2, 1920.0)]);
+        // A lost observation delivers an empty snapshot: region lookups then find nothing.
+        deliver(Vec::new());
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        for (event, read_then) in seen.iter() {
+            assert_eq!(
+                event, read_then,
+                "the cell already holds the event's snapshot"
+            );
+        }
+        assert_eq!(seen[0].0.len(), 2);
+        assert!(read().is_empty());
+    }
+
+    #[test]
+    fn a_first_snapshot_that_fails_fails_the_adapter() {
+        struct Failing;
+        impl Displays for Failing {
+            fn displays(&self) -> Result<Vec<DisplayInfo>, PlatformError> {
+                Err(PlatformError::Backend("gone".into()))
+            }
+            fn subscribe(
+                &mut self,
+                _sink: Arc<dyn EventSink<Vec<DisplayInfo>>>,
+            ) -> Result<(), PlatformError> {
+                Ok(())
+            }
+        }
+        assert!(CachedDisplays::new(Failing).is_err());
     }
 }
 
