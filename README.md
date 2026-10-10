@@ -152,6 +152,8 @@ scripts/test-env.sh cargo nextest run --workspace --locked --no-tests=pass
 
 The [CircleCI pipeline](.circleci/config.yml) runs on pushes, including pull-request branches and `master`, using CircleCI-hosted Linux, macOS and Windows runners. It checks formatting, Clippy, workspace tests, Rust documentation, dependency policy and layering, including the opt-in macOS virtual-display module. Rust dependencies and build output are cached separately for each platform; Linux offscreen rendering uses Mesa's software GPU. Native desktop scenarios require separate platform runs. Hyprland compositor tests skip unless the [nested test session](scripts/hypr-nested/README.md) enables them explicitly.
 
+The hosted macOS test profile explicitly excludes hardware VideoToolbox encode/decode cases that cannot run in CircleCI's VM. Pure codec validation, display enumeration and offscreen GPU tests still run. The default test profile retains the hardware cases for a Mac with working VideoToolbox acceleration.
+
 ## Documentation
 
 | | Start here |

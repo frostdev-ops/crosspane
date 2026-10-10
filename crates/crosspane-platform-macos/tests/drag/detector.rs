@@ -298,6 +298,8 @@ fn drag_edge_rate_grab_history_and_release_are_correlated() {
     );
     let (_, before) = monitor.at_edge(PortalId(1)).unwrap();
     assert_eq!(before.unwrap().origin.x, 370.0);
+    // Empty outward hits while pinned at the edge retain the drag. Leave the edge band.
+    monitor.pointer = CGPoint::new(450.0, 30.0);
     assert!(matches!(
         monitor
             .update(&[p], &[], MonoTime::from_nanos(at.as_nanos() + 21_000_000))

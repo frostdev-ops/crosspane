@@ -2666,7 +2666,9 @@ mod a2_tests {
         let counter = Arc::new(AtomicU64::new(0));
         let hits = counter.clone();
         *r.hook.lock().unwrap() = Some(Arc::new(move |stage, p| {
-            if stage == "metadata" && p == app && hits.fetch_add(1, Ordering::AcqRel) == 3 {
+            // The hook runs after stat. Change the directory after the initial walk snapshot,
+            // before the final stat, rather than after that final observation was already read.
+            if stage == "metadata" && p == app && hits.fetch_add(1, Ordering::AcqRel) == 2 {
                 scratch.put(&app.join("created-during-observation"), b"foreign", 0o600);
             }
             Ok(())
@@ -6522,7 +6524,7 @@ mod a2_tests {
                 .map(|e| e.unwrap().path().join("Crosspane.app"))
                 .find(|p| p.exists())
                 .unwrap();
-            assert!(backup.join("Contents/MacOS/crosspane-agent").exists());
+            assert!(backup.join("Contents/MacOS/Crosspane").exists());
             assert!(!backup.join("Contents/MacOS/crosspane-tutorial").exists());
         }
         #[test]

@@ -874,7 +874,7 @@ fn trusted_inventory_requires_exact_roles_paths_sizes_hashes_and_bounded_feature
             6 => input.files[0].size = MAX_PAYLOAD_BYTES,
             7 => input.files[0].signing = None,
             8 => input.files[1].signing.as_mut().unwrap().identifier.clear(),
-            9 => input.files[3]
+            9 => input.files[2]
                 .signing
                 .as_mut()
                 .unwrap()
@@ -883,7 +883,7 @@ fn trusted_inventory_requires_exact_roles_paths_sizes_hashes_and_bounded_feature
                 .map(|_| ())
                 .unwrap_or(()),
             10 => {
-                input.files.remove(6);
+                input.files.remove(5);
             }
             11 => input.files[0].mode = 0o777,
             12 => input.features = vec!["video".into(), "video".into()],

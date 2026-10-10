@@ -6,3 +6,16 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = 'binary(linux_repair) and test(uninstall_tests::)'
 test-group = 'removal-original-authority'
+
+# CircleCI's macOS VM has Metal, but its hardware VideoToolbox encoder fails with
+# OSStatus -12915 (AppleM2ScalerParavirtDriver is absent). Compile all native code
+# and keep pure codec validation, foreign-picture rejection and offscreen GPU tests.
+# The default profile still runs hardware-dependent tests on a capable Mac.
+[profile.circleci-macos]
+default-filter = '''
+not (package(crosspane-platform-macos) and (
+    binary(/^video$/)
+    or (binary(/^gpu_import$/) and test(/^(byte_exact_import|midstream_output_change|release_1000_cycles|cpu_time_1080p)$/))
+    or test(/^video::tests::(bitrate_and_clean_restart|mutated_real_access_units_do_not_panic|native_bgra_and_crops_match_cpu_quality|native_nv12_quality_exhaustion_and_switch_to_bgra|negative_access_units|unknown_hardware_diagnostic_is_non_fatal)$/)
+))
+'''

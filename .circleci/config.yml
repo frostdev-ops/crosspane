@@ -30,6 +30,10 @@ commands:
                   - target
 
   native-checks:
+    parameters:
+      profile:
+        type: string
+        default: default
     steps:
       - run:
           name: Check lints
@@ -37,7 +41,7 @@ commands:
           no_output_timeout: 20m
       - run:
           name: Run workspace tests
-          command: cargo nextest run --workspace --locked --no-tests=pass --no-fail-fast
+          command: cargo nextest run --workspace --locked --profile << parameters.profile >> --no-tests=pass --no-fail-fast
           no_output_timeout: 20m
       - run:
           name: Build documentation
@@ -87,7 +91,7 @@ jobs:
           name: Install Linux libraries and software GPU
           command: |
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends libxkbcommon-dev libopus-dev libpipewire-0.3-dev libclang-dev pkg-config cmake mesa-vulkan-drivers fonts-dejavu-core
+            sudo apt-get install -y --no-install-recommends libxkbcommon-dev libopus-dev libpipewire-0.3-dev libclang-dev pkg-config cmake mesa-vulkan-drivers fontconfig fonts-dejavu-core
             mkdir -p /tmp/crosspane-xdg-runtime
             chmod 700 /tmp/crosspane-xdg-runtime
             echo 'export XDG_RUNTIME_DIR=/tmp/crosspane-xdg-runtime' >> "$BASH_ENV"
@@ -117,12 +121,13 @@ jobs:
             test -f "$CROSSPANE_TEST_FONT"
       - restore-rust-cache:
           job: macos
-      - native-checks
+      - native-checks:
+          profile: circleci-macos
       - run:
           name: Check the opt-in macOS virtual-display module
           command: |
             cargo clippy -p crosspane-platform-macos --all-targets --features private-vdisplay --locked -- -D warnings
-            cargo nextest run -p crosspane-platform-macos --features private-vdisplay --locked --no-tests=pass --no-fail-fast
+            cargo nextest run -p crosspane-platform-macos --features private-vdisplay --locked --profile circleci-macos --no-tests=pass --no-fail-fast
       - save-rust-cache:
           job: macos
 

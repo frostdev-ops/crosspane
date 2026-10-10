@@ -9,8 +9,10 @@ printf 'export PATH=%q:$PATH\n' "$cargo_bin" >> "$BASH_ENV"
 if ! command -v rustup >/dev/null 2>&1; then
     case "$(uname -s)" in
         MINGW*|MSYS*)
-            curl --fail --location --retry 3 https://win.rustup.rs/x86_64 -o /tmp/crosspane-rustup-init.exe
-            /tmp/crosspane-rustup-init.exe -y --no-modify-path --profile minimal --default-toolchain none
+            # rustup dispatches by executable basename; the installer must be rustup-init.exe.
+            mkdir -p /tmp/crosspane-rustup
+            curl --fail --location --retry 3 https://win.rustup.rs/x86_64 -o /tmp/crosspane-rustup/rustup-init.exe
+            /tmp/crosspane-rustup/rustup-init.exe -y --no-modify-path --profile minimal --default-toolchain none
             ;;
         *)
             curl --fail --location --retry 3 https://sh.rustup.rs -o /tmp/crosspane-rustup-init.sh

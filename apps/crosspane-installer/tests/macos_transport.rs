@@ -2554,12 +2554,12 @@ fn command_and_output_debug_never_prints_raw_responses_or_child_arguments() {
         stderr: b"RAW-RESPONSE-SENTINEL".to_vec(),
     };
     assert!(!format!("{output:?}").contains("SENTINEL"));
-    let helper = f.io.target().app_path().join("Contents/MacOS/tutorial");
+    let helper = f.io.target().app_path().join("Contents/MacOS/crosspane-ui");
     bytes(&helper, b"owned fixture", 0o755);
     let signature =
         f.io.admit_artifact_signature(
             &helper,
-            &requirement(ArtifactRole::Installer),
+            &requirement(ArtifactRole::Settings),
             &f.main(),
             &f.deadline(),
         )
