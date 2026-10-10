@@ -39,10 +39,14 @@
 //!   trigger format cannot tell left and right modifiers apart, so both fold into one name (a
 //!   chord naming both hands of one modifier is `Unsupported`); right Alt is `Unsupported`
 //!   because on many layouts it is AltGr, which the portal's `ALT` does not match.
-//! - **Lifetime.** Dropping the handle stops the worker (the wait is bounded to 2 s; a worker stuck
-//!   in a portal call is detached and exits when the call returns), closes the session, and
-//!   emits `Released` if the chord was pressed. A worker that died is reported by `set_chord` and
-//!   `subscribe` as an error rather than leaving the chord silently unwatched.
+//! - **Lifetime.** Dropping the handle first emits `Released` if the chord was pressed (and
+//!   delivers nothing afterwards), whatever state the worker is in. Then it stops the worker: the
+//!   wait is bounded to 2 s, the worker closes the session with a 1.5 s bound, and a worker stuck
+//!   in some other portal call is detached and exits when the call returns. A worker that died is
+//!   reported by `set_chord` and `subscribe` as an error rather than leaving the chord silently
+//!   unwatched.
+//! - **Reporting.** A bind failure is logged at `warn` once per chord (a session retried by the
+//!   backoff repeats it at `debug`), with the portal's error text and no key contents.
 //! - No GlobalShortcuts portal: `new` returns `PlatformError::Unsupported` (`Timeout` if the
 //!   portal doesn't answer the probe within 2 s) and `set_chord` never succeeds for a chord it
 //!   can't spell (never a silent weakening). The tray and `crosspanectl` keep release and panic
@@ -79,6 +83,8 @@ const SHORTCUT_DESCRIPTION: &str = "Crosspane: release control / panic (hold 1 s
 const PROBE_BOUND: Duration = Duration::from_secs(2);
 /// Dropping the handle waits this long for the worker before detaching it.
 const JOIN_BOUND: Duration = Duration::from_secs(2);
+/// Closing the session on the way out waits this long for the portal (less than `JOIN_BOUND`).
+const CLOSE_BOUND: Duration = Duration::from_millis(1500);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// A session that stayed bound this long was healthy: the next loss starts the backoff over.
@@ -88,6 +94,8 @@ const HEALTHY_AFTER: Duration = Duration::from_secs(30);
 pub struct PortalHotkeys {
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
+    /// How long `drop` waits for the worker (`JOIN_BOUND`; tests shorten it).
+    join_bound: Duration,
 }
 
 impl fmt::Debug for PortalHotkeys {
@@ -112,6 +120,7 @@ impl PortalHotkeys {
             Ok(true) => Ok(PortalHotkeys {
                 shared,
                 worker: Some(worker),
+                join_bound: JOIN_BOUND,
             }),
             Ok(false) => {
                 // The worker returns right after reporting; the join is immediate.
@@ -149,8 +158,11 @@ impl PortalHotkeys {
 impl Drop for PortalHotkeys {
     fn drop(&mut self) {
         self.shared.shutdown();
+        // A pressed chord is released here, whether or not the worker (possibly stuck in a portal
+        // call) ever gets to it.
+        self.shared.hub.close();
         if let Some(worker) = self.worker.take() {
-            let deadline = Instant::now() + JOIN_BOUND;
+            let deadline = Instant::now() + self.join_bound;
             while !worker.is_finished() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(5));
             }
@@ -447,6 +459,20 @@ struct Binder {
     wanted: u64,
     /// A request has been started in this session.
     started: bool,
+    /// The chord generation of the request that finished last.
+    last_finished: Option<u64>,
+}
+
+/// Remembers the chord generation a bind failure was last reported for, so a failure that repeats
+/// for the same chord (a session retried by the backoff) is reported at `warn` only once.
+#[derive(Debug, Default)]
+struct WarnedChord(Option<u64>);
+
+impl WarnedChord {
+    /// True the first time `generation` is reported.
+    fn first(&mut self, generation: u64) -> bool {
+        self.0.replace(generation) != Some(generation)
+    }
 }
 
 impl Binder {
@@ -472,9 +498,15 @@ impl Binder {
         self.has_binding
     }
 
+    /// The chord generation of the request that finished last.
+    fn last_finished(&self) -> Option<u64> {
+        self.last_finished
+    }
+
     /// The request ended. `Ok` means the desktop holds the binding (found or bound).
     fn finished(&mut self, result: Result<(), BindFailure>) -> BindNext {
         let done = self.in_flight.take();
+        self.last_finished = done;
         let retry_needed = done.is_some_and(|done| done != self.wanted);
         match result {
             Ok(()) => self.has_binding = true,
@@ -511,6 +543,8 @@ struct Hub {
 struct HubState {
     pairing: Pairing,
     sink: Option<Arc<dyn EventSink<HotkeyEvent>>>,
+    /// `close` ran: no further `Pressed`.
+    closed: bool,
 }
 
 impl HubState {
@@ -531,6 +565,9 @@ impl Hub {
 
     fn activated(&self) {
         let mut state = lock(&self.state);
+        if state.closed {
+            return;
+        }
         let event = state.pairing.activated(self.clock.now());
         state.deliver(event);
     }
@@ -544,6 +581,16 @@ impl Hub {
     fn lost(&self) {
         let mut state = lock(&self.state);
         let event = state.pairing.lost(self.clock.now());
+        state.deliver(event);
+    }
+
+    /// The handle is going away: release a pressed chord now (not whenever a stuck worker gets
+    /// around to it) and deliver nothing afterwards, so no `Pressed` can follow that `Released`.
+    /// Idempotent.
+    fn close(&self) {
+        let mut state = lock(&self.state);
+        let event = state.pairing.lost(self.clock.now());
+        state.closed = true;
         state.deliver(event);
     }
 
@@ -728,6 +775,81 @@ async fn interruptible<F: Future>(shared: &Shared, fut: F) -> Option<F::Output> 
     .await
 }
 
+/// A one-shot clock for async code that has no timer of its own: a helper thread waits out the
+/// limit and wakes the task.
+#[derive(Default)]
+struct Timer {
+    state: Mutex<TimerState>,
+    condvar: Condvar,
+}
+
+#[derive(Default)]
+struct TimerState {
+    fired: bool,
+    cancelled: bool,
+    waker: Option<Waker>,
+}
+
+impl Timer {
+    /// The helper thread's body: wait `limit` (or until cancelled), then fire.
+    fn run(&self, limit: Duration) {
+        let mut state = self
+            .condvar
+            .wait_timeout_while(lock(&self.state), limit, |s| !s.cancelled)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+        if state.cancelled {
+            return;
+        }
+        state.fired = true;
+        let waker = state.waker.take();
+        drop(state);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn poll_fired(&self, cx: &mut Context<'_>) -> bool {
+        let mut state = lock(&self.state);
+        if state.fired {
+            return true;
+        }
+        state.waker = Some(cx.waker().clone());
+        false
+    }
+
+    /// Let the helper thread go without firing.
+    fn cancel(&self) {
+        lock(&self.state).cancelled = true;
+        self.condvar.notify_all();
+    }
+}
+
+/// Run `fut` for at most `limit`; `None` if it didn't finish. If the clock can't be started the
+/// future is not run at all, so the bound holds either way.
+async fn within<F: Future>(limit: Duration, fut: F) -> Option<F::Output> {
+    let timer = Arc::new(Timer::default());
+    let clock = Arc::clone(&timer);
+    thread::Builder::new()
+        .name("crosspane-portal-timer".into())
+        .spawn(move || clock.run(limit))
+        .ok()?;
+    let mut fut = pin!(fut);
+    let output = poll_fn(|cx| {
+        if let Poll::Ready(output) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Some(output));
+        }
+        if timer.poll_fired(cx) {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    timer.cancel();
+    output
+}
+
 /// Why a session ended.
 #[derive(Debug)]
 enum SessionEnd {
@@ -789,12 +911,13 @@ fn worker_main(shared: &Shared, probe_tx: &mpsc::Sender<bool>) {
 fn run_worker(shared: &Shared) {
     let mut backoff = Backoff::new();
     let mut failures = 0u32;
+    let mut warned = WarnedChord::default();
     loop {
         if !shared.wait_for_trigger() {
             return;
         }
         let mut bound_at = None;
-        let end = zbus::block_on(run_session(shared, &mut bound_at));
+        let end = zbus::block_on(run_session(shared, &mut bound_at, &mut warned));
         // Whatever ended the session, a press in flight will never see its release.
         shared.hub.lost();
         match end {
@@ -820,8 +943,12 @@ fn run_worker(shared: &Shared) {
 }
 
 /// One session: create it, bind the chord, then serve signals until it ends. `bound_at` records
-/// when the first bind succeeded.
-async fn run_session(shared: &Shared, bound_at: &mut Option<Instant>) -> SessionEnd {
+/// when the first bind succeeded; `warned` remembers which chord's bind failure was reported.
+async fn run_session(
+    shared: &Shared,
+    bound_at: &mut Option<Instant>,
+    warned: &mut WarnedChord,
+) -> SessionEnd {
     let portal = match step(shared, "open the portal", true, GlobalShortcuts::new()).await {
         Ok(portal) => portal,
         Err(end) => return end,
@@ -862,17 +989,18 @@ async fn run_session(shared: &Shared, bound_at: &mut Option<Instant>) -> Session
         Err(end) => return end,
     };
 
-    let Err(end) = serve(shared, &portal, &session, signals, owner, bound_at).await;
+    let Err(end) = serve(shared, &portal, &session, signals, owner, bound_at, warned).await;
     match &end {
-        // Close for good so no dialog or shortcut registration outlives us.
+        // Close for good so no dialog or shortcut registration outlives us. Bounded: a portal
+        // that has stopped answering must not hold the worker (and with it the handle's drop).
         SessionEnd::Shutdown => {
-            let _ = session.close().await;
+            let _ = within(CLOSE_BOUND, session.close()).await;
         }
         SessionEnd::Lost {
             session_gone: false,
             ..
         } => {
-            let _ = interruptible(shared, session.close()).await;
+            let _ = interruptible(shared, within(CLOSE_BOUND, session.close())).await;
         }
         SessionEnd::Lost { .. } => {}
     }
@@ -977,6 +1105,7 @@ async fn serve(
     signals: impl Stream<Item = zbus::Message>,
     owner: impl Stream,
     bound_at: &mut Option<Instant>,
+    warned: &mut WarnedChord,
 ) -> Result<Infallible, SessionEnd> {
     let closed = step(shared, "watch the session", false, session.receive_closed()).await?;
     let mut closed = pin!(closed);
@@ -1060,21 +1189,33 @@ async fn serve(
                         (binder.finished(Ok(())), None)
                     }
                     Err(error) => {
-                        let failure = classify_bind_error(&error);
-                        tracing::warn!(
-                            %error,
-                            ?failure,
-                            has_binding = binder.has_binding(),
-                            "binding the release chord failed"
-                        );
-                        (binder.finished(Err(failure)), Some(error))
+                        let class = classify_bind_error(&error);
+                        let next = binder.finished(Err(class));
+                        // Once per chord at `warn`; a retried session repeats at `debug`.
+                        let first = binder.last_finished().is_some_and(|g| warned.first(g));
+                        if first {
+                            tracing::warn!(
+                                %error,
+                                ?class,
+                                has_binding = binder.has_binding(),
+                                "binding the release chord failed"
+                            );
+                            if !binder.has_binding() && next != BindNext::EndSession {
+                                tracing::warn!(
+                                    "the Crosspane release chord is not bound; the session stays open in case the desktop holds a binding for it, and changing the chord asks again"
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                %error,
+                                ?class,
+                                has_binding = binder.has_binding(),
+                                "binding the release chord failed again"
+                            );
+                        }
+                        (next, Some(error))
                     }
                 };
-                if failure.is_some() && !binder.has_binding() && next != BindNext::EndSession {
-                    tracing::warn!(
-                        "the Crosspane release chord is not bound; the session stays open in case the desktop holds a binding for it, and changing the chord asks again"
-                    );
-                }
                 match next {
                     BindNext::Idle => {}
                     BindNext::Rebind => {
@@ -1797,6 +1938,7 @@ mod tests {
             PortalHotkeys {
                 shared: Arc::clone(&shared),
                 worker: Some(worker),
+                join_bound: JOIN_BOUND,
             },
             shared,
         )
@@ -1842,6 +1984,101 @@ mod tests {
         let started = Instant::now();
         drop(hotkeys);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn dropping_while_pressed_releases_even_if_the_worker_is_stuck() {
+        // A worker stuck in a portal call: it never looks at the shutdown flag.
+        let (unstick, stuck) = mpsc::channel::<()>();
+        let (mut hotkeys, shared) = handle_with_worker(move |_| {
+            let _ = stuck.recv();
+        });
+        hotkeys.join_bound = Duration::from_millis(30);
+        let sink = Arc::new(Collect::default());
+        hotkeys.subscribe(sink.clone()).unwrap();
+        shared.hub.activated();
+        assert_eq!(sink.events(), [HotkeyEvent::Pressed { at: at(0) }]);
+
+        drop(hotkeys);
+        assert_eq!(
+            sink.events(),
+            [
+                HotkeyEvent::Pressed { at: at(0) },
+                HotkeyEvent::Released { at: at(0) },
+            ]
+        );
+        // The stuck worker waking up later can't undo that: no further press is delivered.
+        shared.hub.activated();
+        shared.hub.deactivated();
+        shared.hub.lost();
+        assert_eq!(sink.events().len(), 2);
+        unstick.send(()).unwrap();
+    }
+
+    #[test]
+    fn closing_the_hub_releases_once_and_stops_further_presses() {
+        let (clock, hub, sink) = hub();
+        hub.subscribe(sink.clone()).unwrap();
+        clock.set(1);
+        hub.activated();
+        clock.set(2);
+        hub.close();
+        clock.set(3);
+        hub.close();
+        hub.activated();
+        assert_eq!(
+            sink.events(),
+            [
+                HotkeyEvent::Pressed { at: at(1) },
+                HotkeyEvent::Released { at: at(2) },
+            ]
+        );
+    }
+
+    #[test]
+    fn closing_the_hub_with_nothing_pressed_sends_nothing() {
+        let (_clock, hub, sink) = hub();
+        hub.subscribe(sink.clone()).unwrap();
+        hub.close();
+        assert!(sink.events().is_empty());
+    }
+
+    #[test]
+    fn within_passes_a_finished_future_and_cuts_off_a_pending_one() {
+        assert_eq!(
+            pollster::block_on(within(Duration::from_secs(5), std::future::ready(3))),
+            Some(3)
+        );
+        let started = Instant::now();
+        assert_eq!(
+            pollster::block_on(within(
+                Duration::from_millis(30),
+                std::future::pending::<()>()
+            )),
+            None
+        );
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_bind_failure_is_reported_at_warn_once_per_chord() {
+        let mut warned = WarnedChord::default();
+        assert!(warned.first(1));
+        // A retried session fails for the same chord again.
+        assert!(!warned.first(1));
+        assert!(!warned.first(1));
+        // A new chord is reported afresh.
+        assert!(warned.first(2));
+        assert!(!warned.first(2));
+
+        // The generation reported is the one of the request that failed, even if the chord
+        // moved on while it was in flight.
+        let mut binder = Binder::default();
+        binder.begin(4);
+        binder.changed(5);
+        binder.finished(Err(BindFailure::Denied));
+        assert_eq!(binder.last_finished(), Some(4));
     }
 
     #[test]
