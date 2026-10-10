@@ -1932,8 +1932,16 @@ fn create_portal(
                     // are left alone.
                     lock_keys: Arc::new(|| None),
                     gate: gate.clone(),
-                    // G1.7: cursor (the lead wires the Shell bridge's `inhibit_cursor` at merge).
-                    cursor: None,
+                    // A5: the extension (bridge v2) hides the frozen local cursor while captured.
+                    cursor: bridge.as_ref().filter(|b| b.version() >= 2).map(|bridge| {
+                        let bridge = bridge.clone();
+                        Arc::new(move |hide: bool| bridge.inhibit_cursor(hide))
+                            as Arc<
+                                dyn Fn(bool) -> Result<(), crosspane_platform::PlatformError>
+                                    + Send
+                                    + Sync,
+                            >
+                    }),
                     token_path: state_dir.join("portal-input-capture.token"),
                     quirks: capture_quirks(desktop),
                 },
