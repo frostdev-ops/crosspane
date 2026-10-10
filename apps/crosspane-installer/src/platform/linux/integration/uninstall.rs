@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crosspane_installer_core::OperationId;
 
+use super::super::extension;
 use super::super::firewall::{
     FirewallError, LinuxFirewall, ManagerSelection, RuleKind, receipts::DurableIntentStore,
 };
@@ -80,6 +81,110 @@ struct Running {
     /// settle it (the coordinator retired it or refused to keep the rule), so it is finished
     /// with its honest report instead of being attempted again forever.
     firewall_tried: bool,
+    /// What taking back the GNOME/KDE desktop files said, once the core files were handled.
+    desktop: Vec<String>,
+}
+
+/// The state file of the desktop component. Its presence is the only thing that makes removal
+/// look at the desktop files at all, so Hyprland removal never touches any of this.
+fn desktop_record(io: &LinuxNativeIo) -> std::path::PathBuf {
+    io.target()
+        .paths()
+        .state_home
+        .join("crosspane/installer/desktop-outcome.json")
+}
+
+/// A sentence for the removal preview when this install added GNOME/KDE desktop files.
+fn desktop_preview(io: &LinuxNativeIo) -> Option<&'static str> {
+    io.metadata(&desktop_record(io)).ok().flatten().map(|_| {
+        "The desktop files Crosspane added for GNOME or KDE (its desktop entry, and on GNOME the \
+         Shell extension) are removed too, and the extension is switched off in your GNOME \
+         settings. Every other extension stays as it is, and a file you changed is kept."
+    })
+}
+
+/// Take back the desktop entry and the Shell extension this install added, and turn the
+/// extension off in the person's settings. Runs once, after the core files. Nothing here is an
+/// error for the removal as a whole: every outcome is a line for the person.
+fn remove_desktop(
+    io: &Arc<LinuxNativeIo>,
+    env: &ChildEnvironment,
+    support: &Arc<dyn Support>,
+    package: Option<&Package>,
+) -> Vec<String> {
+    match io.metadata(&desktop_record(io)) {
+        Ok(None) => return Vec::new(),
+        Ok(Some(_)) => {}
+        Err(_) => {
+            return vec![
+                "Crosspane's desktop files couldn't be checked, so they were kept.".to_owned(),
+            ];
+        }
+    }
+    let kept = |why: &str| {
+        vec![format!(
+            "Crosspane's GNOME/KDE desktop files were kept: {why}."
+        )]
+    };
+    let Some(deadline) = stage_deadline(STAGE_MS) else {
+        return kept("removal stopped early");
+    };
+    let proof = match support.detect(package, &deadline) {
+        SupportOutcome::Supported(proof) => proof,
+        _ => return kept("support couldn't be proved right now"),
+    };
+    let Ok(installer) = PayloadInstaller::new(io.clone()) else {
+        return kept("the install locations can't be admitted");
+    };
+    let mut lines = Vec::new();
+    let recorded = match installer.desktop_recorded(&proof) {
+        Ok(ids) => ids,
+        Err(_) => return kept("Crosspane's own record of them can't be read"),
+    };
+    // The extension's switch goes first; a failure there is a line, and the files still go.
+    if recorded
+        .iter()
+        .any(|id| id.starts_with("resources/gnome-shell-extension/"))
+    {
+        let switched = extension::GnomeSettings::new(io.clone(), env.values(), &deadline)
+            .and_then(|settings| settings.disable(&proof, &deadline));
+        lines.push(
+            match switched {
+                Ok(extension::Change::Written) => {
+                    "Crosspane's Shell extension was turned off in your GNOME settings; your \
+                     other extensions were not touched."
+                }
+                Ok(extension::Change::Unchanged) => {
+                    "Crosspane's Shell extension was not turned on in your GNOME settings."
+                }
+                Err(_) => {
+                    "Crosspane's Shell extension couldn't be turned off in your GNOME settings; \
+                     remove it in the Extensions app."
+                }
+            }
+            .to_owned(),
+        );
+    }
+    match installer.desktop_remove(&proof, &deadline) {
+        Ok(report) => {
+            lines.push(format!(
+                "{} desktop file(s) were removed.",
+                report.removed.len()
+            ));
+            if !report.kept.is_empty() {
+                lines.push(format!(
+                    "{} desktop file(s) were changed since setup, so they were kept.",
+                    report.kept.len()
+                ));
+            }
+        }
+        Err(_) => lines.push(
+            "Crosspane's desktop files couldn't be removed completely; what is left was not \
+             retried."
+                .to_owned(),
+        ),
+    }
+    lines
 }
 
 fn stage_deadline(ms: u64) -> Option<Deadline> {
@@ -350,14 +455,15 @@ impl Uninstaller for NativeUninstaller {
             }
         };
         let preview = format!(
-            "{}\n\n{form}{}",
+            "{}\n\n{form}{}{}",
             plan.preview(),
             if resume {
                 "\n\nAn earlier removal didn't finish. It is resumed from its record after you \
                  confirm, and nothing already settled is repeated."
             } else {
                 ""
-            }
+            },
+            desktop_preview(&self.io).map_or(String::new(), |note| format!("\n\n{note}"))
         );
         self.state = State::Planned(Box::new(Planned {
             plan,
@@ -402,6 +508,7 @@ impl Uninstaller for NativeUninstaller {
             firewall: None,
             pending_rule: None,
             firewall_tried: false,
+            desktop: Vec::new(),
         }));
         Ok(())
     }
@@ -432,6 +539,7 @@ impl Uninstaller for NativeUninstaller {
             return self.prepare_rule(package);
         }
         let env = self.env.clone();
+        let (io, support, desktop_env) = (self.io.clone(), self.support.clone(), self.env.clone());
         let State::Running(running) = &mut self.state else {
             return finished_empty();
         };
@@ -461,6 +569,8 @@ impl Uninstaller for NativeUninstaller {
         match result {
             Ok(text) => {
                 if running.run.stage() == UninstallStage::Finished {
+                    // The core files are handled; the GNOME/KDE desktop files go with them.
+                    running.desktop = remove_desktop(&io, &desktop_env, &support, package);
                     finish(&mut self.state, "")
                 } else {
                     UninstallProgress::Progress(text.into())
@@ -547,6 +657,7 @@ fn finish(state: &mut State, note: &str) -> UninstallProgress {
     };
     let report = running.run.report();
     let (outcome, mut lines) = describe(&report, running.selection);
+    lines.extend(running.desktop);
     if !note.is_empty() {
         lines.insert(0, note.to_owned());
     }
@@ -646,3 +757,297 @@ fn describe(
 }
 
 opaque_debug!(NativeUninstaller);
+
+#[cfg(test)]
+mod desktop_removal_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::platform::linux::detect::Desktop;
+    use crate::platform::linux::extension::{ENABLED_KEY, UUID};
+    use crate::platform::linux::native_io::{
+        CommandOutput, CommandRunner, CommandSpec, ProcessFacts, ProcessProbe, SupportObservations,
+    };
+    use crate::platform::linux::payload::{DESKTOP_FILES, sha256};
+    use std::collections::BTreeMap;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ID: AtomicU64 = AtomicU64::new(0);
+
+    /// `gsettings` on one key, kept in memory.
+    #[derive(Default)]
+    struct Settings {
+        list: Mutex<Vec<String>>,
+        fail_set: Mutex<bool>,
+        sets: Mutex<usize>,
+    }
+    impl CommandRunner for Settings {
+        fn run(
+            &self,
+            c: &CommandSpec,
+            _: &Deadline,
+        ) -> std::result::Result<CommandOutput, NativeError> {
+            let argv = c.argv();
+            let ok = |text: String| CommandOutput {
+                code: Some(0),
+                stdout: text.into_bytes(),
+                stderr: Vec::new(),
+            };
+            match (argv[0].as_str(), argv[2].as_str()) {
+                ("get", ENABLED_KEY) => {
+                    let list = self.list.lock().unwrap();
+                    Ok(ok(format!(
+                        "[{}]\n",
+                        list.iter()
+                            .map(|n| format!("'{n}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )))
+                }
+                ("get", "disable-user-extensions") => Ok(ok("false\n".into())),
+                ("set", ENABLED_KEY) => {
+                    *self.sets.lock().unwrap() += 1;
+                    if *self.fail_set.lock().unwrap() {
+                        return Ok(CommandOutput {
+                            code: Some(1),
+                            stdout: Vec::new(),
+                            stderr: Vec::new(),
+                        });
+                    }
+                    *self.list.lock().unwrap() =
+                        crate::platform::linux::extension::parse_enabled(&argv[3]).unwrap();
+                    Ok(ok(String::new()))
+                }
+                other => panic!("unapproved command {other:?}"),
+            }
+        }
+    }
+    struct Never;
+    impl ProcessProbe for Never {
+        fn snapshot(&self, _: u32, _: &Deadline) -> std::result::Result<ProcessFacts, NativeError> {
+            Err(NativeError::Unavailable)
+        }
+    }
+    /// Support detection that answers with one fixed proof, or with nothing.
+    struct Fixed(Mutex<Option<crate::platform::linux::native_io::SupportProof>>);
+    impl Support for Fixed {
+        fn detect(&self, _: Option<&Package>, _: &Deadline) -> SupportOutcome {
+            match self.0.lock().unwrap().clone() {
+                Some(proof) => SupportOutcome::Supported(proof),
+                None => SupportOutcome::Pending("not now".into()),
+            }
+        }
+        fn source(&self) -> crosspane_installer_core::ObservationSource {
+            crosspane_installer_core::ObservationSource::Demo
+        }
+    }
+
+    const FILES_AND_PATHS: [(&str, &str); 4] = [
+        (
+            "applications/io.frostdev.crosspane.agent.desktop",
+            "[Desktop Entry]\nType=Application\n",
+        ),
+        (
+            "gnome-shell/extensions/crosspane@frostdev.io/extension.js",
+            "// js\n",
+        ),
+        (
+            "gnome-shell/extensions/crosspane@frostdev.io/metadata.json",
+            "{\"uuid\": \"crosspane@frostdev.io\"}\n",
+        ),
+        (
+            "gnome-shell/extensions/crosspane@frostdev.io/io.frostdev.Crosspane.Shell1.xml",
+            "<node/>\n",
+        ),
+    ];
+
+    struct World {
+        root: PathBuf,
+        io: Arc<LinuxNativeIo>,
+        env: ChildEnvironment,
+        settings: Arc<Settings>,
+        support: Arc<dyn Support>,
+        _bus: UnixListener,
+    }
+    impl World {
+        /// A GNOME session with the four desktop files and their record in place, and the
+        /// extension on among two others.
+        fn installed(with_record: bool) -> Self {
+            let root = PathBuf::from(format!(
+                "/tmp/cpdr-{}-{}",
+                std::process::id(),
+                ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            let settings = Arc::new(Settings::default());
+            let io =
+                Arc::new(LinuxNativeIo::scratch(&root, settings.clone(), Arc::new(Never)).unwrap());
+            let proof = io
+                .scratch_support(SupportObservations {
+                    uid: io.target().paths().uid,
+                    desktop: Desktop::Gnome,
+                    architecture: std::env::consts::ARCH.into(),
+                    arch_based: true,
+                    compositor_version: [50, 4, 0],
+                    protocols_ready: true,
+                    runtime_libraries_ready: true,
+                    compositor_managed: true,
+                    graphical_target_active: true,
+                    graphical_sessions: 1,
+                    session_id: "s".into(),
+                    session_type: "wayland".into(),
+                    seat: "seat0".into(),
+                    active: true,
+                })
+                .unwrap();
+            io.create_private_dir(&proof, &io.target().paths().runtime_home)
+                .unwrap();
+            let state = io.target().paths().state_home.join("crosspane/installer");
+            io.create_private_dir(&proof, &state).unwrap();
+            let data = io.target().paths().data_home.clone();
+            let mut leaves = Vec::new();
+            for (index, (relative, text)) in FILES_AND_PATHS.iter().enumerate() {
+                let path = data.join(relative);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, text).unwrap();
+                std::fs::set_permissions(
+                    &path,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o644),
+                )
+                .unwrap();
+                let digest: String = sha256(text.as_bytes())
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                leaves.push(serde_json::json!({"id": DESKTOP_FILES[index], "sha256": digest}));
+            }
+            if with_record {
+                let record = serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 1, "operation": 1, "desktop": "gnome",
+                    "manifest_sha256": "0".repeat(64), "leaves": leaves,
+                }))
+                .unwrap();
+                io.atomic_write(&proof, &state.join("desktop-outcome.json"), &record)
+                    .unwrap();
+            }
+            *settings.list.lock().unwrap() =
+                vec!["keep@me.org".into(), UUID.into(), "also@keep.org".into()];
+            let bus_path = io.target().paths().runtime_home.join("bus");
+            let bus = UnixListener::bind(&bus_path).unwrap();
+            let env = io
+                .session_bus_environment(
+                    BTreeMap::from([(
+                        "DBUS_SESSION_BUS_ADDRESS".to_owned(),
+                        format!("unix:path={}", bus_path.display()),
+                    )]),
+                    &Deadline::new(5000, Cancellation::default()).unwrap(),
+                )
+                .unwrap();
+            Self {
+                root,
+                io,
+                env,
+                settings,
+                support: Arc::new(Fixed(Mutex::new(Some(proof)))),
+                _bus: bus,
+            }
+        }
+        fn path(&self, index: usize) -> PathBuf {
+            self.io
+                .target()
+                .paths()
+                .data_home
+                .join(FILES_AND_PATHS[index].0)
+        }
+        fn run(&self) -> Vec<String> {
+            remove_desktop(&self.io, &self.env, &self.support, None)
+        }
+    }
+    impl Drop for World {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn removal_turns_only_our_entry_off_and_takes_back_exactly_what_was_installed() {
+        let world = World::installed(true);
+        assert!(desktop_preview(&world.io).is_some());
+        let lines = world.run().join(" ");
+        assert!(
+            lines.contains("turned off in your GNOME settings"),
+            "{lines}"
+        );
+        assert!(lines.contains("4 desktop file(s) were removed"), "{lines}");
+        assert_eq!(
+            *world.settings.list.lock().unwrap(),
+            ["keep@me.org", "also@keep.org"]
+        );
+        for index in 0..4 {
+            assert!(!world.path(index).exists(), "{index}");
+        }
+        assert!(
+            !world
+                .io
+                .target()
+                .paths()
+                .data_home
+                .join("gnome-shell/extensions/crosspane@frostdev.io")
+                .exists()
+        );
+        assert!(!desktop_record(&world.io).exists());
+        // Nothing left: a second run has nothing to say and touches nothing.
+        let sets = *world.settings.sets.lock().unwrap();
+        assert!(world.run().is_empty());
+        assert_eq!(*world.settings.sets.lock().unwrap(), sets);
+        assert!(desktop_preview(&world.io).is_none());
+    }
+
+    #[test]
+    fn without_a_record_nothing_is_read_nothing_is_written_and_nothing_is_said() {
+        let world = World::installed(false);
+        assert!(desktop_preview(&world.io).is_none());
+        assert!(world.run().is_empty());
+        assert_eq!(*world.settings.sets.lock().unwrap(), 0);
+        for index in 0..4 {
+            assert!(
+                world.path(index).exists(),
+                "files without a record are not ours"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_current_proof_everything_is_kept_and_said_so() {
+        let world = World::installed(true);
+        let none: Arc<dyn Support> = Arc::new(Fixed(Mutex::new(None)));
+        let lines = remove_desktop(&world.io, &world.env, &none, None).join(" ");
+        assert!(lines.contains("were kept"), "{lines}");
+        assert_eq!(world.settings.list.lock().unwrap().len(), 3);
+        assert_eq!(*world.settings.sets.lock().unwrap(), 0);
+        for index in 0..4 {
+            assert!(world.path(index).exists());
+        }
+        assert!(desktop_record(&world.io).exists());
+    }
+
+    #[test]
+    fn a_file_the_person_changed_is_kept_and_a_failed_switch_does_not_stop_the_removal() {
+        let world = World::installed(true);
+        std::fs::write(world.path(1), "// my own edit\n").unwrap();
+        *world.settings.fail_set.lock().unwrap() = true;
+        let lines = world.run().join(" ");
+        assert!(lines.contains("couldn't be turned off"), "{lines}");
+        assert!(lines.contains("3 desktop file(s) were removed"), "{lines}");
+        assert!(lines.contains("1 desktop file(s) were changed"), "{lines}");
+        assert_eq!(
+            std::fs::read_to_string(world.path(1)).unwrap(),
+            "// my own edit\n"
+        );
+        assert!(!world.path(0).exists() && !world.path(2).exists() && !world.path(3).exists());
+        // The entry stays on (the write failed); the other two are untouched.
+        assert_eq!(world.settings.list.lock().unwrap().len(), 3);
+        assert!(!desktop_record(&world.io).exists());
+    }
+}

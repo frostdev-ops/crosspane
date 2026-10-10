@@ -98,7 +98,7 @@ impl LinuxRepair {
         )? {
             AgentEvidence::Matched(health) => {
                 let h = health.installer();
-                use crate::agent_contract::{BackendName::*, BackendState, StartupRecovery};
+                use crate::agent_contract::StartupRecovery;
                 let features = &input.package.manifest().members[0].features;
                 if h.build.version != input.package.manifest().product_version
                     || &h.build.features != features
@@ -107,16 +107,10 @@ impl LinuxRepair {
                         StartupRecovery::Restored | StartupRecovery::NothingParked
                     )
                     || h.recovery_pending != 0
-                    || h.backends.iter().any(|b| b.state == BackendState::Failed)
-                    || [
-                        Keystore, Links, Parking, Windows, Frames, Capture, Keys, Pointer,
-                    ]
-                    .iter()
-                    .any(|n| {
-                        !h.backends
-                            .iter()
-                            .any(|b| b.name == *n && b.state == BackendState::Ready)
-                    })
+                    || !crate::platform::linux::payload::backends_operational(
+                        &h.backends,
+                        input.proof.desktop(),
+                    )
                 {
                     return Err(RepairError::NotReady);
                 }

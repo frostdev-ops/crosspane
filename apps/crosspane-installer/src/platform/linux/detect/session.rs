@@ -1,4 +1,4 @@
-use super::{Architecture, EffectiveEnvironment, OsFamily, ProbeIssue};
+use super::{Architecture, Desktop, EffectiveEnvironment, OsFamily, ProbeIssue};
 use std::collections::BTreeMap;
 
 pub const MAX_PROBE_BYTES: usize = 1024 * 1024;
@@ -200,12 +200,24 @@ fn assignments(bytes: &[u8]) -> Result<BTreeMap<String, String>, ProbeIssue> {
 const MAX_VALUE_BYTES: usize = 4096;
 /// `systemctl --user show-environment` lines considered; bytes stay bounded by MAX_PROBE_BYTES.
 pub const MAX_ENVIRONMENT_LINES: usize = 16 * 1024;
-/// The only manager variables detection reads. Each must decode exactly or the read is malformed.
+/// The only manager variables a Hyprland detection reads. Each must decode exactly or the read is
+/// malformed.
 const STRICT_ENVIRONMENT: [&str; 4] = [
     "XDG_RUNTIME_DIR",
     "WAYLAND_DISPLAY",
     "HYPRLAND_INSTANCE_SIGNATURE",
     "XDG_SESSION_ID",
+];
+/// The same for GNOME and KDE: the two variables the agent's backend choice reads, plus the
+/// Hyprland signature (it must be absent: a signature wins in the agent, so a manager that holds
+/// one would start a Hyprland agent whatever this installer judged).
+const STRICT_PORTAL_ENVIRONMENT: [&str; 6] = [
+    "XDG_RUNTIME_DIR",
+    "WAYLAND_DISPLAY",
+    "HYPRLAND_INSTANCE_SIGNATURE",
+    "XDG_SESSION_ID",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_TYPE",
 ];
 /// systemd's POSIX `$'…'` form (escape.c `shell_maybe_quote`/`cescape_char`): `\a \b \f \n \r
 /// \t \v \\ \' \"` and `\xHH`. Any other escape, a missing or early closing quote, or
@@ -263,9 +275,12 @@ fn manager_value(value: &[u8]) -> Result<String, ProbeIssue> {
     }
     Ok(decoded)
 }
-/// One `KEY=value` per line, as systemd prints it. Only STRICT_ENVIRONMENT values must decode;
+/// One `KEY=value` per line, as systemd prints it. Only the `strict` values must decode;
 /// an unrelated line that can't be decoded is skipped, never repaired or returned.
-fn manager_assignments(bytes: &[u8]) -> Result<BTreeMap<String, String>, ProbeIssue> {
+fn manager_assignments(
+    bytes: &[u8],
+    strict: &[&str],
+) -> Result<BTreeMap<String, String>, ProbeIssue> {
     if bytes.len() > MAX_PROBE_BYTES {
         return Err(ProbeIssue::Oversize);
     }
@@ -288,17 +303,12 @@ fn manager_assignments(bytes: &[u8]) -> Result<BTreeMap<String, String>, ProbeIs
         else {
             continue;
         };
-        if !STRICT_ENVIRONMENT.contains(&key) {
+        if !strict.contains(&key) {
             continue;
         }
-        match manager_value(&line[split + 1..]) {
-            Ok(value) => {
-                if values.insert(key.to_owned(), value).is_some() {
-                    return Err(ProbeIssue::Malformed);
-                }
-            }
-            Err(error) if STRICT_ENVIRONMENT.contains(&key) => return Err(error),
-            Err(_) => {}
+        let value = manager_value(&line[split + 1..])?;
+        if values.insert(key.to_owned(), value).is_some() {
+            return Err(ProbeIssue::Malformed);
         }
     }
     Ok(values)
@@ -331,40 +341,83 @@ pub fn parse_architecture(value: &str) -> Result<Architecture, ProbeIssue> {
         other => Architecture::Other(other.into()),
     })
 }
+/// The Hyprland read: the signature is required, and no other desktop variable is consulted.
 pub fn parse_manager_environment(bytes: &[u8]) -> Result<EffectiveEnvironment, ProbeIssue> {
-    let values = manager_assignments(bytes)?;
+    parse_manager_environment_for(bytes, Desktop::Hyprland)
+}
+fn plain_name(value: &str, limit: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= limit
+        && !matches!(value, "." | "..")
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+}
+/// The user manager's environment for `desktop`: exactly what a service started under that
+/// manager will see. Hyprland requires its signature and reads nothing else. GNOME and KDE
+/// require `XDG_CURRENT_DESKTOP`, read `XDG_SESSION_TYPE` when present, and keep the Hyprland
+/// signature when there is one (so a mismatch is visible, never erased).
+pub fn parse_manager_environment_for(
+    bytes: &[u8],
+    desktop: Desktop,
+) -> Result<EffectiveEnvironment, ProbeIssue> {
+    let hyprland = desktop == Desktop::Hyprland;
+    let values = manager_assignments(
+        bytes,
+        if hyprland {
+            &STRICT_ENVIRONMENT
+        } else {
+            &STRICT_PORTAL_ENVIRONMENT
+        },
+    )?;
     let required = |key| values.get(key).cloned().ok_or(ProbeIssue::Missing);
     let runtime_dir = required("XDG_RUNTIME_DIR")?;
     let wayland_display = required("WAYLAND_DISPLAY")?;
-    let signature = required("HYPRLAND_INSTANCE_SIGNATURE")?;
+    let signature = if hyprland {
+        required("HYPRLAND_INSTANCE_SIGNATURE")?
+    } else {
+        values
+            .get("HYPRLAND_INSTANCE_SIGNATURE")
+            .cloned()
+            .unwrap_or_default()
+    };
     text(&runtime_dir, 4096)?;
     if !runtime_dir.starts_with('/')
         || runtime_dir
             .split('/')
             .skip(1)
             .any(|s| s.is_empty() || s == "." || s == "..")
-        || wayland_display.is_empty()
-        || matches!(wayland_display.as_str(), "." | "..")
-        || wayland_display.len() > 128
-        || !wayland_display
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
-        || signature.is_empty()
-        || matches!(signature.as_str(), "." | "..")
-        || signature.len() > 256
-        || !signature
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+        || !plain_name(&wayland_display, 128)
+        || ((hyprland || !signature.is_empty()) && !plain_name(&signature, 256))
     {
         return Err(ProbeIssue::Malformed);
     }
     if let Some(id) = values.get("XDG_SESSION_ID") {
         text(id, 64)?;
     }
+    let (current_desktop, session_type) = if hyprland {
+        (None, None)
+    } else {
+        let current = required("XDG_CURRENT_DESKTOP")?;
+        if current.len() > 128
+            || !current
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
+        {
+            return Err(ProbeIssue::Malformed);
+        }
+        let kind = values.get("XDG_SESSION_TYPE").cloned();
+        if kind.as_deref().is_some_and(|kind| !plain_name(kind, 32)) {
+            return Err(ProbeIssue::Malformed);
+        }
+        (Some(current), kind)
+    };
     Ok(EffectiveEnvironment {
         runtime_dir: runtime_dir.into(),
         wayland_display,
         hyprland_instance_signature: signature,
         session_id: values.get("XDG_SESSION_ID").cloned(),
+        xdg_current_desktop: current_desktop,
+        xdg_session_type: session_type,
     })
 }

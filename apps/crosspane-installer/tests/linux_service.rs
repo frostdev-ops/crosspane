@@ -193,12 +193,13 @@ fn deadline() -> Deadline {
 fn facts(io: &LinuxNativeIo) -> SupportObservations {
     SupportObservations {
         uid: io.target().paths().uid,
+        desktop: crosspane_installer::platform::linux::detect::Desktop::Hyprland,
         architecture: std::env::consts::ARCH.into(),
         arch_based: true,
-        hyprland_version: [0, 56, 0],
+        compositor_version: [0, 56, 0],
         protocols_ready: true,
         runtime_libraries_ready: true,
-        uwsm_managed: true,
+        compositor_managed: true,
         graphical_target_active: true,
         graphical_sessions: 1,
         session_id: "scratch".into(),
@@ -1757,7 +1758,7 @@ fn unsupported_revoked_or_changed_plan_never_mutates() {
         .plan(&proof, ServiceAction::Enable, &deadline())
         .unwrap();
     let mut changed = facts(&f.io);
-    changed.uwsm_managed = false;
+    changed.compositor_managed = false;
     assert!(proof.revalidate(&f.io, &changed).is_err());
     assert!(service.apply(&proof, plan, &deadline()).is_err());
     assert_eq!(f.mutations(), 0);

@@ -192,12 +192,13 @@ fn deadline() -> Deadline {
 fn support(io: &LinuxNativeIo) -> SupportObservations {
     SupportObservations {
         uid: io.target().paths().uid,
+        desktop: crosspane_installer::platform::linux::detect::Desktop::Hyprland,
         architecture: std::env::consts::ARCH.into(),
         arch_based: true,
-        hyprland_version: [0, 56, 0],
+        compositor_version: [0, 56, 0],
         protocols_ready: true,
         runtime_libraries_ready: true,
-        uwsm_managed: true,
+        compositor_managed: true,
         graphical_target_active: true,
         graphical_sessions: 1,
         session_id: "scratch".into(),
@@ -1106,7 +1107,7 @@ fn support_revocation_or_cancellation_refuses_before_mutation() {
             token.cancel();
         } else {
             let mut changed = support(&f.io);
-            changed.uwsm_managed = false;
+            changed.compositor_managed = false;
             assert_eq!(
                 proof.revalidate(&f.io, &changed),
                 Err(NativeError::Unsupported)

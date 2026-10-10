@@ -7,23 +7,29 @@ mod logind;
 mod manager;
 mod os;
 mod registry;
+mod shell;
 use super::*;
 use crate::platform::linux::{native_io::*, transport::CallerClock};
 pub use hyprland::{HyprlandFacts, hyprland_from_stream, parse_hyprland_version};
 pub use installed::associate_installed;
 pub use lineage::{
-    CompositorLineage, ProcessReader, ProcessStat, START_HYPRLAND, compositor_matches, parse_stat,
-    read_lineage,
+    CompositorLineage, KWIN_WRAPPER, ProcessReader, ProcessStat, START_HYPRLAND,
+    compositor_matches, compositor_matches_via, parse_stat, read_lineage,
 };
 pub use logind::{
     LogindFacts, MAX_PROPERTIES, Properties, decode_session, decode_user, logind_from_stream,
 };
-pub use manager::{MAX_UNIT_ROWS, ManagerFacts, UnitRows, decode_units, manager_from_stream};
+pub use manager::{
+    GNOME_SHELL, MAX_UNIT_ROWS, ManagerFacts, UnitRows, decode_units, manager_from_stream,
+    manager_from_stream_for,
+};
 pub use os::{OsFacts, os_from_reader};
 pub use registry::{
-    MAX_REGISTRY_GLOBALS, REQUIRED_PROTOCOLS, RegistryFacts, protocols_satisfy,
-    registry_from_stream,
+    MAX_REGISTRY_GLOBALS, REQUIRED_PORTAL_PROTOCOLS, REQUIRED_PROTOCOLS, RegistryFacts,
+    protocols_satisfy, protocols_satisfy_for, registry_from_stream, registry_from_stream_for,
+    required_protocols,
 };
+pub use shell::{parse_shell_version, shell_version_from_stream};
 use std::{
     net::Shutdown,
     os::unix::net::UnixStream,
@@ -131,7 +137,6 @@ impl NativeSessionProbes {
     }
     /// One pass and shared deadline, with no cache, mutation, fallback target or preference probe.
     pub fn detect(&self, runtime: RuntimeFacts, deadline: &Deadline) -> DetectionResult {
-        let source = self.io.target().source();
         let values = self.environment.values();
         let selected_environment = EffectiveEnvironment {
             runtime_dir: self.io.target().paths().runtime_home.clone(),
@@ -141,7 +146,124 @@ impl NativeSessionProbes {
                 .cloned()
                 .unwrap_or_default(),
             session_id: values.get("XDG_SESSION_ID").cloned(),
+            xdg_current_desktop: values.get("XDG_CURRENT_DESKTOP").cloned(),
+            xdg_session_type: values.get("XDG_SESSION_TYPE").cloned(),
         };
+        // The desktop is the agent's own answer for this environment; each desktop has its own
+        // evidence chain, and none borrows another's.
+        match selected_environment.desktop() {
+            Ok(Desktop::Hyprland) => self.detect_hyprland(selected_environment, runtime, deadline),
+            Ok(desktop) => self.detect_portal(desktop, selected_environment, runtime, deadline),
+            Err(reason) => self.detect_unsupported(reason, selected_environment, runtime, deadline),
+        }
+    }
+    /// An established negative needs no bus: the agent has no backend for this desktop. Nothing
+    /// that could grant authority is read, and the report carries no proof.
+    fn detect_unsupported(
+        &self,
+        reason: UnsupportedReason,
+        selected_environment: EffectiveEnvironment,
+        runtime: RuntimeFacts,
+        deadline: &Deadline,
+    ) -> DetectionResult {
+        let source = self.io.target().source();
+        let now = (self.clock)();
+        fn unverified<T>(source: ObservationSource, now: u64) -> Fact<T> {
+            Fact::issue(ProbeIssue::Unverified, source, now)
+        }
+        let os = self.os(deadline);
+        let session = SessionFacts {
+            uid: self.io.target().paths().uid,
+            os: os.family,
+            architecture: Fact {
+                value: parse_architecture(std::env::consts::ARCH),
+                source,
+                observed_at_ms: now,
+            },
+            desktop: Err(reason),
+            compositor_version: unverified(source, now),
+            protocols: unverified(source, now),
+            compositor_managed: unverified(source, now),
+            graphical_target_active: unverified(source, now),
+            graphical_sessions: unverified(source, now),
+            selected_session: unverified(source, now),
+            selected_environment,
+            manager_environment: unverified(source, now),
+        };
+        let installed_agent = self.installed_agent(deadline);
+        DetectionResult {
+            backends: super::report::backends_of(&installed_agent, Desktop::Hyprland),
+            report: SupportReport {
+                eligibility: classify(&session, &runtime),
+                session,
+                runtime,
+                installed_agent,
+                reduced_motion: unverified(source, now),
+            },
+            os_path: os.path,
+            proof: None,
+        }
+    }
+    /// GNOME or KDE Plasma. The chain mirrors uwsm's: the user manager's own compositor unit is
+    /// the running process that serves this session's Wayland socket, inside the selected
+    /// logind session, with the manager's environment agreeing with the installer's.
+    fn detect_portal(
+        &self,
+        desktop: Desktop,
+        selected_environment: EffectiveEnvironment,
+        runtime: RuntimeFacts,
+        deadline: &Deadline,
+    ) -> DetectionResult {
+        let source = self.io.target().source();
+        let architecture = Fact {
+            value: parse_architecture(std::env::consts::ARCH),
+            source,
+            observed_at_ms: (self.clock)(),
+        };
+        let os = self.os(deadline);
+        let logind = self.logind(deadline);
+        let manager = self.manager_for(deadline, desktop);
+        let manager_environment = self.manager_environment_for(deadline, desktop);
+        let registry = self.registry_for(deadline, desktop);
+        let lineage = self.lineage_between(
+            &manager,
+            registry.value.as_ref().ok().map(|facts| facts.pid),
+            desktop,
+            deadline,
+        );
+        let version = match desktop {
+            Desktop::Gnome => self.shell_version(deadline),
+            _ => Fact::issue(ProbeIssue::Unverified, source, (self.clock)()),
+        };
+        let pass = PortalPass {
+            desktop,
+            os,
+            architecture,
+            logind,
+            manager,
+            manager_environment,
+            registry,
+            lineage,
+            version,
+            installed_agent: self.installed_agent(deadline),
+            reduced_motion: Fact::issue(ProbeIssue::Unverified, source, (self.clock)()),
+        };
+        super::report::compose_portal_support(
+            &self.io,
+            selected_environment,
+            pass,
+            runtime,
+            deadline,
+            true,
+        )
+    }
+    fn detect_hyprland(
+        &self,
+        selected_environment: EffectiveEnvironment,
+        runtime: RuntimeFacts,
+        deadline: &Deadline,
+    ) -> DetectionResult {
+        let source = self.io.target().source();
         let os = self.os(deadline);
         let architecture = Fact {
             value: parse_architecture(std::env::consts::ARCH),
@@ -229,16 +351,33 @@ impl NativeSessionProbes {
         hyprland: &Fact<HyprlandFacts>,
         deadline: &Deadline,
     ) -> Fact<CompositorLineage> {
+        self.lineage_between(
+            manager,
+            hyprland.value.as_ref().ok().map(|facts| facts.pid),
+            Desktop::Hyprland,
+            deadline,
+        )
+    }
+    /// The same read for any desktop, with the compositor PID taken from its socket peer. GNOME
+    /// has no launcher: its Shell must be the unit's main process itself, so nothing is read.
+    pub fn lineage_between(
+        &self,
+        manager: &Fact<ManagerFacts>,
+        compositor: Option<u32>,
+        desktop: Desktop,
+        deadline: &Deadline,
+    ) -> Fact<CompositorLineage> {
         let source = self.io.target().source();
-        let value = match (&manager.value, &hyprland.value) {
-            (Ok(manager), Ok(hyprland)) => match manager.compositor_pid {
-                Some(main) if main != hyprland.pid => {
+        let value = match (&manager.value, compositor) {
+            (Ok(manager), Some(compositor)) => match manager.compositor_pid {
+                Some(main) if main != compositor && desktop != Desktop::Gnome => {
                     if source == ObservationSource::Demo {
                         Err(ProbeIssue::Foreign)
                     } else {
-                        deadline.check().map_err(issue).and_then(|_| {
-                            read_lineage(&lineage::NativeProcesses, main, hyprland.pid)
-                        })
+                        deadline
+                            .check()
+                            .map_err(issue)
+                            .and_then(|_| read_lineage(&lineage::NativeProcesses, main, compositor))
                     }
                 }
                 _ => Err(ProbeIssue::Unverified),
@@ -252,6 +391,9 @@ impl NativeSessionProbes {
         }
     }
     pub fn manager(&self, deadline: &Deadline) -> Fact<ManagerFacts> {
+        self.manager_for(deadline, Desktop::Hyprland)
+    }
+    pub fn manager_for(&self, deadline: &Deadline, desktop: Desktop) -> Fact<ManagerFacts> {
         let shared = deadline.clone();
         let clock = self.clock.clone();
         let source = self.io.target().source();
@@ -259,14 +401,31 @@ impl NativeSessionProbes {
             self.io.connect_session_bus(&self.environment, deadline),
             deadline,
             move |stream| {
-                let mut facts = manager::read(stream, &shared, clock)?;
-                facts.uwsm_managed.source = source;
+                let mut facts = manager::read_for(stream, &shared, clock, desktop)?;
+                facts.compositor_managed.source = source;
                 facts.graphical_target_active.source = source;
                 Ok(facts)
             },
         )
     }
+    /// GNOME Shell's version (advisory; never authority).
+    pub fn shell_version(&self, deadline: &Deadline) -> Fact<[u16; 3]> {
+        let shared = deadline.clone();
+        let clock = self.clock.clone();
+        self.read(
+            self.io.connect_session_bus(&self.environment, deadline),
+            deadline,
+            move |stream| shell::read(stream, &shared, clock),
+        )
+    }
     pub fn manager_environment(&self, deadline: &Deadline) -> Fact<EffectiveEnvironment> {
+        self.manager_environment_for(deadline, Desktop::Hyprland)
+    }
+    pub fn manager_environment_for(
+        &self,
+        deadline: &Deadline,
+        desktop: Desktop,
+    ) -> Fact<EffectiveEnvironment> {
         let result = (|| {
             let bus = self
                 .environment
@@ -288,7 +447,7 @@ impl NativeSessionProbes {
             )?;
             self.io.run(&command, deadline)
         })();
-        manager::environment_output(result, self.io.target().source(), (self.clock)())
+        manager::environment_output(result, self.io.target().source(), (self.clock)(), desktop)
     }
     pub fn hyprland(&self, deadline: &Deadline) -> Fact<HyprlandFacts> {
         let clock = self.clock.clone();
@@ -304,13 +463,16 @@ impl NativeSessionProbes {
         )
     }
     pub fn registry(&self, deadline: &Deadline) -> Fact<RegistryFacts> {
+        self.registry_for(deadline, Desktop::Hyprland)
+    }
+    pub fn registry_for(&self, deadline: &Deadline, desktop: Desktop) -> Fact<RegistryFacts> {
         let clock = self.clock.clone();
         let source = self.io.target().source();
         self.read(
             self.io.connect_wayland(&self.environment, deadline),
             deadline,
             move |stream| {
-                let mut facts = registry::read(stream, clock)?;
+                let mut facts = registry::read_for(stream, clock, desktop)?;
                 facts.protocols.source = source;
                 Ok(facts)
             },

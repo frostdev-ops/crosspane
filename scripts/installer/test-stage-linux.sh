@@ -12,6 +12,14 @@ FILES = ["bin/crosspane-agent", "bin/crosspanectl", "bin/crosspane-ui",
 TEMPLATES = {FILES[4]: b"[Service]\nExecStart={{agent_executable}} run\nEnvironment={{xdg_config_environment}}\nEnvironment={{xdg_state_environment}}\nEnvironment={{xdg_runtime_environment}}\nEnvironment={{crosspane_runtime_environment}}\n",
              FILES[5]: b"[Desktop Entry]\nExec={{settings_executable}}\n",
              FILES[6]: b"[Desktop Entry]\nExec={{installer_executable}}\n"}
+DESKTOP = ["resources/io.frostdev.crosspane.agent.desktop",
+           "resources/gnome-shell-extension/extension.js",
+           "resources/gnome-shell-extension/metadata.json",
+           "resources/gnome-shell-extension/io.frostdev.Crosspane.Shell1.xml"]
+DESKTOP_DATA = {DESKTOP[0]: b"[Desktop Entry]\nType=Application\nName=Crosspane\nExec=crosspane-agent\n",
+                DESKTOP[1]: b"// inert fixture extension \xc3\xa9\n",
+                DESKTOP[2]: b'{"uuid": "crosspane@frostdev.io", "shell-version": ["48"]}\n',
+                DESKTOP[3]: b'<node><interface name="io.frostdev.Crosspane.Shell1"/></node>\n'}
 def sha(data):
     return hashlib.sha256(data).hexdigest()
 def elf(machine=62):
@@ -26,15 +34,19 @@ def write(path, data):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.write_bytes(data)
     path.chmod(0o600)
-def fixture(root, machine=62):
+def fixture(root, machine=62, schema=1):
     root.mkdir(mode=0o700)
-    metadata = {"schema_version": 1, "product_version": "0.0.0", "architecture": "x86_64" if machine == 62 else "aarch64",
+    metadata = {"schema_version": schema, "product_version": "0.0.0", "architecture": "x86_64" if machine == 62 else "aarch64",
                 "source_revision": "1" * 40, "profile": "dev", "libraries": [], "members": []}
     for index, name in enumerate(FILES):
         data = elf(machine) if index < 4 else TEMPLATES.get(name, b"inert-resource\n")
         write(root / name, data)
         metadata["members"].append({"name": name, "size": len(data), "sha256": sha(data),
                                     "features": ["video"] if index == 0 else []})
+    for name in DESKTOP if schema == 2 else []:
+        write(root / name, DESKTOP_DATA[name])
+        metadata["members"].append({"name": name, "size": len(DESKTOP_DATA[name]),
+                                    "sha256": sha(DESKTOP_DATA[name]), "features": []})
     write(root / "libraries/libavcodec.so.61", elf(machine))
     metadata["libraries"] = [{"name": "libavcodec.so.61", "sha256": sha(elf(machine))}]
     write(root / "provenance.json", json.dumps(metadata).encode())
@@ -194,5 +206,42 @@ with tempfile.TemporaryDirectory(prefix="cp47b-stage-", dir="/tmp") as directory
     checks += 1
     assert all((source / name).read_bytes() == content for name, content in original.items())
     checks += 1
+    # Schema 2: the nine core members and the four GNOME/KDE desktop members, in that order.
+    desktop_source, desktop_output = scratch / "desktop", scratch / "desktop-output"
+    desktop_metadata = fixture(desktop_source, schema=2)
+    run(desktop_source, desktop_output, True)
+    with tarfile.open(desktop_output / "payload.tar", mode="r:") as bundle:
+        assert bundle.getnames() == ["manifest.json", *FILES, *DESKTOP]
+        assert json.load(bundle.extractfile("manifest.json")) == desktop_metadata
+        for name in DESKTOP:
+            assert bundle.extractfile(name).read() == DESKTOP_DATA[name]
+            assert bundle.getmember(name).mode == 0o644
+    checks += 1
+    for case in range(6):
+        broken, out = scratch / f"desktop-bad-{case}", scratch / f"desktop-out-{case}"
+        m = fixture(broken, schema=2)
+        if case == 0:
+            # A schema-2 payload never half-carries the desktop files.
+            (broken / DESKTOP[1]).unlink()
+        elif case == 1:
+            m["members"].pop()
+        elif case == 2:
+            content = DESKTOP_DATA[DESKTOP[2]].replace(b"crosspane@frostdev.io", b"other@example.org")
+            write(broken / DESKTOP[2], content)
+            m["members"][11]["size"], m["members"][11]["sha256"] = len(content), sha(content)
+        elif case == 3:
+            content = DESKTOP_DATA[DESKTOP[0]] + b"Exec={{agent_executable}}\n"
+            write(broken / DESKTOP[0], content)
+            m["members"][9]["size"], m["members"][9]["sha256"] = len(content), sha(content)
+        elif case == 4:
+            content = DESKTOP_DATA[DESKTOP[1]] + b"\0"
+            write(broken / DESKTOP[1], content)
+            m["members"][10]["size"], m["members"][10]["sha256"] = len(content), sha(content)
+        else:
+            # A schema-1 manifest may not list the desktop members.
+            m["schema_version"] = 1
+        write(broken / "provenance.json", json.dumps(m).encode())
+        run(broken, out, False)
+        checks += 1
 print(f"stage-linux: {checks} scratch checks passed; artifacts stayed inert")
 PY

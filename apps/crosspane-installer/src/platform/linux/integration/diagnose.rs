@@ -202,11 +202,24 @@ pub(crate) fn diagnose(payload: Option<&Path>, out: &mut Report) {
         session.architecture.value.as_ref(),
         false,
     );
+    // Which desktop this is (the agent's own rule), then that desktop's facts under its own names.
+    out.debug(
+        "support",
+        "desktop",
+        S,
+        session.desktop.as_ref().map_err(|reason| *reason),
+        false,
+    );
+    let (version_name, lifecycle_name) = match session.desktop {
+        Ok(detect::Desktop::Gnome) => ("GNOME Shell version", "GNOME session lifecycle"),
+        Ok(detect::Desktop::Kde) => ("Plasma version", "Plasma session lifecycle"),
+        _ => ("Hyprland version", "uwsm lifecycle"),
+    };
     out.record(
         "support",
-        "Hyprland version",
+        version_name,
         E,
-        session.hyprland_version.value,
+        session.compositor_version.value,
         false,
     );
     out.record(
@@ -218,9 +231,9 @@ pub(crate) fn diagnose(payload: Option<&Path>, out: &mut Report) {
     );
     out.record(
         "support",
-        "uwsm lifecycle",
+        lifecycle_name,
         S,
-        session.uwsm_managed.value,
+        session.compositor_managed.value,
         true,
     );
     out.record(
@@ -258,11 +271,12 @@ pub(crate) fn diagnose(payload: Option<&Path>, out: &mut Report) {
         "support",
         "session environment matches",
         S,
-        session
-            .manager_environment
-            .value
-            .as_ref()
-            .map(|e| e == &session.selected_environment),
+        session.manager_environment.value.as_ref().map(|e| {
+            e.agrees_with(
+                &session.selected_environment,
+                session.desktop.unwrap_or(detect::Desktop::Hyprland),
+            )
+        }),
         true,
     );
     out.record(
@@ -285,16 +299,56 @@ pub(crate) fn diagnose(payload: Option<&Path>, out: &mut Report) {
     );
     if let detect::Eligibility::NotSupported(reason) = result.report.eligibility {
         let class = match reason {
-            detect::UnsupportedReason::Uwsm | detect::UnsupportedReason::SessionType => S,
+            detect::UnsupportedReason::Uwsm
+            | detect::UnsupportedReason::SessionType
+            | detect::UnsupportedReason::Desktop
+            | detect::UnsupportedReason::SessionManager => S,
             _ => E,
         };
         out.issue(
             "service",
             "observed compatibility refusal",
             class,
-            &detect::unsupported_text(reason),
+            &detect::unsupported_text_for(reason, session.desktop.ok()),
             true,
         );
+    }
+    // GNOME's Shell extension switch, read only. Nothing here writes to the person's settings.
+    if session.desktop == Ok(detect::Desktop::Gnome) {
+        let reading = deadline().ok().map(|settings_deadline| {
+            super::super::extension::GnomeSettings::new(
+                io.clone(),
+                env.values(),
+                &settings_deadline,
+            )
+            .and_then(|settings| settings.read(&settings_deadline))
+        });
+        match reading {
+            Some(Ok(reading)) => {
+                out.record(
+                    "payload",
+                    "Shell extension turned on",
+                    S,
+                    Ok::<_, &str>(reading.enabled),
+                    false,
+                );
+                out.record(
+                    "payload",
+                    "GNOME user extensions switched off",
+                    S,
+                    Ok::<_, &str>(reading.user_extensions_disabled),
+                    false,
+                );
+            }
+            Some(Err(error)) => out.issue(
+                "payload",
+                "Shell extension turned on",
+                S,
+                &error.to_string(),
+                false,
+            ),
+            None => {}
+        }
     }
     for (name, value) in [
         ("dependency graph", &runtime.dependency_graph),

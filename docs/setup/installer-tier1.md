@@ -22,9 +22,29 @@ resources/crosspane-settings.desktop
 resources/crosspane-installer.desktop
 resources/crosspane-icon.svg
 resources/LICENSE
+resources/io.frostdev.crosspane.agent.desktop
+resources/gnome-shell-extension/extension.js
+resources/gnome-shell-extension/metadata.json
+resources/gnome-shell-extension/io.frostdev.Crosspane.Shell1.xml
 ```
 
-`provenance.json` records schema version 1, product version, architecture (`x86_64` or `aarch64`),
+The last four members are the GNOME and KDE support files (manifest schema 2). A schema 1
+manifest lists only the first nine, which is still a valid Hyprland payload; a GNOME or KDE
+session refuses it ("prepared before GNOME and KDE support") rather than half-installing. The
+archive always carries all thirteen under schema 2; what a session installs from them is decided
+by the session:
+
+| Session | Installed from the four support members |
+|---|---|
+| Hyprland (uwsm) | nothing |
+| KDE Plasma (Wayland) | `~/.local/share/applications/io.frostdev.crosspane.agent.desktop` (the desktop portals refuse the agent's application id without it) |
+| GNOME (Wayland) | that desktop entry, and the Shell extension in `~/.local/share/gnome-shell/extensions/crosspane@frostdev.io/` (left out when the Shell is known to be older than version 48, the first the extension supports), which is then added to `org.gnome.shell enabled-extensions` through `gsettings` (every existing entry stays; a failure to do so is a warning). GNOME loads a newly installed extension at the next log-in, and the installer says so. |
+
+Removal takes back exactly what was installed, from the installer's own record
+(`~/.local/state/crosspane/installer/desktop-outcome.json`): a changed file is kept, and only this
+extension's entry is removed from `enabled-extensions`.
+
+`provenance.json` records schema version 1 or 2, product version, architecture (`x86_64` or `aarch64`),
 the 40-character source revision, profile (`release`), and each member's size, SHA-256 and sorted
 features. The agent must include `video`. Each declared library has a name and SHA-256.
 Use the installer's approved templates: the stager validates the complete placeholder syntax,

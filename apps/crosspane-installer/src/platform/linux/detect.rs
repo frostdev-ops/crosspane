@@ -10,6 +10,10 @@ pub use crate::agent_contract::ObservationSource;
 use crate::agent_contract::{
     AgentReply, BootstrapV1, DecodedReply, KeyStoreProvenance, StatusAdmission,
 };
+/// The desktops the agent has a backend for. The installer asks the agent's own rule which one a
+/// session is, so the two can never disagree about it.
+pub use crosspane_platform_linux::desktop::LinuxDesktop as Desktop;
+use crosspane_platform_linux::desktop::{DesktopEnv, detect as agent_desktop};
 pub use probe::*;
 pub use report::*;
 pub use session::*;
@@ -67,18 +71,92 @@ pub enum Architecture {
 pub struct EffectiveEnvironment {
     pub runtime_dir: PathBuf,
     pub wayland_display: String,
+    /// Empty outside Hyprland.
     pub hyprland_instance_signature: String,
     pub session_id: Option<String>,
+    /// `XDG_CURRENT_DESKTOP` and `XDG_SESSION_TYPE`: what the agent reads to pick its backend.
+    pub xdg_current_desktop: Option<String>,
+    pub xdg_session_type: Option<String>,
+}
+impl EffectiveEnvironment {
+    /// The agent's own question: which desktop is this? (`crosspane_platform_linux::desktop`.)
+    /// An X11 session is `SessionType`; anything the agent has no backend for is `Desktop`.
+    pub fn desktop(&self) -> Result<Desktop, UnsupportedReason> {
+        let env = DesktopEnv {
+            xdg_current_desktop: self.xdg_current_desktop.clone(),
+            xdg_session_type: self.xdg_session_type.clone(),
+            hyprland_signature: !self.hyprland_instance_signature.is_empty(),
+            wayland_display: !self.wayland_display.is_empty(),
+        };
+        agent_desktop(&env).or_else(|_| {
+            let lists = |name: &str| {
+                self.xdg_current_desktop
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split(':')
+                    .any(|entry| entry.trim().eq_ignore_ascii_case(name))
+            };
+            if lists("Hyprland")
+                || self
+                    .xdg_current_desktop
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+            {
+                // A Hyprland session whose signature didn't reach this environment, or an
+                // environment that names no desktop at all, is judged by the original Hyprland
+                // pipeline, which finds its IPC missing, stays pending and admits nothing. It is
+                // not called an unknown desktop: nothing says it is one.
+                Ok(Desktop::Hyprland)
+            } else if self
+                .xdg_session_type
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("x11"))
+                // The agent refuses a lone GNOME or KDE entry only when nothing says the session
+                // is Wayland (X11, or neither a session type nor a Wayland display).
+                || lists("GNOME") != lists("KDE")
+            {
+                Err(UnsupportedReason::SessionType)
+            } else {
+                Err(UnsupportedReason::Desktop)
+            }
+        })
+    }
+    /// Whether the user manager's environment describes the same session as the installer's own.
+    /// Hyprland keeps its original three fields. GNOME and KDE also compare the two variables the
+    /// agent's backend choice reads, so a service started under this manager picks the backend
+    /// that this installer judged.
+    pub fn agrees_with(&self, selected: &Self, desktop: Desktop) -> bool {
+        let base = self.runtime_dir == selected.runtime_dir
+            && self.wayland_display == selected.wayland_display;
+        match desktop {
+            Desktop::Hyprland => {
+                base && self.hyprland_instance_signature == selected.hyprland_instance_signature
+            }
+            Desktop::Gnome | Desktop::Kde => {
+                base && self.hyprland_instance_signature.is_empty()
+                    && selected.hyprland_instance_signature.is_empty()
+                    && self.xdg_current_desktop == selected.xdg_current_desktop
+                    && self.xdg_session_type == selected.xdg_session_type
+            }
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionFacts {
     pub uid: u32,
     pub os: Fact<OsFamily>,
     pub architecture: Fact<Architecture>,
-    pub hyprland_version: Fact<[u16; 3]>,
+    /// Which desktop this session is, by the agent's own rule over the installer's environment.
+    /// `Err` is an established negative: the agent has no backend for it (or it is X11).
+    pub desktop: Result<Desktop, UnsupportedReason>,
+    /// Hyprland's version, or the GNOME Shell's. Unverified for KDE.
+    pub compositor_version: Fact<[u16; 3]>,
     pub protocols: Fact<bool>,
-    /// Actual lifecycle evidence, not a unit name, exported flag, or active target alone.
-    pub uwsm_managed: Fact<bool>,
+    /// Actual lifecycle evidence, not a unit name, exported flag, or active target alone: the
+    /// compositor that serves this session is the running, session-bound unit of the user's own
+    /// service manager (uwsm's `wayland-wm@` unit, GNOME's `org.gnome.Shell@` unit, or KDE's
+    /// `plasma-kwin_wayland.service`).
+    pub compositor_managed: Fact<bool>,
     pub graphical_target_active: Fact<bool>,
     pub graphical_sessions: Fact<usize>,
     pub selected_session: Fact<Option<SelectedSession>>,
@@ -157,6 +235,10 @@ pub enum UnsupportedReason {
     SessionType,
     VideoFeature,
     RuntimeLibrary,
+    /// The agent has no backend for this desktop (not Hyprland, GNOME or KDE Plasma).
+    Desktop,
+    /// GNOME or KDE whose compositor isn't a running unit of the user's service manager.
+    SessionManager,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Eligibility {
@@ -198,7 +280,9 @@ pub fn session_authority(session: &SessionFacts) -> Result<(), ProbeIssue> {
         Ok(false) => Err(ProbeIssue::Unverified),
         Err(issue) => Err(issue),
     };
-    required(&session.uwsm_managed)?;
+    // A session the agent has no backend for is never admitted, whatever else holds.
+    let desktop = session.desktop.map_err(|_| ProbeIssue::Unverified)?;
+    required(&session.compositor_managed)?;
     required(&session.graphical_target_active)?;
     match session.graphical_sessions.value {
         Ok(1) => {}
@@ -227,11 +311,7 @@ pub fn session_authority(session: &SessionFacts) -> Result<(), ProbeIssue> {
         .value
         .as_ref()
         .map_err(|issue| *issue)?;
-    if effective.runtime_dir != session.selected_environment.runtime_dir
-        || effective.wayland_display != session.selected_environment.wayland_display
-        || effective.hyprland_instance_signature
-            != session.selected_environment.hyprland_instance_signature
-    {
+    if !effective.agrees_with(&session.selected_environment, desktop) {
         return Err(ProbeIssue::Foreign);
     }
     Ok(())
@@ -249,7 +329,14 @@ pub fn compatibility_report(session: &SessionFacts, runtime: &RuntimeFacts) -> C
         "architecture",
         session.architecture.value.as_ref().err().copied(),
     );
-    note("Hyprland version", session.hyprland_version.value.err());
+    note(
+        match session.desktop {
+            Ok(Desktop::Gnome) => "GNOME Shell version",
+            Ok(Desktop::Kde) => "Plasma version",
+            _ => "Hyprland version",
+        },
+        session.compositor_version.value.err(),
+    );
     for (label, fact) in [
         ("required protocols", &session.protocols),
         ("dependency graph", &runtime.dependency_graph),
@@ -278,7 +365,7 @@ pub fn compatibility_report(session: &SessionFacts, runtime: &RuntimeFacts) -> C
     }
     let eligibility = classify(session, runtime);
     if let Eligibility::NotSupported(reason) = eligibility {
-        notes.push(unsupported_text(reason));
+        notes.push(unsupported_text_for(reason, session.desktop.ok()));
     }
     CompatibilityReport { eligibility, notes }
 }
@@ -287,7 +374,22 @@ pub fn compatibility_report(session: &SessionFacts, runtime: &RuntimeFacts) -> C
 /// audio, store unlock, or next-login evidence. Optional GPU and nonapplicable libei are ignored.
 pub fn classify(session: &SessionFacts, runtime: &RuntimeFacts) -> Eligibility {
     use UnsupportedReason as U;
+    let desktop = match session.desktop {
+        Ok(desktop) => desktop,
+        Err(reason) => return Eligibility::NotSupported(reason),
+    };
     let mut pending = None;
+    // Only Hyprland has a version floor (its backend needs the 0.56 protocols). GNOME and KDE are
+    // probed at run time and the agent does less when something is missing, so their version is
+    // information, not eligibility.
+    let version = match desktop {
+        Desktop::Hyprland => session
+            .compositor_version
+            .value
+            .as_ref()
+            .map(|v| *v >= [0, 56, 0]),
+        Desktop::Gnome | Desktop::Kde => Ok(true),
+    };
     let checks = [
         (
             session.os.value.as_ref().map(|v| *v == OsFamily::Arch),
@@ -301,18 +403,18 @@ pub fn classify(session: &SessionFacts, runtime: &RuntimeFacts) -> Eligibility {
                 .map(|v| matches!(v, Architecture::X86_64 | Architecture::Aarch64)),
             U::Architecture,
         ),
-        (
-            session
-                .hyprland_version
-                .value
-                .as_ref()
-                .map(|v| *v >= [0, 56, 0]),
-            U::HyprlandVersion,
-        ),
+        (version, U::HyprlandVersion),
     ];
     let booleans = [
         (&session.protocols, U::RequiredProtocols),
-        (&session.uwsm_managed, U::Uwsm),
+        (
+            &session.compositor_managed,
+            if desktop == Desktop::Hyprland {
+                U::Uwsm
+            } else {
+                U::SessionManager
+            },
+        ),
         (&runtime.dependency_graph, U::RuntimeLibrary),
         (&runtime.video_feature, U::VideoFeature),
         (&runtime.ffmpeg, U::RuntimeLibrary),
@@ -382,11 +484,7 @@ pub fn classify(session: &SessionFacts, runtime: &RuntimeFacts) -> Eligibility {
         );
     }
     match &session.manager_environment.value {
-        Ok(effective)
-            if effective.runtime_dir == session.selected_environment.runtime_dir
-                && effective.wayland_display == session.selected_environment.wayland_display
-                && effective.hyprland_instance_signature
-                    == session.selected_environment.hyprland_instance_signature => {}
+        Ok(effective) if effective.agrees_with(&session.selected_environment, desktop) => {}
         Ok(_) => {
             pending.get_or_insert(ProbeIssue::Foreign);
         }
@@ -397,8 +495,34 @@ pub fn classify(session: &SessionFacts, runtime: &RuntimeFacts) -> Eligibility {
     pending.map_or(Eligibility::Supported, Eligibility::Pending)
 }
 
+/// The wording for a desktop. Hyprland keeps the original sentences; GNOME and KDE name
+/// themselves, so a GNOME session is never told it "isn't managed by uwsm".
+pub fn unsupported_text_for(reason: UnsupportedReason, desktop: Option<Desktop>) -> String {
+    let name = match desktop {
+        Some(Desktop::Gnome) => "GNOME",
+        Some(Desktop::Kde) => "KDE Plasma",
+        _ => return unsupported_text(reason),
+    };
+    match reason {
+        UnsupportedReason::RequiredProtocols => {
+            format!("This {name} session doesn't offer the Wayland features Crosspane needs.")
+        }
+        UnsupportedReason::SessionManager => format!(
+            "Setup supports {name} sessions started by your user systemd (the usual way on \
+             current distributions). Yours isn't."
+        ),
+        other => unsupported_text(other),
+    }
+}
+
 pub fn unsupported_text(reason: UnsupportedReason) -> String {
     match reason {
+        UnsupportedReason::Desktop => "Crosspane supports Hyprland, GNOME and KDE Plasma on \
+             Wayland. This desktop isn't one of them."
+            .into(),
+        UnsupportedReason::SessionManager => "Setup supports GNOME and KDE Plasma sessions \
+             started by your user systemd. Yours isn't."
+            .into(),
         UnsupportedReason::OperatingSystem => {
             "This installer supports Arch-based Linux, such as Omarchy, for now.".into()
         }

@@ -979,12 +979,13 @@ impl Drop for Fixture {
 fn facts(io: &LinuxNativeIo) -> SupportObservations {
     SupportObservations {
         uid: io.target().paths().uid,
+        desktop: crosspane_installer::platform::linux::detect::Desktop::Hyprland,
         architecture: std::env::consts::ARCH.into(),
         arch_based: true,
-        hyprland_version: [0, 56, 0],
+        compositor_version: [0, 56, 0],
         protocols_ready: true,
         runtime_libraries_ready: true,
-        uwsm_managed: true,
+        compositor_managed: true,
         graphical_target_active: true,
         graphical_sessions: 1,
         session_id: "test-session".into(),
@@ -1037,10 +1038,10 @@ fn session_authority_fails_closed_without_gating_compatibility() {
         let mut f = facts(&fixture.io);
         match index {
             0 => f.arch_based = false,
-            1 => f.hyprland_version = [0, 55, 9],
+            1 => f.compositor_version = [0, 55, 9],
             2 => f.protocols_ready = false,
             3 => f.runtime_libraries_ready = false,
-            4 => f.uwsm_managed = false,
+            4 => f.compositor_managed = false,
             5 => f.graphical_target_active = false,
             6 => f.graphical_sessions = 0,
             7 => f.graphical_sessions = 2,
