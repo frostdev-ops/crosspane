@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::os::unix::fs::MetadataExt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, JoinHandle};
@@ -46,8 +46,16 @@ type Properties = HashMap<String, OwnedValue>;
 pub enum LockerEvidence {
     /// External lockers (Hyprland): a same-user locker process found by the `/proc` scan.
     ProcessScan,
-    /// GNOME Shell: `org.gnome.ScreenSaver` `GetActive` at `/org/gnome/ScreenSaver` on the session
-    /// bus, watched through its `ActiveChanged` signal, together with the `/proc` scan.
+    /// GNOME Shell: `GetActive` of the shell's screen shield (the owner of
+    /// `org.gnome.Shell.ScreenShield`, which is what `org.gnome.ScreenSaver` forwards to) at
+    /// `/org/gnome/ScreenSaver` on the session bus, watched through its `ActiveChanged` signal,
+    /// together with the `/proc` scan.
+    ///
+    /// The shell creates its screen shield only when GDM is the display manager. Without one
+    /// GNOME cannot lock, and the shield counts as "not active" only while `org.gnome.Shell` has an
+    /// owner on the session bus, `org.gnome.Shell.ScreenShield` has none, and
+    /// `org.gnome.DisplayManager` has none on the system bus, all checked on every read (owner
+    /// ruling 2026-10-09, `docs/wp/WP-G0.1.md`). Any failed check is unknown.
     GnomeScreenSaver,
     /// KDE Plasma: `org.freedesktop.ScreenSaver` `GetActive` at `/ScreenSaver`
     /// (ksmserver/kscreenlocker), watched through `ActiveChanged`, together with the `/proc` scan.
@@ -62,19 +70,45 @@ struct ScreenSaverApi {
     name: &'static str,
     path: &'static str,
     interface: &'static str,
+    /// `None`: the service must have an owner. `Some`: it may have none, and what that means is
+    /// decided by [`gnome_screensaver_active`].
+    no_shield: Option<NoShield>,
+}
+
+/// The other names the "no screen shield" decision looks at ([`gnome_screensaver_active`]).
+#[derive(Clone, Copy, Debug)]
+struct NoShield {
+    /// Session bus: the shell itself, which owns the screen shield's name when it can lock.
+    shell: &'static str,
+    /// System bus: the display manager the shell asks whether it can lock.
+    display_manager: &'static str,
 }
 
 const GNOME_SCREENSAVER: ScreenSaverApi = ScreenSaverApi {
-    name: "org.gnome.ScreenSaver",
+    name: "org.gnome.Shell.ScreenShield",
     path: "/org/gnome/ScreenSaver",
     interface: "org.gnome.ScreenSaver",
+    no_shield: Some(NoShield {
+        shell: "org.gnome.Shell",
+        display_manager: "org.gnome.DisplayManager",
+    }),
 };
 
 const FREEDESKTOP_SCREENSAVER: ScreenSaverApi = ScreenSaverApi {
     name: "org.freedesktop.ScreenSaver",
     path: "/ScreenSaver",
     interface: "org.freedesktop.ScreenSaver",
+    no_shield: None,
 };
+
+impl ScreenSaverApi {
+    /// The names whose owners the watch depends on: the service, and the shell for `no_shield`.
+    fn watched(self) -> impl Iterator<Item = &'static str> {
+        [Some(self.name), self.no_shield.map(|n| n.shell)]
+            .into_iter()
+            .flatten()
+    }
+}
 
 impl LockerEvidence {
     /// The screensaver service this evidence needs, if it needs one.
@@ -121,7 +155,9 @@ impl LogindSession {
     /// With a screensaver variant of [`LockerEvidence`], the session is provably unlocked only when
     /// logind's `LockedHint`, the desktop's screensaver service and the `/proc` scan all say so. Any
     /// of them failing to answer (or the service having no owner on the session bus) leaves the
-    /// state unknown and the gate closed.
+    /// state unknown and the gate closed. The one exception is GNOME without a lock screen (no
+    /// GDM), where the screensaver part is provably "not active" under the conditions documented
+    /// on [`LockerEvidence::GnomeScreenSaver`].
     pub fn with_locker(
         gate: Arc<IoGate>,
         locker: LockerEvidence,
@@ -407,6 +443,69 @@ fn locker_evidence(
     }
 }
 
+/// The only D-Bus reply to `GetNameOwner` that means nobody has the name.
+const NAME_HAS_NO_OWNER: &str = "org.freedesktop.DBus.Error.NameHasNoOwner";
+
+/// What one `GetNameOwner` said about a well-known name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NameProbe {
+    /// The unique name of the owner.
+    Owned(String),
+    /// The bus replied `NameHasNoOwner`.
+    Unowned,
+    /// A timeout, a refusal, a malformed reply, ...: nothing is known about the name.
+    Failed,
+}
+
+/// Classifies the reply to `GetNameOwner`. Only the named error reply means "no owner"; everything
+/// else that is not an owner (an empty one included) is a failure.
+fn name_probe(reply: zbus::Result<String>) -> NameProbe {
+    match reply {
+        Ok(owner) if !owner.is_empty() => NameProbe::Owned(owner),
+        Err(e) if is_error_reply(&e, NAME_HAS_NO_OWNER) => NameProbe::Unowned,
+        Ok(_) | Err(_) => NameProbe::Failed,
+    }
+}
+
+fn probe_owner(connection: &Connection, name: &str) -> NameProbe {
+    name_probe(call_raw(
+        connection,
+        DBUS,
+        DBUS_PATH,
+        DBUS,
+        "GetNameOwner",
+        &(name,),
+    ))
+}
+
+/// Whether a probe made now contradicts the one the watch was set up against, which means the
+/// signals it holds no longer describe the service. A failed probe says nothing either way.
+fn probe_changed(setup: &NameProbe, now: &NameProbe) -> bool {
+    *now != NameProbe::Failed && now != setup
+}
+
+/// The screensaver part of the lock evidence on GNOME: whether the screen shield is active.
+///
+/// GNOME Shell creates its screen shield (and owns `org.gnome.Shell.ScreenShield`) only when it
+/// can lock, which needs GDM. So, from the three probes, made fresh for this read:
+/// - the screen shield has an owner: ask it (`get_active`, which is `None` on any failure);
+/// - it has none, the shell has an owner and the display manager has none on the system bus: GNOME
+///   cannot lock at all, so "not active" (owner ruling 2026-10-09, `docs/wp/WP-G0.1.md`);
+/// - anything else, any failed probe included (the shell missing, or a display manager that
+///   should have given the shell a shield): `None`, unknown.
+fn gnome_screensaver_active(
+    shell: &NameProbe,
+    shield: &NameProbe,
+    display_manager: &NameProbe,
+    get_active: impl FnOnce(&str) -> Option<bool>,
+) -> Option<bool> {
+    match (shield, shell, display_manager) {
+        (NameProbe::Owned(owner), _, _) => get_active(owner),
+        (NameProbe::Unowned, NameProbe::Owned(_), NameProbe::Unowned) => Some(false),
+        _ => None,
+    }
+}
+
 fn lock_state(reading: Reading, lock_requested: bool) -> LockState {
     if !reading.bus_ok || reading.locked_hint.is_none() || reading.active.is_none() {
         LockState::Unknown
@@ -625,12 +724,14 @@ impl StateSource for LiveSource {
                 let sleeping = sleeping.ok().and_then(|v| bool::try_from(v).ok());
                 let uid = self.uid;
                 let watch = self.screensaver.as_ref();
+                // The system-bus connection, for the one probe that is not on the session bus.
+                let system = &self.connection;
                 Reading {
                     locked_hint,
                     active,
                     locker: locker_evidence(
                         self.locker,
-                        || watch.and_then(ScreenSaverWatch::active),
+                        || watch.and_then(|watch| watch.active(system)),
                         || locker_present(uid).ok(),
                     ),
                     sleeping,
@@ -654,22 +755,31 @@ impl Drop for LiveSource {
 }
 
 /// The desktop's screen-locker service on the session bus: its answer to `GetActive`, and its
-/// `ActiveChanged` signal, on a connection of its own. The system-bus logind connection is not
-/// involved.
+/// `ActiveChanged` signal, on a connection of its own. GNOME's "no screen shield" decision also
+/// asks the system bus; that one probe borrows the logind connection (see
+/// [`ScreenSaverWatch::active`]).
 struct ScreenSaverWatch {
     connection: Connection,
     api: ScreenSaverApi,
-    /// The unique name that owned `api.name` at setup. Calls go to it and not to the well-known
-    /// name, so they can neither start a service nor reach a replacement we have not seen.
-    owner: String,
+    /// Who owned `api.name` at setup: an owner, or `Unowned` where `api.no_shield` allows that.
+    /// Calls and `ActiveChanged` go to an owner and not to the well-known name, so they can neither
+    /// start a service nor reach a replacement we have not seen.
+    shield: NameProbe,
+    /// Who owned `api.no_shield`'s shell at setup. `Unowned`, and unused, without `no_shield`.
+    shell: NameProbe,
+    /// Set when a read finds the owners changed since setup. The signals that should have ended
+    /// the watch then did not arrive in time, so [`ScreenSaverWatch::lost`] makes the observer
+    /// reconnect.
+    owners_changed: AtomicBool,
     /// Taken by [`ScreenSaverWatch::start`].
     messages: Option<MessageIterator>,
     signals: Option<JoinHandle<()>>,
 }
 
 impl ScreenSaverWatch {
-    /// Connect to the session bus and resolve the service's owner. A service that has no owner is
-    /// an error, so the source is not established and the gate stays closed.
+    /// Connect to the session bus and resolve the owners to watch: the service's, and for
+    /// `no_shield` the shell's too. A service that must have an owner and has none is an error, so
+    /// the source is not established and the gate stays closed. So is any failed lookup.
     fn connect(api: ScreenSaverApi) -> Result<Self, PlatformError> {
         let connection: Connection = bounded(
             zbus::connection::Builder::session()
@@ -681,39 +791,42 @@ impl ScreenSaverWatch {
         .map_err(bus_error)?
         .into();
         let messages = MessageIterator::from(&connection);
-        let owner: String = call(
-            &connection,
-            DBUS,
-            DBUS_PATH,
-            DBUS,
-            "GetNameOwner",
-            &(api.name,),
-        )?;
+        let (shield, shell) = Self::owners(&connection, &api)?;
+        let mut rules = Vec::new();
+        if let NameProbe::Owned(owner) = &shield {
+            rules.push(
+                MatchRule::builder()
+                    .msg_type(zbus::message::Type::Signal)
+                    .sender(owner.as_str())
+                    .map_err(bus_error)?
+                    .path(api.path)
+                    .map_err(bus_error)?
+                    .interface(api.interface)
+                    .map_err(bus_error)?
+                    .member(ACTIVE_CHANGED)
+                    .map_err(bus_error)?
+                    .build(),
+            );
+        }
+        // Every watched name, the ones that have no owner now included: an owner appearing or
+        // changing is as much a reason to start over as one disappearing.
+        for name in api.watched() {
+            rules.push(
+                MatchRule::builder()
+                    .msg_type(zbus::message::Type::Signal)
+                    .sender(DBUS)
+                    .map_err(bus_error)?
+                    .interface(DBUS)
+                    .map_err(bus_error)?
+                    .member("NameOwnerChanged")
+                    .map_err(bus_error)?
+                    .add_arg(name)
+                    .map_err(bus_error)?
+                    .build(),
+            );
+        }
         // The iterator is active before AddMatch, so setup cannot lose an early signal.
-        for rule in [
-            MatchRule::builder()
-                .msg_type(zbus::message::Type::Signal)
-                .sender(owner.as_str())
-                .map_err(bus_error)?
-                .path(api.path)
-                .map_err(bus_error)?
-                .interface(api.interface)
-                .map_err(bus_error)?
-                .member(ACTIVE_CHANGED)
-                .map_err(bus_error)?
-                .build(),
-            MatchRule::builder()
-                .msg_type(zbus::message::Type::Signal)
-                .sender(DBUS)
-                .map_err(bus_error)?
-                .interface(DBUS)
-                .map_err(bus_error)?
-                .member("NameOwnerChanged")
-                .map_err(bus_error)?
-                .add_arg(api.name)
-                .map_err(bus_error)?
-                .build(),
-        ] {
+        for rule in rules {
             let _: () = call(
                 &connection,
                 DBUS,
@@ -723,15 +836,7 @@ impl ScreenSaverWatch {
                 &(rule.to_string(),),
             )?;
         }
-        let current_owner: String = call(
-            &connection,
-            DBUS,
-            DBUS_PATH,
-            DBUS,
-            "GetNameOwner",
-            &(api.name,),
-        )?;
-        if owner != current_owner {
+        if Self::owners(&connection, &api)? != (shield.clone(), shell.clone()) {
             return Err(PlatformError::Backend(
                 "screensaver owner changed during setup".into(),
             ));
@@ -739,10 +844,35 @@ impl ScreenSaverWatch {
         Ok(Self {
             connection,
             api,
-            owner,
+            shield,
+            shell,
+            owners_changed: AtomicBool::new(false),
             messages: Some(messages),
             signals: None,
         })
+    }
+
+    /// The owner of the service and of the shell (`Unowned` without `no_shield`), as a setup
+    /// needs them: a failed lookup, or a service that must have an owner and has none, is an
+    /// error.
+    fn owners(
+        connection: &Connection,
+        api: &ScreenSaverApi,
+    ) -> Result<(NameProbe, NameProbe), PlatformError> {
+        let shield = probe_owner(connection, api.name);
+        let shell = match api.no_shield {
+            Some(no_shield) => probe_owner(connection, no_shield.shell),
+            None => NameProbe::Unowned,
+        };
+        match (&shield, &shell) {
+            (NameProbe::Failed, _) | (_, NameProbe::Failed) => Err(PlatformError::Backend(
+                "screensaver owner lookup failed".into(),
+            )),
+            (NameProbe::Unowned, _) if api.no_shield.is_none() => Err(PlatformError::Backend(
+                "screensaver service has no owner".into(),
+            )),
+            _ => Ok((shield, shell)),
+        }
     }
 
     /// Start delivering `ActiveChanged` (and the service losing its owner) to the monitor.
@@ -753,7 +883,8 @@ impl ScreenSaverWatch {
             ));
         };
         let observed = monitor.clone();
-        let (api, owner) = (self.api, self.owner.clone());
+        let api = self.api;
+        let owner = self.owner().map(str::to_owned);
         self.signals = Some(
             thread::Builder::new()
                 .name("crosspane-screensaver-signals".into())
@@ -762,9 +893,9 @@ impl ScreenSaverWatch {
                         if observed.lock().stopped {
                             return;
                         }
-                        match message
-                            .and_then(|message| parse_screensaver_signal(&message, &api, &owner))
-                        {
+                        match message.and_then(|message| {
+                            parse_screensaver_signal(&message, &api, owner.as_deref())
+                        }) {
                             Ok(Some(signal)) => {
                                 observed.signal(signal);
                                 if matches!(signal, Signal::Lost) {
@@ -785,12 +916,47 @@ impl ScreenSaverWatch {
         Ok(())
     }
 
-    /// `GetActive` from the owner we are watching. Any failure, including the owner having gone
-    /// away or not answering within the call timeout, is `None`.
-    fn active(&self) -> Option<bool> {
+    /// The owner of the service at setup, if it had one.
+    fn owner(&self) -> Option<&str> {
+        match &self.shield {
+            NameProbe::Owned(owner) => Some(owner),
+            NameProbe::Unowned | NameProbe::Failed => None,
+        }
+    }
+
+    /// The screensaver part of the lock evidence: `Some(true)` if the lock screen is active,
+    /// `Some(false)` if it provably is not, `None` if that can't be told.
+    ///
+    /// With `no_shield` (GNOME) the owners are probed afresh on every read, `system` being the
+    /// system-bus connection for the display manager's name, and
+    /// [`gnome_screensaver_active`] decides. Probes that contradict the owners this watch was set
+    /// up against give `None` and have the observer reconnect: the answer would otherwise rest
+    /// on signals from a service that is no longer the one in charge. Otherwise it is `GetActive`
+    /// of the owner at setup.
+    fn active(&self, system: &Connection) -> Option<bool> {
+        let Some(no_shield) = self.api.no_shield else {
+            return self.get_active(self.owner()?);
+        };
+        let shell = probe_owner(&self.connection, no_shield.shell);
+        let shield = probe_owner(&self.connection, self.api.name);
+        let display_manager = probe_owner(system, no_shield.display_manager);
+        if probe_changed(&self.shell, &shell) || probe_changed(&self.shield, &shield) {
+            self.owners_changed.store(true, Ordering::Release);
+            return None;
+        }
+        let active = gnome_screensaver_active(&shell, &shield, &display_manager, |owner| {
+            self.get_active(owner)
+        });
+        note_shield_mode(&shield, active);
+        active
+    }
+
+    /// `GetActive` from `owner`. Any failure, including the owner having gone away or not
+    /// answering within the call timeout, is `None`.
+    fn get_active(&self, owner: &str) -> Option<bool> {
         call::<_, bool>(
             &self.connection,
-            &self.owner,
+            owner,
             self.api.path,
             self.api.interface,
             "GetActive",
@@ -799,9 +965,35 @@ impl ScreenSaverWatch {
         .ok()
     }
 
-    /// Whether the connection has closed or the signal thread has ended after it started.
+    /// Whether the watch has to be set up again: the connection has closed, the signal thread has
+    /// ended after it started, or a read found the owners changed.
     fn lost(&self) -> bool {
-        self.connection.is_closed() || self.signals.as_ref().is_some_and(JoinHandle::is_finished)
+        self.connection.is_closed()
+            || self.signals.as_ref().is_some_and(JoinHandle::is_finished)
+            || self.owners_changed.load(Ordering::Acquire)
+    }
+}
+
+/// The shield mode [`note_shield_mode`] last reported: 0 none yet, 1 no lock screen, 2 lock screen.
+static REPORTED_SHIELD_MODE: AtomicUsize = AtomicUsize::new(0);
+
+/// Says once, and again only if it changes, which lock evidence GNOME is giving: the screen
+/// shield's, or (without a lock screen) logind and the process scan alone. A read that could not
+/// tell says nothing.
+fn note_shield_mode(shield: &NameProbe, active: Option<bool>) {
+    let mode = match (shield, active) {
+        (NameProbe::Owned(_), _) => 2,
+        (_, Some(false)) => 1,
+        _ => return,
+    };
+    if REPORTED_SHIELD_MODE.swap(mode, Ordering::Relaxed) != mode {
+        if mode == 1 {
+            tracing::info!(
+                "GNOME has no lock screen (no GDM): lock evidence is logind + process scan"
+            );
+        } else {
+            tracing::info!("GNOME has a lock screen: lock evidence includes its screen shield");
+        }
     }
 }
 
@@ -1309,15 +1501,18 @@ fn parse_signal(
     }
 }
 
-/// Decodes the screensaver service's `ActiveChanged(b)` and the service losing its owner.
-/// Only a signal from the owner we watch, on the object and interface we watch, counts: the
-/// bus's `NameOwnerChanged` for the service name ends the watch (the name going to no owner or to
-/// any owner but the one we hold), and a malformed `ActiveChanged` is an error, which the caller
-/// treats as a loss.
+/// Decodes the screensaver service's `ActiveChanged(b)` and the watched names changing hands.
+/// `owner` is who owned the service when the watch was set up, if anybody did.
+///
+/// `ActiveChanged` counts only from that owner, on the object and interface we watch. The bus's
+/// `NameOwnerChanged` for any watched name ([`ScreenSaverApi::watched`]) ends the watch, whatever
+/// the change: the owners were fixed at setup and are not followed, so a name that was lost,
+/// replaced or has appeared since sends the observer back to setup. A malformed `ActiveChanged` is
+/// an error, which the caller treats as a loss.
 fn parse_screensaver_signal(
     message: &Message,
     api: &ScreenSaverApi,
-    owner: &str,
+    owner: Option<&str>,
 ) -> zbus::Result<Option<Signal>> {
     let header = message.header();
     if header.message_type() != zbus::message::Type::Signal {
@@ -1328,10 +1523,11 @@ fn parse_screensaver_signal(
     let path = header.path().map(|v| v.as_str());
     let sender = header.sender().map(|v| v.as_str());
     if sender == Some(DBUS) && interface == Some(DBUS) && member == Some("NameOwnerChanged") {
-        let (name, _old, new): (String, String, String) = message.body().deserialize()?;
-        return Ok((name == api.name && new != owner).then_some(Signal::Lost));
+        let (name, _old, _new): (String, String, String) = message.body().deserialize()?;
+        return Ok(api.watched().any(|v| v == name).then_some(Signal::Lost));
     }
-    if sender == Some(owner)
+    let from_owner = matches!((sender, owner), (Some(sender), Some(owner)) if sender == owner);
+    if from_owner
         && path == Some(api.path)
         && interface == Some(api.interface)
         && member == Some(ACTIVE_CHANGED)
@@ -2665,15 +2861,26 @@ mod tests {
     #[test]
     fn each_desktop_names_its_screensaver_service() {
         assert!(LockerEvidence::ProcessScan.screensaver().is_none());
+        // GNOME: the shell's screen shield, which `org.gnome.ScreenSaver` only forwards to.
         let gnome = LockerEvidence::GnomeScreenSaver.screensaver().unwrap();
         assert_eq!(
             (gnome.name, gnome.path, gnome.interface),
             (
-                "org.gnome.ScreenSaver",
+                "org.gnome.Shell.ScreenShield",
                 "/org/gnome/ScreenSaver",
                 "org.gnome.ScreenSaver"
             )
         );
+        let no_shield = gnome.no_shield.unwrap();
+        assert_eq!(
+            (no_shield.shell, no_shield.display_manager),
+            ("org.gnome.Shell", "org.gnome.DisplayManager")
+        );
+        assert_eq!(
+            gnome.watched().collect::<Vec<_>>(),
+            ["org.gnome.Shell.ScreenShield", "org.gnome.Shell"]
+        );
+        // KDE needs its service to have an owner and watches nothing else.
         let kde = LockerEvidence::FreedesktopScreenSaver
             .screensaver()
             .unwrap();
@@ -2685,6 +2892,11 @@ mod tests {
                 "org.freedesktop.ScreenSaver"
             )
         );
+        assert!(kde.no_shield.is_none());
+        assert_eq!(
+            kde.watched().collect::<Vec<_>>(),
+            ["org.freedesktop.ScreenSaver"]
+        );
     }
 
     #[test]
@@ -2692,7 +2904,8 @@ mod tests {
         for api in [GNOME_SCREENSAVER, FREEDESKTOP_SCREENSAVER] {
             for active in [false, true] {
                 let parsed =
-                    parse_screensaver_signal(&active_changed(&api, active), &api, OWNER).unwrap();
+                    parse_screensaver_signal(&active_changed(&api, active), &api, Some(OWNER))
+                        .unwrap();
                 assert!(
                     matches!(parsed, Some(Signal::ScreenSaver(v)) if v == active),
                     "{api:?} {active}: {parsed:?}"
@@ -2712,7 +2925,7 @@ mod tests {
             ];
             for message in ignored {
                 assert!(
-                    parse_screensaver_signal(&message, &api, OWNER)
+                    parse_screensaver_signal(&message, &api, Some(OWNER))
                         .unwrap()
                         .is_none()
                 );
@@ -2727,30 +2940,42 @@ mod tests {
                 .build(&true)
                 .unwrap();
             assert!(
-                parse_screensaver_signal(&call, &api, OWNER)
+                parse_screensaver_signal(&call, &api, Some(OWNER))
                     .unwrap()
                     .is_none()
             );
             // The right signal with a body that is not a boolean is an error, which the watch
             // treats as a loss.
             let malformed = screensaver_signal(&api, OWNER, api.interface, ACTIVE_CHANGED, &"yes");
-            assert!(parse_screensaver_signal(&malformed, &api, OWNER).is_err());
+            assert!(parse_screensaver_signal(&malformed, &api, Some(OWNER)).is_err());
         }
     }
 
     #[test]
-    fn the_service_losing_or_changing_owner_ends_the_watch() {
-        let api = GNOME_SCREENSAVER;
-        // Released, or taken over by someone else: the watched owner is gone either way.
-        for new in ["", ":1.77"] {
-            let message = name_owner_changed(api.name, OWNER, new);
-            let parsed = parse_screensaver_signal(&message, &api, OWNER).unwrap();
-            assert!(matches!(parsed, Some(Signal::Lost)), "{new:?}: {parsed:?}");
+    fn a_watched_name_changing_hands_ends_the_watch() {
+        // Released, taken over, or (for a name that had no owner) acquired: all send the observer
+        // back to setup, for the service and, on GNOME, for the shell.
+        for api in [GNOME_SCREENSAVER, FREEDESKTOP_SCREENSAVER] {
+            for owner in [Some(OWNER), None] {
+                for name in api.watched() {
+                    for (old, new) in [(OWNER, ""), (OWNER, ":1.77"), ("", ":1.77")] {
+                        let message = name_owner_changed(name, old, new);
+                        let parsed = parse_screensaver_signal(&message, &api, owner).unwrap();
+                        assert!(
+                            matches!(parsed, Some(Signal::Lost)),
+                            "{name} {old:?} -> {new:?}: {parsed:?}"
+                        );
+                    }
+                }
+            }
         }
-        // Another name, a change that keeps our owner, or a sender that is not the bus: ignored.
+        // Another name, or a sender that is not the bus: ignored. The shell is watched on GNOME
+        // only.
+        let api = GNOME_SCREENSAVER;
         let ignored = [
             name_owner_changed("org.example.Other", OWNER, ""),
-            name_owner_changed(api.name, "", OWNER),
+            name_owner_changed("org.gnome.ScreenSaver", OWNER, ""),
+            name_owner_changed("org.gnome.DisplayManager", OWNER, ""),
             Message::signal(DBUS_PATH, DBUS, "NameOwnerChanged")
                 .unwrap()
                 .sender(":1.99")
@@ -2760,9 +2985,198 @@ mod tests {
         ];
         for message in ignored {
             assert!(
-                parse_screensaver_signal(&message, &api, OWNER)
+                parse_screensaver_signal(&message, &api, Some(OWNER))
                     .unwrap()
                     .is_none()
+            );
+        }
+        let message = name_owner_changed("org.gnome.Shell", OWNER, "");
+        assert!(
+            parse_screensaver_signal(&message, &FREEDESKTOP_SCREENSAVER, Some(OWNER))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn active_changed_needs_an_owner_to_come_from() {
+        // GNOME without a screen shield has no owner to hear `ActiveChanged` from: nothing, not
+        // even a message with no sender, matches.
+        let api = GNOME_SCREENSAVER;
+        assert!(
+            parse_screensaver_signal(&active_changed(&api, true), &api, None)
+                .unwrap()
+                .is_none()
+        );
+        let unsent = Message::signal(api.path, api.interface, ACTIVE_CHANGED)
+            .unwrap()
+            .build(&true)
+            .unwrap();
+        assert!(
+            parse_screensaver_signal(&unsent, &api, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn owned_by(name: &str) -> NameProbe {
+        NameProbe::Owned(name.to_owned())
+    }
+
+    /// Every answer a probe can give, with one owner as the representative.
+    fn probe_answers() -> [NameProbe; 3] {
+        [NameProbe::Failed, NameProbe::Unowned, owned_by(":1.7")]
+    }
+
+    #[test]
+    fn name_owner_replies_are_classified_strictly() {
+        assert_eq!(name_probe(Ok(":1.7".to_owned())), owned_by(":1.7"));
+        // Only the named error reply is "nobody has it".
+        assert_eq!(
+            name_probe(Err(reply(NAME_HAS_NO_OWNER))),
+            NameProbe::Unowned
+        );
+        for failure in failures() {
+            assert_eq!(name_probe(Err(failure)), NameProbe::Failed);
+        }
+        assert_eq!(
+            name_probe(Err(reply("org.freedesktop.DBus.Error.ServiceUnknown"))),
+            NameProbe::Failed
+        );
+        // The bus never answers with an empty name; if it did, that is not an owner.
+        assert_eq!(name_probe(Ok(String::new())), NameProbe::Failed);
+    }
+
+    #[test]
+    fn a_probe_contradicts_the_setup_only_when_it_is_definite_and_differs() {
+        for setup in [NameProbe::Unowned, owned_by(":1.7")] {
+            assert!(!probe_changed(&setup, &setup.clone()));
+            assert!(!probe_changed(&setup, &NameProbe::Failed));
+        }
+        assert!(probe_changed(&NameProbe::Unowned, &owned_by(":1.7")));
+        assert!(probe_changed(&owned_by(":1.7"), &NameProbe::Unowned));
+        assert!(probe_changed(&owned_by(":1.7"), &owned_by(":1.8")));
+    }
+
+    /// `gnome_screensaver_active`, with the answer `get_active` gives and who it was asked.
+    fn gnome_active(
+        shell: &NameProbe,
+        shield: &NameProbe,
+        display_manager: &NameProbe,
+        asked_answer: Option<bool>,
+    ) -> (Option<bool>, Option<String>) {
+        let mut asked = None;
+        let active = gnome_screensaver_active(shell, shield, display_manager, |owner| {
+            asked = Some(owner.to_owned());
+            asked_answer
+        });
+        (active, asked)
+    }
+
+    #[test]
+    fn gnome_without_a_screen_shield_reads_as_not_active_only_when_all_three_probes_agree() {
+        let (no_owner, shell_owner) = (NameProbe::Unowned, owned_by(":1.3"));
+        // The ruling's three conditions: the shell has an owner, the screen shield has none, the
+        // display manager has none. `get_active` is never asked.
+        assert_eq!(
+            gnome_active(&shell_owner, &no_owner, &no_owner, Some(true)),
+            (Some(false), None)
+        );
+        for shell in probe_answers() {
+            for shield in probe_answers() {
+                for display_manager in probe_answers() {
+                    for answer in [None, Some(false), Some(true)] {
+                        let (active, asked) =
+                            gnome_active(&shell, &shield, &display_manager, answer);
+                        let context =
+                            format!("{shell:?} {shield:?} {display_manager:?} {answer:?}");
+                        match &shield {
+                            // A screen shield exists: its owner is asked, and its answer is the
+                            // answer, a failure included. The other probes do not matter.
+                            NameProbe::Owned(owner) => {
+                                assert_eq!(asked.as_deref(), Some(owner.as_str()), "{context}");
+                                assert_eq!(active, answer, "{context}");
+                            }
+                            // No screen shield: not active exactly when the shell is there and no
+                            // display manager is. Anything else, any failed probe included, is
+                            // unknown.
+                            NameProbe::Unowned | NameProbe::Failed => {
+                                assert_eq!(asked, None, "{context}");
+                                let proven = shield == NameProbe::Unowned
+                                    && matches!(shell, NameProbe::Owned(_))
+                                    && display_manager == NameProbe::Unowned;
+                                assert_eq!(active, proven.then_some(false), "{context}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Spelled out: each way of not meeting the ruling is unknown.
+        for (shell, shield, display_manager) in [
+            // The shell is not there, or could not be looked up.
+            (&no_owner, &no_owner, &no_owner),
+            (&NameProbe::Failed, &no_owner, &no_owner),
+            // The shield's owner could not be looked up.
+            (&shell_owner, &NameProbe::Failed, &no_owner),
+            // A display manager (GDM) that should have given the shell a shield, or that could not
+            // be looked up.
+            (&shell_owner, &no_owner, &owned_by(":1.9")),
+            (&shell_owner, &no_owner, &NameProbe::Failed),
+        ] {
+            assert_eq!(
+                gnome_active(shell, shield, display_manager, Some(false)),
+                (None, None),
+                "{shell:?} {shield:?} {display_manager:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_unprovable_cases_close_the_gate_through_the_whole_read_path() {
+        // The shield part of GNOME's evidence feeds `locker_evidence` unchanged, so a lock screen
+        // that is absent still needs logind and the scan to agree.
+        let kind = LockerEvidence::GnomeScreenSaver;
+        let (no_owner, shell_owner) = (NameProbe::Unowned, owned_by(":1.3"));
+        let gnome = |shell: &NameProbe, shield: &NameProbe, dm: &NameProbe| {
+            gnome_screensaver_active(shell, shield, dm, |_| Some(true))
+        };
+        let no_lock_screen = gnome(&shell_owner, &no_owner, &no_owner);
+        assert_eq!(
+            evidence_read(kind, no_lock_screen, Some(false), Some(false), Some(true)),
+            (LockState::Unlocked, true)
+        );
+        // logind's LockedHint or a locker process still lock the session.
+        assert_eq!(
+            evidence_read(kind, no_lock_screen, Some(false), Some(true), Some(true)),
+            (LockState::Locked, false)
+        );
+        assert_eq!(
+            evidence_read(kind, no_lock_screen, Some(true), Some(false), Some(true)),
+            (LockState::Locked, false)
+        );
+        assert_eq!(
+            evidence_read(kind, no_lock_screen, None, Some(false), Some(true)),
+            (LockState::Unknown, false)
+        );
+        // A probe that fails makes the whole read unknown.
+        let unprovable = gnome(&NameProbe::Failed, &no_owner, &no_owner);
+        assert_eq!(unprovable, None);
+        assert_eq!(
+            evidence_read(kind, unprovable, Some(false), Some(false), Some(true)),
+            (LockState::Unknown, false)
+        );
+        // With a screen shield its answer decides.
+        for (answer, expected) in [
+            (Some(true), (LockState::Locked, false)),
+            (Some(false), (LockState::Unlocked, true)),
+            (None, (LockState::Unknown, false)),
+        ] {
+            let with_shield =
+                gnome_screensaver_active(&shell_owner, &owned_by(":1.3"), &no_owner, |_| answer);
+            assert_eq!(
+                evidence_read(kind, with_shield, Some(false), Some(false), Some(true)),
+                expected
             );
         }
     }
@@ -2776,7 +3190,7 @@ mod tests {
         assert!(gate.is_open());
         let api = GNOME_SCREENSAVER;
         let signal = |active| {
-            parse_screensaver_signal(&active_changed(&api, active), &api, OWNER)
+            parse_screensaver_signal(&active_changed(&api, active), &api, Some(OWNER))
                 .unwrap()
                 .unwrap()
         };
