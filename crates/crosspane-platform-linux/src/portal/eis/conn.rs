@@ -8,6 +8,7 @@
 //! logical state reset, so the ledger forgets it.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -42,6 +43,24 @@ pub(super) fn no_session() -> PlatformError {
 
 fn lost() -> PlatformError {
     backend("EIS connection lost")
+}
+
+/// Whether `value` of `REIS_DEBUG` turns on reis's message tracing: any non-empty value does
+/// (reis then prints every request and event it sends and receives, key codes included, to stderr).
+fn debug_requested(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
+}
+
+/// Refuse to connect while `REIS_DEBUG` would make reis log key codes (logs never hold key
+/// contents).
+fn refuse_debug(value: Option<&OsStr>) -> Result<(), PlatformError> {
+    if debug_requested(value) {
+        Err(backend(
+            "REIS_DEBUG is set; refusing to attach (it would log key codes)",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn timespec(duration: Duration) -> Timespec {
@@ -112,6 +131,8 @@ impl Conn {
         gate: Arc<IoGate>,
         budget: Duration,
     ) -> Result<Conn, PlatformError> {
+        // Before the context exists: reis reads the variable when it is created.
+        refuse_debug(std::env::var_os("REIS_DEBUG").as_deref())?;
         let deadline = Instant::now() + budget;
         let context = ei::Context::new(UnixStream::from(fd))
             .map_err(|_| backend("could not use the EIS socket"))?;
@@ -622,11 +643,13 @@ impl Conn {
 
     // ---- pointer --------------------------------------------------------------------------
 
-    /// Absolute motion to a point in the desktop's logical space.
+    /// Absolute motion to a point in the desktop's logical space, on `display` (that display's
+    /// logical rectangle: the only one whose regions may absorb rounding at its edge).
     pub(super) fn move_to(
         &mut self,
         x: f64,
         y: f64,
+        display: &RegionRect,
         deadline: Instant,
     ) -> Result<(), PlatformError> {
         self.admit(deadline)?;
@@ -636,7 +659,7 @@ impl Conn {
             .filter(|d| d.resumed && d.pointer_absolute.is_some())
             .flat_map(|d| d.regions.iter().map(|r| (d.id, *r)))
             .collect();
-        let target = regions::locate(&candidates, self.active_pointer, x, y)
+        let target = regions::locate(&candidates, self.active_pointer, display, x, y)
             .ok_or(PlatformError::NotFound)?;
         let index = self.index_of(target.key).ok_or(PlatformError::NotFound)?;
         let pointer = self
@@ -860,5 +883,33 @@ impl Conn {
         let _ = self.flush_until(deadline);
         self.ledger.clear();
         self.dead = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn any_non_empty_reis_debug_turns_tracing_on() {
+        // reis only looks for a non-empty value, so "0" and "false" count too.
+        assert!(!debug_requested(None));
+        assert!(!debug_requested(Some(OsStr::new(""))));
+        for value in ["1", "0", "false", "yes please"] {
+            assert!(debug_requested(Some(OsStr::new(value))), "{value}");
+        }
+    }
+
+    #[test]
+    fn a_set_reis_debug_refuses_the_connection_with_a_message_that_names_no_key() {
+        assert!(refuse_debug(None).is_ok());
+        assert!(refuse_debug(Some(OsStr::new(""))).is_ok());
+        match refuse_debug(Some(OsStr::new("1"))) {
+            Err(PlatformError::Backend(message)) => assert_eq!(
+                message,
+                "REIS_DEBUG is set; refusing to attach (it would log key codes)"
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 }

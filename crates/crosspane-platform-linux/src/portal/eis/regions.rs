@@ -28,6 +28,17 @@ impl RegionRect {
         }
     }
 
+    /// A display's rectangle in the desktop's logical space (`logical_origin`, logical size).
+    pub(super) fn of_display(geometry: &DisplayGeometry) -> Self {
+        let bounds = geometry.logical_bounds();
+        RegionRect {
+            x: bounds.origin.x,
+            y: bounds.origin.y,
+            width: bounds.size.width,
+            height: bounds.size.height,
+        }
+    }
+
     fn contains(&self, x: f64, y: f64) -> bool {
         self.width > 0.0
             && self.height > 0.0
@@ -35,6 +46,18 @@ impl RegionRect {
             && x < self.x + self.width
             && y >= self.y
             && y < self.y + self.height
+    }
+
+    /// The two share some area (touching edges don't count).
+    fn overlaps(&self, other: &RegionRect) -> bool {
+        self.width > 0.0
+            && self.height > 0.0
+            && other.width > 0.0
+            && other.height > 0.0
+            && self.x < other.x + other.width
+            && other.x < self.x + self.width
+            && self.y < other.y + other.height
+            && other.y < self.y + self.height
     }
 
     /// The point of the region nearest `(x, y)`, kept strictly inside (by `INSET`), and the
@@ -67,12 +90,17 @@ pub(super) struct Target<K> {
     pub y: f32,
 }
 
-/// The region that contains `(x, y)`, searched in order. A point within `EDGE_TOLERANCE` of the
-/// nearest region but outside every one is moved onto that region's edge; further out there is no
-/// target. `prefer` wins when several candidates contain the point (the device used last).
+/// The region that contains `(x, y)`, searched in order. `prefer` wins when several candidates
+/// contain the point (the device used last).
+///
+/// A point outside every region may be moved onto a region's edge, but only a region that overlaps
+/// `display` (the logical rectangle of the display the caller asked for) and lies within
+/// `EDGE_TOLERANCE` of the point: the slack is the rounding on that display's own edge, never a
+/// licence to land on a neighbouring display's region. Otherwise there is no target.
 pub(super) fn locate<K: Copy + PartialEq>(
     candidates: &[(K, RegionRect)],
     prefer: Option<K>,
+    display: &RegionRect,
     x: f64,
     y: f64,
 ) -> Option<Target<K>> {
@@ -96,7 +124,8 @@ pub(super) fn locate<K: Copy + PartialEq>(
     }
     let mut best: Option<(K, f64, f64, f64)> = None;
     for &(key, region) in candidates {
-        if let Some((nx, ny, distance)) = region.nearest(px, py)
+        if region.overlaps(display)
+            && let Some((nx, ny, distance)) = region.nearest(px, py)
             && distance <= EDGE_TOLERANCE
             && best.is_none_or(|(_, _, _, d)| distance < d)
         {
@@ -162,6 +191,93 @@ mod tests {
             scale,
             logical_origin: PointLogical::new(ox, oy),
         }
+    }
+
+    /// Where a test doesn't care which display was asked for: all of the plane.
+    fn everywhere() -> RegionRect {
+        RegionRect {
+            x: -1e9,
+            y: -1e9,
+            width: 2e9,
+            height: 2e9,
+        }
+    }
+
+    /// `super::locate` for the display-agnostic tests.
+    fn locate<K: Copy + PartialEq>(
+        candidates: &[(K, RegionRect)],
+        prefer: Option<K>,
+        x: f64,
+        y: f64,
+    ) -> Option<Target<K>> {
+        super::locate(candidates, prefer, &everywhere(), x, y)
+    }
+
+    #[test]
+    fn edge_slack_is_only_taken_from_a_region_of_the_display_asked_for() {
+        // Two displays 3 logical pixels apart, one region each.
+        let left = RegionRect::new(0, 0, 100, 100);
+        let right = RegionRect::new(103, 0, 100, 100);
+        let candidates = [(1u32, left), (2, right)];
+        // Past the left display's edge, asked for on the left display: its own region takes it.
+        let target = super::locate(&candidates, None, &left, 100.5, 50.0).unwrap();
+        assert_eq!(target.key, 1);
+        assert!(f64::from(target.x) < 100.0);
+        // The same point asked for on the right display must not land on the left display's
+        // region, however close it is; the right display's own region is too far.
+        assert_eq!(super::locate(&candidates, None, &right, 100.5, 50.0), None);
+        // Just short of the right display's own region it is taken.
+        let target = super::locate(&candidates, None, &right, 102.4, 50.0).unwrap();
+        assert_eq!((target.key, target.x), (2, 103.0));
+        // A display with no region of its own near the point has no target at all.
+        let elsewhere = RegionRect::new(500, 0, 100, 100);
+        assert_eq!(
+            super::locate(&candidates, None, &elsewhere, 100.5, 50.0),
+            None
+        );
+        // A point inside a region is found whichever display was asked for (the slack is the only
+        // thing the display restricts).
+        let target = super::locate(&candidates, None, &right, 50.0, 50.0).unwrap();
+        assert_eq!(target.key, 1);
+    }
+
+    #[test]
+    fn the_nearer_of_two_overlapping_regions_takes_the_edge_point() {
+        // The display's rectangle overlaps regions 1 and 2 (not 3): the one nearer the point wins.
+        let candidates = [
+            (1u32, RegionRect::new(0, 0, 100, 100)),
+            (2, RegionRect::new(101, 0, 100, 100)),
+            (3, RegionRect::new(300, 0, 100, 100)),
+        ];
+        let display = RegionRect {
+            x: 90.0,
+            y: 0.0,
+            width: 120.0,
+            height: 100.0,
+        };
+        let target = super::locate(&candidates, None, &display, 100.8, 50.0).unwrap();
+        assert_eq!(target.key, 2);
+        let target = super::locate(&candidates, None, &display, 100.2, 50.0).unwrap();
+        assert_eq!(target.key, 1);
+    }
+
+    #[test]
+    fn regions_overlap_only_with_shared_area() {
+        let a = RegionRect::new(0, 0, 100, 100);
+        assert!(a.overlaps(&RegionRect::new(99, 99, 10, 10)));
+        // Touching edges and corners share no area.
+        assert!(!a.overlaps(&RegionRect::new(100, 0, 100, 100)));
+        assert!(!a.overlaps(&RegionRect::new(0, 100, 100, 100)));
+        assert!(!a.overlaps(&RegionRect::new(100, 100, 10, 10)));
+        assert!(!a.overlaps(&RegionRect::new(10, 10, 0, 10)));
+        assert!(!RegionRect::new(10, 10, 10, 0).overlaps(&a));
+    }
+
+    #[test]
+    fn a_display_rectangle_is_its_logical_bounds() {
+        let rect = RegionRect::of_display(&geometry(1366, 768, 1.5, 10.0, 20.0));
+        assert_eq!((rect.x, rect.y, rect.height), (10.0, 20.0, 512.0));
+        assert!((rect.width - 910.666_666_666_666_6).abs() < 1e-9);
     }
 
     #[test]

@@ -58,7 +58,8 @@
 //! - **Absolute motion** targets the region containing the point in the compositor's logical
 //!   space; the offset is part of the coordinate. A point within one logical pixel outside every
 //!   region (the rounding between a fractional-scale display and its integer region) is moved onto
-//!   the nearest region's edge, anything further is `NotFound`.
+//!   the nearest region's edge, but only a region that overlaps the logical rectangle of the
+//!   display asked for, never a neighbouring display's; anything further is `NotFound`.
 //! - **Lock keys.** The compositor reports the locked-modifier mask; Caps and Num Lock are the
 //!   keymap's `Lock` and `Mod2` bits. A compositor sends modifiers after a resume only when some
 //!   are set, so `set_lock_keys` treats "no report yet" as off (the tap is applied, and the state
@@ -271,7 +272,8 @@ impl PointerInjector for EisPointerInjector {
             .find(|info| info.id == display)
             .ok_or(PlatformError::NotFound)?;
         let (x, y) = regions::logical_point(&info.geometry, position)?;
-        self.shared.call(Action::Move { x, y }, deadline)
+        let display = regions::RegionRect::of_display(&info.geometry);
+        self.shared.call(Action::Move { x, y, display }, deadline)
     }
 
     fn button(&mut self, button: MouseButton, down: bool) -> Result<(), PlatformError> {

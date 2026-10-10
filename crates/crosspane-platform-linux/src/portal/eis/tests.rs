@@ -28,6 +28,7 @@ use reis::request::{DeviceCapability, EisRequest, EisRequestConverter};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
 use super::keymap::test_keymap_text;
+use super::worker::Action;
 use super::{DisplaysFn, EisKeyInjector, EisPointerInjector, EisSource};
 
 const WAIT: Duration = Duration::from_secs(3);
@@ -779,6 +780,34 @@ fn absolute_motion_is_global_logical_across_mixed_scales() {
 }
 
 #[test]
+fn edge_rounding_stays_on_the_display_asked_for() {
+    // A 1366x768 display at scale 1.5 is 910.67 logical wide but its region is announced as 910.
+    // Display 7 starts at x = 910.5, so a point of its own is within a pixel of display 1's region
+    // yet must never be pulled onto it.
+    let mut rig = rig_with(
+        vec![keyboard(None), absolute("absolute", vec![(0, 0, 910, 512)])],
+        vec![
+            display(1, (1366, 768), 1.5, (0.0, 0.0)),
+            display(7, (1920, 1080), 1.0, (910.5, 0.0)),
+        ],
+    );
+    rig.pointer
+        .move_to(DisplayId(1), PointDevice::new(1365.9, 100.0))
+        .unwrap();
+    rig.fake.expect(&[
+        ("absolute", Seen::Start(1)),
+        ("absolute", Seen::Motion(909.99, (100.0_f64 / 1.5) as f32)),
+        ("absolute", Seen::Frame),
+    ]);
+    assert!(matches!(
+        rig.pointer
+            .move_to(DisplayId(7), PointDevice::new(0.2, 5.0)),
+        Err(PlatformError::NotFound)
+    ));
+    rig.fake.quiet();
+}
+
+#[test]
 fn one_absolute_device_per_monitor_is_chosen_by_region() {
     let mut rig = rig_with(
         vec![
@@ -1117,6 +1146,42 @@ fn unmapped_input_is_refused_before_it_reaches_the_wire() {
         Err(PlatformError::Unsupported(_))
     ));
     rig.fake.quiet();
+}
+
+#[test]
+fn a_worker_that_panics_stops_reporting_a_live_session_and_lock_state() {
+    let text = test_keymap_text();
+    let mut rig = rig_with(
+        vec![
+            keyboard(text.clone()),
+            absolute("absolute", vec![(0, 0, 1920, 1080)]),
+        ],
+        two_displays(),
+    );
+    if text.is_some() {
+        rig.fake.send(Ctl::Modifiers {
+            device: "keyboard",
+            locked: 1 << 1,
+        });
+        wait_until("caps lock to be reported", || {
+            rig.keys.lock_keys().unwrap().caps_lock == Some(true)
+        });
+    }
+    assert!(rig.source.is_live());
+    // The worker dies handling this; its reply channel closes with it.
+    let died = rig.source.shared.call(Action::Panic, Instant::now() + WAIT);
+    assert!(matches!(died, Err(PlatformError::Backend(_))), "{died:?}");
+    wait_until("the source to stop being live", || !rig.source.is_live());
+    wait_until("the lock state to be cleared", || {
+        rig.keys.lock_keys().unwrap() == LockKeys::default()
+    });
+    // A later press says the worker is gone, and releases return instead of hanging.
+    match rig.keys.key(KEY_A, true) {
+        Err(PlatformError::Backend(message)) => assert_eq!(message, "EIS worker stopped"),
+        other => panic!("{other:?}"),
+    }
+    let _ = rig.keys.release_all();
+    let _ = rig.pointer.release_all();
 }
 
 #[test]

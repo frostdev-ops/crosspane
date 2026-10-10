@@ -13,6 +13,7 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
 use super::conn::{Conn, no_session};
 use super::map::ScrollPlan;
+use super::regions::RegionRect;
 
 /// How long the handshake with a new EIS socket may take.
 pub(super) const HANDSHAKE_BUDGET: Duration = Duration::from_secs(2);
@@ -90,15 +91,29 @@ pub(super) fn unpack_locks(packed: u8) -> LockKeys {
 pub(super) enum Action {
     Attach(OwnedFd),
     Detach,
-    Key { code: u16, down: bool },
+    Key {
+        code: u16,
+        down: bool,
+    },
     SetLocks(LockKeys),
     ReleaseKeys,
     RecoverKeys(Vec<u16>),
-    Move { x: f64, y: f64 },
-    Button { code: u32, down: bool },
+    /// Absolute motion to a logical point on the display whose logical rectangle is `display`.
+    Move {
+        x: f64,
+        y: f64,
+        display: RegionRect,
+    },
+    Button {
+        code: u32,
+        down: bool,
+    },
     Scroll(ScrollPlan),
     ReleaseButtons,
     RecoverButtons(Vec<u32>),
+    /// Make the worker fail, to see what the handles report afterwards.
+    #[cfg(test)]
+    Panic,
 }
 
 pub(super) struct Command {
@@ -118,7 +133,21 @@ pub(super) fn spawn(
         .map(drop)
 }
 
+/// On the way out of [`run`], however that happens (a panic included), the source stops being
+/// live and reports no lock state: with the worker gone nothing can be injected, and `is_live` and
+/// `lock_keys` read atomics that only the worker updates.
+struct Retire<'a>(&'a Inner);
+
+impl Drop for Retire<'_> {
+    fn drop(&mut self) {
+        self.0.live.store(false, Ordering::Release);
+        self.0.locks.store(0, Ordering::Release);
+    }
+}
+
 fn run(gate: &Arc<IoGate>, inner: &Inner, commands: &Receiver<Command>) {
+    // Declared before the connection, so it drops after the connection has been closed.
+    let _retire = Retire(inner);
     let mut conn: Option<Conn> = None;
     loop {
         inner.drain();
@@ -187,7 +216,7 @@ fn execute(
         Action::SetLocks(wanted) => with(conn, |c| c.set_locks(wanted, deadline)),
         Action::ReleaseKeys => release(conn, |c| c.release_keys(deadline)),
         Action::RecoverKeys(codes) => release(conn, |c| c.recover_keys(&codes, deadline)),
-        Action::Move { x, y } => with(conn, |c| c.move_to(x, y, deadline)),
+        Action::Move { x, y, display } => with(conn, |c| c.move_to(x, y, &display, deadline)),
         Action::Button { code, down: true } => with(conn, |c| c.press_button(code, deadline)),
         Action::Button { code, down: false } => release(conn, |c| c.release_button(code, deadline)),
         Action::Scroll(plan) => {
@@ -199,6 +228,8 @@ fn execute(
         }
         Action::ReleaseButtons => release(conn, |c| c.release_buttons(deadline)),
         Action::RecoverButtons(codes) => release(conn, |c| c.recover_buttons(&codes, deadline)),
+        #[cfg(test)]
+        Action::Panic => panic!("test: the EIS worker is made to fail"),
     }
 }
 
@@ -270,5 +301,37 @@ mod tests {
             }
         }
         assert_eq!(unpack_locks(0), LockKeys::default());
+    }
+
+    #[test]
+    fn a_worker_that_ends_by_panicking_is_no_longer_live() {
+        let wake = rustix::event::eventfd(
+            0,
+            rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+        )
+        .unwrap();
+        let inner = Arc::new(Inner::new(wake));
+        inner.live.store(true, Ordering::Release);
+        inner.locks.store(
+            pack_locks(LockKeys {
+                caps_lock: Some(true),
+                num_lock: Some(false),
+                scroll_lock: None,
+            }),
+            Ordering::Release,
+        );
+        let worker = {
+            let inner = inner.clone();
+            std::thread::spawn(move || {
+                let _retire = Retire(&inner);
+                panic!("test: the worker fails");
+            })
+        };
+        assert!(worker.join().is_err());
+        assert!(!inner.live.load(Ordering::Acquire));
+        assert_eq!(
+            unpack_locks(inner.locks.load(Ordering::Acquire)),
+            LockKeys::default()
+        );
     }
 }
