@@ -1,0 +1,106 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!--
+  The Crosspane GNOME Shell bridge, version 1 (WP-G0.1, frozen; WP-G1.2).
+
+  Exported by the Crosspane Shell extension on the session bus under the well-known name
+  io.frostdev.Crosspane.Shell, object /io/frostdev/Crosspane/Shell. Owner-approved (2026-10-09)
+  as an isolated, opt-in module. The agent works without it (E1 target, E2 destination); with it
+  the agent gains window listing/control (E2 source) and the on-screen indicators.
+
+  Rules:
+  - Typed methods only. No evaluation, no arbitrary property access, no JS strings executed.
+  - Every argument is validated; bad arguments return a D-Bus error, never partial effects.
+  - Windows are normal Meta.Window toplevels of type NORMAL/DIALOG that are not override-redirect
+    and not skip-taskbar. WindowId = Meta.Window.get_id() (unique for the Shell's lifetime).
+    The Shell's own epoch (`ShellEpoch`, random u64 picked at enable()) qualifies every id: an id
+    from another epoch is unknown.
+  - Rectangles are frame rects in the Shell's global logical (stage) coordinates.
+  - Overlays never take input or focus, sit above everything (including fullscreen windows) and
+    show on every workspace.
+-->
+<node>
+  <interface name="io.frostdev.Crosspane.Shell1">
+    <!-- 1 for this interface. -->
+    <property name="Version" type="u" access="read"/>
+    <!-- Random per enable(); changes when the extension is re-enabled or the Shell restarts. -->
+    <property name="ShellEpoch" type="t" access="read"/>
+
+    <!--
+      Every eligible window: (id, app_id, title, pid, x, y, width, height, focused, minimized,
+      fullscreen). app_id is the Shell's app id (e.g. "org.gnome.Nautilus.desktop") or the
+      wm_class when no app matches; pid 0 when unknown.
+    -->
+    <method name="ListWindows">
+      <arg name="epoch" type="t" direction="out"/>
+      <arg name="windows" type="a(tssuiiiibbb)" direction="out"/>
+    </method>
+
+    <!-- Focus and raise. Returns false if the id is unknown. -->
+    <method name="Activate">
+      <arg name="id" type="t" direction="in"/>
+      <arg name="found" type="b" direction="out"/>
+    </method>
+
+    <!--
+      Unmaximize/unfullscreen if needed, then move_resize_frame(user_op=true, ...). Returns false
+      if the id is unknown. The window's actual rect arrives with the next WindowsChanged.
+    -->
+    <method name="MoveResize">
+      <arg name="id" type="t" direction="in"/>
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+      <arg name="width" type="i" direction="in"/>
+      <arg name="height" type="i" direction="in"/>
+      <arg name="found" type="b" direction="out"/>
+    </method>
+
+    <!-- Minimize (true) or unminimize (false). Returns false if the id is unknown. -->
+    <method name="SetMinimized">
+      <arg name="id" type="t" direction="in"/>
+      <arg name="minimized" type="b" direction="in"/>
+      <arg name="found" type="b" direction="out"/>
+    </method>
+
+    <!-- Ask the window to close (Meta.Window.delete). Returns false if the id is unknown. -->
+    <method name="Close">
+      <arg name="id" type="t" direction="in"/>
+      <arg name="found" type="b" direction="out"/>
+    </method>
+
+    <!--
+      Coalesced (at most every 50 ms): something about the window list changed (created,
+      destroyed, title, geometry, focus, minimized, fullscreen). Clients call ListWindows.
+    -->
+    <signal name="WindowsChanged">
+      <arg name="epoch" type="t"/>
+    </signal>
+
+    <!--
+      Show or update an overlay. monitor: the Shell's monitor index whose rect contains
+      (x, y) in global logical coordinates (the client passes a point inside the display it means;
+      the extension resolves it with global.display.get_monitor_index_for_rect).
+      anchor: 0 TopCenter, 1 TopRight, 2 BottomRight, 3 Center. accent: 0xRRGGBB.
+      Emits OverlayState(id, true) once the actor is mapped and painted on that monitor.
+    -->
+    <method name="ShowOverlay">
+      <arg name="id" type="u" direction="in"/>
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+      <arg name="anchor" type="u" direction="in"/>
+      <arg name="text" type="s" direction="in"/>
+      <arg name="accent" type="u" direction="in"/>
+    </method>
+
+    <!-- Hide an overlay; hiding one that isn't shown succeeds. Emits OverlayState(id, false). -->
+    <method name="HideOverlay">
+      <arg name="id" type="u" direction="in"/>
+    </method>
+
+    <!-- visible=false also when the overlay can't be kept on screen (monitor gone, disable()). -->
+    <signal name="OverlayState">
+      <arg name="id" type="u"/>
+      <arg name="visible" type="b"/>
+    </signal>
+  </interface>
+</node>

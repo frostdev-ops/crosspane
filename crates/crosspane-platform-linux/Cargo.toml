@@ -24,6 +24,8 @@ gpu = ["dep:wgpu", "dep:ash"]
 cuda = ["gpu", "ffmpeg", "dep:libloading"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
+ashpd.workspace = true
+reis.workspace = true
 wgpu = { workspace = true, optional = true }
 ash = { workspace = true, optional = true }
 libloading = { workspace = true, optional = true }
