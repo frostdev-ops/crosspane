@@ -473,16 +473,25 @@ fn literal_privacy_copy_and_global_removal_checkbox_are_present() {
     );
     let view = demo::fixture(ScreenId::RepairRemove);
     harness.settle(&view);
-    assert_eq!(
-        harness.click(&view, demo::REMOVE_AUDIO_LABEL),
-        vec![WizardAction {
-            revision: 1,
-            intent: WizardIntent::SetToggle {
-                field: 21,
-                checked: false
-            }
-        }]
-    );
+    if cfg!(windows) {
+        assert!(
+            !harness
+                .texts()
+                .iter()
+                .any(|(text, _)| text == demo::REMOVE_AUDIO_LABEL)
+        );
+    } else {
+        assert_eq!(
+            harness.click(&view, demo::REMOVE_AUDIO_LABEL),
+            vec![WizardAction {
+                revision: 1,
+                intent: WizardIntent::SetToggle {
+                    field: 21,
+                    checked: false
+                }
+            }]
+        );
+    }
     let label = "Delete this machine's Crosspane identity and trust";
     assert_eq!(
         harness.click(&view, label),
@@ -906,12 +915,16 @@ fn progress_uses_supplied_groups_and_the_actual_viewport_breakpoint() {
         };
         harness.settle(&view);
         let texts = harness.texts();
-        let labels = ["Install", "Permissions", "Connect", "Arrange", "Ready"];
+        let labels: &[&str] = if cfg!(windows) {
+            &["Install", "Connect", "Arrange", "Ready"]
+        } else {
+            &["Install", "Permissions", "Connect", "Arrange", "Ready"]
+        };
         // Progress reads by marks, not by "Current"/"Completed" words.
         for word in ["Current", "Completed", "Current: Arrange"] {
             assert!(!texts.iter().any(|(text, _)| text == word));
         }
-        // The narrow strip: five slim segments, the completed one Frost, the current Glacier.
+        // The narrow strip: one segment per platform group, completed Frost, current Glacier.
         let segments: Vec<egui::Color32> = harness
             .shapes()
             .into_iter()
@@ -925,18 +938,18 @@ fn progress_uses_supplied_groups_and_the_actual_viewport_breakpoint() {
             })
             .collect();
         if size.x == 1100.0 {
-            for label in labels {
+            for &label in labels {
                 assert!(texts.iter().any(|(text, _)| text == label), "{label}");
             }
             assert!(segments.is_empty(), "the rail replaces the strip");
         } else {
-            for label in labels {
+            for &label in labels {
                 assert!(
                     !texts.iter().any(|(text, _)| text == label),
                     "the narrow layout has no rail: {label}"
                 );
             }
-            assert_eq!(segments.len(), 5);
+            assert_eq!(segments.len(), labels.len());
             assert_eq!(segments.iter().filter(|c| **c == theme::FROST).count(), 1);
             assert_eq!(segments.iter().filter(|c| **c == theme::GLACIER).count(), 1);
         }
@@ -1530,7 +1543,7 @@ fn nothing_is_squished_at_the_minimum_size_or_at_retina_scale() {
     ] {
         let mut harness = Harness::new(size);
         harness.ctx.set_pixels_per_point(ppp);
-        let names = demo::SCREENS
+        let names = demo::screens_for(demo::copy_platform())
             .iter()
             .map(|(_, name)| *name)
             .chain(demo::VARIANTS.iter().map(|(name, _)| *name));

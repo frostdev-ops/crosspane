@@ -113,6 +113,8 @@ fn normal_entry_stays_disconnected_and_cannot_become_a_demo_or_production_job() 
 
 #[test]
 fn screen_and_screenshot_require_demo_including_ready_summary() {
+    let font = std::env::temp_dir().join("explicit-review.ttf");
+    let font = font.to_str().unwrap();
     for args in [
         vec!["--screen", "summary"],
         vec!["--screenshot", "review.png"],
@@ -125,32 +127,19 @@ fn screen_and_screenshot_require_demo_including_ready_summary() {
         "--screen",
         "summary",
         "--font",
-        "/explicit/review.ttf",
+        font,
         "--screenshot",
         "review.png",
     ]);
     assert_eq!(valid.validate().unwrap(), Some(ScreenId::Summary));
     assert!(
-        options(&[
-            "--demo",
-            "--screen",
-            "unknown",
-            "--font",
-            "/explicit/review.ttf"
-        ])
-        .validate()
-        .is_err()
+        options(&["--demo", "--screen", "unknown", "--font", font])
+            .validate()
+            .is_err()
     );
     assert!(
-        ReviewOptions::try_parse_from([
-            "installer",
-            "--demo",
-            "--font",
-            "/explicit/review.ttf",
-            "--screenshot",
-            ""
-        ])
-        .is_err()
+        ReviewOptions::try_parse_from(["installer", "--demo", "--font", font, "--screenshot", ""])
+            .is_err()
     );
 }
 
@@ -202,7 +191,10 @@ fn fresh_consent_defaults_are_explicit_and_no_animation_completes_checks() {
     }
     assert_eq!(demo::fixture(ScreenId::HidingChoice).hiding_choice, None);
     let view = demo::fixture(ScreenId::RepairRemove);
-    assert!(view.fields.iter().any(|field| matches!(field, FieldView::Toggle { role: ToggleRole::RemoveAudioDriver, checked: true, label, .. } if label == demo::REMOVE_AUDIO_LABEL)));
+    assert_eq!(
+        view.fields.iter().any(|field| matches!(field, FieldView::Toggle { role: ToggleRole::RemoveAudioDriver, checked: true, label, .. } if label == demo::REMOVE_AUDIO_LABEL)),
+        !cfg!(windows)
+    );
     assert!(view.fields.iter().any(|field| matches!(
         field,
         FieldView::Toggle {

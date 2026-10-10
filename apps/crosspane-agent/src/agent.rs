@@ -18680,8 +18680,26 @@ mod home_tests {
         let failed =
             |name: &str, reason: &str| json!({ "name": name, "state": "failed", "reason": reason });
         let ready = |name: &str| json!({ "name": name, "state": "ready", "reason": null });
+        let actual = anonymous(&h);
+        #[cfg(windows)]
+        let actual = {
+            let mut actual = actual;
+            assert_eq!(
+                actual.as_object_mut().unwrap().remove("network"),
+                Some(json!({
+                    "listener_bound": true,
+                    "discovery_policy": "links_unavailable_all",
+                    "selected_interface_addresses": 0,
+                    "firewall_rule": "Unavailable",
+                    "firewall_checked": false,
+                    "firewall_checked_ms_ago": null,
+                    "inbound": "InboundUnverified",
+                }))
+            );
+            actual
+        };
         assert_eq!(
-            anonymous(&h),
+            actual,
             json!({
                 "schema_version": 1,
                 "build": { "version": env!("CARGO_PKG_VERSION"), "features": features },

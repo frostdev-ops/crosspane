@@ -60,19 +60,16 @@ fn ready_lists_only_the_existing_connect_and_arrange_deferrals() {
         .filter(|row| row.state == RowState::Skipped)
         .map(|row| (row.id, row.label.as_str(), row.detail.as_str()))
         .collect();
+    let detail = if cfg!(windows) {
+        "Do this later from Crosspane > Settings; open Crosspane from the Start menu"
+    } else {
+        "Do this later from the Crosspane menu > Settings"
+    };
     assert_eq!(
         rows,
         [
-            (
-                940,
-                "Connect another computer",
-                "Do this later from the Crosspane menu > Settings"
-            ),
-            (
-                941,
-                "Arrange your screens",
-                "Do this later from the Crosspane menu > Settings"
-            ),
+            (940, "Connect another computer", detail),
+            (941, "Arrange your screens", detail),
         ]
     );
     assert_eq!(view.screen, ScreenId::Summary);

@@ -123,14 +123,14 @@ async fn a_second_address_of_a_connected_peer_is_a_quiet_no_op() {
 /// Characterize dual-stack fixture admission without relying on random ephemeral-port reuse.
 /// Every address below belongs to a node this test starts, including the IPv4 occupant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_dual_stack_fixture_first_dial_cannot_reach_an_owned_ipv4_port_occupant() {
+async fn a_dual_stack_fixture_first_dial_cannot_admit_an_owned_ipv4_port_occupant() {
     use std::sync::Arc;
 
     use crosspane_transport::{Transport, TransportConfig};
     use tokio::sync::mpsc::unbounded_channel;
 
     if !dual_stack_available(
-        "a_dual_stack_fixture_first_dial_cannot_reach_an_owned_ipv4_port_occupant",
+        "a_dual_stack_fixture_first_dial_cannot_admit_an_owned_ipv4_port_occupant",
     ) {
         return;
     }
@@ -167,10 +167,17 @@ async fn a_dual_stack_fixture_first_dial_cannot_reach_an_owned_ipv4_port_occupan
         "owned IPv4/IPv6 same-port first dial",
     )
     .await;
-    assert!(
-        matches!(result, Ok(peer) if peer == idb.node()),
-        "IPv6 wildcard bound over our IPv4 occupant; first dial result={result:?}"
-    );
+    // Some hosts admit a dual-stack wildcard alongside a specific IPv4 bind and route this
+    // address to the occupant. Pinning must refuse that identity, never register it as B.
+    match result {
+        Ok(peer) => {
+            assert_eq!(peer, idb.node());
+            assert_eq!(a.transport.peers(), vec![idb.node()]);
+        }
+        Err(TransportError::Untrusted) => assert!(a.transport.peers().is_empty()),
+        Err(error) => panic!("unexpected same-port first dial failure: {error:?}"),
+    }
+    assert!(a.transport.link(occupant.id).is_none());
 }
 
 /// The NodeId a pin store returns must be the hash of the key it was asked about.

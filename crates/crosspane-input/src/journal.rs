@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -68,8 +68,9 @@ impl FileJournal {
     pub fn open(path: &Path) -> Result<FileJournal, JournalError> {
         let mut file = OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
         let file_bytes = file.metadata()?.len();
         let mut bytes = 0;
@@ -102,6 +103,9 @@ impl FileJournal {
     }
 
     fn record(&mut self, op: u8, item: Held) -> Result<(), JournalError> {
+        // This journal has one writer (compaction replaces its file). Use a writable handle
+        // so recovery and compaction can resize it on Windows, and explicitly append records.
+        self.file.seek(SeekFrom::End(0))?;
         // File has no process-side buffer. No disk sync is needed for process-crash recovery.
         if let Err(error) = self.file.write_all(&encode(op, item)) {
             // A failed write may have left a partial record. Keep later records replayable.
@@ -153,7 +157,7 @@ impl FileJournal {
             let path = PathBuf::from(name);
             match OpenOptions::new()
                 .read(true)
-                .append(true)
+                .write(true)
                 .create_new(true)
                 .open(&path)
             {
