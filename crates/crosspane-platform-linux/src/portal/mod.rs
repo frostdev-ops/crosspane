@@ -10,6 +10,7 @@
 use crosspane_platform::PlatformError;
 
 pub mod eis;
+pub mod input_capture;
 pub mod screencast;
 pub mod session;
 pub mod shortcuts;

@@ -1726,10 +1726,76 @@ fn recover_parked(backend: &mut dyn WindowParking) -> Result<usize, ()> {
     }
 }
 
+/// The InputCapture portal's deviations per desktop (WP-G1.7). GNOME's mutter follows the portal
+/// sequence; KDE's xdp-kde re-enables the session on `Disable` and KWin disables it when barriers
+/// are set, so there the replacement skips `Disable` and a dropped or replaced set closes the
+/// session instead.
+#[cfg(target_os = "linux")]
+fn capture_quirks(
+    desktop: crosspane_platform_linux::desktop::LinuxDesktop,
+) -> crosspane_platform_linux::portal::input_capture::Quirks {
+    use crosspane_platform_linux::desktop::LinuxDesktop;
+    use crosspane_platform_linux::portal::input_capture::Quirks;
+    match desktop {
+        LinuxDesktop::Kde => Quirks {
+            disable_before_barriers: true,
+            close_to_replace: true,
+        },
+        LinuxDesktop::Gnome | LinuxDesktop::Hyprland => Quirks::default(),
+    }
+}
+
+/// The capture backend's status callback: it runs on the backend's threads and must not block, so
+/// it only logs. A refusal also reaches the engine as a failed `set_portals`.
+#[cfg(target_os = "linux")]
+fn report_capture_status(status: crosspane_platform_linux::portal::input_capture::CaptureStatus) {
+    use crosspane_platform_linux::portal::input_capture::CaptureStatus;
+    match status {
+        CaptureStatus::Idle | CaptureStatus::Pending => {
+            tracing::debug!(?status, "controller capture")
+        }
+        CaptureStatus::Ready => tracing::info!("controller capture is ready"),
+        CaptureStatus::Denied => tracing::warn!(
+            "controller capture was not allowed: this node cannot control others until the agent \
+             restarts"
+        ),
+        CaptureStatus::Closed => tracing::warn!(
+            "the controller capture session was closed: this node cannot control others until \
+             the agent restarts"
+        ),
+        CaptureStatus::Unavailable => tracing::warn!(
+            "controller capture is unavailable on this desktop: this node cannot control others"
+        ),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod capture_wiring_tests {
+    use super::*;
+    use crosspane_platform_linux::desktop::LinuxDesktop;
+    use crosspane_platform_linux::portal::input_capture::Quirks;
+
+    #[test]
+    fn only_kde_gets_the_xdp_kde_disable_workarounds() {
+        assert_eq!(capture_quirks(LinuxDesktop::Gnome), Quirks::default());
+        assert_eq!(
+            capture_quirks(LinuxDesktop::Kde),
+            Quirks {
+                disable_before_barriers: true,
+                close_to_replace: true
+            }
+        );
+    }
+}
+
 /// GNOME and KDE (WP-G1.6): E1 target and E2 destination through portals, EIS and public Wayland
-/// protocols. Input capture (this node cannot control others yet), GPU capture, home on the twin
-/// and proxy placement are absent. The agent grants `InputAccept` only while the portal session is
-/// live (`Platform::input_live`).
+/// protocols. GPU capture, home on the twin and proxy placement are absent. The agent grants
+/// `InputAccept` only while the portal session is live (`Platform::input_live`).
+///
+/// **Controller capture** (WP-G1.7) is the InputCapture portal (`PortalInputCapture`), built when
+/// the EIS source exists. It never blocks and asks for consent lazily, the first time a peer is
+/// placed next to this node (GNOME 50 shows a dialog on every session), so building it here shows
+/// nothing. Its status is logged; the engine learns of a refusal through `set_portals`.
 ///
 /// **GNOME as an E2 source** (WP-G2.3/G2.2) needs the Crosspane Shell extension: one
 /// `ShellBridge` is shared (cloned) by the overlay, the window source, the mirror parking and the
@@ -1761,6 +1827,7 @@ fn create_portal(
     };
     use crosspane_platform_linux::logind::{LockerEvidence, LogindSession};
     use crosspane_platform_linux::permissions::LinuxPermissions;
+    use crosspane_platform_linux::portal::input_capture::{InputCaptureConfig, PortalInputCapture};
     use crosspane_platform_linux::portal::screencast::{PortalScreenCast, ScreenCastConfig};
     use crosspane_platform_linux::portal::{eis::EisSource, shortcuts::PortalHotkeys};
     use crosspane_platform_linux::wayland_outputs::WaylandOutputs;
@@ -1851,6 +1918,31 @@ fn create_portal(
     // The consent may be asked now (the first time): this is the startup, off the input path.
     let portal_session = source.and_then(|source| start_portal_session(state_dir, source));
 
+    // Controller capture (WP-G1.7): where this node can also be controlled (the EIS source
+    // exists). No portal call happens here; the session is created on the first non-empty
+    // `set_portals`.
+    let capture = input_live.as_ref().and_then(|_| {
+        optional(
+            "input capture",
+            PortalInputCapture::new(
+                InputCaptureConfig {
+                    displays: displays_fn.clone(),
+                    // G1.7: lock keys. `EisSource::lock_keys` does not exist yet, so the lock-key
+                    // state is unknown: capture starts with it unset and the target's lock keys
+                    // are left alone.
+                    lock_keys: Arc::new(|| None),
+                    gate: gate.clone(),
+                    // G1.7: cursor (the lead wires the Shell bridge's `inhibit_cursor` at merge).
+                    cursor: None,
+                    token_path: state_dir.join("portal-input-capture.token"),
+                    quirks: capture_quirks(desktop),
+                },
+                Arc::new(report_capture_status),
+            ),
+        )
+        .map(|capture| Box::new(capture) as Box<dyn InputCapture>)
+    });
+
     // The release chord (panic: holding it for a second ends everything). Without the
     // GlobalShortcuts portal there is none, and the tray and `crosspanectl` remain.
     let hotkeys =
@@ -1897,8 +1989,7 @@ fn create_portal(
         gate,
         session: Box::new(session),
         displays: Box::new(displays),
-        // Controller capture is deferred (GNOME-v0, G1.7): this node can be controlled, not control.
-        capture: None,
+        capture,
         keys,
         pointer,
         overlay,
