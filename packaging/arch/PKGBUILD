@@ -4,13 +4,18 @@
 pkgname=crosspane-git
 pkgver=r0.0000000
 pkgrel=1
-pkgdesc="One keyboard and mouse, and projected windows, across your Mac and Hyprland machines"
+pkgdesc="One keyboard and mouse, and projected windows, across your Mac, Hyprland, GNOME and KDE machines"
 arch=('x86_64' 'aarch64')
 url="https://github.com/frostdev-ops/crosspane"
 license=('GPL-3.0-or-later')
 depends=('dbus' 'ffmpeg' 'libxkbcommon' 'vulkan-icd-loader' 'wayland')
 makedepends=('cargo' 'clang' 'git')
-optdepends=('hyprland: the supported Linux desktop'
+optdepends=('hyprland: a supported Linux desktop'
+            'gnome-shell: a supported Linux desktop (enable the bundled Crosspane extension)'
+            'xdg-desktop-portal-gnome: remote input, screen capture and input capture on GNOME'
+            'plasma-desktop: a supported Linux desktop (portal backends)'
+            'xdg-desktop-portal-kde: remote input and screen capture on KDE Plasma'
+            'libei: emulated input through the portals'
             'waybar: shows the tray icon'
             'walker: menu for crosspanectl pick (or fuzzel, wofi, rofi)')
 provides=('crosspane')
@@ -51,9 +56,17 @@ package() {
   sed 's|{{settings_executable}}|/usr/bin/crosspane-ui|' \
     packaging/linux/crosspane-settings.desktop \
     | install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/crosspane-settings.desktop"
+  sed 's|^Exec=crosspane-agent|Exec=/usr/bin/crosspane-agent|' \
+    packaging/linux/io.frostdev.crosspane.agent.desktop \
+    | install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/io.frostdev.crosspane.agent.desktop"
   sed -e 's|{{agent_executable}}|/usr/bin/crosspane-agent|' -e '/^Environment={{/d' \
     -e '/^# Installer payload template/d' packaging/linux/crosspane-agent.service \
     | install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/crosspane-agent.service"
+  # The GNOME Shell extension: every regular file in its directory (subdirectories are skipped).
+  for f in packaging/gnome-shell-extension/crosspane@frostdev.io/*; do
+    [ -f "$f" ] || continue
+    install -Dm644 "$f" "$pkgdir/usr/share/gnome-shell/extensions/crosspane@frostdev.io/${f##*/}"
+  done
   install -Dm644 docs/running.md "$pkgdir/usr/share/doc/crosspane/running.md"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
