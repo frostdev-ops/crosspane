@@ -1735,11 +1735,11 @@ fn create_portal(
     let (displays, displays_fn) =
         CachedDisplays::new(outputs).context("Wayland outputs: first snapshot")?;
 
-    // lead: portals identify this non-sandboxed process by an app id registered on its bus
-    // connection ("io.frostdev.crosspane.agent", `ashpd::register_host_app`, a warning on failure).
-    // It must happen here, before the portal session and the hotkeys below talk to a portal. The
-    // agent crate has no ashpd/zbus dependency, so the call belongs in `crosspane-platform-linux`
-    // (see the WP-G1.6 report).
+    // Portals know this non-sandboxed process by a registered app id; the shared connection
+    // (GlobalShortcuts) is registered here, the RemoteDesktop worker registers its own.
+    if let Err(e) = crosspane_platform_linux::portal::register_host_app() {
+        tracing::warn!(error = %e, "portal app id not registered");
+    }
 
     // Injection: one EIS source shared by the keyboard and the pointer. It is live only while the
     // portal session below is, and the agent reads that through `input_live`.

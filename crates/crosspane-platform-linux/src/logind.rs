@@ -104,17 +104,6 @@ impl fmt::Debug for LogindSession {
     }
 }
 
-/// Which desktop screen-locker service supplies lock evidence next to logind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LockerEvidence {
-    /// Scan for external locker processes (the Hyprland path).
-    ProcessScan,
-    /// `org.gnome.ScreenSaver` `GetActive` / `ActiveChanged`.
-    GnomeScreenSaver,
-    /// `org.freedesktop.ScreenSaver` (KDE).
-    FreedesktopScreenSaver,
-}
-
 impl LogindSession {
     /// Find this graphical session and read its state. The session is, in order, the one that owns
     /// this process (`GetSessionByPID`), the one `$XDG_SESSION_ID` names, or the user's logind
@@ -158,17 +147,6 @@ impl LogindSession {
                 }
             })?;
         Ok(session)
-    }
-
-    /// Like [`LogindSession::new`], with the desktop's own screen locker as additional lock
-    /// evidence (GNOME ScreenSaver or freedesktop ScreenSaver, no Hyprland IPC).
-    pub fn with_locker(
-        gate: Arc<IoGate>,
-        locker: LockerEvidence,
-    ) -> Result<LogindSession, PlatformError> {
-        // lead: replaced by the G1.3 lock-evidence implementation
-        let _ = locker;
-        LogindSession::new(gate, None)
     }
 }
 

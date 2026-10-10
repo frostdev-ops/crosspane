@@ -557,6 +557,9 @@ impl Worker {
         let restore_token = token::read(&self.token_path);
 
         let connection = step!(self.connect());
+        if self.bus_address.is_none() {
+            super::register_on(&connection).await;
+        }
         let remote = step!(RemoteDesktop::with_connection(connection));
         if remote.version() < 2 {
             // ConnectToEIS (and persistence) arrived in version 2.
