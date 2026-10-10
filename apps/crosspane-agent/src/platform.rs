@@ -1726,6 +1726,252 @@ fn recover_parked(backend: &mut dyn WindowParking) -> Result<usize, ()> {
     }
 }
 
+/// What `ShellBridge::connect` says while nothing owns the bridge's bus name: the Shell has not
+/// loaded the Crosspane extension (yet). `connect_waiting` recognises it by "extension is not
+/// running"; this is the full text, for the tests.
+#[cfg(all(test, target_os = "linux"))]
+const EXTENSION_NOT_RUNNING: &str = "the Crosspane Shell extension is not running";
+/// The extension's uuid in `org.gnome.shell enabled-extensions`.
+#[cfg(target_os = "linux")]
+const EXTENSION_UUID: &str = "crosspane@frostdev.io";
+/// How long, and how often, the agent looks for an extension the Shell has not loaded yet.
+#[cfg(target_os = "linux")]
+const EXTENSION_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(target_os = "linux")]
+const EXTENSION_STEP: std::time::Duration = std::time::Duration::from_millis(500);
+/// The consent dialog of the virtual monitor is the user's: how long the agent leaves it up.
+#[cfg(target_os = "linux")]
+const VIRTUAL_CONSENT_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `ShellBridge::connect`, patient at login: when the Shell has not loaded the extension yet but
+/// the extension is enabled, tries again every 500 ms for up to 20 s.
+#[cfg(target_os = "linux")]
+fn connect_shell_bridge()
+-> Result<crosspane_platform_linux::gnome::shell::ShellBridge, PlatformError> {
+    connect_waiting(
+        crosspane_platform_linux::gnome::shell::ShellBridge::connect,
+        extension_enabled,
+        EXTENSION_WAIT,
+        EXTENSION_STEP,
+        std::thread::sleep,
+    )
+}
+
+/// Runs `connect`; on "the extension is not running" waits for it: `enabled` says whether the
+/// extension is listed as enabled (`Some(false)`: it will never load, give up at once; `None`: the
+/// setting could not be read, wait anyway), then `connect` is retried every `step` for up to
+/// `wait`. Logs "waiting for the Crosspane Shell extension" once. Any other error ends the wait.
+#[cfg(target_os = "linux")]
+fn connect_waiting<B>(
+    mut connect: impl FnMut() -> Result<B, PlatformError>,
+    enabled: impl FnOnce() -> Option<bool>,
+    wait: std::time::Duration,
+    step: std::time::Duration,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<B, PlatformError> {
+    // Matched on the words rather than on the whole text, so that a rewording in `shell.rs`
+    // does not silently end the waiting. (None of the bridge's other `Unsupported` texts has them.)
+    fn not_running<B>(result: &Result<B, PlatformError>) -> bool {
+        matches!(
+            result,
+            Err(PlatformError::Unsupported(reason)) if reason.contains("extension is not running")
+        )
+    }
+    let mut result = connect();
+    if !not_running(&result) || enabled() == Some(false) {
+        return result;
+    }
+    tracing::info!("waiting for the Crosspane Shell extension");
+    let mut waited = std::time::Duration::ZERO;
+    while waited < wait && not_running(&result) {
+        sleep(step);
+        waited += step;
+        result = connect();
+    }
+    result
+}
+
+/// Whether the Shell will load the extension: it is listed in `org.gnome.shell
+/// enabled-extensions` and `disable-user-extensions` is not set. Read with `gsettings get`, each
+/// bounded at 2 s; `None` when the list can't be read (an unreadable second key counts as "not
+/// set").
+#[cfg(target_os = "linux")]
+fn extension_enabled() -> Option<bool> {
+    let read = |key: &str| {
+        run_bounded(
+            "/usr/bin/gsettings",
+            &["get", "org.gnome.shell", key],
+            std::time::Duration::from_secs(2),
+        )
+    };
+    let listing = read("enabled-extensions")?;
+    if !lists_extension(&listing, EXTENSION_UUID) {
+        return Some(false);
+    }
+    let user_extensions_off =
+        read("disable-user-extensions").is_some_and(|text| text.trim() == "true");
+    Some(!user_extensions_off)
+}
+
+/// Whether `listing` (what `gsettings get` prints for a string list: `['a@b', 'c@d']`, or
+/// `@as []`) holds `uuid` as an element.
+#[cfg(target_os = "linux")]
+fn lists_extension(listing: &str, uuid: &str) -> bool {
+    listing.split(['\'', '"']).any(|part| part == uuid)
+}
+
+/// Runs `program` and returns its standard output, if it exits successfully within `limit`; the
+/// process is killed when the limit passes. `None` for any failure.
+#[cfg(target_os = "linux")]
+fn run_bounded(program: &str, args: &[&str], limit: std::time::Duration) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut output = String::new();
+    child.stdout.take()?.read_to_string(&mut output).ok()?;
+    Some(output)
+}
+
+/// What `gnome_twin` builds: the twin manager, if this session can make one, and the twin parking.
+#[cfg(target_os = "linux")]
+type GnomeTwinStack = (
+    Option<crosspane_platform_linux::gnome::twin::GnomeTwin>,
+    Box<dyn WindowParking>,
+);
+
+/// The GNOME twin (M2, WP-G2.4): the twin parking, with its startup `recover()` already run (its
+/// result is pushed on `recoveries`), and the twin manager. The journal is recovered whether or
+/// not a twin can be made today (an extension still at version 1, or no Mutter DisplayConfig):
+/// then there is no manager, and the parking refuses every park so that the window is mirrored.
+/// `None` when the parking can't be trusted (an unreadable journal or a failed recovery:
+/// `recoveries` then holds an error and the caller parks nothing).
+#[cfg(target_os = "linux")]
+fn gnome_twin(
+    state_dir: &std::path::Path,
+    gate: &Arc<IoGate>,
+    bridge: &crosspane_platform_linux::gnome::shell::ShellBridge,
+    displays: &crosspane_platform_linux::portal::eis::DisplaysFn,
+    recoveries: &mut Vec<Result<usize, ()>>,
+) -> Option<GnomeTwinStack> {
+    use crosspane_platform_linux::gnome::{twin::GnomeTwin, twin_parking::GnomeTwinParking};
+    use crosspane_platform_linux::portal::virtual_screen::VirtualScreenConfig;
+
+    let twin = if bridge.version() < 2 {
+        tracing::info!(
+            "log out and back in to load Crosspane Shell extension v2; until then projected \
+             windows are mirrored, not hidden"
+        );
+        None
+    } else {
+        let config = VirtualScreenConfig {
+            token_path: state_dir.join("portal-virtual.token"),
+        };
+        match GnomeTwin::new(gate.clone(), config, bridge.clone()) {
+            Ok(twin) => Some(twin),
+            Err(error) => {
+                tracing::warn!(%error, "no virtual monitor support: projected windows are mirrored");
+                None
+            }
+        }
+    };
+    match GnomeTwinParking::new(
+        bridge.clone(),
+        twin.clone(),
+        displays.clone(),
+        state_dir.join("gnome-twin.json"),
+    ) {
+        Ok(mut parking) => match recover_parked(&mut parking) {
+            Ok(count) => {
+                recoveries.push(Ok(count));
+                Some((twin, Box::new(parking) as Box<dyn WindowParking>))
+            }
+            Err(()) => {
+                recoveries.push(Err(()));
+                None
+            }
+        },
+        Err(error) => {
+            tracing::error!(%error, "the twin journal can't be read: windows are not parked");
+            recoveries.push(Err(()));
+            None
+        }
+    }
+}
+
+/// Asks for the consent the virtual monitor needs (a restore token) on a background thread, so
+/// that the startup never waits for the desktop's dialog: with a token stored it does nothing.
+#[cfg(target_os = "linux")]
+fn prepare_virtual_consent(state_dir: &std::path::Path) {
+    use crosspane_platform_linux::portal::virtual_screen::{VirtualScreenConfig, prepare_consent};
+
+    let config = VirtualScreenConfig {
+        token_path: state_dir.join("portal-virtual.token"),
+    };
+    let started = std::thread::Builder::new()
+        .name("portal-virtual-consent".into())
+        .spawn(
+            move || match prepare_consent(&config, VIRTUAL_CONSENT_WAIT) {
+                Ok(true) => tracing::debug!("virtual monitor consent is in place"),
+                Ok(false) => tracing::warn!(
+                    "virtual monitor consent was not given: projected windows are mirrored, not hidden"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "virtual monitor consent is unavailable: projected windows are mirrored"
+                ),
+            },
+        );
+    if let Err(error) = started {
+        tracing::warn!(%error, "could not ask for virtual monitor consent");
+    }
+}
+
+/// The displays the EIS injector maps with: the physical ones plus the twin's while it exists.
+/// Without a twin, `physical` itself.
+#[cfg(target_os = "linux")]
+fn twin_displays(
+    twin: Option<&crosspane_platform_linux::gnome::twin::GnomeTwin>,
+    physical: &crosspane_platform_linux::portal::eis::DisplaysFn,
+) -> crosspane_platform_linux::portal::eis::DisplaysFn {
+    match twin {
+        Some(twin) => twin.displays(physical.clone()),
+        None => physical.clone(),
+    }
+}
+
+/// The window capture, behind the twin's router when there is a twin.
+#[cfg(target_os = "linux")]
+fn twin_capture(
+    twin: Option<&crosspane_platform_linux::gnome::twin::GnomeTwin>,
+    capture: crosspane_platform_linux::gnome::window_capture::GnomeWindowCapture,
+) -> Box<dyn FrameCapture> {
+    match twin {
+        Some(twin) => Box::new(twin.capture(Box::new(capture))),
+        None => Box::new(capture),
+    }
+}
+
 /// GNOME and KDE (WP-G1.6): E1 target and E2 destination through portals, EIS and public Wayland
 /// protocols. Input capture (this node cannot control others yet), GPU capture, home on the twin
 /// and proxy placement are absent. The agent grants `InputAccept` only while the portal session is
@@ -1737,11 +1983,14 @@ fn recover_parked(backend: &mut dyn WindowParking) -> Result<usize, ()> {
 /// and on KDE, there is no window source, parking or frame capture, and the node stays a
 /// destination. The order is fixed:
 ///
-/// 1. connect the bridge;
-/// 2. build the M1 mirror parking and run its `recover()`, before anything else can park (04 §8
+/// 1. connect the bridge (waiting for the Shell to load the extension at login);
+/// 2. build the M2 twin parking (WP-G2.4, with a version-2 extension) and the M1 mirror parking
+///    and run their `recover()`s, the twin's first, before anything else can park (04 §8
 ///    invariant 4) and before the consent dialogs below. A failing recovery (or an unreadable
 ///    journal) is `StartupRecovery::Failed` and leaves no parking backend, so nothing is parked
-///    on top of entries that could not be undone;
+///    on top of entries that could not be undone. With both, `TwinOrMirror` parks on the twin
+///    and mirrors what it refuses; the twin also gets the EIS pointer hook and display list and
+///    wraps the frame capture;
 /// 3. the injection and RemoteDesktop session, hotkeys and overlay (as on KDE);
 /// 4. the window source;
 /// 5. frame capture, only with both a window source and a parking backend: the ScreenCast session
@@ -1756,8 +2005,8 @@ fn create_portal(
     use anyhow::Context;
     use crosspane_platform_linux::desktop::LinuxDesktop;
     use crosspane_platform_linux::gnome::{
-        overlay::GnomeOverlay, parking::GnomeMirrorParking, shell::ShellBridge,
-        window_capture::GnomeWindowCapture, windows::GnomeWindows,
+        overlay::GnomeOverlay, parking::GnomeMirrorParking, window_capture::GnomeWindowCapture,
+        windows::GnomeWindows,
     };
     use crosspane_platform_linux::logind::{LockerEvidence, LogindSession};
     use crosspane_platform_linux::permissions::LinuxPermissions;
@@ -1778,9 +2027,10 @@ fn create_portal(
         CachedDisplays::new(outputs).context("Wayland outputs: first snapshot")?;
 
     // The Crosspane Shell extension's bridge (GNOME only), shared by everything that needs the
-    // Shell: the overlay, the window source, the mirror parking and the window capture.
+    // Shell: the overlay, the window source, the parkings and the window capture. At login the
+    // Shell may not have loaded the extension yet: `connect_shell_bridge` waits for it.
     let bridge = match desktop {
-        LinuxDesktop::Gnome => match ShellBridge::connect() {
+        LinuxDesktop::Gnome => match connect_shell_bridge() {
             Ok(bridge) => Some(bridge),
             Err(error) => {
                 tracing::warn!(
@@ -1796,11 +2046,15 @@ fn create_portal(
     };
 
     // No window is lost (04 §8 invariant 4): undo a previous run's parking before anything else,
-    // including the consent dialogs below. Windows are mirrored in place (M1); a failed recovery,
-    // or a journal that can't be read (it is the only record of the original frames), is reported
-    // and leaves no parking backend, so nothing is parked on top of it.
+    // including the consent dialogs below: the twin's journal first (M2, WP-G2.4, with a version-2
+    // extension), then the mirror's (M1). A failed recovery, or a journal that can't be read (it
+    // is the only record of the original frames), is reported and leaves no parking backend, so
+    // nothing is parked on top of it.
     let mut recoveries: Vec<Result<usize, ()>> = Vec::new();
-    let parking: Option<Box<dyn WindowParking>> = bridge.as_ref().and_then(|bridge| {
+    let twin = bridge
+        .as_ref()
+        .and_then(|bridge| gnome_twin(state_dir, &gate, bridge, &displays_fn, &mut recoveries));
+    let mirror: Option<Box<dyn WindowParking>> = bridge.as_ref().and_then(|bridge| {
         match GnomeMirrorParking::new(
             bridge.clone(),
             displays_fn.clone(),
@@ -1824,6 +2078,19 @@ fn create_portal(
         }
     });
     let startup_recovery = StartupRecovery::combine(&recoveries);
+    let (twin, twin_parking) = match twin {
+        Some((twin, parking)) => (twin, Some(parking)),
+        None => (None, None),
+    };
+    let parking: Option<Box<dyn WindowParking>> = match (mirror, twin_parking) {
+        _ if recoveries.iter().any(Result::is_err) => None,
+        (Some(mirror), Some(twin)) => Some(Box::new(crate::twin::TwinOrMirror::new(twin, mirror))),
+        (mirror, _) => mirror,
+    };
+    if twin.is_some() && parking.is_some() {
+        // Off the startup path: the desktop's dialog is the user's.
+        prepare_virtual_consent(state_dir);
+    }
 
     // Portals know this non-sandboxed process by a registered app id; the shared connection
     // (GlobalShortcuts) is registered here, the RemoteDesktop worker registers its own.
@@ -1835,13 +2102,19 @@ fn create_portal(
     // portal session below is, and the agent reads that through `input_live`.
     let (source, keys, pointer) = match optional(
         "injection",
-        EisSource::new(gate.clone(), displays_fn.clone()),
+        // The twin's display is known to the injector only (peers are never offered it).
+        EisSource::new(gate.clone(), twin_displays(twin.as_ref(), &displays_fn)),
     ) {
-        Some((source, k, p)) => (
-            Some(source),
-            Some(Box::new(k) as Box<dyn KeyInjector>),
-            Some(Box::new(p) as Box<dyn PointerInjector>),
-        ),
+        Some((source, k, p)) => {
+            if let Some(twin) = &twin {
+                source.set_before_move(twin.before_move());
+            }
+            (
+                Some(source),
+                Some(Box::new(k) as Box<dyn KeyInjector>),
+                Some(Box::new(p) as Box<dyn PointerInjector>),
+            )
+        }
         None => (None, None, None),
     };
     let input_live = source.as_ref().map(|source| {
@@ -1890,7 +2163,8 @@ fn create_portal(
                 "frame capture",
                 GnomeWindowCapture::new(inner, bridge.clone(), displays_fn.clone()),
             )
-        }),
+        })
+        .map(|capture| twin_capture(twin.as_ref(), capture)),
         _ => None,
     };
     Ok(Platform {
@@ -1907,7 +2181,8 @@ fn create_portal(
         permissions: Box::new(LinuxPermissions),
         windows: windows.map(|w| Box::new(w) as Box<dyn WindowSource>),
         parking,
-        frames: frames.map(|f| Box::new(f) as Box<dyn FrameCapture>),
+        // Already boxed: the window capture, wrapped by the twin's router when there is a twin.
+        frames,
         tray: optional("tray", crosspane_platform_linux::tray::SniTray::new())
             .map(|t| Box::new(t) as Box<dyn TrayHost>),
         links: Some(Box::new(
@@ -2997,5 +3272,220 @@ mod windows_source_claim_tests {
         assert!(owned_source_claim(&invalid.to_string(), executable).is_err());
         assert!(owned_source_claim(&format!("[{}]", valid), executable).is_err());
         assert!(owned_source_claim(&" ".repeat(8193), executable).is_err());
+    }
+}
+
+/// The patient bridge connection at login and its helpers (no D-Bus, no gsettings: the connect,
+/// the setting and the sleep are fakes).
+#[cfg(all(test, target_os = "linux"))]
+mod shell_wait_tests {
+    #![allow(clippy::unwrap_used)]
+    use std::cell::{Cell, RefCell};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    const WAIT: Duration = Duration::from_secs(2);
+    const STEP: Duration = Duration::from_millis(500);
+
+    fn not_running() -> PlatformError {
+        PlatformError::Unsupported(EXTENSION_NOT_RUNNING)
+    }
+
+    /// A connect that fails `failures` times with "not running", then gives `7`; counts calls.
+    fn connect_after(failures: usize, calls: &Cell<usize>) -> Result<u32, PlatformError> {
+        calls.set(calls.get() + 1);
+        if calls.get() <= failures {
+            Err(not_running())
+        } else {
+            Ok(7)
+        }
+    }
+
+    #[test]
+    fn a_bridge_that_is_there_connects_at_once() {
+        let calls = Cell::new(0);
+        let slept = RefCell::new(Vec::new());
+        let result = connect_waiting(
+            || connect_after(0, &calls),
+            || panic!("the setting is not read when the bridge is there"),
+            WAIT,
+            STEP,
+            |d| slept.borrow_mut().push(d),
+        );
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls.get(), 1);
+        assert!(slept.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_extension_the_shell_has_not_loaded_yet_is_waited_for() {
+        let calls = Cell::new(0);
+        let slept = RefCell::new(Vec::new());
+        let result = connect_waiting(
+            || connect_after(3, &calls),
+            || Some(true),
+            WAIT,
+            STEP,
+            |d| slept.borrow_mut().push(d),
+        );
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls.get(), 4);
+        assert_eq!(*slept.borrow(), [STEP; 3]);
+    }
+
+    #[test]
+    fn an_extension_that_is_not_enabled_is_not_waited_for() {
+        let calls = Cell::new(0);
+        let slept = RefCell::new(Vec::new());
+        let result = connect_waiting(
+            || connect_after(usize::MAX, &calls),
+            || Some(false),
+            WAIT,
+            STEP,
+            |d| slept.borrow_mut().push(d),
+        );
+        assert!(matches!(
+            result,
+            Err(PlatformError::Unsupported(EXTENSION_NOT_RUNNING))
+        ));
+        assert_eq!(calls.get(), 1);
+        assert!(slept.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_setting_waits_anyway_and_gives_up_after_the_limit() {
+        let calls = Cell::new(0);
+        let slept = RefCell::new(Duration::ZERO);
+        let result = connect_waiting(
+            || connect_after(usize::MAX, &calls),
+            || None,
+            WAIT,
+            STEP,
+            |d| *slept.borrow_mut() += d,
+        );
+        assert!(matches!(
+            result,
+            Err(PlatformError::Unsupported(EXTENSION_NOT_RUNNING))
+        ));
+        // The first try, then one per step for the whole wait.
+        assert_eq!(calls.get(), 1 + 4);
+        assert_eq!(*slept.borrow(), WAIT);
+    }
+
+    #[test]
+    fn the_real_limits_are_twenty_seconds_in_half_second_steps() {
+        assert_eq!(EXTENSION_WAIT, Duration::from_secs(20));
+        assert_eq!(EXTENSION_STEP, Duration::from_millis(500));
+        assert_eq!(
+            EXTENSION_NOT_RUNNING,
+            "the Crosspane Shell extension is not running"
+        );
+    }
+
+    #[test]
+    fn any_other_failure_ends_the_wait_at_once() {
+        let calls = Cell::new(0);
+        let slept = RefCell::new(Vec::new());
+        let result = connect_waiting(
+            || {
+                calls.set(calls.get() + 1);
+                Err::<u32, _>(PlatformError::Backend("boom".into()))
+            },
+            || panic!("only the not-running error reads the setting"),
+            WAIT,
+            STEP,
+            |d| slept.borrow_mut().push(d),
+        );
+        assert!(matches!(result, Err(PlatformError::Backend(_))));
+        assert_eq!(calls.get(), 1);
+        assert!(slept.borrow().is_empty());
+        // A different Unsupported (a version this agent can't speak) is not "not running" either.
+        let calls = Cell::new(0);
+        let result = connect_waiting(
+            || {
+                calls.set(calls.get() + 1);
+                Err::<u32, _>(PlatformError::Unsupported(
+                    "the Crosspane Shell extension speaks another bridge version",
+                ))
+            },
+            || panic!("not read"),
+            WAIT,
+            STEP,
+            |_| panic!("not slept"),
+        );
+        assert!(matches!(result, Err(PlatformError::Unsupported(_))));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_wait_that_ends_with_another_error_returns_that_error() {
+        let calls = Cell::new(0);
+        let result = connect_waiting(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    Err::<u32, _>(not_running())
+                } else {
+                    Err(PlatformError::Backend("the bridge broke".into()))
+                }
+            },
+            || Some(true),
+            WAIT,
+            STEP,
+            |_| {},
+        );
+        assert!(matches!(result, Err(PlatformError::Backend(_))));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn gsettings_lists_are_read_for_the_extension_uuid() {
+        let uuid = EXTENSION_UUID;
+        assert!(lists_extension("['crosspane@frostdev.io']\n", uuid));
+        assert!(lists_extension(
+            "['dash-to-panel@jderose9.github.com', 'crosspane@frostdev.io', 'x@y']\n",
+            uuid
+        ));
+        assert!(lists_extension("[\"crosspane@frostdev.io\"]", uuid));
+        assert!(!lists_extension("@as []\n", uuid));
+        assert!(!lists_extension("['other@frostdev.io']", uuid));
+        assert!(!lists_extension(
+            "['crosspane@frostdev.io.evil', 'xcrosspane@frostdev.io']",
+            uuid
+        ));
+        assert!(!lists_extension("", uuid));
+    }
+
+    #[test]
+    fn a_bounded_run_returns_the_output_of_a_command_that_finishes() {
+        let out = run_bounded("/bin/sh", &["-c", "printf hello"], Duration::from_secs(5));
+        assert_eq!(out.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn a_bounded_run_gives_up_on_failure_timeout_and_a_missing_program() {
+        assert_eq!(
+            run_bounded("/bin/sh", &["-c", "exit 3"], Duration::from_secs(5)),
+            None
+        );
+        let started = Instant::now();
+        assert_eq!(
+            run_bounded(
+                "/bin/sh",
+                &["-c", "exec sleep 30"],
+                Duration::from_millis(150)
+            ),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            run_bounded(
+                "/nonexistent/crosspane-test-program",
+                &[],
+                Duration::from_secs(1)
+            ),
+            None
+        );
     }
 }

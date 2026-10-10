@@ -8,5 +8,7 @@ pub mod display_config;
 pub mod overlay;
 pub mod parking;
 pub mod shell;
+pub mod twin;
+pub mod twin_parking;
 pub mod window_capture;
 pub mod windows;
