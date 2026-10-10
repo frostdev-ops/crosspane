@@ -1,7 +1,8 @@
 <!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
 <!--
-  The Crosspane GNOME Shell bridge, version 1 (WP-G0.1, frozen; WP-G1.2).
+  The Crosspane GNOME Shell bridge, version 2 (WP-G0.1, frozen; WP-G1.2; v2 additions frozen by
+  WP-G2.4 and WP-G1.7 on 2026-10-10 under the owner's twin/fence ruling of that day).
 
   Exported by the Crosspane Shell extension on the session bus under the well-known name
   io.frostdev.Crosspane.Shell, object /io/frostdev/Crosspane/Shell. Owner-approved (2026-10-09)
@@ -21,7 +22,7 @@
 -->
 <node>
   <interface name="io.frostdev.Crosspane.Shell1">
-    <!-- 1 for this interface. -->
+    <!-- 2 for this interface (1 = without the v2 methods below; clients accept both). -->
     <property name="Version" type="u" access="read"/>
     <!-- Random per enable(); changes when the extension is re-enabled or the Shell restarts. -->
     <property name="ShellEpoch" type="t" access="read"/>
@@ -29,7 +30,8 @@
     <!--
       Every eligible window: (id, app_id, title, pid, x, y, width, height, focused, minimized,
       fullscreen). app_id is the Shell's app id (e.g. "org.gnome.Nautilus.desktop") or the
-      wm_class when no app matches; pid 0 when unknown.
+      wm_class when no app matches (the Shell's synthetic "window:N" ids are never reported; v2);
+      pid 0 when unknown.
     -->
     <method name="ListWindows">
       <arg name="epoch" type="t" direction="out"/>
@@ -102,5 +104,55 @@
       <arg name="id" type="u"/>
       <arg name="visible" type="b"/>
     </signal>
+
+    <!-- ===== v2 (WP-G2.4: virtual twin parking; WP-G1.7: controller capture) ===== -->
+
+    <!--
+      Fence the pointer out of one rectangle (the agent's virtual twin monitor), in global logical
+      coordinates: four Meta.Barriers on its edges, each letting motion pass only outward (left
+      edge NEGATIVE_X, top NEGATIVE_Y, right POSITIVE_X, bottom POSITIVE_Y). Replaces any previous
+      fence. width and height in 1..=32768, x and y within +-2^20. Barriers stop physical and
+      injected motion alike, so the agent clears the fence while it injects into the rectangle.
+    -->
+    <method name="SetPointerFence">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+      <arg name="width" type="i" direction="in"/>
+      <arg name="height" type="i" direction="in"/>
+    </method>
+
+    <!-- Remove the fence; removing none succeeds. disable() removes it too. -->
+    <method name="ClearPointerFence"/>
+
+    <!--
+      Snapshot every eligible window: frame rect, maximize flags, fullscreen. Returns a nonzero
+      token. At most 4 snapshots are kept; a fifth drops the oldest.
+    -->
+    <method name="SaveLayout">
+      <arg name="token" type="u" direction="out"/>
+    </method>
+
+    <!--
+      Put back every window of the snapshot that still exists and whose state differs, in this
+      order: fullscreen again if it was; maximize with the saved flags if it was; otherwise
+      move_resize_frame(false, saved rect). Windows in `skip` are left alone (the windows the agent
+      is parking). Returns how many windows were changed and drops the snapshot. An unknown token is
+      a D-Bus error (InvalidArgs). Tiling cannot be restored through public API: a tiled window gets
+      its tiled rect back as a floating window.
+    -->
+    <method name="RestoreLayout">
+      <arg name="token" type="u" direction="in"/>
+      <arg name="skip" type="at" direction="in"/>
+      <arg name="restored" type="u" direction="out"/>
+    </method>
+
+    <!--
+      Hide (true) or show (false) the pointer while the agent captures input (WP-G1.7), through
+      Meta.CursorTracker inhibit/uninhibit_cursor_visibility. Idempotent per state (a second
+      `true` does not inhibit twice); disable() shows it again.
+    -->
+    <method name="InhibitCursor">
+      <arg name="inhibit" type="b" direction="in"/>
+    </method>
   </interface>
 </node>
