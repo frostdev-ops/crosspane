@@ -374,8 +374,9 @@ fn invalid(reason: impl Into<String>) -> SnapshotError {
     SnapshotError::Invalid(reason.into())
 }
 
-/// FNV-1a, 32 bit, over the name's UTF-8 bytes.
-fn display_id(name: &str) -> DisplayId {
+/// FNV-1a, 32 bit, over the name's UTF-8 bytes. (`pub(crate)`: the GNOME twin builds its own
+/// display id from the connector name the same way.)
+pub(crate) fn display_id(name: &str) -> DisplayId {
     DisplayId(name.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
         (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
     }))

@@ -77,9 +77,9 @@ mod tests;
 
 use std::fmt;
 use std::os::fd::OwnedFd;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crosspane_platform::{IoGate, KeyInjector, PlatformError, PointerInjector};
@@ -105,12 +105,18 @@ const COMMAND_QUEUE: usize = 64;
 /// The displays snapshot used for region mapping (the platform's `Displays::displays`).
 pub type DisplaysFn = Arc<dyn Fn() -> Vec<DisplayInfo> + Send + Sync>;
 
+/// A hook called with the target display before every absolute pointer move
+/// ([`EisSource::set_before_move`]).
+pub type MoveHook = Arc<dyn Fn(DisplayId) + Send + Sync>;
+
 /// What the three handles share. When the last one goes, the worker releases what is held, says
 /// goodbye to the compositor and stops.
 struct Shared {
     commands: SyncSender<Command>,
     inner: Arc<Inner>,
     displays: DisplaysFn,
+    /// See [`EisSource::set_before_move`].
+    before_move: Mutex<Option<MoveHook>>,
 }
 
 impl fmt::Debug for Shared {
@@ -157,6 +163,19 @@ impl Shared {
     fn call_within(&self, action: Action) -> Result<(), PlatformError> {
         self.call(action, Instant::now() + CALL_BUDGET)
     }
+
+    /// Runs the move hook, if one is set. The hook is cloned out of its lock first, so it may call
+    /// back into [`EisSource::set_before_move`].
+    fn run_before_move(&self, display: DisplayId) {
+        let hook = self
+            .before_move
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(display);
+        }
+    }
 }
 
 /// The shared injection source. Cloning gives another handle to the same worker.
@@ -193,6 +212,7 @@ impl EisSource {
             commands,
             inner,
             displays,
+            before_move: Mutex::new(None),
         });
         Ok((
             EisSource {
@@ -224,6 +244,20 @@ impl EisSource {
     /// Whether a connection with a resumed keyboard and pointer exists now.
     pub fn is_live(&self) -> bool {
         self.shared.inner.live.load(Ordering::Acquire)
+    }
+
+    /// Sets (replaces) the hook called with the target display **before every absolute pointer
+    /// move** (`PointerInjector::move_to`), on the caller's thread, before the display is looked up
+    /// and before the move's 45 ms budget starts. Nothing else (keys, buttons, scrolling) runs it,
+    /// and it cannot change or veto the move. It must be quick and must not panic: the GNOME twin
+    /// (WP-G2.4) uses it to lower its pointer fence when the move targets the twin's display,
+    /// because the fence's barriers stop injected absolute motion as well.
+    pub fn set_before_move(&self, hook: MoveHook) {
+        *self
+            .shared
+            .before_move
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hook);
     }
 }
 
@@ -265,6 +299,7 @@ impl KeyInjector for EisKeyInjector {
 
 impl PointerInjector for EisPointerInjector {
     fn move_to(&mut self, display: DisplayId, position: PointDevice) -> Result<(), PlatformError> {
+        self.shared.run_before_move(display);
         let deadline = Instant::now() + CALL_BUDGET;
         let displays = (self.shared.displays)();
         let info = displays
@@ -314,5 +349,103 @@ impl Drop for EisKeyInjector {
 impl Drop for EisPointerInjector {
     fn drop(&mut self) {
         let _ = self.shared.call_within(Action::ReleaseButtons);
+    }
+}
+
+/// The before-move hook (WP-G2.4). It does not need a compositor: the hook runs before the move
+/// is looked at, so a source with no session shows it.
+#[cfg(test)]
+mod hook_tests {
+    #![allow(clippy::unwrap_used)]
+    use std::sync::Mutex;
+
+    use crosspane_types::input::ScrollPhase;
+
+    use super::*;
+
+    fn source() -> (EisSource, EisKeyInjector, EisPointerInjector) {
+        let gate = IoGate::new();
+        gate.set_session_permits(true);
+        gate.set_engine_permits(true);
+        EisSource::new(gate, Arc::new(Vec::new)).unwrap()
+    }
+
+    fn recording() -> (MoveHook, Arc<Mutex<Vec<DisplayId>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        (
+            Arc::new(move |display| sink.lock().unwrap().push(display)),
+            seen,
+        )
+    }
+
+    #[test]
+    fn the_hook_runs_before_every_absolute_move_with_its_display() {
+        let (source, _keys, mut pointer) = source();
+        let (hook, seen) = recording();
+        source.set_before_move(hook);
+        // Whatever becomes of the move (no such display, no session), the hook has run first.
+        assert!(matches!(
+            pointer.move_to(DisplayId(7), PointDevice::new(1.0, 1.0)),
+            Err(PlatformError::NotFound)
+        ));
+        assert!(
+            pointer
+                .move_to(DisplayId(9), PointDevice::new(-5.0, 1.0))
+                .is_err()
+        );
+        assert_eq!(*seen.lock().unwrap(), [DisplayId(7), DisplayId(9)]);
+    }
+
+    #[test]
+    fn keys_buttons_and_scrolling_do_not_run_the_hook() {
+        let (source, mut keys, mut pointer) = source();
+        let (hook, seen) = recording();
+        source.set_before_move(hook);
+        let _ = keys.key(HidUsage::keyboard(0x04), true);
+        let _ = keys.key(HidUsage::keyboard(0x04), false);
+        let _ = pointer.button(MouseButton::PRIMARY, true);
+        let _ = pointer.button(MouseButton::PRIMARY, false);
+        let _ = pointer.scroll(ScrollDelta {
+            v120_x: 0,
+            v120_y: 120,
+            pixels: None,
+            phase: ScrollPhase::Discrete,
+            stop_x: false,
+            stop_y: false,
+        });
+        let _ = pointer.release_all();
+        let _ = keys.release_all();
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_hook_can_be_replaced_and_every_handle_shares_it() {
+        let (source, _keys, mut pointer) = source();
+        // No hook: a move is just a move.
+        assert!(
+            pointer
+                .move_to(DisplayId(1), PointDevice::new(1.0, 1.0))
+                .is_err()
+        );
+        let (first, first_seen) = recording();
+        source.set_before_move(first);
+        let _ = pointer.move_to(DisplayId(1), PointDevice::new(1.0, 1.0));
+        let (second, second_seen) = recording();
+        source.clone().set_before_move(second);
+        let _ = pointer.move_to(DisplayId(2), PointDevice::new(1.0, 1.0));
+        assert_eq!(*first_seen.lock().unwrap(), [DisplayId(1)]);
+        assert_eq!(*second_seen.lock().unwrap(), [DisplayId(2)]);
+    }
+
+    #[test]
+    fn a_hook_may_install_another_hook_without_deadlocking() {
+        let (source, _keys, mut pointer) = source();
+        let inner = source.clone();
+        let (next, next_seen) = recording();
+        source.set_before_move(Arc::new(move |_| inner.set_before_move(Arc::clone(&next))));
+        let _ = pointer.move_to(DisplayId(1), PointDevice::new(1.0, 1.0));
+        let _ = pointer.move_to(DisplayId(2), PointDevice::new(1.0, 1.0));
+        assert_eq!(*next_seen.lock().unwrap(), [DisplayId(2)]);
     }
 }

@@ -204,8 +204,9 @@ impl WindowParking for GnomeMirrorParking {
 }
 
 /// The bridge calls parking makes. A private seam so that tests run without D-Bus; it deliberately
-/// has no minimize and no close.
-trait Shell: Send {
+/// has no minimize and no close. (`pub(super)`: the twin parking, `twin_parking`, runs on the same
+/// engine.)
+pub(super) trait Shell: Send {
     fn epoch(&self) -> u64;
     fn list_windows(&self) -> Result<Vec<ShellWindow>, PlatformError>;
     fn move_resize(
@@ -240,24 +241,24 @@ impl Shell for ShellBridge {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Settle {
-    interval: Duration,
-    budget: Duration,
+pub(super) struct Settle {
+    pub(super) interval: Duration,
+    pub(super) budget: Duration,
 }
 
 /// Where `restore_at` was asked to put the window's top-left.
 #[derive(Clone, Copy, Debug)]
-struct Placement {
-    display: DisplayId,
-    origin: PointDevice,
+pub(super) struct Placement {
+    pub(super) display: DisplayId,
+    pub(super) origin: PointDevice,
 }
 
 /// Opens a new connection to the bridge: [`ShellBridge::connect`], or a fake in tests.
-type Connect<S> = Box<dyn Fn() -> Result<S, PlatformError> + Send>;
+pub(super) type Connect<S> = Box<dyn Fn() -> Result<S, PlatformError> + Send>;
 
 /// Whether `error` says the bridge can no longer serve the Shell it connected to. Only the bridge's
 /// own messages count; any other failure (a timeout, a refused argument) is not a loss.
-fn bridge_lost(error: &PlatformError) -> bool {
+pub(super) fn bridge_lost(error: &PlatformError) -> bool {
     matches!(error, PlatformError::Backend(text) if LOST_MESSAGES.contains(&text.as_str()))
 }
 
@@ -287,7 +288,7 @@ enum Reconnect {
 
 /// Why a bridge call produced no value.
 #[derive(Debug)]
-enum Failure {
+pub(super) enum Failure {
     Error(PlatformError),
     /// The bridge was lost and the Shell has a new epoch, so the window ids the caller holds belong
     /// to a Shell that is gone. The call was not retried.
@@ -300,27 +301,29 @@ impl From<PlatformError> for Failure {
     }
 }
 
-type Outcome<T> = Result<T, Failure>;
+pub(super) type Outcome<T> = Result<T, Failure>;
 
 /// What a caller of the `WindowParking` methods gets for a call that went stale: the window it
 /// names no longer exists as far as the new Shell is concerned.
-fn or_not_found<T>(outcome: Outcome<T>) -> Result<T, PlatformError> {
+pub(super) fn or_not_found<T>(outcome: Outcome<T>) -> Result<T, PlatformError> {
     outcome.map_err(|failure| match failure {
         Failure::Error(error) => error,
         Failure::Stale => PlatformError::NotFound,
     })
 }
 
-/// All the parking logic, generic over the bridge so tests can drive it with a fake.
-struct Core<S: Shell> {
+/// All the parking logic, generic over the bridge so tests can drive it with a fake. The twin
+/// parking (`twin_parking`) wraps one of these for the journal, the bridge-loss handling, restore
+/// and recovery, and adds its own placement.
+pub(super) struct Core<S: Shell> {
     link: RefCell<Link<S>>,
     connect: Connect<S>,
     /// The least time between two reconnect attempts.
-    reconnect_gap: Duration,
+    pub(super) reconnect_gap: Duration,
     displays: DisplaysFn,
     path: PathBuf,
-    journal: Journal,
-    settle: Settle,
+    pub(super) journal: Journal,
+    pub(super) settle: Settle,
 }
 
 impl<S: Shell> fmt::Debug for Core<S> {
@@ -334,7 +337,7 @@ impl<S: Shell> fmt::Debug for Core<S> {
 }
 
 impl<S: Shell> Core<S> {
-    fn open(
+    pub(super) fn open(
         shell: S,
         connect: Connect<S>,
         displays: DisplaysFn,
@@ -358,11 +361,11 @@ impl<S: Shell> Core<S> {
     }
 
     /// The epoch of the current bridge.
-    fn epoch(&self) -> u64 {
+    pub(super) fn epoch(&self) -> u64 {
         self.link.borrow().epoch
     }
 
-    fn key(&self, window: WindowId) -> Key {
+    pub(super) fn key(&self, window: WindowId) -> Key {
         (self.epoch(), window.0)
     }
 
@@ -370,7 +373,7 @@ impl<S: Shell> Core<S> {
     /// within `reconnect_gap` of the last attempt) and tries the call once more on the new bridge,
     /// unless the Shell has a new epoch: then the window ids this call carries are void and it
     /// ends as [`Failure::Stale`].
-    fn call<T>(&self, op: impl Fn(&S) -> Result<T, PlatformError>) -> Outcome<T> {
+    pub(super) fn call<T>(&self, op: impl Fn(&S) -> Result<T, PlatformError>) -> Outcome<T> {
         // Bound before the match: the borrow must be gone before `reconnect` takes it mutably.
         let first = op(&self.link.borrow().shell);
         let error = match first {
@@ -440,14 +443,14 @@ impl<S: Shell> Core<S> {
 
     /// After a reconnect to a new epoch, retires the old epoch's entries. Run at the start and the
     /// end of every call that can write the journal.
-    fn sync_epoch(&mut self) {
+    pub(super) fn sync_epoch(&mut self) {
         if self.link.get_mut().switched && self.retire_stale() {
             self.link.get_mut().switched = false;
         }
     }
 
     /// Writes `next` to disk and, only when that worked, makes it the current journal.
-    fn commit(&mut self, next: Journal) -> Result<(), PlatformError> {
+    pub(super) fn commit(&mut self, next: Journal) -> Result<(), PlatformError> {
         write_journal(&self.path, &next)?;
         self.journal = next;
         Ok(())
@@ -459,7 +462,7 @@ impl<S: Shell> Core<S> {
     }
 
     /// A fresh `ListWindows` read of one window (`None`: it is not listed).
-    fn window(&self, id: u64) -> Outcome<Option<ShellWindow>> {
+    pub(super) fn window(&self, id: u64) -> Outcome<Option<ShellWindow>> {
         let windows = self.call(|shell| shell.list_windows())?;
         Ok(windows.into_iter().find(|w| w.id == id))
     }
@@ -575,7 +578,7 @@ impl<S: Shell> Core<S> {
 
     /// Reads the window back until it reports `target`'s size or the budget runs out; the Shell
     /// applies a `MoveResize` asynchronously and the app may refuse the size.
-    fn settle(&self, id: u64, target: Frame) -> Outcome<ShellWindow> {
+    pub(super) fn settle(&self, id: u64, target: Frame) -> Outcome<ShellWindow> {
         let deadline = Instant::now() + self.settle.budget;
         loop {
             let window = self.window(id)?.ok_or(PlatformError::NotFound)?;
@@ -588,7 +591,7 @@ impl<S: Shell> Core<S> {
         }
     }
 
-    fn rollback(&mut self, id: u64) {
+    pub(super) fn rollback(&mut self, id: u64) {
         match self.restore_op(id, None) {
             // Stale: the entry is of a Shell that is gone, and `sync_epoch` retires it.
             Ok(_) | Err(Failure::Stale) => {}
@@ -614,7 +617,7 @@ impl<S: Shell> Core<S> {
     }
 
     /// `restore` and `restore_at`: a window of a Shell that has since gone is as good as closed.
-    fn restore_checked(
+    pub(super) fn restore_checked(
         &mut self,
         id: u64,
         placement: Option<Placement>,
@@ -676,7 +679,7 @@ impl<S: Shell> Core<S> {
         Ok(true)
     }
 
-    fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+    pub(super) fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
         self.sync_epoch();
         let mut restored = Vec::new();
         let mut failure = None;
@@ -714,15 +717,15 @@ impl<S: Shell> Core<S> {
 
 /// A window rect in the Shell's global logical coordinates, as the bridge reports and accepts it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Frame {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
+pub(super) struct Frame {
+    pub(super) x: i32,
+    pub(super) y: i32,
+    pub(super) width: i32,
+    pub(super) height: i32,
 }
 
 impl Frame {
-    fn of(window: &ShellWindow) -> Frame {
+    pub(super) fn of(window: &ShellWindow) -> Frame {
         Frame {
             x: window.x,
             y: window.y,
@@ -732,7 +735,7 @@ impl Frame {
     }
 
     /// Whether the bridge would accept this rect back in `MoveResize`.
-    fn is_valid(self) -> bool {
+    pub(super) fn is_valid(self) -> bool {
         (1..=MAX_EXTENT).contains(&self.width)
             && (1..=MAX_EXTENT).contains(&self.height)
             && (-MAX_COORD..=MAX_COORD).contains(&self.x)
@@ -740,7 +743,7 @@ impl Frame {
     }
 }
 
-fn check_size(size: PixelSize) -> Result<(), PlatformError> {
+pub(super) fn check_size(size: PixelSize) -> Result<(), PlatformError> {
     if size.width == 0 || size.height == 0 {
         Err(backend("invalid parking size"))
     } else {
@@ -787,7 +790,10 @@ fn display_for(frame: Frame, displays: &[DisplayInfo]) -> Option<&DisplayInfo> {
 /// A logical frame as a device-pixel rect on the display `geometry` describes: origin
 /// `(logical − display origin) × scale` and size `logical size × scale`, each rounded (the size
 /// separately from the origin, so a window's content size does not wobble as it moves).
-fn to_device(frame: Frame, geometry: &DisplayGeometry) -> Result<PixelRect, PlatformError> {
+pub(super) fn to_device(
+    frame: Frame,
+    geometry: &DisplayGeometry,
+) -> Result<PixelRect, PlatformError> {
     let scale = geometry.scale;
     let axis = |position: i32, origin: f64, extent: i32| -> Result<(i32, i32), PlatformError> {
         let min = ((f64::from(position) - origin) * scale).round();
@@ -808,7 +814,7 @@ fn to_device(frame: Frame, geometry: &DisplayGeometry) -> Result<PixelRect, Plat
 }
 
 /// A content size in device pixels as a logical window size on a display of `scale`, rounded.
-fn logical_extent(size: PixelSize, scale: f64) -> Result<(i32, i32), PlatformError> {
+pub(super) fn logical_extent(size: PixelSize, scale: f64) -> Result<(i32, i32), PlatformError> {
     let axis = |pixels: u32| -> Result<i32, PlatformError> {
         let logical = (f64::from(pixels) / scale).round();
         if (1.0..=f64::from(MAX_EXTENT)).contains(&logical) {
@@ -899,7 +905,7 @@ fn place_frame(
     })
 }
 
-fn backend(error: impl fmt::Display) -> PlatformError {
+pub(super) fn backend(error: impl fmt::Display) -> PlatformError {
     PlatformError::Backend(error.to_string())
 }
 
@@ -908,12 +914,12 @@ fn backend(error: impl fmt::Display) -> PlatformError {
 // ---------------------------------------------------------------------------------------------
 
 /// `(Shell epoch, window id)`.
-type Key = (u64, u64);
+pub(super) type Key = (u64, u64);
 
 /// One parked window's original state. Fields are the journal's JSON fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Entry {
+pub(super) struct Entry {
     epoch: u64,
     window: u64,
     x: i32,
@@ -924,7 +930,7 @@ struct Entry {
 }
 
 impl Entry {
-    fn new(epoch: u64, window: u64, frame: Frame, fullscreen: bool) -> Entry {
+    pub(super) fn new(epoch: u64, window: u64, frame: Frame, fullscreen: bool) -> Entry {
         Entry {
             epoch,
             window,
@@ -961,7 +967,7 @@ struct JournalFile {
 /// The set of parked windows. Every change returns a new value, so the caller can persist it
 /// before it replaces the current one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Journal {
+pub(super) struct Journal {
     entries: BTreeMap<Key, Entry>,
 }
 
@@ -1000,13 +1006,13 @@ impl Journal {
         self.entries.get(&key)
     }
 
-    fn contains(&self, key: Key) -> bool {
+    pub(super) fn contains(&self, key: Key) -> bool {
         self.entries.contains_key(&key)
     }
 
     /// With `entry` added. An entry for the same window is kept as it is: the original frame is
     /// never overwritten by a later one.
-    fn with(&self, entry: Entry) -> Journal {
+    pub(super) fn with(&self, entry: Entry) -> Journal {
         let mut next = self.clone();
         next.entries.entry(entry.key()).or_insert(entry);
         next
@@ -1019,7 +1025,7 @@ impl Journal {
     }
 
     /// The ids of the windows journaled under `epoch`, in order.
-    fn windows_of(&self, epoch: u64) -> Vec<u64> {
+    pub(super) fn windows_of(&self, epoch: u64) -> Vec<u64> {
         self.entries
             .keys()
             .filter(|(e, _)| *e == epoch)
