@@ -36,7 +36,7 @@ target=$(cargo metadata --no-deps --format-version 1 --locked |
 
 tmp=$(mktemp -d "$(dirname "$out")/.prepare-linux-input.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
-mkdir -m 700 "$tmp/bin" "$tmp/resources" "$tmp/libraries"
+mkdir -m 700 "$tmp/bin" "$tmp/resources" "$tmp/resources/gnome-shell-extension" "$tmp/libraries"
 for b in crosspane-agent crosspanectl crosspane-ui crosspane-installer; do
     install -m 0755 "$target/release/$b" "$tmp/bin/$b"
     strip --strip-debug "$tmp/bin/$b"
@@ -44,6 +44,15 @@ done
 install -m 0644 packaging/linux/crosspane-agent.service packaging/linux/crosspane-settings.desktop \
     packaging/linux/crosspane-installer.desktop assets/brand/crosspane-icon.svg "$tmp/resources/"
 install -m 0644 LICENSE "$tmp/resources/LICENSE"
+# GNOME and KDE support (manifest schema 2): the agent's desktop entry, which the desktop portals
+# need before they accept the agent's application id, and the GNOME Shell extension. A Hyprland
+# install carries them in the payload but never installs them.
+install -m 0644 packaging/linux/io.frostdev.crosspane.agent.desktop "$tmp/resources/"
+install -m 0644 \
+    packaging/gnome-shell-extension/crosspane@frostdev.io/extension.js \
+    packaging/gnome-shell-extension/crosspane@frostdev.io/metadata.json \
+    packaging/gnome-shell-extension/crosspane@frostdev.io/io.frostdev.Crosspane.Shell1.xml \
+    "$tmp/resources/gnome-shell-extension/"
 
 # Runtime libraries the binaries link against, excluding the C runtime itself. Each is resolved
 # through the loader cache for this architecture and copied as a regular file.
@@ -64,7 +73,11 @@ src, rev, version, arch = pathlib.Path(sys.argv[1]), *sys.argv[2:]
 files = ["bin/crosspane-agent", "bin/crosspanectl", "bin/crosspane-ui", "bin/crosspane-installer",
          "resources/crosspane-agent.service",
          "resources/crosspane-settings.desktop", "resources/crosspane-installer.desktop",
-         "resources/crosspane-icon.svg", "resources/LICENSE"]
+         "resources/crosspane-icon.svg", "resources/LICENSE",
+         "resources/io.frostdev.crosspane.agent.desktop",
+         "resources/gnome-shell-extension/extension.js",
+         "resources/gnome-shell-extension/metadata.json",
+         "resources/gnome-shell-extension/io.frostdev.Crosspane.Shell1.xml"]
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 members = [{"name": f, "size": (src / f).stat().st_size, "sha256": sha(src / f),
@@ -72,7 +85,7 @@ members = [{"name": f, "size": (src / f).stat().st_size, "sha256": sha(src / f),
 libraries = [{"name": p.name, "sha256": sha(p)} for p in sorted((src / "libraries").iterdir())]
 if not libraries:
     sys.exit("no runtime libraries recorded")
-provenance = {"schema_version": 1, "product_version": version, "architecture": arch,
+provenance = {"schema_version": 2, "product_version": version, "architecture": arch,
               "source_revision": rev, "profile": "release", "libraries": libraries,
               "members": members}
 (src / "provenance.json").write_text(json.dumps(provenance, indent=1) + "\n")

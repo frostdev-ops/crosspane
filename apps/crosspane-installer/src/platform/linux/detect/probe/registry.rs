@@ -18,12 +18,27 @@ pub const REQUIRED_PROTOCOLS: &[(&str, u32)] = &[
     ("ext_image_copy_capture_manager_v1", 1),
     ("ext_output_image_capture_source_manager_v1", 1),
 ];
+/// GNOME and KDE: what the portal-based backend binds itself. Input, capture and window control
+/// go through portals and the compositor's own bridge, so no wlroots protocol is asked for.
+/// `xdg_wm_base` hosts the projection windows; `zxdg_output_manager_v1` gives output geometry.
+pub const REQUIRED_PORTAL_PROTOCOLS: &[(&str, u32)] = &[
+    ("wl_compositor", 4),
+    ("wl_shm", 1),
+    ("wl_seat", 5),
+    ("wl_output", 4),
+    ("xdg_wm_base", 1),
+    ("zxdg_output_manager_v1", 1),
+];
+/// The protocol list judged for `desktop`.
+pub fn required_protocols(desktop: Desktop) -> &'static [(&'static str, u32)] {
+    match desktop {
+        Desktop::Hyprland => REQUIRED_PROTOCOLS,
+        Desktop::Gnome | Desktop::Kde => REQUIRED_PORTAL_PROTOCOLS,
+    }
+}
 pub const MAX_REGISTRY_GLOBALS: usize = 4096;
-fn global(interface: &str, version: u32) -> Result<(), ProbeIssue> {
-    if !REQUIRED_PROTOCOLS
-        .iter()
-        .any(|(name, _)| *name == interface)
-    {
+fn global(interface: &str, version: u32, required: &[(&str, u32)]) -> Result<(), ProbeIssue> {
+    if !required.iter().any(|(name, _)| *name == interface) {
         return Ok(());
     }
     logind::bounded_text(interface, 128)?;
@@ -34,13 +49,21 @@ fn global(interface: &str, version: u32) -> Result<(), ProbeIssue> {
 }
 /// Availability only: globals are never bound and no input/capture/output object is created.
 pub fn protocols_satisfy(globals: &[(String, u32)]) -> Result<bool, ProbeIssue> {
+    protocols_satisfy_for(globals, Desktop::Hyprland)
+}
+/// The same availability check against the list for `desktop`.
+pub fn protocols_satisfy_for(
+    globals: &[(String, u32)],
+    desktop: Desktop,
+) -> Result<bool, ProbeIssue> {
+    let required = required_protocols(desktop);
     if globals.len() > MAX_REGISTRY_GLOBALS {
         return Err(ProbeIssue::Oversize);
     }
     for (interface, version) in globals {
-        global(interface, *version)?;
+        global(interface, *version, required)?;
     }
-    Ok(REQUIRED_PROTOCOLS.iter().all(|(name, minimum)| {
+    Ok(required.iter().all(|(name, minimum)| {
         globals
             .iter()
             .any(|(interface, version)| interface == name && version >= minimum)
@@ -51,6 +74,7 @@ struct Registry {
     bytes: usize,
     error: Option<ProbeIssue>,
     stop: UnixStream,
+    required: &'static [(&'static str, u32)],
 }
 impl Dispatch<wl_registry::WlRegistry, ()> for Registry {
     fn event(
@@ -68,7 +92,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Registry {
                     interface,
                     version,
                 } => {
-                    global(&interface, version)?;
+                    global(&interface, version, state.required)?;
                     if name == 0 || state.globals.contains_key(&name) {
                         return Err(ProbeIssue::Malformed);
                     }
@@ -98,7 +122,11 @@ pub struct RegistryFacts {
     pub protocols: Fact<bool>,
     pub pid: u32,
 }
-pub(crate) fn read(stream: UnixStream, clock: CallerClock) -> Result<RegistryFacts, ProbeIssue> {
+pub(crate) fn read_for(
+    stream: UnixStream,
+    clock: CallerClock,
+    desktop: Desktop,
+) -> Result<RegistryFacts, ProbeIssue> {
     let pid = hyprland::peer_pid(&stream)?;
     let stop = stream.try_clone().map_err(|_| ProbeIssue::Unavailable)?;
     let connection = Connection::from_socket(stream).map_err(|_| ProbeIssue::Unavailable)?;
@@ -108,6 +136,7 @@ pub(crate) fn read(stream: UnixStream, clock: CallerClock) -> Result<RegistryFac
         bytes: 0,
         error: None,
         stop,
+        required: required_protocols(desktop),
     };
     let _registry = connection.display().get_registry(&queue.handle(), ());
     let result = queue.roundtrip(&mut state);
@@ -119,7 +148,7 @@ pub(crate) fn read(stream: UnixStream, clock: CallerClock) -> Result<RegistryFac
     let globals: Vec<_> = state.globals.into_values().collect();
     Ok(RegistryFacts {
         protocols: Fact {
-            value: completeness.and_then(|()| protocols_satisfy(&globals)),
+            value: completeness.and_then(|()| protocols_satisfy_for(&globals, desktop)),
             source: ObservationSource::Demo,
             observed_at_ms: receipt,
         },
@@ -133,12 +162,21 @@ pub fn registry_from_stream(
     deadline: &Deadline,
     clock: CallerClock,
 ) -> Fact<RegistryFacts> {
+    registry_from_stream_for(stream, deadline, clock, Desktop::Hyprland)
+}
+/// The same, judged against the protocol list for `desktop`.
+pub fn registry_from_stream_for(
+    stream: UnixStream,
+    deadline: &Deadline,
+    clock: CallerClock,
+    desktop: Desktop,
+) -> Fact<RegistryFacts> {
     let receipt = clock.clone();
     bounded(
         stream,
         deadline,
         clock,
         ObservationSource::Demo,
-        move |stream| read(stream, receipt),
+        move |stream| read_for(stream, receipt, desktop),
     )
 }

@@ -4,6 +4,7 @@
 //! module's typed results into the worker's vocabulary. The worker (see `worker.rs`) holds the
 //! policy that decides what each result means for a step.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,8 +14,8 @@ use crate::agent_contract::AgentReply;
 use crate::live::{Availability, CheckState, SupportCheck, SupportChecksSlot};
 
 use super::super::detect::{
-    self, Eligibility, Fact, NativeSessionProbes, OsFamily, ProbeIssue, RuntimeFacts,
-    SupportReport, UnsupportedReason, runtime::RuntimeInput,
+    self, Desktop, Eligibility, Fact, NativeSessionProbes, OsFamily, ProbeIssue, RuntimeFacts,
+    SessionFacts, SupportReport, UnsupportedReason, runtime::RuntimeInput,
 };
 use super::super::firewall::{
     Activity, FirewallError, FirewallPlan, LinuxFirewall, ManagerSelection, PlanRequest, Presence,
@@ -101,6 +102,17 @@ pub trait Payloads {
     /// cannot authorize restarting a deleted old executable.
     fn applied_operation(&self) -> Option<OperationId> {
         None
+    }
+    /// GNOME and KDE: a sentence for the preview naming what this install adds for the desktop
+    /// (the desktop entry, and on GNOME the Shell extension). `None` when it adds nothing, as on
+    /// Hyprland.
+    fn desktop_note(&self) -> Option<String> {
+        None
+    }
+    /// Things the last apply did not manage but that don't fail it (for example an extension
+    /// installed but not turned on), and what the person needs to do next (log out and in).
+    fn warnings(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -359,7 +371,7 @@ pub fn pending_text(issue: ProbeIssue) -> String {
 // Presentation only: each row restates one part of the detection report in plain words. The
 // step's outcome still comes from `Eligibility` alone; nothing here decides support.
 
-/// The checklist rows, in the order they are shown.
+/// The checklist rows of a Hyprland session, in the order they are shown.
 pub const LINUX_CHECKS: [&str; 9] = [
     "Operating system",
     "Processor",
@@ -371,6 +383,55 @@ pub const LINUX_CHECKS: [&str; 9] = [
     "Required libraries",
     "Video support in the payload",
 ];
+
+/// The same nine rows for a GNOME session.
+pub const GNOME_CHECKS: [&str; 9] = [
+    "Operating system",
+    "Processor",
+    "GNOME Shell version",
+    "Wayland protocols",
+    "GNOME session",
+    "Graphical session active",
+    "This session is the signed-in one",
+    "Required libraries",
+    "Video support in the payload",
+];
+
+/// The same nine rows for a KDE Plasma session.
+pub const KDE_CHECKS: [&str; 9] = [
+    "Operating system",
+    "Processor",
+    "Plasma version",
+    "Wayland protocols",
+    "Plasma session",
+    "Graphical session active",
+    "This session is the signed-in one",
+    "Required libraries",
+    "Video support in the payload",
+];
+
+/// The same nine rows when the desktop is one the agent has no backend for.
+pub const OTHER_DESKTOP_CHECKS: [&str; 9] = [
+    "Operating system",
+    "Processor",
+    "Desktop",
+    "Wayland protocols",
+    "Session manager",
+    "Graphical session active",
+    "This session is the signed-in one",
+    "Required libraries",
+    "Video support in the payload",
+];
+
+/// The rows for the desktop a report describes. Hyprland keeps the original labels.
+pub fn check_labels(desktop: &Result<Desktop, UnsupportedReason>) -> &'static [&'static str; 9] {
+    match desktop {
+        Ok(Desktop::Hyprland) => &LINUX_CHECKS,
+        Ok(Desktop::Gnome) => &GNOME_CHECKS,
+        Ok(Desktop::Kde) => &KDE_CHECKS,
+        Err(_) => &OTHER_DESKTOP_CHECKS,
+    }
+}
 
 /// What couldn't be confirmed about `what`, in plain words.
 fn unconfirmed(what: &str, issue: ProbeIssue) -> CheckState {
@@ -390,10 +451,15 @@ fn unconfirmed(what: &str, issue: ProbeIssue) -> CheckState {
 }
 
 /// A yes/no fact: true passes, false fails with `reason`, an issue is unconfirmed.
-fn yes_no(fact: &Fact<bool>, what: &str, reason: UnsupportedReason) -> CheckState {
+fn yes_no(
+    fact: &Fact<bool>,
+    what: &str,
+    reason: UnsupportedReason,
+    desktop: Option<Desktop>,
+) -> CheckState {
     match fact.value {
         Ok(true) => CheckState::Passed(None),
-        Ok(false) => CheckState::Failed(unsupported_text(reason)),
+        Ok(false) => CheckState::Failed(detect::unsupported_text_for(reason, desktop)),
         Err(issue) => unconfirmed(what, issue),
     }
 }
@@ -466,18 +532,52 @@ fn signed_in_session(report: &SupportReport) -> CheckState {
         ))),
         Err(issue) => parts.push(unconfirmed("the list of graphical sessions", issue)),
     }
+    // An unsupported desktop never gets here with a verdict of its own: its row says so above.
+    let desktop = session.desktop.unwrap_or(Desktop::Hyprland);
     match &session.manager_environment.value {
-        Ok(effective)
-            if effective.runtime_dir == session.selected_environment.runtime_dir
-                && effective.wayland_display == session.selected_environment.wayland_display
-                && effective.hyprland_instance_signature
-                    == session.selected_environment.hyprland_instance_signature => {}
+        Ok(effective) if effective.agrees_with(&session.selected_environment, desktop) => {}
         Ok(_) => parts.push(CheckState::Unconfirmed(
             "the session manager's environment doesn't match this session".into(),
         )),
         Err(issue) => parts.push(unconfirmed("the session environment", *issue)),
     }
     worst(parts, None)
+}
+
+/// The version row: Hyprland's floor is eligibility; GNOME's and KDE's version is information
+/// (plus a note when the Shell is too old for the Crosspane extension, which then isn't installed).
+fn compositor_row(session: &SessionFacts) -> CheckState {
+    let version = session.compositor_version.value;
+    match session.desktop {
+        Ok(Desktop::Hyprland) => match version {
+            Ok(v) if v >= [0, 56, 0] => {
+                CheckState::Passed(Some(format!("Hyprland {}.{}.{}", v[0], v[1], v[2])))
+            }
+            Ok(v) => CheckState::Failed(format!(
+                "Hyprland {}.{}.{} is older than 0.56, which Crosspane needs",
+                v[0], v[1], v[2]
+            )),
+            Err(issue) => unconfirmed("the Hyprland version", issue),
+        },
+        Ok(Desktop::Gnome) => match version {
+            Ok(v) if v[0] >= super::super::extension::MIN_SHELL => {
+                CheckState::Passed(Some(format!("GNOME Shell {}.{}", v[0], v[1])))
+            }
+            Ok(v) => CheckState::Note(format!(
+                "GNOME Shell {}.{} is older than {}: Crosspane works without its Shell extension, \
+                 which won't be installed",
+                v[0],
+                v[1],
+                super::super::extension::MIN_SHELL
+            )),
+            Err(issue) => unconfirmed("the GNOME Shell version", issue),
+        },
+        Ok(Desktop::Kde) => match version {
+            Ok(v) => CheckState::Passed(Some(format!("Plasma {}.{}", v[0], v[1]))),
+            Err(issue) => unconfirmed("the Plasma version", issue),
+        },
+        Err(reason) => CheckState::Failed(detect::unsupported_text(reason)),
+    }
 }
 
 fn required_libraries(runtime: &RuntimeFacts) -> CheckState {
@@ -559,29 +659,35 @@ pub fn support_checks(report: &SupportReport) -> Vec<SupportCheck> {
         }
         Err(issue) => unconfirmed("the processor type", *issue),
     };
-    let hyprland = match session.hyprland_version.value {
-        Ok(v) if v >= [0, 56, 0] => {
-            CheckState::Passed(Some(format!("Hyprland {}.{}.{}", v[0], v[1], v[2])))
-        }
-        Ok(v) => CheckState::Failed(format!(
-            "Hyprland {}.{}.{} is older than 0.56, which Crosspane needs",
-            v[0], v[1], v[2]
-        )),
-        Err(issue) => unconfirmed("the Hyprland version", issue),
+    let desktop = session.desktop.ok();
+    let (protocols_what, managed_reason) = match desktop {
+        Some(Desktop::Gnome) => (
+            "GNOME's Wayland protocols",
+            UnsupportedReason::SessionManager,
+        ),
+        Some(Desktop::Kde) => (
+            "Plasma's Wayland protocols",
+            UnsupportedReason::SessionManager,
+        ),
+        _ => ("Hyprland's Wayland protocols", UnsupportedReason::Uwsm),
     };
     let states = [
         advisory(os),
         advisory(processor),
-        advisory(hyprland),
+        // Hyprland's floor is eligibility and an established negative fails; an unknown or a
+        // GNOME/KDE version never blocks setup (the agent probes at run time).
+        advisory(compositor_row(session)),
         advisory(yes_no(
             &session.protocols,
-            "Hyprland's Wayland protocols",
+            protocols_what,
             UnsupportedReason::RequiredProtocols,
+            desktop,
         )),
         yes_no(
-            &session.uwsm_managed,
+            &session.compositor_managed,
             "how this session is managed",
-            UnsupportedReason::Uwsm,
+            managed_reason,
+            desktop,
         ),
         graphical_session_active(report),
         signed_in_session(report),
@@ -590,9 +696,10 @@ pub fn support_checks(report: &SupportReport) -> Vec<SupportCheck> {
             &report.runtime.video_feature,
             "the staged payload's features",
             UnsupportedReason::VideoFeature,
+            desktop,
         )),
     ];
-    LINUX_CHECKS
+    check_labels(&session.desktop)
         .iter()
         .zip(states)
         .map(|(label, state)| SupportCheck::new(*label, state))
@@ -711,7 +818,7 @@ impl Support for NativeSupport {
             ),
             Eligibility::NotSupported(reason) => SupportOutcome::NotSupported(format!(
                 "Not supported yet. {} Nothing will be changed.",
-                unsupported_text(reason)
+                detect::unsupported_text_for(reason, result.report.session.desktop.ok())
             )),
             Eligibility::Pending(issue) => SupportOutcome::Pending(pending_text(issue)),
         }
@@ -733,6 +840,11 @@ pub struct NativePayloads {
     /// An earlier apply in this run didn't finish: the next plan starts fresh (WP-4.32).
     start_fresh: bool,
     applied_operation: Option<OperationId>,
+    /// The selected session's bus address, for the GNOME settings. Without it the Shell
+    /// extension is installed but cannot be turned on, which is a warning.
+    session: BTreeMap<String, String>,
+    note: Option<String>,
+    warnings: Vec<String>,
 }
 
 /// A kept plan: the ordinary one, or a fresh start over whatever is in the install paths.
@@ -764,7 +876,49 @@ impl NativePayloads {
             held: None,
             start_fresh: false,
             applied_operation: None,
+            session: BTreeMap::new(),
+            note: None,
+            warnings: Vec::new(),
         })
+    }
+
+    /// Let this adapter reach the selected session's settings (GNOME's extension switch).
+    pub fn with_session(mut self, env: &ChildEnvironment) -> Self {
+        self.session = env
+            .values()
+            .iter()
+            .filter(|(key, _)| key.as_str() == "DBUS_SESSION_BUS_ADDRESS")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        self
+    }
+
+    /// The desktop files as resource rows, after the core files' own.
+    fn with_desktop_rows(
+        &self,
+        proof: &SupportProof,
+        package: &Package,
+        mut rows: Vec<ResourceReceipt>,
+    ) -> Result<Vec<ResourceReceipt>, PayloadError> {
+        let plan = self.installer.desktop_plan_for(package, proof)?;
+        rows.extend(self.installer.desktop_rows(proof, &plan)?);
+        Ok(rows)
+    }
+
+    /// Put the desktop files in place and turn the extension on. A file that can't be written
+    /// fails the apply; the extension's switch only ever warns.
+    fn apply_desktop(
+        &mut self,
+        proof: &SupportProof,
+        package: &Package,
+        operation: OperationId,
+        deadline: &Deadline,
+    ) -> Result<(), PayloadError> {
+        self.warnings.clear();
+        self.warnings =
+            self.installer
+                .desktop_install(package, proof, &self.session, operation, deadline)?;
+        Ok(())
     }
 
     /// Clear the install paths into the backup folder, then install from nothing.
@@ -812,7 +966,8 @@ impl Payloads for NativePayloads {
         {
             return Err(PayloadError::Pending);
         }
-        Ok(rows)
+        // GNOME and KDE: the desktop files are judged the same way, after the core files.
+        self.with_desktop_rows(proof, package, rows)
     }
 
     fn observe(
@@ -820,7 +975,8 @@ impl Payloads for NativePayloads {
         proof: &SupportProof,
         package: &Package,
     ) -> Result<Vec<ResourceReceipt>, PayloadError> {
-        self.installer.detect(proof, package)
+        let rows = self.installer.detect(proof, package)?;
+        self.with_desktop_rows(proof, package, rows)
     }
 
     fn plan(
@@ -831,6 +987,7 @@ impl Payloads for NativePayloads {
         resume: bool,
     ) -> Result<PayloadPreview, PayloadError> {
         self.held = None;
+        self.note = self.installer.desktop_plan_for(package, proof)?.preview();
         let attempt = if self.start_fresh {
             Err(PayloadError::Foreign)
         } else if resume {
@@ -875,6 +1032,7 @@ impl Payloads for NativePayloads {
     ) -> Result<(), PayloadError> {
         // The plan is single use: whatever happens next, it is gone.
         self.applied_operation = None;
+        self.warnings.clear();
         let Some((planned, plan)) = self.held.take() else {
             return Err(PayloadError::Pending);
         };
@@ -897,8 +1055,11 @@ impl Payloads for NativePayloads {
         };
         if result.is_err() {
             self.start_fresh = true;
+            return result;
         }
-        result
+        // The nine core files are in place. The desktop files follow; a failure there is its own
+        // outcome and does not send the next plan down the clear-and-reinstall path.
+        self.apply_desktop(proof, package, operation, deadline)
     }
 
     fn verify(
@@ -919,6 +1080,12 @@ impl Payloads for NativePayloads {
     }
     fn applied_operation(&self) -> Option<OperationId> {
         self.applied_operation
+    }
+    fn desktop_note(&self) -> Option<String> {
+        self.note.clone()
+    }
+    fn warnings(&self) -> Vec<String> {
+        self.warnings.clone()
     }
 }
 
@@ -1312,6 +1479,20 @@ mod checklist_tests {
             wayland_display: "wayland-1".into(),
             hyprland_instance_signature: "sig".into(),
             session_id: Some("2".into()),
+            xdg_current_desktop: None,
+            xdg_session_type: None,
+        }
+    }
+
+    /// A GNOME session's environment: no Hyprland signature, the two variables the agent reads.
+    fn gnome_env() -> EffectiveEnvironment {
+        EffectiveEnvironment {
+            runtime_dir: PathBuf::from("/run/user/1000"),
+            wayland_display: "wayland-0".into(),
+            hyprland_instance_signature: String::new(),
+            session_id: Some("2".into()),
+            xdg_current_desktop: Some("GNOME".into()),
+            xdg_session_type: Some("wayland".into()),
         }
     }
 
@@ -1329,9 +1510,10 @@ mod checklist_tests {
             uid: 1000,
             os: ok(OsFamily::Arch),
             architecture: ok(Architecture::X86_64),
-            hyprland_version: ok([0, 56, 2]),
+            desktop: Ok(Desktop::Hyprland),
+            compositor_version: ok([0, 56, 2]),
             protocols: ok(true),
-            uwsm_managed: ok(true),
+            compositor_managed: ok(true),
             graphical_target_active: ok(true),
             graphical_sessions: ok(1),
             selected_session: ok(Some(SelectedSession {
@@ -1422,7 +1604,7 @@ mod checklist_tests {
                 "processor isn't supported",
             ),
             (
-                |r| r.session.hyprland_version = ok([0, 55, 1]),
+                |r| r.session.compositor_version = ok([0, 55, 1]),
                 "Hyprland version",
                 "Hyprland 0.55.1 is older than 0.56",
             ),
@@ -1432,7 +1614,7 @@ mod checklist_tests {
                 "Wayland features",
             ),
             (
-                |r| r.session.uwsm_managed = ok(false),
+                |r| r.session.compositor_managed = ok(false),
                 "uwsm session",
                 "managed by uwsm",
             ),
@@ -1523,7 +1705,7 @@ mod checklist_tests {
                 "isn't shown as the active one",
             ),
             (
-                |r| r.session.hyprland_version = Fact::issue(ProbeIssue::Timeout, LIVE, 1),
+                |r| r.session.compositor_version = Fact::issue(ProbeIssue::Timeout, LIVE, 1),
                 "Hyprland version",
                 "reading the Hyprland version took too long",
             ),
@@ -1533,7 +1715,7 @@ mod checklist_tests {
                 "staged payload",
             ),
             (
-                |r| r.session.uwsm_managed = Fact::issue(ProbeIssue::Malformed, LIVE, 1),
+                |r| r.session.compositor_managed = Fact::issue(ProbeIssue::Malformed, LIVE, 1),
                 "uwsm session",
                 "couldn't be understood",
             ),
@@ -1596,5 +1778,128 @@ mod checklist_tests {
             rows.iter().all(|r| r.state
                 == CheckState::Unconfirmed("this session's checks couldn't start".into()))
         );
+    }
+
+    /// The supported Hyprland report, turned into a GNOME or KDE one.
+    fn portal(desktop: Desktop, version: Option<[u16; 3]>) -> SupportReport {
+        let mut report = supported();
+        report.session.desktop = Ok(desktop);
+        report.session.compositor_version = match version {
+            Some(v) => ok(v),
+            None => Fact::issue(ProbeIssue::Unverified, LIVE, 1),
+        };
+        report.session.selected_environment = gnome_env();
+        report.session.manager_environment = ok(gnome_env());
+        reclassify(report)
+    }
+
+    #[test]
+    fn gnome_and_kde_pass_with_their_own_row_names_and_hyprland_keeps_the_original_ones() {
+        let rows = |report: &SupportReport| -> Vec<String> {
+            support_checks(report)
+                .into_iter()
+                .map(|c| c.label)
+                .collect()
+        };
+        assert_eq!(rows(&supported()), LINUX_CHECKS.to_vec());
+        let gnome = portal(Desktop::Gnome, Some([50, 4, 0]));
+        assert_eq!(gnome.eligibility, Eligibility::Supported);
+        assert_eq!(rows(&gnome), GNOME_CHECKS.to_vec());
+        assert!(not_passed(&gnome).is_empty(), "{:?}", not_passed(&gnome));
+        let kde = portal(Desktop::Kde, None);
+        assert_eq!(kde.eligibility, Eligibility::Supported);
+        assert_eq!(rows(&kde), KDE_CHECKS.to_vec());
+        // An unknown Plasma version is a note: setup can continue.
+        let flagged = not_passed(&kde);
+        assert_eq!(flagged.len(), 1, "{flagged:?}");
+        assert_eq!(flagged[0].0, "Plasma version");
+        assert!(
+            matches!(flagged[0].1, CheckState::Note(_)),
+            "{:?}",
+            flagged[0].1
+        );
+        // Nothing in the GNOME or KDE rows talks about Hyprland or uwsm.
+        for label in GNOME_CHECKS.iter().chain(&KDE_CHECKS) {
+            assert!(
+                !label.contains("Hyprland") && !label.contains("uwsm"),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_old_gnome_shell_is_a_note_not_a_refusal_and_gnome_failures_speak_of_gnome() {
+        let old = portal(Desktop::Gnome, Some([47, 2, 0]));
+        assert_eq!(old.eligibility, Eligibility::Supported);
+        let flagged = not_passed(&old);
+        assert_eq!(flagged.len(), 1, "{flagged:?}");
+        match &flagged[0].1 {
+            CheckState::Note(text) => {
+                assert!(text.contains("47.2") && text.contains("without its Shell extension"))
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut unmanaged = portal(Desktop::Gnome, Some([50, 4, 0]));
+        unmanaged.session.compositor_managed = ok(false);
+        let unmanaged = reclassify(unmanaged);
+        assert_eq!(
+            unmanaged.eligibility,
+            Eligibility::NotSupported(UnsupportedReason::SessionManager)
+        );
+        let flagged = not_passed(&unmanaged);
+        assert_eq!(flagged.len(), 1, "{flagged:?}");
+        assert_eq!(flagged[0].0, "GNOME session");
+        match &flagged[0].1 {
+            CheckState::Failed(text) => {
+                assert!(text.contains("GNOME") && !text.contains("uwsm"), "{text}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut protocols = portal(Desktop::Kde, None);
+        protocols.session.protocols = ok(false);
+        let flagged = not_passed(&reclassify(protocols));
+        assert!(
+            flagged
+                .iter()
+                .any(|(label, state)| label == "Wayland protocols"
+                    && matches!(state, CheckState::Failed(text) if text.contains("KDE Plasma")
+                    && !text.contains("Hyprland"))),
+            "{flagged:?}"
+        );
+    }
+
+    #[test]
+    fn a_manager_environment_for_another_desktop_is_unconfirmed_not_matched() {
+        let mut gnome = portal(Desktop::Gnome, Some([50, 4, 0]));
+        let mut other = gnome_env();
+        other.xdg_current_desktop = Some("KDE".into());
+        gnome.session.manager_environment = ok(other);
+        let gnome = reclassify(gnome);
+        assert_eq!(gnome.eligibility, Eligibility::Pending(ProbeIssue::Foreign));
+        let flagged = not_passed(&gnome);
+        assert_eq!(flagged.len(), 1, "{flagged:?}");
+        assert_eq!(flagged[0].0, "This session is the signed-in one");
+        assert!(matches!(flagged[0].1, CheckState::Unconfirmed(_)));
+    }
+
+    #[test]
+    fn an_unsupported_desktop_has_its_own_rows_and_one_plain_refusal() {
+        for reason in [UnsupportedReason::Desktop, UnsupportedReason::SessionType] {
+            let mut report = supported();
+            report.session.desktop = Err(reason);
+            let report = reclassify(report);
+            assert_eq!(report.eligibility, Eligibility::NotSupported(reason));
+            let rows = support_checks(&report);
+            assert_eq!(
+                rows.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
+                OTHER_DESKTOP_CHECKS.to_vec()
+            );
+            let desktop_row = &rows[2];
+            assert_eq!(desktop_row.label, "Desktop");
+            match &desktop_row.state {
+                CheckState::Failed(text) => assert_eq!(text, &detect::unsupported_text(reason)),
+                other => panic!("{other:?}"),
+            }
+        }
     }
 }

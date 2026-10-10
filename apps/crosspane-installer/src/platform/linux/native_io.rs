@@ -655,12 +655,15 @@ impl LinuxTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SupportObservations {
     pub uid: u32,
+    /// The desktop whose lifecycle evidence `compositor_managed` and the other session facts
+    /// are: part of the admitted authority, so a proof for one desktop never serves another.
+    pub desktop: super::detect::Desktop,
     pub architecture: String,
     pub arch_based: bool,
-    pub hyprland_version: [u16; 3],
+    pub compositor_version: [u16; 3],
     pub protocols_ready: bool,
     pub runtime_libraries_ready: bool,
-    pub uwsm_managed: bool,
+    pub compositor_managed: bool,
     pub graphical_target_active: bool,
     pub graphical_sessions: usize,
     pub session_id: String,
@@ -671,7 +674,8 @@ pub struct SupportObservations {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SessionAuthority {
     uid: u32,
-    uwsm_managed: bool,
+    desktop: super::detect::Desktop,
+    compositor_managed: bool,
     graphical_target_active: bool,
     graphical_sessions: usize,
     session_id: String,
@@ -683,7 +687,8 @@ impl From<&SupportObservations> for SessionAuthority {
     fn from(facts: &SupportObservations) -> Self {
         Self {
             uid: facts.uid,
-            uwsm_managed: facts.uwsm_managed,
+            desktop: facts.desktop,
+            compositor_managed: facts.compositor_managed,
             graphical_target_active: facts.graphical_target_active,
             graphical_sessions: facts.graphical_sessions,
             session_id: facts.session_id.clone(),
@@ -700,11 +705,14 @@ pub struct SupportProof {
     facts: SessionAuthority,
     valid: Arc<AtomicBool>,
     advisory: super::detect::CompatibilityReport,
+    /// The compositor version seen with this proof (the GNOME Shell's, or Hyprland's). Not
+    /// authority: it never takes part in `revalidate`, and an unreadable version is `None`.
+    compositor_version: Option<[u16; 3]>,
 }
 impl SupportProof {
     pub(crate) fn admit(io: &LinuxNativeIo, facts: SupportObservations) -> Result<Self> {
         if facts.uid != io.target.paths.uid
-            || !facts.uwsm_managed
+            || !facts.compositor_managed
             || !facts.graphical_target_active
             || facts.graphical_sessions != 1
             || facts.session_type != "wayland"
@@ -722,7 +730,17 @@ impl SupportProof {
             facts: SessionAuthority::from(&facts),
             valid: Arc::new(AtomicBool::new(true)),
             advisory: super::detect::CompatibilityReport::default(),
+            compositor_version: None,
         })
+    }
+    pub(crate) fn with_compositor_version(mut self, version: Option<[u16; 3]>) -> Self {
+        self.compositor_version = version;
+        self
+    }
+    /// The compositor version observed with this proof, when it could be read. Information for
+    /// choosing optional parts (the GNOME Shell extension); never authority.
+    pub fn compositor_version(&self) -> Option<[u16; 3]> {
+        self.compositor_version
     }
     pub fn revalidate(&self, io: &LinuxNativeIo, current: &SupportObservations) -> Result<()> {
         self.check(io)?;
@@ -731,6 +749,10 @@ impl SupportProof {
             return Err(NativeError::Unsupported);
         }
         io.validate_target()
+    }
+    /// The desktop this proof was admitted for. Desktop-specific payload and settings follow it.
+    pub fn desktop(&self) -> super::detect::Desktop {
+        self.facts.desktop
     }
     pub(crate) fn with_advisory(mut self, report: super::detect::CompatibilityReport) -> Self {
         self.advisory = report;
@@ -943,6 +965,7 @@ impl ChildEnvironment {
                     | "HYPRLAND_INSTANCE_SIGNATURE"
                     | "XDG_SESSION_ID"
                     | "XDG_SESSION_TYPE"
+                    | "XDG_CURRENT_DESKTOP"
             ) || value.is_empty()
                 || value.len() > 4096
                 || value.chars().any(char::is_control)
@@ -1046,6 +1069,12 @@ impl CommandSpec {
         {
             return Err(NativeError::Invalid);
         }
+        // Settings go to the selected session's own bus, never to a manager or an unadmitted bus.
+        if executable == Path::new("/usr/bin/gsettings")
+            && (environment.bus.is_none() || environment.manager.is_some())
+        {
+            return Err(NativeError::Invalid);
+        }
         Ok(Self {
             executable,
             argv,
@@ -1074,6 +1103,11 @@ impl CommandSpec {
 // Fixed mappings only: /bin/ps -> /usr/bin/ps; systemctl and fc-match use their literal /usr/bin paths.
 /// The sole show query; no caller-selected property, unit, scope or remote target.
 pub const MANAGER_PROPERTIES: &str = "Id,LoadState,FragmentPath,DropInPaths,ExecStart,Environment,User,Group,DynamicUser,ActiveState,SubState,UnitFileState,MainPID,PartOf,After,Requisite,WantedBy,KillSignal,TimeoutStopUSec,Restart,RestartUSec,NeedDaemonReload,ExecStartPre,ExecStartPost,ExecStop,ExecStopPost,ExecReload,EnvironmentFiles,RootDirectory,RootImage,StartLimitIntervalUSec,StartLimitBurst,ExecCondition,Type,Requires,Wants,BindsTo,Upholds,OnFailure,Conflicts,Before,DefaultDependencies,KillMode,SendSIGKILL,FinalKillSignal,RestartKillSignal,SendSIGHUP,UnsetEnvironment,PassEnvironment,WorkingDirectory,UMask,BusName,PIDFile,RemainAfterExit,NotifyAccess,ExecSearchPath,StandardInput,StandardOutput,StandardError,TTYPath,OnSuccess,PropagatesStopTo,PropagatesReloadTo,ReloadPropagatedFrom,StopPropagatedFrom,JoinsNamespaceOf,RequiresMountsFor,WantsMountsFor,RequiredBy,RequisiteOf,BoundBy,UpheldBy,ConsistsOf,ConflictedBy,OnSuccessOf,OnFailureOf,Triggers,TriggeredBy,Following,SliceOf,DelegateControllers,DelegateSubgroup,Conditions,Asserts,ExecConditionEx,ExecStartPreEx,ExecStartPostEx,ExecStopEx,ExecStopPostEx,ExecReloadEx,ExecReloadPost,ExecReloadPostEx,RestartPreventExitStatus,RestartForceExitStatus,SuccessExitStatus,OpenFile,ExtraFileDescriptorNames,BindPaths,BindReadOnlyPaths,TemporaryFileSystem,MountImages,ExtensionImages,ExtensionDirectories,PAMName,Slice,Delegate,OOMPolicy,ManagedOOMSwap,ManagedOOMMemoryPressure,ManagedOOMPreference,SuccessAction,FailureAction,StartLimitAction,JobTimeoutAction,OnSuccessJobMode,OnFailureJobMode,StopWhenUnneeded,RefuseManualStart,RefuseManualStop,AllowIsolate,IgnoreOnIsolate,SurviveFinalKillSignal,JobTimeoutUSec,JobRunningTimeoutUSec,CollectMode,RestartMode,RestartSteps,RestartMaxDelayUSec,TimeoutStartFailureMode,TimeoutStopFailureMode,RuntimeMaxUSec,RuntimeRandomizedExtraUSec,WatchdogUSec,ExitType,FileDescriptorStoreMax,NFileDescriptorStore,FileDescriptorStorePreserve,RootDirectoryStartOnly,RootEphemeral,ExecStartEx,RuntimeDirectory,StateDirectory,CacheDirectory,LogsDirectory,ConfigurationDirectory,RuntimeDirectorySymlink,StateDirectorySymlink,CacheDirectorySymlink,LogsDirectorySymlink,RootMStack,RuntimeDirectoryPreserve";
+/// `gsettings set` is the only desktop-settings write.
+fn settings_mutation(spec: &CommandSpec) -> bool {
+    spec.executable == Path::new("/usr/bin/gsettings")
+        && spec.argv.first().is_some_and(|verb| verb == "set")
+}
 fn manager_mutation(spec: &CommandSpec) -> bool {
     spec.executable == Path::new("/usr/bin/systemctl")
         && matches!(
@@ -1105,6 +1139,21 @@ fn approved_executable(path: &Path, argv: &[String]) -> Result<&'static str> {
     let a: Vec<_> = argv.iter().map(String::as_str).collect();
     match (path.to_str(), a.as_slice()) {
         (Some("/usr/bin/fc-match"), ["-f", "%{file}", "sans-serif"]) => Ok("/usr/bin/fc-match"),
+        // The one key the Crosspane GNOME Shell extension is turned on and off through. Reads are
+        // fixed; the only write is the canonical list literal (see `extension`).
+        (
+            Some("/usr/bin/gsettings"),
+            [
+                "get",
+                "org.gnome.shell",
+                "enabled-extensions" | "disable-user-extensions",
+            ],
+        ) => Ok("/usr/bin/gsettings"),
+        (Some("/usr/bin/gsettings"), ["set", "org.gnome.shell", "enabled-extensions", value])
+            if super::extension::is_list_literal(value) =>
+        {
+            Ok("/usr/bin/gsettings")
+        }
         (Some("/usr/bin/systemctl"), ["--user", "show-environment"]) => Ok("/usr/bin/systemctl"),
         (Some("/bin/ps"), ["-o", "lstart=" | "comm=", "-p", pid])
             if pid
@@ -1962,12 +2011,13 @@ impl LinuxNativeIo {
         let proof = io
             .scratch_support(SupportObservations {
                 uid: facts.uid,
+                desktop: facts.desktop,
                 architecture: String::new(),
                 arch_based: false,
-                hyprland_version: [0; 3],
+                compositor_version: [0; 3],
                 protocols_ready: false,
                 runtime_libraries_ready: false,
-                uwsm_managed: facts.uwsm_managed,
+                compositor_managed: facts.compositor_managed,
                 graphical_target_active: facts.graphical_target_active,
                 graphical_sessions: facts.graphical_sessions,
                 session_id: facts.session_id.clone(),
@@ -2336,6 +2386,16 @@ impl LinuxNativeIo {
         }
         SupportProof::admit(self, facts)
     }
+    /// The same, with the compositor version the proof carries (information, never authority).
+    pub fn scratch_support_with_version(
+        &self,
+        facts: SupportObservations,
+        version: Option<[u16; 3]>,
+    ) -> Result<SupportProof> {
+        Ok(self
+            .scratch_support(facts)?
+            .with_compositor_version(version))
+    }
     pub fn validate_target(&self) -> Result<()> {
         validate_target(&self.target)
     }
@@ -2561,10 +2621,43 @@ impl LinuxNativeIo {
         Ok(File::from(fd))
     }
     pub fn run(&self, spec: &CommandSpec, deadline: &Deadline) -> Result<CommandOutput> {
-        if manager_mutation(spec) || spec.agent.is_some() {
+        if manager_mutation(spec) || settings_mutation(spec) || spec.agent.is_some() {
             return Err(NativeError::Unsupported);
         }
         self.execute(spec, deadline, None)
+    }
+    /// The one write to the person's desktop settings (`gsettings set`): only with a current
+    /// support proof, and only the allowlisted command.
+    pub fn settings_mutation(
+        &self,
+        proof: &SupportProof,
+        spec: &CommandSpec,
+        deadline: &Deadline,
+    ) -> Result<CommandOutput> {
+        if !settings_mutation(spec) || spec.agent.is_some() || spec.environment.manager.is_some() {
+            return Err(NativeError::Invalid);
+        }
+        proof.check(self)?;
+        self.execute(spec, deadline, Some(proof))
+    }
+    /// Bounded admission for the selected session bus alone (GNOME settings): the same child
+    /// environment as every command, plus the admitted bus endpoint; no manager endpoint.
+    pub fn session_bus_environment(
+        &self,
+        session: BTreeMap<String, String>,
+        deadline: &Deadline,
+    ) -> Result<ChildEnvironment> {
+        if session.keys().any(|k| k != "DBUS_SESSION_BUS_ADDRESS") {
+            return Err(NativeError::Invalid);
+        }
+        let target = self.target.clone();
+        let worker_deadline = deadline.clone();
+        bounded_launch(&PROCESS_LAUNCHES, deadline, move || {
+            validate_target(&target)?;
+            let environment = ChildEnvironment::selected(&target, session)?;
+            worker_deadline.check()?;
+            Ok(environment)
+        })
     }
     /// Bounded admission for the user manager and optional selected session bus. No inherited
     /// SYSTEMD_* or system-bus variable enters the explicit child environment.
@@ -4206,12 +4299,13 @@ mod tests {
     fn observations(io: &LinuxNativeIo) -> SupportObservations {
         SupportObservations {
             uid: io.target.paths.uid,
+            desktop: crate::platform::linux::detect::Desktop::Hyprland,
             architecture: std::env::consts::ARCH.into(),
             arch_based: true,
-            hyprland_version: [0, 56, 0],
+            compositor_version: [0, 56, 0],
             protocols_ready: true,
             runtime_libraries_ready: true,
-            uwsm_managed: true,
+            compositor_managed: true,
             graphical_target_active: true,
             graphical_sessions: 1,
             session_id: "scratch".into(),
@@ -4727,12 +4821,13 @@ mod tests {
             .unwrap();
         let facts = SupportObservations {
             uid: io.target.paths.uid,
+            desktop: crate::platform::linux::detect::Desktop::Hyprland,
             architecture: std::env::consts::ARCH.into(),
             arch_based: true,
-            hyprland_version: [0, 56, 0],
+            compositor_version: [0, 56, 0],
             protocols_ready: true,
             runtime_libraries_ready: true,
-            uwsm_managed: true,
+            compositor_managed: true,
             graphical_target_active: true,
             graphical_sessions: 1,
             session_id: "scratch".into(),

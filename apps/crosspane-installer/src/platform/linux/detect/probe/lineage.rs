@@ -85,14 +85,28 @@ pub fn compositor_matches(
     compositor_pid: u32,
     lineage: &Result<CompositorLineage, ProbeIssue>,
 ) -> Result<(), ProbeIssue> {
+    compositor_matches_via(main_pid, compositor_pid, lineage, Some(START_HYPRLAND))
+}
+/// The only launcher accepted between a KDE `plasma-kwin_wayland.service` and `kwin_wayland`.
+pub const KWIN_WRAPPER: &str = "/usr/bin/kwin_wayland_wrapper";
+/// The same rule for any one named launcher: the compositor is the manager's main process
+/// itself, or (when a launcher is named) the direct child of a main process whose executable is
+/// exactly that launcher. `None` accepts only the main process itself (GNOME Shell).
+pub fn compositor_matches_via(
+    main_pid: u32,
+    compositor_pid: u32,
+    lineage: &Result<CompositorLineage, ProbeIssue>,
+    launcher: Option<&str>,
+) -> Result<(), ProbeIssue> {
     if main_pid == compositor_pid {
         return Ok(());
     }
+    let launcher = launcher.ok_or(ProbeIssue::Foreign)?;
     let lineage = lineage.as_ref().map_err(|error| *error)?;
     if lineage.launcher_pid == main_pid
         && lineage.compositor_pid == compositor_pid
         && lineage.compositor_parent == main_pid
-        && lineage.launcher_executable == Path::new(START_HYPRLAND)
+        && lineage.launcher_executable == Path::new(launcher)
     {
         Ok(())
     } else {

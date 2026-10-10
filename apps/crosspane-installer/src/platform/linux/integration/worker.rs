@@ -506,6 +506,11 @@ impl Worker {
                                 preview.version
                             )
                         };
+                        // GNOME and KDE add their desktop files; Hyprland adds nothing here.
+                        let text = match self.payloads.desktop_note() {
+                            Some(note) => format!("{text} {note}"),
+                            None => text,
+                        };
                         self.emit(
                             job,
                             NativeOutcome::Planned { preview: text },
@@ -544,6 +549,13 @@ impl Worker {
                             ),
                             None => "Crosspane's files were written. They are checked next.".into(),
                         };
+                        // Warnings (an extension installed but not turned on) and what to do
+                        // next. They never fail the apply: Crosspane works without the extension.
+                        let text = self
+                            .payloads
+                            .warnings()
+                            .into_iter()
+                            .fold(text, |text, warning| format!("{text} {warning}"));
                         self.emit(job, NativeOutcome::Applied(ApplyOutcome::Applied), text);
                     }
                     Err(PayloadError::OutcomeUnknown) => self.emit(
@@ -1608,6 +1620,16 @@ fn payload_problem(stage: JobStage, error: PayloadError) -> Stop {
         PayloadError::Pending => (
             NativeOutcome::Waiting(WaitKind::Contract),
             "The install is checked again before anything continues.".into(),
+        ),
+        PayloadError::NoDesktopFiles => (
+            if stage == JobStage::Apply {
+                NativeOutcome::Applied(ApplyOutcome::Refused)
+            } else {
+                NativeOutcome::Waiting(WaitKind::User)
+            },
+            "The staged Crosspane payload was prepared before GNOME and KDE support and doesn't \
+             include their desktop files. Stage a newer payload; nothing was changed."
+                .into(),
         ),
         other => (
             if stage == JobStage::Apply {

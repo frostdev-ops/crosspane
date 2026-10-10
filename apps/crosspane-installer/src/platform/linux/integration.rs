@@ -133,6 +133,7 @@ fn session_env() -> BTreeMap<String, String> {
         "HYPRLAND_INSTANCE_SIGNATURE",
         "XDG_SESSION_ID",
         "XDG_SESSION_TYPE",
+        "XDG_CURRENT_DESKTOP",
     ] {
         if let Ok(value) = std::env::var(key)
             && !value.is_empty()
@@ -157,7 +158,7 @@ fn manager_session_of(values: &BTreeMap<String, String>) -> BTreeMap<String, Str
 mod manager_environment_tests {
     use super::*;
     #[test]
-    fn all_five_selected_session_variables_pass_only_the_already_selected_bus_to_manager() {
+    fn all_six_selected_session_variables_pass_only_the_already_selected_bus_to_manager() {
         let selected = BTreeMap::from([
             (
                 "DBUS_SESSION_BUS_ADDRESS".into(),
@@ -170,6 +171,7 @@ mod manager_environment_tests {
             ),
             ("XDG_SESSION_ID".into(), "fixture-session".into()),
             ("XDG_SESSION_TYPE".into(), "wayland".into()),
+            ("XDG_CURRENT_DESKTOP".into(), "GNOME".into()),
         ]);
         assert_eq!(
             manager_session_of(&selected),
@@ -370,7 +372,7 @@ impl LinuxPlatform {
         let native_support = support.clone();
         let domains: DomainFactory = Box::new(move || Domains {
             payloads: match NativePayloads::new(native_io.clone()) {
-                Ok(payloads) => Box::new(payloads),
+                Ok(payloads) => Box::new(payloads.with_session(&native_env)),
                 Err(_) => Box::new(domains::BrokenPayloads),
             },
             services: Box::new(NativeServices::new(native_io.clone(), native_env.clone())),

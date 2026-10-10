@@ -549,12 +549,13 @@ impl Fixture {
     fn facts(&self) -> SupportObservations {
         SupportObservations {
             uid: self.io.target().paths().uid,
+            desktop: crosspane_installer::platform::linux::detect::Desktop::Hyprland,
             architecture: std::env::consts::ARCH.into(),
             arch_based: true,
-            hyprland_version: [0, 56, 0],
+            compositor_version: [0, 56, 0],
             protocols_ready: true,
             runtime_libraries_ready: true,
-            uwsm_managed: true,
+            compositor_managed: true,
             graphical_target_active: true,
             graphical_sessions: 1,
             session_id: "scratch".into(),

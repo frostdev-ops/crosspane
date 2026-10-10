@@ -51,6 +51,9 @@ pub struct NativeRepairer {
     support: Arc<dyn Support>,
     scratch_reader: Option<Arc<dyn ExitReader>>,
     held: Option<Held>,
+    /// A repair that only puts the GNOME/KDE desktop files back: the plan it was previewed under
+    /// and the files it named. The agent is not stopped for it, so it has no stages.
+    desktop_held: Option<(OperationId, Vec<String>)>,
     active: Option<Active>,
 }
 
@@ -116,8 +119,111 @@ impl NativeRepairer {
             support,
             scratch_reader: None,
             held: None,
+            desktop_held: None,
             active: None,
         }
+    }
+
+    /// The desktop files that are not as the payload says, by id. A repair of the core files
+    /// (which stops the agent) never covers them: they are not files a running process holds.
+    fn desktop_drift(&self, package: &Package) -> Result<Vec<String>, String> {
+        let proof = self.proof(package)?;
+        let installer = PayloadInstaller::new(self.io.clone()).map_err(|_| {
+            "The install locations can't be admitted. Nothing was changed.".to_owned()
+        })?;
+        installer
+            .desktop_drift(package, &proof)
+            .map(|rows| rows.into_iter().map(|row| row.resource_id).collect())
+            .map_err(|_| {
+                "Crosspane's desktop files can't be checked just now. Nothing was changed."
+                    .to_owned()
+            })
+    }
+
+    /// The repair preview when only the desktop files have drifted.
+    fn plan_desktop_only(
+        &mut self,
+        package: &Package,
+        operation: OperationId,
+    ) -> Result<String, String> {
+        // A Hyprland session has no desktop files: it is answered as it always was, without
+        // another look at the session.
+        let drifted = if self
+            .env
+            .values()
+            .contains_key("HYPRLAND_INSTANCE_SIGNATURE")
+        {
+            Vec::new()
+        } else {
+            self.desktop_drift(package)?
+        };
+        if drifted.is_empty() {
+            return Err(
+                "Nothing needs repair: every file Crosspane installed is in place and \
+                        matches this installer. Nothing was changed."
+                    .to_owned(),
+            );
+        }
+        let text = format!(
+            "Put back Crosspane's desktop files for this session ({} not as they should be). \
+             Anything you changed there is saved in ~/.local/state/crosspane/backups first. \
+             Crosspane keeps running and nothing else changes.",
+            drifted.len()
+        );
+        self.desktop_held = Some((operation, drifted));
+        Ok(text)
+    }
+
+    /// Confirm a desktop-only repair: observed again now, started only if it still previews what
+    /// was shown, and ended with what was read back. A failure part-way is reported as not
+    /// proved, never retried.
+    fn confirm_desktop(
+        &mut self,
+        package: &Package,
+        operation: OperationId,
+        shown: Vec<String>,
+    ) -> Result<RepairStep, String> {
+        let now = self.desktop_drift(package)?;
+        if now != shown {
+            return Err(
+                "Things changed since the preview was shown. Nothing was changed; review \
+                        the repair again."
+                    .to_owned(),
+            );
+        }
+        let deadline = stage_deadline(STAGE_MS)?;
+        let proof = self.proof(package)?;
+        let installer = PayloadInstaller::new(self.io.clone()).map_err(|_| {
+            "The install locations can't be admitted. Nothing was changed.".to_owned()
+        })?;
+        let session = self
+            .env
+            .values()
+            .iter()
+            .filter(|(key, _)| key.as_str() == "DBUS_SESSION_BUS_ADDRESS")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        Ok(RepairStep::Finished(
+            match installer.desktop_install(package, &proof, &session, operation, &deadline) {
+                Ok(mut lines) => {
+                    lines.insert(0, format!("{} desktop file(s) were put back.", shown.len()));
+                    RepairFinish {
+                        outcome: Shown::Verified,
+                        lines,
+                        resumable: false,
+                    }
+                }
+                Err(_) => RepairFinish {
+                    outcome: Shown::OutcomeUnknown,
+                    lines: vec![
+                        "Putting the desktop files back didn't finish, and nothing was retried. \
+                         Run Repair again to check what is in place."
+                            .to_owned(),
+                    ],
+                    resumable: false,
+                },
+            },
+        ))
     }
 
     /// The scratch-only seam for the original-process exit reader; the coordinator refuses it on
@@ -774,17 +880,15 @@ impl Repairer for NativeRepairer {
         now_ms: u64,
     ) -> Result<String, String> {
         self.held = None;
+        self.desktop_held = None;
         let package = Self::package(package)?;
         if self.active.is_some() {
             return Err(guidance(&RepairError::RecoveryPending));
         }
         let (_repair, plan) = self.fresh_plan(package, status, operation, now_ms)?;
         if plan.delta().is_empty() {
-            return Err(
-                "Nothing needs repair: every file Crosspane installed is in place and \
-                        matches this installer. Nothing was changed."
-                    .to_owned(),
-            );
+            // The core files are intact. GNOME and KDE may still have drifted desktop files.
+            return self.plan_desktop_only(package, operation);
         }
         let text = preview(&plan);
         self.held = Some(Held {
@@ -802,6 +906,15 @@ impl Repairer for NativeRepairer {
         operation: OperationId,
         now_ms: u64,
     ) -> Result<RepairStep, String> {
+        if let Some((held_plan, shown)) = self.desktop_held.take()
+            && held_plan == plan
+        {
+            let package = Self::package(package)?;
+            if self.active.is_some() {
+                return Err(guidance(&RepairError::RecoveryPending));
+            }
+            return self.confirm_desktop(package, operation, shown);
+        }
         let held = self.held.take().filter(|h| h.plan == plan).ok_or_else(|| {
             "That repair preview is no longer current. Review the repair again. Nothing was \
              changed."

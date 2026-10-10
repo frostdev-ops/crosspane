@@ -82,9 +82,25 @@ struct Unit {
     active: bool,
     binds: Vec<String>,
     requires: Vec<String>,
+    /// Read when the manager reports it (every real manager does); GNOME and KDE judge by it.
+    /// The uwsm chain never consults it.
+    part_of: Vec<String>,
     path: OwnedObjectPath,
 }
+/// The uwsm chain reads a unit exactly as it always has: `PartOf` is never consulted.
 fn unit(bus: &mut Bus, row: &UnitRows, name: &str) -> Result<Unit, ProbeIssue> {
+    unit_reading(bus, row, name, false)
+}
+/// GNOME and KDE also read `PartOf` (absent counts as empty, as a manager without it has none).
+fn unit_with_part_of(bus: &mut Bus, row: &UnitRows, name: &str) -> Result<Unit, ProbeIssue> {
+    unit_reading(bus, row, name, true)
+}
+fn unit_reading(
+    bus: &mut Bus,
+    row: &UnitRows,
+    name: &str,
+    with_part_of: bool,
+) -> Result<Unit, ProbeIssue> {
     let row = row
         .iter()
         .find(|row| row.0 == name)
@@ -95,11 +111,17 @@ fn unit(bus: &mut Bus, row: &UnitRows, name: &str) -> Result<Unit, ProbeIssue> {
     let active: String = required(&values, "ActiveState")?;
     let binds: Vec<String> = required(&values, "BindsTo")?;
     let requires: Vec<String> = required(&values, "Requires")?;
+    let part_of: Vec<String> = if with_part_of {
+        property(&values, "PartOf")?.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     for value in [&id, &load, &active] {
         bounded_text(value, 256)?;
     }
     names(&binds, true)?;
     names(&requires, true)?;
+    names(&part_of, true)?;
     if id != row.0 || load != row.2 || active != row.3 {
         return Err(ProbeIssue::Foreign);
     }
@@ -111,6 +133,7 @@ fn unit(bus: &mut Bus, row: &UnitRows, name: &str) -> Result<Unit, ProbeIssue> {
         active: active == "active",
         binds,
         requires,
+        part_of,
         path: row.6.clone(),
     })
 }
@@ -200,10 +223,25 @@ fn running_uwsm(values: &Properties, id: &str) -> Result<Option<u32>, ProbeIssue
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct ManagerFacts {
-    pub uwsm_managed: Fact<bool>,
+    pub compositor_managed: Fact<bool>,
     pub graphical_target_active: Fact<bool>,
     /// Correlate this PID with the selected IPC/Wayland peers in support assembly; not logind.
     pub compositor_pid: Option<u32>,
+}
+mod portal;
+pub use portal::GNOME_SHELL;
+/// The lifecycle read for `desktop`. Hyprland is the original uwsm read, unchanged.
+pub(crate) fn read_for(
+    stream: UnixStream,
+    deadline: &Deadline,
+    clock: CallerClock,
+    desktop: Desktop,
+) -> Result<ManagerFacts, ProbeIssue> {
+    match desktop {
+        Desktop::Hyprland => read(stream, deadline, clock),
+        Desktop::Gnome => portal::read_gnome(stream, deadline, clock),
+        Desktop::Kde => portal::read_kde(stream, deadline, clock),
+    }
 }
 pub(crate) fn read(
     stream: UnixStream,
@@ -268,7 +306,7 @@ pub(crate) fn read(
         }
     }
     Ok(ManagerFacts {
-        uwsm_managed: Fact::known(pid.is_some(), ObservationSource::Demo, management_time),
+        compositor_managed: Fact::known(pid.is_some(), ObservationSource::Demo, management_time),
         graphical_target_active: Fact::known(graphical, ObservationSource::Demo, graphical_time),
         compositor_pid: pid,
     })
@@ -277,6 +315,7 @@ pub(crate) fn environment_output(
     output: Result<CommandOutput, NativeError>,
     source: ObservationSource,
     time: u64,
+    desktop: Desktop,
 ) -> Fact<EffectiveEnvironment> {
     let value = output.map_err(issue).and_then(|output| {
         if output.stdout.len() + output.stderr.len() > MAX_PROBE_BYTES {
@@ -285,7 +324,7 @@ pub(crate) fn environment_output(
         if output.code != Some(0) {
             return Err(ProbeIssue::Unavailable);
         }
-        parse_manager_environment(&output.stdout)
+        parse_manager_environment_for(&output.stdout, desktop)
     });
     Fact {
         value,
@@ -299,6 +338,15 @@ pub fn manager_from_stream(
     deadline: &Deadline,
     clock: CallerClock,
 ) -> Fact<ManagerFacts> {
+    manager_from_stream_for(stream, deadline, clock, Desktop::Hyprland)
+}
+/// The same for any desktop the agent has a backend for.
+pub fn manager_from_stream_for(
+    stream: UnixStream,
+    deadline: &Deadline,
+    clock: CallerClock,
+    desktop: Desktop,
+) -> Fact<ManagerFacts> {
     let shared = deadline.clone();
     let receipt = clock.clone();
     bounded(
@@ -306,6 +354,6 @@ pub fn manager_from_stream(
         deadline,
         clock,
         ObservationSource::Demo,
-        move |stream| read(stream, &shared, receipt),
+        move |stream| read_for(stream, &shared, receipt, desktop),
     )
 }

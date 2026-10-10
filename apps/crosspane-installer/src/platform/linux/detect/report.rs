@@ -19,13 +19,23 @@ pub enum BackendReadiness {
 }
 /// Exact frozen 4.5 order; optional GPU/tray/audio/discovery and Linux Home do not block.
 pub fn backend_readiness(status: &InstallerStatusV1) -> BackendReadiness {
+    backend_readiness_for(status, Desktop::Hyprland)
+}
+/// The same for any desktop. GNOME and KDE require only the backends their installed agent is
+/// judged by (`payload::mandatory_backends`); the rest are reported but never block.
+pub fn backend_readiness_for(status: &InstallerStatusV1, desktop: Desktop) -> BackendReadiness {
     use BackendName::{Audio, Discovery, Gpu, Home, Tray};
     let facts = &status.backends;
     if facts.len() != 15 || facts.iter().enumerate().any(|(n, f)| f.name as usize != n) {
         return BackendReadiness::Invalid;
     }
     let optional = [Gpu, Tray, Audio, Discovery, Home];
-    let required = |f: &&BackendFact| !optional.contains(&f.name);
+    let required = |f: &&BackendFact| match desktop {
+        Desktop::Hyprland => !optional.contains(&f.name),
+        Desktop::Gnome | Desktop::Kde => {
+            crate::platform::linux::payload::mandatory_backends(desktop).contains(&f.name)
+        }
+    };
     let failed: Vec<_> = facts
         .iter()
         .filter(required)
@@ -75,10 +85,49 @@ pub struct DetectionResult {
     /// Structural mutation admission only; never WorkspaceReady or attended release evidence.
     pub proof: Option<SupportProof>,
 }
+/// One acquired pass for GNOME or KDE Plasma. The same retained receipts as [`DetectionPass`];
+/// there is no compositor IPC, so the Wayland socket's peer is the only compositor PID.
+#[derive(Debug)]
+pub struct PortalPass {
+    pub desktop: Desktop,
+    pub os: OsFacts,
+    pub architecture: Fact<Architecture>,
+    pub logind: Fact<LogindFacts>,
+    pub manager: Fact<ManagerFacts>,
+    pub manager_environment: Fact<EffectiveEnvironment>,
+    pub registry: Fact<RegistryFacts>,
+    /// Launcher evidence, consulted only when the unit's MainPID differs from the socket peer
+    /// (KDE's wrapper). GNOME's Shell must be the main process itself.
+    pub lineage: Fact<CompositorLineage>,
+    /// The Shell's version; Unverified for KDE. Information only.
+    pub version: Fact<[u16; 3]>,
+    pub installed_agent: Fact<InstalledAgentFacts>,
+    pub reduced_motion: Fact<bool>,
+}
 fn field<T, U>(fact: Fact<T>, take: impl FnOnce(T) -> Fact<U>) -> Fact<U> {
     match fact.value {
         Ok(value) => take(value),
         Err(error) => Fact::issue(error, fact.source, fact.observed_at_ms),
+    }
+}
+/// Backend readiness from the installed agent's status, retaining the status receipt.
+pub(super) fn backends_of(
+    agent: &Fact<InstalledAgentFacts>,
+    desktop: Desktop,
+) -> Fact<BackendReadiness> {
+    Fact {
+        value: agent
+            .value
+            .as_ref()
+            .map_err(|e| *e)
+            .and_then(|agent| match &agent.status {
+                StatusAdmission::Supported(health) => {
+                    Ok(backend_readiness_for(health.installer(), desktop))
+                }
+                StatusAdmission::PendingHealthContract(_) => Err(ProbeIssue::Unverified),
+            }),
+        source: agent.source,
+        observed_at_ms: agent.observed_at_ms,
     }
 }
 /// Injected composition admits proofs only for explicit scratch targets. Native callers use
@@ -119,26 +168,15 @@ pub(super) fn compose_support(
         },
         (Err(issue), _, _) | (_, Err(issue), _) | (_, _, Err(issue)) => Err(*issue),
     };
-    let backends = Fact {
-        value: pass
-            .installed_agent
-            .value
-            .as_ref()
-            .map_err(|e| *e)
-            .and_then(|agent| match &agent.status {
-                StatusAdmission::Supported(health) => Ok(backend_readiness(health.installer())),
-                StatusAdmission::PendingHealthContract(_) => Err(ProbeIssue::Unverified),
-            }),
-        source: pass.installed_agent.source,
-        observed_at_ms: pass.installed_agent.observed_at_ms,
-    };
+    let backends = backends_of(&pass.installed_agent, Desktop::Hyprland);
     let mut session = SessionFacts {
         uid: io.target().paths().uid,
         os: pass.os.family,
         architecture: pass.architecture,
-        hyprland_version: field(pass.hyprland, |f| f.version),
+        desktop: Ok(Desktop::Hyprland),
+        compositor_version: field(pass.hyprland, |f| f.version),
         protocols: field(pass.registry, |f| f.protocols),
-        uwsm_managed: field(pass.manager.clone(), |f| f.uwsm_managed),
+        compositor_managed: field(pass.manager.clone(), |f| f.compositor_managed),
         graphical_target_active: field(pass.manager, |f| f.graphical_target_active),
         graphical_sessions: field(pass.logind.clone(), |f| f.graphical_sessions),
         selected_session: field(pass.logind, |f| f.selected_session),
@@ -148,6 +186,102 @@ pub(super) fn compose_support(
     if let Err(error) = correlation {
         session.protocols.value = Err(error);
     }
+    finish_support(
+        io,
+        Assembled {
+            session,
+            correlation,
+            backends,
+            os_path: pass.os.path,
+            installed_agent: pass.installed_agent,
+            reduced_motion: pass.reduced_motion,
+        },
+        runtime,
+        deadline,
+        admitted_pass,
+    )
+}
+/// GNOME or KDE Plasma. Mirrors [`compose_support`]: the compositor PID that the user manager's
+/// unit runs must be the process serving this session's Wayland socket (itself, or for KDE the
+/// direct child of the one accepted launcher); everything after that is the shared admission.
+pub(super) fn compose_portal_support(
+    io: &LinuxNativeIo,
+    selected_environment: EffectiveEnvironment,
+    pass: PortalPass,
+    runtime: RuntimeFacts,
+    deadline: &Deadline,
+    admitted_pass: bool,
+) -> DetectionResult {
+    let launcher = match pass.desktop {
+        Desktop::Kde => Some(KWIN_WRAPPER),
+        Desktop::Gnome | Desktop::Hyprland => None,
+    };
+    let correlation = match (&pass.manager.value, &pass.registry.value) {
+        (Ok(manager), Ok(registry)) => match manager.compositor_pid {
+            Some(pid) => compositor_matches_via(pid, registry.pid, &pass.lineage.value, launcher),
+            None => Err(ProbeIssue::Unverified),
+        },
+        (Err(issue), _) | (_, Err(issue)) => Err(*issue),
+    };
+    let backends = backends_of(&pass.installed_agent, pass.desktop);
+    let mut session = SessionFacts {
+        uid: io.target().paths().uid,
+        os: pass.os.family,
+        architecture: pass.architecture,
+        desktop: Ok(pass.desktop),
+        compositor_version: pass.version,
+        protocols: field(pass.registry, |f| f.protocols),
+        compositor_managed: field(pass.manager.clone(), |f| f.compositor_managed),
+        graphical_target_active: field(pass.manager, |f| f.graphical_target_active),
+        graphical_sessions: field(pass.logind.clone(), |f| f.graphical_sessions),
+        selected_session: field(pass.logind, |f| f.selected_session),
+        selected_environment,
+        manager_environment: pass.manager_environment,
+    };
+    if let Err(error) = correlation {
+        session.protocols.value = Err(error);
+    }
+    finish_support(
+        io,
+        Assembled {
+            session,
+            correlation,
+            backends,
+            os_path: pass.os.path,
+            installed_agent: pass.installed_agent,
+            reduced_motion: pass.reduced_motion,
+        },
+        runtime,
+        deadline,
+        admitted_pass,
+    )
+}
+/// What composition hands to the shared admission.
+struct Assembled {
+    session: SessionFacts,
+    correlation: Result<(), ProbeIssue>,
+    backends: Fact<BackendReadiness>,
+    os_path: Option<PathBuf>,
+    installed_agent: Fact<InstalledAgentFacts>,
+    reduced_motion: Fact<bool>,
+}
+/// Eligibility, then the one admission every desktop passes through: session authority, the
+/// compositor correlation, the selected target, and the complete set of session facts.
+fn finish_support(
+    io: &LinuxNativeIo,
+    assembled: Assembled,
+    runtime: RuntimeFacts,
+    deadline: &Deadline,
+    admitted_pass: bool,
+) -> DetectionResult {
+    let Assembled {
+        session,
+        correlation,
+        backends,
+        os_path,
+        installed_agent,
+        reduced_motion,
+    } = assembled;
     let mut eligibility = classify(&session, &runtime);
     let environment = &session.selected_environment;
     let admission = (|| {
@@ -157,6 +291,7 @@ pub(super) fn compose_support(
             return Err(ProbeIssue::Foreign);
         }
         deadline.check().map_err(issue)?;
+        let desktop = session.desktop.map_err(|_| ProbeIssue::Unverified)?;
         let selected = session
             .selected_session
             .value
@@ -170,16 +305,18 @@ pub(super) fn compose_support(
             _ => "",
         };
         let chosen = &selected.session;
+        // The identifiers the agent will be started under: Hyprland also needs its IPC signature.
         if environment.wayland_display.is_empty()
-            || environment.hyprland_instance_signature.is_empty()
+            || (desktop == Desktop::Hyprland && environment.hyprland_instance_signature.is_empty())
         {
             return Err(ProbeIssue::Unverified);
         }
         let facts = SupportObservations {
             uid: session.uid,
+            desktop,
             architecture: architecture.into(),
             arch_based: session.os.value == Ok(OsFamily::Arch),
-            hyprland_version: session.hyprland_version.value.unwrap_or_default(),
+            compositor_version: session.compositor_version.value.unwrap_or_default(),
             protocols_ready: session.protocols.value == Ok(true),
             runtime_libraries_ready: runtime.dependency_graph.value == Ok(true)
                 && runtime.libraries.iter().any(|v| v.required)
@@ -198,7 +335,7 @@ pub(super) fn compose_support(
                 ]
                 .iter()
                 .all(|fact| fact.value == Ok(true)),
-            uwsm_managed: session.uwsm_managed.value?,
+            compositor_managed: session.compositor_managed.value?,
             graphical_target_active: session.graphical_target_active.value?,
             graphical_sessions: session.graphical_sessions.value?,
             session_id: chosen.id.clone(),
@@ -208,7 +345,8 @@ pub(super) fn compose_support(
         };
         let proof = SupportProof::admit(io, facts)
             .map_err(issue)?
-            .with_advisory(compatibility_report(&session, &runtime));
+            .with_advisory(compatibility_report(&session, &runtime))
+            .with_compositor_version(session.compositor_version.value.ok());
         deadline.check().map_err(issue)?;
         Ok(Some(proof))
     })();
@@ -226,10 +364,10 @@ pub(super) fn compose_support(
             eligibility,
             session,
             runtime,
-            installed_agent: pass.installed_agent,
-            reduced_motion: pass.reduced_motion,
+            installed_agent,
+            reduced_motion,
         },
-        os_path: pass.os.path,
+        os_path,
         backends,
         proof,
     }

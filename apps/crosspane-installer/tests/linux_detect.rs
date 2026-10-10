@@ -377,13 +377,13 @@ mod session_tests {
                         graphical_sessions: s.graphical_sessions,
                     }),
                     manager: known(ManagerFacts {
-                        uwsm_managed: s.uwsm_managed,
+                        compositor_managed: s.compositor_managed,
                         graphical_target_active: s.graphical_target_active,
                         compositor_pid: Some(71),
                     }),
                     manager_environment: known(s.selected_environment),
                     hyprland: known(HyprlandFacts {
-                        version: s.hyprland_version,
+                        version: s.compositor_version,
                         pid: 71,
                     }),
                     registry: known(RegistryFacts {
@@ -404,12 +404,13 @@ mod session_tests {
         fn expected_observations(io: &LinuxNativeIo) -> SupportObservations {
             SupportObservations {
                 uid: io.target().paths().uid,
+                desktop: crosspane_installer::platform::linux::detect::Desktop::Hyprland,
                 architecture: std::env::consts::ARCH.into(),
                 arch_based: true,
-                hyprland_version: [0, 56, 0],
+                compositor_version: [0, 56, 0],
                 protocols_ready: true,
                 runtime_libraries_ready: true,
-                uwsm_managed: true,
+                compositor_managed: true,
                 graphical_target_active: true,
                 graphical_sessions: 1,
                 session_id: "c7".into(),
@@ -669,7 +670,7 @@ mod session_tests {
                         Eligibility::NotSupported(UnsupportedReason::RequiredProtocols)
                     }
                     4 => {
-                        p.manager.value.as_mut().unwrap().uwsm_managed.value = Ok(false);
+                        p.manager.value.as_mut().unwrap().compositor_managed.value = Ok(false);
                         Eligibility::NotSupported(UnsupportedReason::Uwsm)
                     }
                     5 => {
@@ -1046,7 +1047,7 @@ mod session_tests {
                 .value
                 .as_mut()
                 .unwrap()
-                .uwsm_managed
+                .compositor_managed
                 .observed_at_ms = 202;
             p.hyprland.value.as_mut().unwrap().version.observed_at_ms = 303;
             p.registry.value.as_mut().unwrap().protocols.observed_at_ms = 404;
@@ -1055,8 +1056,8 @@ mod session_tests {
             assert_eq!(result.report.eligibility, Eligibility::Supported);
             assert!(result.proof.is_some());
             assert_eq!(result.report.session.selected_session.observed_at_ms, 101);
-            assert_eq!(result.report.session.uwsm_managed.observed_at_ms, 202);
-            assert_eq!(result.report.session.hyprland_version.observed_at_ms, 303);
+            assert_eq!(result.report.session.compositor_managed.observed_at_ms, 202);
+            assert_eq!(result.report.session.compositor_version.observed_at_ms, 303);
             assert_eq!(result.report.session.protocols.observed_at_ms, 404);
             assert_eq!(
                 result.report.session.manager_environment.observed_at_ms,
@@ -1447,7 +1448,10 @@ mod session_tests {
                         assert!(contains(&bytes, step.method));
                         assert!(contains(&bytes, step.path));
                         assert!(contains(&bytes, step.interface));
-                        assert!(contains(&bytes, "org.freedesktop.systemd1"));
+                        assert!(
+                            contains(&bytes, "org.freedesktop.systemd1")
+                                || contains(&bytes, "org.gnome.Shell")
+                        );
                         assert!(contains(&body, step.body));
                         record
                             .lock()
@@ -1552,7 +1556,7 @@ mod session_tests {
             let (fact, log) = manager(script());
             let decoded = fact.value.unwrap();
             assert_eq!(
-                decoded.uwsm_managed,
+                decoded.compositor_managed,
                 Fact::known(true, ObservationSource::Demo, 50)
             );
             assert_eq!(
@@ -1586,7 +1590,7 @@ mod session_tests {
                 assert_eq!(values.len(), count);
             }
             let decoded = manager(steps).0.value.unwrap();
-            assert_eq!(decoded.uwsm_managed.value, Ok(true));
+            assert_eq!(decoded.compositor_managed.value, Ok(true));
             assert_eq!(decoded.graphical_target_active.value, Ok(true));
             let mut steps = script();
             let values = properties(&mut steps[1]);
@@ -1618,7 +1622,7 @@ mod session_tests {
             let mut steps = script();
             steps[4].reply = Reply::Properties(systemd_261_service());
             let decoded = manager(steps).0.value.unwrap();
-            assert_eq!(decoded.uwsm_managed.value, Ok(true));
+            assert_eq!(decoded.compositor_managed.value, Ok(true));
             assert_eq!(decoded.compositor_pid, Some(4242));
             // The populated-row path still works, with or without the ExecMain* properties.
             let mut steps = script();
@@ -1688,7 +1692,7 @@ mod session_tests {
             let (fact, log) = manager(steps);
             let decoded = fact.value.unwrap();
             assert_eq!(
-                decoded.uwsm_managed,
+                decoded.compositor_managed,
                 Fact::known(false, ObservationSource::Demo, 10)
             );
             assert_eq!(
@@ -1702,7 +1706,7 @@ mod session_tests {
                 ..script().remove(0)
             }]);
             let decoded = fact.value.unwrap();
-            assert_eq!(decoded.uwsm_managed.value, Ok(false));
+            assert_eq!(decoded.compositor_managed.value, Ok(false));
             assert_eq!(decoded.graphical_target_active.value, Ok(false));
             assert_eq!(log.len(), 1);
         }
@@ -1767,7 +1771,7 @@ mod session_tests {
                 let mut steps = script();
                 properties(&mut steps[4]).insert("Type".into(), value(kind.to_string()));
                 let decoded = manager(steps).0.value.unwrap();
-                assert_eq!(decoded.uwsm_managed.value, Ok(kind == "notify"));
+                assert_eq!(decoded.compositor_managed.value, Ok(kind == "notify"));
             }
             for active in [
                 "reloading",
@@ -1860,7 +1864,11 @@ mod session_tests {
                     continue;
                 }
                 let decoded = result.unwrap();
-                assert_eq!(decoded.uwsm_managed.value, Ok(false), "variant {variant}");
+                assert_eq!(
+                    decoded.compositor_managed.value,
+                    Ok(false),
+                    "variant {variant}"
+                );
                 assert_eq!(decoded.compositor_pid, None);
             }
             for exec in [Vec::<Exec>::new(), vec![exec(), exec()]] {
@@ -1952,7 +1960,10 @@ mod session_tests {
             }
             let mut steps = script();
             properties(&mut steps[1]).insert("Ignored".into(), value("x".repeat(64 * 1024)));
-            assert_eq!(manager(steps).0.value.unwrap().uwsm_managed.value, Ok(true));
+            assert_eq!(
+                manager(steps).0.value.unwrap().compositor_managed.value,
+                Ok(true)
+            );
         }
         #[test]
         fn uwsm_instance_decoding_preserves_escaped_identity_and_all_configured_arguments() {
@@ -1972,7 +1983,10 @@ mod session_tests {
                 .1
                 .extend(["".into(), "--config".into(), "/test/config".into()]);
             properties(&mut steps[4]).insert("ExecStart".into(), value(vec![command]));
-            assert_eq!(manager(steps).0.value.unwrap().uwsm_managed.value, Ok(true));
+            assert_eq!(
+                manager(steps).0.value.unwrap().compositor_managed.value,
+                Ok(true)
+            );
             for instance in ["", r"bad\x", r"bad\xZZ", r"bad\x00", r"bad\xff"] {
                 let wm = format!("wayland-wm@{instance}.service");
                 let session = format!("wayland-session@{instance}.target");
@@ -2457,7 +2471,7 @@ mod session_tests {
             }
             // A successful next owned exchange confirms cancelled clients retired their workers.
             assert_eq!(
-                manager(script()).0.value.unwrap().uwsm_managed.value,
+                manager(script()).0.value.unwrap().compositor_managed.value,
                 Ok(true)
             );
         }
@@ -2587,7 +2601,9 @@ mod session_tests {
                         runtime_dir: runtime,
                         wayland_display: "wayland-test".into(),
                         hyprland_instance_signature: "test-instance".into(),
-                        session_id: Some("c7".into())
+                        session_id: Some("c7".into()),
+                        xdg_current_desktop: None,
+                        xdg_session_type: None,
                     },
                     ObservationSource::Demo,
                     10
@@ -2671,6 +2687,610 @@ mod session_tests {
                 Err(ProbeIssue::Cancelled)
             );
             assert_eq!(*runner.calls.lock().unwrap(), 6);
+        }
+        /// GNOME Shell and KDE Plasma lifecycle reads (`probe/manager/portal.rs`), over the same
+        /// scripted systemd fake as the Hyprland read and judged by the same unit properties.
+        mod portal {
+            use super::*;
+            const SHELL_BIN: &str = "/usr/bin/gnome-shell";
+            const KWIN_BIN: &str = "/usr/bin/kwin_wayland";
+            const KWIN_WRAPPER_BIN: &str = "/usr/bin/kwin_wayland_wrapper";
+            const SHELL_ID: &str = "org.gnome.Shell@user.service";
+            const SHELL_OBJECT: &str = "/units/shell";
+            const SESSION_ID: &str = "gnome-session@gnome.target";
+            const SESSION_OBJECT: &str = "/units/session";
+            const KWIN_ID: &str = "plasma-kwin_wayland.service";
+            const KWIN_OBJECT: &str = "/units/kwin";
+            const UNIT_IFACE: &str = "org.freedesktop.systemd1.Unit";
+            const SERVICE_IFACE: &str = "org.freedesktop.systemd1.Service";
+            const GNOME_PID: u32 = 4242;
+            const KDE_PID: u32 = 4300;
+            fn strings(texts: &[&str]) -> Vec<String> {
+                texts.iter().map(|text| text.to_string()).collect()
+            }
+            /// The parent's `unit` fixture plus the `PartOf` list that GNOME and KDE also read.
+            fn unit_part_of(
+                id: &str,
+                part_of: &[&str],
+                binds: &[&str],
+                requires: &[&str],
+            ) -> Properties {
+                let mut values = unit(id, binds, requires);
+                values.insert("PartOf".into(), value(strings(part_of)));
+                values
+            }
+            /// One `ExecStart` record of a running main process `pid`, with systemd's timestamps.
+            fn command(path: &str, argv: &[&str], ignore_errors: bool, pid: u32) -> Exec {
+                (
+                    path.into(),
+                    strings(argv),
+                    ignore_errors,
+                    123,
+                    124,
+                    0,
+                    0,
+                    pid,
+                    0,
+                    0,
+                )
+            }
+            fn gnome_exec(argv: &[&str]) -> Exec {
+                command(SHELL_BIN, argv, false, GNOME_PID)
+            }
+            fn kde_exec(path: &str, argv: &[&str]) -> Exec {
+                command(path, argv, false, KDE_PID)
+            }
+            /// A `Service` GetAll: its `Type`, its `MainPID` and the one `ExecStart` record.
+            fn service_props(kind: &str, pid: u32, exec: Exec) -> Properties {
+                [
+                    ("Type".into(), value(kind.to_string())),
+                    ("MainPID".into(), value(pid)),
+                    ("ExecStart".into(), value(vec![exec])),
+                ]
+                .into_iter()
+                .collect()
+            }
+            /// systemd 261 (see the Hyprland fixture): the `ExecStart` record is all zero and the
+            /// running main process is only in the `ExecMain*` properties.
+            fn systemd_261(kind: &str, pid: u32, exec: Exec) -> Properties {
+                let mut row = exec;
+                (row.3, row.4, row.5, row.6, row.7) = (0, 0, 0, 0, 0);
+                let mut values = service_props(kind, pid, row);
+                values.insert("ExecMainPID".into(), value(pid));
+                values.insert(
+                    "ExecMainStartTimestamp".into(),
+                    value(1_791_096_132_706_343u64),
+                );
+                values.insert("ExecMainExitTimestamp".into(), value(0u64));
+                values.insert("ExecMainCode".into(), value(0i32));
+                values.insert("ExecMainStatus".into(), value(0i32));
+                values
+            }
+            fn list_step(body: &'static str, rows: UnitRows) -> Step {
+                Step {
+                    method: "ListUnitsByPatterns",
+                    path: "/org/freedesktop/systemd1",
+                    interface: "org.freedesktop.systemd1.Manager",
+                    body,
+                    reply: Reply::Rows(rows),
+                }
+            }
+            /// A `GetAll` on `path`; `body` names the interface it asks for.
+            fn get_all(path: &'static str, body: &'static str, values: Properties) -> Step {
+                Step {
+                    method: "GetAll",
+                    path,
+                    interface: "org.freedesktop.DBus.Properties",
+                    body,
+                    reply: Reply::Properties(values),
+                }
+            }
+            fn listed(steps: &mut [Step]) -> &mut UnitRows {
+                match &mut steps[0].reply {
+                    Reply::Rows(rows) => rows,
+                    _ => panic!("fixture is not rows"),
+                }
+            }
+            /// The GNOME session as systemd lists and reads it: `shell` runs `exec` and is required
+            /// by `gnome-session@gnome.target`, which is part of `graphical-session.target`.
+            fn gnome_script_with(shell: &str, exec: Exec) -> Vec<Step> {
+                vec![
+                    list_step(
+                        "org.gnome.Shell@*.service",
+                        vec![
+                            row(GRAPHICAL, "/units/graphical"),
+                            row(shell, SHELL_OBJECT),
+                            row(SESSION_ID, SESSION_OBJECT),
+                        ],
+                    ),
+                    get_all("/units/graphical", UNIT_IFACE, unit(GRAPHICAL, &[], &[])),
+                    get_all(SHELL_OBJECT, UNIT_IFACE, unit(shell, &[], &[])),
+                    get_all(
+                        SESSION_OBJECT,
+                        UNIT_IFACE,
+                        unit_part_of(SESSION_ID, &[GRAPHICAL], &[], &[shell]),
+                    ),
+                    get_all(
+                        SHELL_OBJECT,
+                        SERVICE_IFACE,
+                        service_props("notify", GNOME_PID, exec),
+                    ),
+                ]
+            }
+            fn gnome_script() -> Vec<Step> {
+                gnome_script_with(SHELL_ID, gnome_exec(&[SHELL_BIN, "--mode=user"]))
+            }
+            fn instance_script(instance: &str, argv: &[&str]) -> Vec<Step> {
+                gnome_script_with(
+                    &format!("org.gnome.Shell@{instance}.service"),
+                    gnome_exec(argv),
+                )
+            }
+            /// KWin's unit as systemd lists and reads it, running `exec`.
+            fn kde_script_with(exec: Exec) -> Vec<Step> {
+                vec![
+                    list_step(
+                        KWIN_ID,
+                        vec![
+                            row(GRAPHICAL, "/units/graphical"),
+                            row(KWIN_ID, KWIN_OBJECT),
+                        ],
+                    ),
+                    get_all("/units/graphical", UNIT_IFACE, unit(GRAPHICAL, &[], &[])),
+                    get_all(
+                        KWIN_OBJECT,
+                        UNIT_IFACE,
+                        unit_part_of(KWIN_ID, &[GRAPHICAL], &[], &[]),
+                    ),
+                    get_all(
+                        KWIN_OBJECT,
+                        SERVICE_IFACE,
+                        service_props("notify", KDE_PID, exec),
+                    ),
+                ]
+            }
+            fn kde_script() -> Vec<Step> {
+                kde_script_with(kde_exec(
+                    KWIN_WRAPPER_BIN,
+                    &[KWIN_WRAPPER_BIN, "--xwayland"],
+                ))
+            }
+            /// Runs the `desktop` read over the scripted bus: the fact, and the calls in order.
+            fn run(desktop: Desktop, script: Vec<Step>) -> (Fact<ManagerFacts>, Vec<String>) {
+                let (stream, server) = BusServer::new(script);
+                let result = manager_from_stream_for(
+                    stream,
+                    &Deadline::new(1500, Cancellation::default()).unwrap(),
+                    clock(),
+                    desktop,
+                );
+                (result, server.finish())
+            }
+            /// Not proven managed: an established `false`, and no PID.
+            fn unmanaged(desktop: Desktop, script: Vec<Step>) -> ManagerFacts {
+                let decoded = run(desktop, script).0.value.unwrap();
+                assert_eq!(decoded.compositor_managed.value, Ok(false));
+                assert_eq!(decoded.compositor_pid, None);
+                decoded
+            }
+            /// Proven managed: `pid` is the running main process of the compositor's unit.
+            fn managed(desktop: Desktop, script: Vec<Step>, pid: u32) -> ManagerFacts {
+                let decoded = run(desktop, script).0.value.unwrap();
+                assert_eq!(decoded.compositor_managed.value, Ok(true));
+                assert_eq!(decoded.compositor_pid, Some(pid));
+                decoded
+            }
+            /// Only the listing and the graphical read happen: nothing is proven managed.
+            fn only_listing(desktop: Desktop, mut script: Vec<Step>) -> ManagerFacts {
+                script.truncate(2);
+                let (fact, log) = run(desktop, script);
+                assert_eq!(log.len(), 2);
+                let decoded = fact.value.unwrap();
+                assert_eq!(decoded.compositor_managed.value, Ok(false));
+                assert_eq!(decoded.compositor_pid, None);
+                assert_eq!(decoded.graphical_target_active.value, Ok(true));
+                decoded
+            }
+            #[test]
+            fn gnome_healthy_session_is_managed_with_exactly_the_five_expected_calls() {
+                let (fact, log) = run(Desktop::Gnome, gnome_script());
+                assert_eq!(fact.observed_at_ms, 60);
+                assert_eq!(fact.source, ObservationSource::Demo);
+                let decoded = fact.value.unwrap();
+                assert_eq!(
+                    decoded.compositor_managed,
+                    Fact::known(true, ObservationSource::Demo, 50)
+                );
+                assert_eq!(
+                    decoded.graphical_target_active,
+                    Fact::known(true, ObservationSource::Demo, 20)
+                );
+                assert_eq!(decoded.compositor_pid, Some(GNOME_PID));
+                assert_eq!(
+                    log,
+                    [
+                        "ListUnitsByPatterns:/org/freedesktop/systemd1",
+                        "GetAll:/units/graphical",
+                        "GetAll:/units/shell",
+                        "GetAll:/units/session",
+                        "GetAll:/units/shell",
+                    ]
+                );
+            }
+            #[test]
+            fn gnome_inactive_second_shell_row_does_not_displace_the_session_shell() {
+                let mut steps = gnome_script();
+                let rows = listed(&mut steps);
+                rows.push(row("org.gnome.Shell@wayland.service", "/units/wayland"));
+                rows[3].3 = "inactive".into();
+                managed(Desktop::Gnome, steps, GNOME_PID);
+            }
+            #[test]
+            fn gnome_shell_instance_must_be_user_or_wayland_and_its_mode_must_match() {
+                // The greeter's `@gdm` shell belongs to another account's manager.
+                unmanaged(
+                    Desktop::Gnome,
+                    instance_script("gdm", &[SHELL_BIN, "--mode=user"]),
+                );
+                // `@wayland` (GNOME 48 and earlier) takes its own mode, with or without switches.
+                managed(
+                    Desktop::Gnome,
+                    instance_script("wayland", &[SHELL_BIN, "--mode=wayland"]),
+                    GNOME_PID,
+                );
+                managed(
+                    Desktop::Gnome,
+                    instance_script(
+                        "wayland",
+                        &[SHELL_BIN, "--mode=wayland", "--wayland", "--no-x11"],
+                    ),
+                    GNOME_PID,
+                );
+                managed(
+                    Desktop::Gnome,
+                    instance_script("user", &[SHELL_BIN, "--mode=user", "--wayland"]),
+                    GNOME_PID,
+                );
+                // The mode must be the instance's own, and any other instance name is refused.
+                unmanaged(
+                    Desktop::Gnome,
+                    instance_script("wayland", &[SHELL_BIN, "--mode=user"]),
+                );
+                unmanaged(
+                    Desktop::Gnome,
+                    instance_script("user", &[SHELL_BIN, "--mode=wayland"]),
+                );
+                unmanaged(
+                    Desktop::Gnome,
+                    instance_script("other", &[SHELL_BIN, "--mode=other"]),
+                );
+            }
+            #[test]
+            fn gnome_executable_and_arguments_must_be_the_shell_itself() {
+                managed(
+                    Desktop::Gnome,
+                    gnome_script_with(SHELL_ID, gnome_exec(&[SHELL_BIN])),
+                    GNOME_PID,
+                );
+                let refused: [(&str, &[&str]); 4] = [
+                    ("/usr/bin/evil", &["/usr/bin/evil", "--mode=user"]),
+                    (SHELL_BIN, &["/usr/bin/evil", "--mode=user"]),
+                    ("/usr/local/bin/gnome-shell", &[SHELL_BIN, "--mode=user"]),
+                    (SHELL_BIN, &[SHELL_BIN, "--mode=user", "--eval"]),
+                ];
+                for (path, argv) in refused {
+                    let exec = command(path, argv, false, GNOME_PID);
+                    unmanaged(Desktop::Gnome, gnome_script_with(SHELL_ID, exec));
+                }
+            }
+            #[test]
+            fn gnome_service_must_be_notify_and_must_not_ignore_errors() {
+                let mut steps = gnome_script();
+                properties(&mut steps[4]).insert("Type".into(), value("simple".to_string()));
+                unmanaged(Desktop::Gnome, steps);
+                let exec = command(SHELL_BIN, &[SHELL_BIN, "--mode=user"], true, GNOME_PID);
+                unmanaged(Desktop::Gnome, gnome_script_with(SHELL_ID, exec));
+            }
+            #[test]
+            fn gnome_session_must_require_the_shell_and_be_bound_to_graphical() {
+                let mut steps = gnome_script();
+                steps[3].reply =
+                    Reply::Properties(unit_part_of(SESSION_ID, &[GRAPHICAL], &[], &[]));
+                unmanaged(Desktop::Gnome, steps);
+                // Neither PartOf nor BindsTo names the graphical target.
+                let mut steps = gnome_script();
+                steps[3].reply = Reply::Properties(unit_part_of(SESSION_ID, &[], &[], &[SHELL_ID]));
+                unmanaged(Desktop::Gnome, steps);
+                let mut steps = gnome_script();
+                steps[3].reply = Reply::Properties(unit_part_of(
+                    SESSION_ID,
+                    &["default.target"],
+                    &[],
+                    &[SHELL_ID],
+                ));
+                unmanaged(Desktop::Gnome, steps);
+                // BindsTo is the other accepted way to be bound to the graphical target.
+                let mut steps = gnome_script();
+                steps[3].reply =
+                    Reply::Properties(unit_part_of(SESSION_ID, &[], &[GRAPHICAL], &[SHELL_ID]));
+                managed(Desktop::Gnome, steps, GNOME_PID);
+            }
+            #[test]
+            fn gnome_inactive_units_and_a_missing_session_stop_after_the_graphical_read() {
+                let mut steps = gnome_script();
+                listed(&mut steps)[1].3 = "inactive".into();
+                only_listing(Desktop::Gnome, steps);
+                let mut steps = gnome_script();
+                listed(&mut steps)[2].3 = "inactive".into();
+                only_listing(Desktop::Gnome, steps);
+                let mut steps = gnome_script();
+                listed(&mut steps).truncate(2);
+                only_listing(Desktop::Gnome, steps);
+                // No graphical row: the target reads inactive and its call never happens. The
+                // session's own PartOf still names the target, so the shell stays managed.
+                let mut steps = gnome_script();
+                listed(&mut steps).remove(0);
+                steps.remove(1);
+                let (fact, log) = run(Desktop::Gnome, steps);
+                let decoded = fact.value.unwrap();
+                assert_eq!(decoded.graphical_target_active.value, Ok(false));
+                assert_eq!(decoded.compositor_managed.value, Ok(true));
+                assert_eq!(decoded.compositor_pid, Some(GNOME_PID));
+                assert_eq!(
+                    log,
+                    [
+                        "ListUnitsByPatterns:/org/freedesktop/systemd1",
+                        "GetAll:/units/shell",
+                        "GetAll:/units/session",
+                        "GetAll:/units/shell",
+                    ]
+                );
+            }
+            #[test]
+            fn gnome_ambiguous_or_transitional_units_fail_closed() {
+                let mut steps = gnome_script();
+                listed(&mut steps).push(row("org.gnome.Shell@wayland.service", "/units/wayland"));
+                steps.truncate(2);
+                let (fact, log) = run(Desktop::Gnome, steps);
+                assert_eq!(fact.value, Err(ProbeIssue::Ambiguous));
+                assert_eq!(log.len(), 2);
+                let mut steps = gnome_script();
+                listed(&mut steps).push(row("gnome-session@other.target", "/units/other"));
+                steps.truncate(2);
+                assert_eq!(
+                    run(Desktop::Gnome, steps).0.value,
+                    Err(ProbeIssue::Ambiguous)
+                );
+                for state in ["activating", "deactivating", "reloading", "maintenance"] {
+                    for index in [1, 2] {
+                        let mut steps = gnome_script();
+                        listed(&mut steps)[index].3 = state.into();
+                        steps.truncate(1);
+                        let (fact, log) = run(Desktop::Gnome, steps);
+                        assert_eq!(fact.value, Err(ProbeIssue::Unverified), "{state} {index}");
+                        assert_eq!(log.len(), 1);
+                    }
+                }
+                let mut steps = gnome_script();
+                properties(&mut steps[4]).insert("ExecStart".into(), value(Vec::<Exec>::new()));
+                assert_eq!(
+                    run(Desktop::Gnome, steps).0.value,
+                    Err(ProbeIssue::Unverified)
+                );
+                let mut steps = gnome_script();
+                let two = vec![
+                    gnome_exec(&[SHELL_BIN, "--mode=user"]),
+                    gnome_exec(&[SHELL_BIN, "--mode=user"]),
+                ];
+                properties(&mut steps[4]).insert("ExecStart".into(), value(two));
+                assert_eq!(
+                    run(Desktop::Gnome, steps).0.value,
+                    Err(ProbeIssue::Ambiguous)
+                );
+            }
+            #[test]
+            fn gnome_systemd_261_exec_main_properties_are_accepted_and_contradictions_fail() {
+                let argv = [SHELL_BIN, "--mode=user"];
+                let mut steps = gnome_script();
+                let values = systemd_261("notify", GNOME_PID, gnome_exec(&argv));
+                steps[4].reply = Reply::Properties(values);
+                managed(Desktop::Gnome, steps, GNOME_PID);
+                // A populated row beside the ExecMain* properties is accepted as well.
+                let mut steps = gnome_script();
+                let mut values = systemd_261("notify", GNOME_PID, gnome_exec(&argv));
+                values.insert("ExecStart".into(), value(vec![gnome_exec(&argv)]));
+                steps[4].reply = Reply::Properties(values);
+                managed(Desktop::Gnome, steps, GNOME_PID);
+                let contradictions: [(&str, OwnedValue); 6] = [
+                    ("ExecMainPID", value(4243u32)),
+                    ("ExecMainPID", value(0u32)),
+                    ("ExecMainStartTimestamp", value(0u64)),
+                    ("ExecMainExitTimestamp", value(1u64)),
+                    ("ExecMainCode", value(1i32)),
+                    ("ExecMainStatus", value(1i32)),
+                ];
+                for (key, bad) in contradictions {
+                    let mut steps = gnome_script();
+                    let mut values = systemd_261("notify", GNOME_PID, gnome_exec(&argv));
+                    values.insert(key.into(), bad);
+                    steps[4].reply = Reply::Properties(values);
+                    let result = run(Desktop::Gnome, steps).0.value;
+                    assert_eq!(result, Err(ProbeIssue::Unverified), "{key}");
+                }
+                for key in [
+                    "ExecMainPID",
+                    "ExecMainStartTimestamp",
+                    "ExecMainExitTimestamp",
+                    "ExecMainCode",
+                    "ExecMainStatus",
+                ] {
+                    let mut steps = gnome_script();
+                    let mut values = systemd_261("notify", GNOME_PID, gnome_exec(&argv));
+                    values.remove(key);
+                    steps[4].reply = Reply::Properties(values);
+                    let result = run(Desktop::Gnome, steps).0.value;
+                    assert_eq!(result, Err(ProbeIssue::Unverified), "missing {key}");
+                    let mut steps = gnome_script();
+                    let mut values = systemd_261("notify", GNOME_PID, gnome_exec(&argv));
+                    values.insert(key.into(), value("wrong".to_string()));
+                    steps[4].reply = Reply::Properties(values);
+                    let result = run(Desktop::Gnome, steps).0.value;
+                    assert_eq!(result, Err(ProbeIssue::Malformed), "mistyped {key}");
+                }
+                for field in 3..=6 {
+                    let mut row = gnome_exec(&argv);
+                    (row.3, row.4, row.5, row.6, row.7) = (0, 0, 0, 0, 0);
+                    match field {
+                        3 => row.3 = 1,
+                        4 => row.4 = 1,
+                        5 => row.5 = 1,
+                        _ => row.6 = 1,
+                    }
+                    let mut steps = gnome_script();
+                    let mut values = systemd_261("notify", GNOME_PID, gnome_exec(&argv));
+                    values.insert("ExecStart".into(), value(vec![row]));
+                    steps[4].reply = Reply::Properties(values);
+                    let result = run(Desktop::Gnome, steps).0.value;
+                    assert_eq!(result, Err(ProbeIssue::Unverified), "field {field}");
+                }
+            }
+            #[test]
+            fn gnome_list_error_is_unavailable_and_nothing_else_is_read() {
+                let mut steps = gnome_script();
+                steps[0].reply = Reply::Error;
+                steps.truncate(1);
+                let (fact, log) = run(Desktop::Gnome, steps);
+                assert_eq!(fact.value, Err(ProbeIssue::Unavailable));
+                assert_eq!(log, ["ListUnitsByPatterns:/org/freedesktop/systemd1"]);
+            }
+            #[test]
+            fn kde_healthy_kwin_unit_is_managed_with_four_calls_and_its_wrapper_pid() {
+                let (fact, log) = run(Desktop::Kde, kde_script());
+                assert_eq!(fact.observed_at_ms, 50);
+                let decoded = fact.value.unwrap();
+                assert_eq!(
+                    decoded.compositor_managed,
+                    Fact::known(true, ObservationSource::Demo, 40)
+                );
+                assert_eq!(
+                    decoded.graphical_target_active,
+                    Fact::known(true, ObservationSource::Demo, 20)
+                );
+                assert_eq!(decoded.compositor_pid, Some(KDE_PID));
+                assert_eq!(
+                    log,
+                    [
+                        "ListUnitsByPatterns:/org/freedesktop/systemd1",
+                        "GetAll:/units/graphical",
+                        "GetAll:/units/kwin",
+                        "GetAll:/units/kwin",
+                    ]
+                );
+                // The compositor binary itself is accepted, and so is the systemd 261 form.
+                let exec = kde_exec(KWIN_BIN, &[KWIN_BIN, "--xwayland"]);
+                managed(Desktop::Kde, kde_script_with(exec), KDE_PID);
+                let mut steps = kde_script();
+                let exec = kde_exec(KWIN_WRAPPER_BIN, &[KWIN_WRAPPER_BIN]);
+                steps[3].reply = Reply::Properties(systemd_261("notify", KDE_PID, exec));
+                managed(Desktop::Kde, steps, KDE_PID);
+            }
+            #[test]
+            fn kde_compositor_path_argv_ignore_and_binding_must_all_match() {
+                let refused: [(&str, &[&str]); 3] = [
+                    ("/usr/bin/other", &["/usr/bin/other"]),
+                    (KWIN_WRAPPER_BIN, &[KWIN_BIN, "--xwayland"]),
+                    (KWIN_BIN, &[KWIN_WRAPPER_BIN, "--xwayland"]),
+                ];
+                for (path, argv) in refused {
+                    unmanaged(Desktop::Kde, kde_script_with(kde_exec(path, argv)));
+                }
+                let exec = command(KWIN_WRAPPER_BIN, &[KWIN_WRAPPER_BIN], true, KDE_PID);
+                unmanaged(Desktop::Kde, kde_script_with(exec));
+                let mut steps = kde_script();
+                steps[2].reply =
+                    Reply::Properties(unit_part_of(KWIN_ID, &["default.target"], &[], &[]));
+                unmanaged(Desktop::Kde, steps);
+                let mut steps = kde_script();
+                steps[2].reply = Reply::Properties(unit_part_of(KWIN_ID, &[], &[GRAPHICAL], &[]));
+                managed(Desktop::Kde, steps, KDE_PID);
+            }
+            #[test]
+            fn kde_inactive_absent_or_transitional_kwin_stops_before_the_unit_reads() {
+                let mut steps = kde_script();
+                listed(&mut steps)[1].3 = "inactive".into();
+                only_listing(Desktop::Kde, steps);
+                let mut steps = kde_script();
+                listed(&mut steps).truncate(1);
+                only_listing(Desktop::Kde, steps);
+                let mut steps = kde_script();
+                listed(&mut steps)[1].3 = "activating".into();
+                steps.truncate(1);
+                let (fact, log) = run(Desktop::Kde, steps);
+                assert_eq!(fact.value, Err(ProbeIssue::Unverified));
+                assert_eq!(log.len(), 1);
+            }
+            #[test]
+            fn hyprland_desktop_read_is_the_original_uwsm_read_unchanged() {
+                assert_eq!(run(Desktop::Hyprland, script()), manager(script()));
+            }
+            fn version_cases() -> [(&'static str, [u16; 3]); 4] {
+                [
+                    ("50.4", [50, 4, 0]),
+                    ("49.2.1", [49, 2, 1]),
+                    ("50.rc", [50, 0, 0]),
+                    ("50.beta.1", [50, 0, 0]),
+                ]
+            }
+            fn read_shell_version(script: Vec<Step>) -> (Fact<[u16; 3]>, Vec<String>) {
+                let (stream, server) = BusServer::new(script);
+                let result = shell_version_from_stream(
+                    stream,
+                    &Deadline::new(1500, Cancellation::default()).unwrap(),
+                    clock(),
+                );
+                (result, server.finish())
+            }
+            /// The one call the version read makes: GNOME Shell's own properties.
+            fn shell_step(values: Properties) -> Step {
+                get_all("/org/gnome/Shell", "org.gnome.Shell", values)
+            }
+            fn shell_version_text(text: OwnedValue) -> Properties {
+                [("ShellVersion".into(), text)].into_iter().collect()
+            }
+            #[test]
+            fn shell_version_property_maps_through_the_literal_parser() {
+                for (text, expected) in version_cases() {
+                    let values = shell_version_text(value(text.to_string()));
+                    let (fact, log) = read_shell_version(vec![shell_step(values)]);
+                    assert_eq!(fact.value, Ok(expected), "{text}");
+                    assert_eq!(log, ["GetAll:/org/gnome/Shell"]);
+                }
+                let values = shell_version_text(value("50.4".to_string()));
+                let (fact, _) = read_shell_version(vec![shell_step(values)]);
+                assert_eq!(fact.observed_at_ms, 20);
+            }
+            #[test]
+            fn shell_version_missing_or_mistyped_property_is_pending_or_malformed() {
+                let (fact, log) = read_shell_version(vec![shell_step(Properties::new())]);
+                assert_eq!(fact.value, Err(ProbeIssue::Unverified));
+                assert_eq!(log.len(), 1);
+                let values = shell_version_text(value(7u32));
+                let (fact, _) = read_shell_version(vec![shell_step(values)]);
+                assert_eq!(fact.value, Err(ProbeIssue::Malformed));
+                let values = shell_version_text(value("x.y".to_string()));
+                let (fact, _) = read_shell_version(vec![shell_step(values)]);
+                assert_eq!(fact.value, Err(ProbeIssue::Malformed));
+            }
+            #[test]
+            fn parse_shell_version_keeps_the_leading_numbers_and_rejects_the_rest() {
+                for (text, expected) in version_cases() {
+                    assert_eq!(parse_shell_version(text), Ok(expected), "{text}");
+                }
+                assert_eq!(parse_shell_version(""), Err(ProbeIssue::Malformed));
+                assert_eq!(parse_shell_version("x.y"), Err(ProbeIssue::Malformed));
+                let long = "5".repeat(100);
+                assert_eq!(parse_shell_version(&long), Err(ProbeIssue::Oversize));
+            }
         }
     }
     mod native_logind {
@@ -3686,6 +4306,8 @@ mod session_tests {
             wayland_display: "wayland-2".into(),
             hyprland_instance_signature: "test_1790950000".into(),
             session_id: None,
+            xdg_current_desktop: None,
+            xdg_session_type: None,
         }
     }
     fn session() -> SessionFacts {
@@ -3693,9 +4315,10 @@ mod session_tests {
             uid: 1000,
             os: known(OsFamily::Arch),
             architecture: known(Architecture::X86_64),
-            hyprland_version: known([0, 56, 0]),
+            desktop: Ok(Desktop::Hyprland),
+            compositor_version: known([0, 56, 0]),
             protocols: known(true),
-            uwsm_managed: known(true),
+            compositor_managed: known(true),
             graphical_target_active: known(true),
             graphical_sessions: known(1),
             selected_session: known(Some(SelectedSession {
@@ -4430,9 +5053,9 @@ ID_LIKE="arch \linux""#,
             match field {
                 "os" => s.os = known(OsFamily::Other("debian".into())),
                 "arch" => s.architecture = known(Architecture::Other("riscv64".into())),
-                "version" => s.hyprland_version = known([0, 55, 99]),
+                "version" => s.compositor_version = known([0, 55, 99]),
                 "protocol" => s.protocols = known(false),
-                "uwsm" => s.uwsm_managed = known(false),
+                "uwsm" => s.compositor_managed = known(false),
                 _ => unreachable!(),
             }
             assert_eq!(
@@ -4447,14 +5070,14 @@ ID_LIKE="arch \linux""#,
                         Fact::issue(ProbeIssue::Unavailable, ObservationSource::Demo, 1)
                 }
                 "version" => {
-                    s.hyprland_version =
+                    s.compositor_version =
                         Fact::issue(ProbeIssue::Unavailable, ObservationSource::Demo, 1)
                 }
                 "protocol" => {
                     s.protocols = Fact::issue(ProbeIssue::Unavailable, ObservationSource::Demo, 1)
                 }
                 "uwsm" => {
-                    s.uwsm_managed =
+                    s.compositor_managed =
                         Fact::issue(ProbeIssue::Unavailable, ObservationSource::Demo, 1)
                 }
                 _ => unreachable!(),
@@ -4469,7 +5092,7 @@ ID_LIKE="arch \linux""#,
             let mut s = session();
             s.architecture = known(arch);
             for version in [[0, 56, 0], [0, 57, 0], [1, 0, 0]] {
-                s.hyprland_version = known(version);
+                s.compositor_version = known(version);
                 assert_eq!(classify(&s, &runtime()), Eligibility::Supported);
             }
         }
@@ -4478,7 +5101,7 @@ ID_LIKE="arch \linux""#,
     #[test]
     fn target_and_environment_alone_never_prove_uwsm_and_known_negative_precedes_pending() {
         let mut s = session();
-        s.uwsm_managed = Fact::issue(ProbeIssue::Unverified, ObservationSource::Demo, 42);
+        s.compositor_managed = Fact::issue(ProbeIssue::Unverified, ObservationSource::Demo, 42);
         assert_eq!(
             classify(&s, &runtime()),
             Eligibility::Pending(ProbeIssue::Unverified)

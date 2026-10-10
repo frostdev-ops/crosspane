@@ -10,6 +10,13 @@ FILES = ["bin/crosspane-agent", "bin/crosspanectl", "bin/crosspane-ui",
          "bin/crosspane-installer",
          "resources/crosspane-agent.service", "resources/crosspane-settings.desktop",
          "resources/crosspane-installer.desktop", "resources/crosspane-icon.svg", "resources/LICENSE"]
+# Schema 2 adds these four members after the nine above (GNOME and KDE support: the agent's desktop
+# entry, which the portals need, and the GNOME Shell extension). Schema 1 is the nine alone.
+DESKTOP = ["resources/io.frostdev.crosspane.agent.desktop",
+           "resources/gnome-shell-extension/extension.js",
+           "resources/gnome-shell-extension/metadata.json",
+           "resources/gnome-shell-extension/io.frostdev.Crosspane.Shell1.xml"]
+EXTENSION_UUID = "crosspane@frostdev.io"
 # Each placeholder is a whole quoted Exec argument or unit Environment assignment, never a fragment.
 FIELDS = {FILES[4]: ["{{agent_executable}}", "{{xdg_config_environment}}", "{{xdg_state_environment}}",
                      "{{xdg_runtime_environment}}", "{{crosspane_runtime_environment}}"],
@@ -81,19 +88,20 @@ try:
     metadata = json.loads(read(source / "provenance.json", RECORD), object_pairs_hook=pairs)
     require(set(metadata) == {"schema_version", "product_version", "architecture", "source_revision",
                               "profile", "libraries", "members"})
-    require(type(metadata["schema_version"]) is int and metadata["schema_version"] == 1
+    require(type(metadata["schema_version"]) is int and metadata["schema_version"] in (1, 2)
             and token(metadata["product_version"]) and metadata["architecture"] in ("x86_64", "aarch64")
             and isinstance(metadata["source_revision"], str)
             and re.fullmatch(r"[0-9a-f]{40}", metadata["source_revision"])
             and metadata["profile"] in ("dev", "release"))
     machine = 62 if metadata["architecture"] == "x86_64" else 183
-    require(isinstance(metadata["members"], list) and len(metadata["members"]) == 9
+    members = FILES + (DESKTOP if metadata["schema_version"] == 2 else [])
+    require(isinstance(metadata["members"], list) and len(metadata["members"]) == len(members)
             and isinstance(metadata["libraries"], list) and 0 < len(metadata["libraries"]) <= 32)
     data, expected = {}, {"provenance.json"}
     for artifact in metadata["members"]:
         require(set(artifact) == {"name", "size", "sha256", "features"})
         name, features = artifact["name"], artifact["features"]
-        require(name in FILES and name not in data and isinstance(features, list)
+        require(name in members and name not in data and isinstance(features, list)
                 and len(features) <= 32 and all(token(v) for v in features)
                 and features == sorted(set(features)))
         require(name != FILES[0] or "video" in features)
@@ -102,6 +110,20 @@ try:
                 and artifact["sha256"] == sha(content))
         if name.startswith("bin/"):
             elf(content, machine)
+        if name in DESKTOP:
+            # Plain text the installer copies as it is: small, printable, and what its name says.
+            require(len(content) <= RECORD)
+            text = content.decode("utf-8")
+            require(all(c in "\n\t\r" or (ord(c) >= 32 and not 127 <= ord(c) <= 159) for c in text))
+            if name == DESKTOP[0]:
+                require(text.startswith("[Desktop Entry]") and "{{" not in text
+                        and "Type=Application" in text.split("\n"))
+            elif name == DESKTOP[2]:
+                require(json.loads(text).get("uuid") == EXTENSION_UUID)
+            elif name == DESKTOP[3]:
+                require("io.frostdev.Crosspane.Shell1" in text)
+            else:
+                require(text.strip() != "")
         if name in FIELDS:
             require(len(content) <= RECORD)
             require(content.isascii())
@@ -149,7 +171,7 @@ try:
     manifest = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode()
     require(len(manifest) <= RECORD)
     archive = bytearray()
-    for name, content in [("manifest.json", manifest), *[(name, data[name]) for name in FILES]]:
+    for name, content in [("manifest.json", manifest), *[(name, data[name]) for name in members]]:
         archive += header(name, content) + content + bytes((-len(content)) % 512)
         require(len(archive) + 1024 <= ARCHIVE)
     archive += bytes(1024)

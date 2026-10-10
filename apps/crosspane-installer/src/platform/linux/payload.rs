@@ -1,4 +1,5 @@
 //! Local development payloads. Archive metadata never grants ownership of an arbitrary path.
+use super::detect::Desktop;
 use super::native_io::{DeadRuntime, Deadline, LinuxNativeIo, NativeError, SupportProof};
 use crate::agent_contract::{
     AgentReply, BackendName, BackendState, DecodedReply, InstallerStatusV1, ObservationSource,
@@ -23,6 +24,8 @@ use std::{
     },
 };
 
+mod desktop;
+pub use desktop::{DesktopFile, DesktopPlan, DesktopRemoval};
 mod reclaim;
 pub use reclaim::KEEP_BACKUPS;
 
@@ -39,6 +42,20 @@ pub const FILES: [&str; 9] = [
     "resources/crosspane-installer.desktop",
     "resources/crosspane-icon.svg",
     "resources/LICENSE",
+];
+/// Payload manifest schema with the nine core members only (Hyprland needs nothing more).
+pub const SCHEMA_CORE: u32 = 1;
+/// Payload manifest schema that also carries [`DESKTOP_FILES`]. A schema-2 archive holds all
+/// thirteen members; which of the four desktop members a session installs is decided by the
+/// session (see `desktop.rs`), never by the archive.
+pub const SCHEMA_DESKTOP: u32 = 2;
+/// The desktop members of a schema-2 payload, in archive order: the agent's desktop entry (the
+/// portals refuse the agent's application id without it) and the GNOME Shell extension.
+pub const DESKTOP_FILES: [&str; 4] = [
+    "resources/io.frostdev.crosspane.agent.desktop",
+    "resources/gnome-shell-extension/extension.js",
+    "resources/gnome-shell-extension/metadata.json",
+    "resources/gnome-shell-extension/io.frostdev.Crosspane.Shell1.xml",
 ];
 // V1 a3aafbfb placed this obsolete executable at journal index 4. Read-only compatibility:
 // it is never a member of a current package or an executable admission.
@@ -200,28 +217,47 @@ fn template(raw: &[u8], index: usize) -> Result<&str> {
     }
     Ok(text)
 }
-/// Payload retirement requires completed recovery and operational mandatory backends. Optional
-/// CPU/desktop backends may be missing or blocked; a failed backend always retains every backup.
-fn operational(health: &InstallerStatusV1) -> bool {
+/// The backends that must be `Ready` before a freshly installed agent counts as working, so the
+/// previous copy may be retired. Hyprland's eight are the original list.
+///
+/// GNOME and KDE: only the keystore and the link layer. Their other backends depend on things
+/// that are not about the installed files: the desktop's own consent dialog for input (until it
+/// is answered the injectors report not ready), the Shell extension (windows, parking) and
+/// capture parts that those desktops do not have yet (controller capture, source frames). The
+/// agent reports those honestly; an installer that waited for them would never finish recording
+/// an install that works.
+pub(crate) fn mandatory_backends(desktop: Desktop) -> &'static [BackendName] {
     use BackendName::*;
+    match desktop {
+        Desktop::Hyprland => &[
+            Keystore, Links, Parking, Windows, Frames, Capture, Keys, Pointer,
+        ],
+        Desktop::Gnome | Desktop::Kde => &[Keystore, Links],
+    }
+}
+/// Whether the backends of a status make the new agent operational: every mandatory backend
+/// is `Ready`, and (Hyprland, as before) no backend at all has failed. GNOME and KDE report
+/// failed backends that are simply not built for them yet, so there only the mandatory ones count.
+pub(crate) fn backends_operational(
+    backends: &[crate::agent_contract::BackendFact],
+    desktop: Desktop,
+) -> bool {
+    (desktop != Desktop::Hyprland || backends.iter().all(|b| b.state != BackendState::Failed))
+        && mandatory_backends(desktop).iter().all(|name| {
+            backends
+                .iter()
+                .any(|b| b.name == *name && b.state == BackendState::Ready)
+        })
+}
+/// Payload retirement requires completed recovery and operational mandatory backends. Optional
+/// CPU/desktop backends may be missing or blocked; on Hyprland a failed backend always retains
+/// every backup.
+fn operational(health: &InstallerStatusV1, desktop: Desktop) -> bool {
     matches!(
         health.startup_recovery,
         StartupRecovery::Restored | StartupRecovery::NothingParked
     ) && health.recovery_pending == 0
-        && health
-            .backends
-            .iter()
-            .all(|b| b.state != BackendState::Failed)
-        && [
-            Keystore, Links, Parking, Windows, Frames, Capture, Keys, Pointer,
-        ]
-        .iter()
-        .all(|name| {
-            health
-                .backends
-                .iter()
-                .any(|b| b.name == *name && b.state == BackendState::Ready)
-        })
+        && backends_operational(&health.backends, desktop)
 }
 const PAYLOAD_STEP: StepId = StepId(47);
 type Result<T> = std::result::Result<T, PayloadError>;
@@ -237,6 +273,12 @@ pub enum PayloadError {
     Pending,
     #[error("interrupted mutation; inspect before retry")]
     OutcomeUnknown,
+    /// This session is GNOME or KDE and the staged payload predates their support files.
+    #[error("the staged payload has no GNOME or KDE support files")]
+    NoDesktopFiles,
+    /// The desktop entry or Shell extension files couldn't be put in place or checked.
+    #[error("the desktop files for this session couldn't be put in place")]
+    Desktop,
 }
 fn system<T>(value: std::result::Result<T, impl std::fmt::Debug>) -> Result<T> {
     value.map_err(|_| PayloadError::Native(NativeError::Unavailable))
@@ -380,8 +422,10 @@ impl Package {
                 .ok_or(PayloadError::Invalid)?;
             let name = std::str::from_utf8(&header[..end]).map_err(|_| PayloadError::Invalid)?;
             if header[end..100].iter().any(|b| *b != 0)
-                || (name != "manifest.json" && !FILES.contains(&name))
-                || files.len() >= 11
+                || (name != "manifest.json"
+                    && !FILES.contains(&name)
+                    && !DESKTOP_FILES.contains(&name))
+                || files.len() > FILES.len() + DESKTOP_FILES.len() + 1
                 || files.contains_key(name)
                 || header[156] != b'0'
                 || &header[257..265] != b"ustar\x0000"
@@ -418,7 +462,10 @@ impl Package {
             let size = octal(&header[124..136])?;
             if size == 0
                 || size
-                    > if name == "manifest.json" || FILES[4..7].contains(&name) {
+                    > if name == "manifest.json"
+                        || FILES[4..7].contains(&name)
+                        || DESKTOP_FILES.contains(&name)
+                    {
                         MAX_RECORD_BYTES
                     } else {
                         MAX_MEMBER_BYTES
@@ -446,8 +493,14 @@ impl Package {
         let metadata = files.remove("manifest.json").ok_or(PayloadError::Invalid)?;
         let manifest: Manifest =
             serde_json::from_slice(&metadata).map_err(|_| PayloadError::Invalid)?;
-        if manifest.schema_version != 1
-            || manifest.architecture != architecture
+        // Schema 1: the nine core members. Schema 2: those and the four desktop members, all of
+        // them (an archive never half-carries the desktop files).
+        let members = match manifest.schema_version {
+            SCHEMA_CORE => FILES.len(),
+            SCHEMA_DESKTOP => FILES.len() + DESKTOP_FILES.len(),
+            _ => return Err(PayloadError::Invalid),
+        };
+        if manifest.architecture != architecture
             || !token(&manifest.product_version)
             || manifest.source_revision.len() != 40
             || !manifest
@@ -455,8 +508,8 @@ impl Package {
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit())
             || !["dev", "release"].contains(&manifest.profile.as_str())
-            || manifest.members.len() != FILES.len()
-            || files.len() != FILES.len()
+            || manifest.members.len() != members
+            || files.len() != members
             || manifest.libraries.is_empty()
             || manifest.libraries.len() > 32
         {
@@ -488,6 +541,9 @@ impl Package {
             if member.name.starts_with("bin/") {
                 architecture.elf(data)?;
             }
+            if DESKTOP_FILES.contains(&member.name.as_str()) {
+                desktop::check_member(&member.name, data)?;
+            }
         }
         Ok(Self {
             manifest,
@@ -499,11 +555,105 @@ impl Package {
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
+    /// Whether this payload carries the GNOME and KDE support files (manifest schema 2).
+    pub fn has_desktop_files(&self) -> bool {
+        self.manifest.schema_version == SCHEMA_DESKTOP
+    }
+    /// The digest of the archive's manifest record, as receipts bind it.
+    pub fn manifest_hash(&self) -> [u8; 32] {
+        self.manifest_hash
+    }
 
     /// The whole already hash-validated agent member (at most `MAX_MEMBER_BYTES`). Its dependency
     /// metadata (PT_DYNAMIC, DT_STRTAB) can lie anywhere in the image. No archive re-parse.
     pub(crate) fn agent_elf(&self) -> &[u8] {
         self.files.get(FILES[0]).map_or(&[], Vec::as_slice)
+    }
+}
+
+#[cfg(test)]
+mod operational_tests {
+    use super::*;
+    use crate::agent_contract::{BackendFact, BackendState};
+
+    /// The fifteen backends of a status, in wire order, each `Ready` unless named.
+    fn backends(overrides: &[(BackendName, BackendState)]) -> Vec<BackendFact> {
+        use BackendName::*;
+        [
+            Capture, Keys, Pointer, Overlay, Hotkeys, Keystore, Windows, Parking, Frames, Tray,
+            Links, Gpu, Home, Audio, Discovery,
+        ]
+        .into_iter()
+        .map(|name| BackendFact {
+            name,
+            state: overrides
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map_or(BackendState::Ready, |(_, state)| *state),
+            reason: None,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn hyprland_still_needs_its_eight_ready_and_no_failure_anywhere() {
+        use BackendName::*;
+        assert!(backends_operational(&backends(&[]), Desktop::Hyprland));
+        for name in mandatory_backends(Desktop::Hyprland) {
+            for state in [
+                BackendState::Missing,
+                BackendState::Blocked,
+                BackendState::Failed,
+            ] {
+                assert!(
+                    !backends_operational(&backends(&[(*name, state)]), Desktop::Hyprland),
+                    "{name:?} {state:?}"
+                );
+            }
+        }
+        // Optional ones may be missing or blocked, but a failed one of any kind retains backups.
+        assert!(backends_operational(
+            &backends(&[(Gpu, BackendState::Missing), (Audio, BackendState::Blocked)]),
+            Desktop::Hyprland
+        ));
+        assert!(!backends_operational(
+            &backends(&[(Tray, BackendState::Failed)]),
+            Desktop::Hyprland
+        ));
+        assert_eq!(mandatory_backends(Desktop::Hyprland).len(), 8);
+    }
+
+    #[test]
+    fn gnome_and_kde_are_judged_by_the_keystore_and_the_link_layer_alone() {
+        use BackendName::*;
+        // What a target-only GNOME agent reports before the desktop's consent dialog is answered:
+        // no controller capture, no Shell extension, injectors waiting. Still a working install.
+        let waiting = backends(&[
+            (Capture, BackendState::Failed),
+            (Keys, BackendState::Failed),
+            (Pointer, BackendState::Failed),
+            (Windows, BackendState::Failed),
+            (Parking, BackendState::Failed),
+            (Frames, BackendState::Failed),
+            (Overlay, BackendState::Failed),
+        ]);
+        for desktop in [Desktop::Gnome, Desktop::Kde] {
+            assert!(backends_operational(&waiting, desktop), "{desktop:?}");
+            assert!(!backends_operational(&waiting, Desktop::Hyprland));
+            for name in [Keystore, Links] {
+                for state in [
+                    BackendState::Missing,
+                    BackendState::Blocked,
+                    BackendState::Failed,
+                ] {
+                    assert!(
+                        !backends_operational(&backends(&[(name, state)]), desktop),
+                        "{desktop:?} {name:?} {state:?}"
+                    );
+                }
+            }
+            assert_eq!(mandatory_backends(desktop), [Keystore, Links]);
+        }
     }
 }
 
@@ -764,6 +914,10 @@ impl PayloadInstaller {
     }
     pub fn targets(&self) -> &[PathBuf] {
         &self.paths
+    }
+    /// The selected target this installer writes to.
+    pub fn io(&self) -> Arc<LinuxNativeIo> {
+        self.io.clone()
     }
     pub(crate) fn cleanup_targets(&self) -> Vec<PathBuf> {
         let mut paths = self.paths.clone();
@@ -1886,7 +2040,7 @@ impl PayloadInstaller {
         let Ok(DecodedReply::Status(StatusAdmission::Supported(health))) = &reply.result else {
             return Err(PayloadError::Pending);
         };
-        if !operational(health.installer()) {
+        if !operational(health.installer(), proof.desktop()) {
             return Err(PayloadError::Pending);
         }
         if expected_reply_id == 0

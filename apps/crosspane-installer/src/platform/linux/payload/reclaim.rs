@@ -37,8 +37,10 @@ pub(crate) fn backup_stamp(seconds: u64) -> String {
 
 fn is_record(name: &str) -> bool {
     let base = name.strip_suffix(".retired").unwrap_or(name);
-    matches!(base, "payload-intent.json" | "payload-outcome.json")
-        || (base.starts_with("quarantine-") && base.ends_with(".json"))
+    matches!(
+        base,
+        "payload-intent.json" | "payload-outcome.json" | "desktop-outcome.json"
+    ) || (base.starts_with("quarantine-") && base.ends_with(".json"))
 }
 
 fn is_leftover(name: &str, installed: &[&str]) -> bool {
@@ -481,6 +483,7 @@ mod tests {
             "payload-outcome.json",
             "payload-intent.json.retired",
             "quarantine-00ff.json",
+            "desktop-outcome.json",
         ] {
             assert!(is_record(name), "{name}");
         }
