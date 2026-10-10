@@ -7,4 +7,5 @@
 pub mod overlay;
 pub mod parking;
 pub mod shell;
+pub mod window_capture;
 pub mod windows;
