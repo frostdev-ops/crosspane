@@ -9,14 +9,29 @@
 //!   consumed and only counted, except that motion drives a *virtual pointer* (its distance from
 //!   the barrier and its place along the portal) which becomes `EdgePressed`, once per EIS frame
 //!   that moved the pointer. The activation is released to its origin point (nudged two logical
-//!   pixels inward) when the virtual pointer moves more than [`INWARD_BOX`] logical pixels away
-//!   from the barrier, leaves the portal's stretch, the gate closes, the portal is removed, or
+//!   pixels inward) when the virtual pointer moves more than [`INWARD_BOX`] (32) logical pixels
+//!   away from the barrier, leaves the portal's stretch by more than [`SPAN_SLACK`] (32) logical
+//!   pixels at either end, the gate closes, the portal is removed, `end` is called, or
 //!   [`PENDING_MAX`] passes without a `begin`. Each release after an `EdgePressed` is followed by
-//!   `EdgeReleased`.
+//!   `EdgeReleased`. The wide box and slack are deliberate: the EIS motion the compositor reports
+//!   while it holds the pointer is accelerated, so a small hand movement adds up to many pixels,
+//!   and a push that merely slides along the edge must not abandon the crossing.
+//!   **A refused crossing** (the engine never calls `begin`, and never `end` for a capture that
+//!   did not start) leaves the activation pending until one of the above happens: the user
+//!   moves away, or 3 s pass. That is a documented limitation, not a leak: nothing is routed.
 //! - **Active (A2).** `begin` adopts the pending activation synchronously: `Started` precedes every
 //!   other capture event, `held_keys` are the keys pressed since the activation (A3), and a button
 //!   pressed since the activation refuses the begin (`PointerButtonHeld`). Every failed `begin`
-//!   releases the activation. `end` releases it to the point the caller computed.
+//!   releases the activation. `end` releases it to the point the caller computed (and releases a
+//!   pending activation too, when it is called then).
+//! - **Local ups (A3 amended).** A key or button that was already down when the activation began
+//!   is unknown to the compositor's capture: its up arrives as `down: false` (forwarded; the
+//!   router drops it) and the compositor does not deliver it to the local clients, which would
+//!   keep the key held (and repeating). The ledger therefore remembers those ups (an up for a key
+//!   not pressed since the activation), and the activation's end hands them over with its
+//!   `Release` (the `ups` of [`Out::Release`]) or, when the compositor ended it on its own, as
+//!   [`Out::LocalUps`]: the owner replays them locally once the compositor no longer holds the
+//!   activation. Keys pressed after the activation never appear there.
 //! - **Loss.** An activation the compositor ended on its own (the escape chord, a zone change, the
 //!   session disabled) is `Ended { Lost }` for an active capture and `EdgeReleased` for a pending
 //!   one, and asks to re-arm the portal session ([`Out::Rearm`]). An activation this machine
@@ -26,7 +41,9 @@
 //! sequence number, which mutter sets to the activation id. The receiver tags each input with its
 //! device's sequence. Input for an activation the `Activated` signal has not announced yet (the EIS
 //! socket can be faster than the D-Bus signal) is held back and replayed when the signal arrives;
-//! input for an activation that is over is dropped.
+//! input for an activation that is over is dropped. Input that waits longer than
+//! [`EARLY_MAX_AGE`] (250 ms) means the signal was lost: the buffer is dropped and
+//! [`Out::ReleaseUnknown`] asks the owner to release whatever the compositor holds.
 //!
 //! Logs and counters never record key or button codes.
 
@@ -41,14 +58,20 @@ use crosspane_types::hid::{HidUsage, MouseButton, evdev_to_hid};
 use crosspane_types::input::{LockKeys, ScrollDelta, ScrollPhase};
 use crosspane_types::time::MonoTime;
 
+use super::LocalUp;
 use super::barriers::Entry;
 
 /// A pending activation nobody adopted is released after this long: push-to-cross (default 0) plus
 /// the capture indicator (500 ms) plus the handshake (1 s) plus margin.
 pub(super) const PENDING_MAX: Duration = Duration::from_secs(3);
 /// The virtual pointer may move this far (logical px) away from the barrier before the pending
-/// activation counts as abandoned: mutter's own barrier hit box.
-pub(super) const INWARD_BOX: f64 = 2.0;
+/// activation counts as abandoned. Much wider than mutter's own 2 px hit box: the EIS motion
+/// while the compositor holds the pointer is accelerated, and a live crossing was abandoned by
+/// an ordinary push (2026-10-10).
+pub(super) const INWARD_BOX: f64 = 32.0;
+/// The virtual pointer may slide this far (logical px) past either end of the portal's stretch
+/// before the pending activation counts as abandoned (the same acceleration, along the edge).
+pub(super) const SPAN_SLACK: f64 = 32.0;
 /// A released activation puts the pointer this far (logical px) inside its origin, so that the
 /// compositor's truncating warp lands inside the display and not on the barrier it just left
 /// (mutter reported an origin x of -6e-8 on a left edge).
@@ -56,6 +79,11 @@ const NUDGE: f64 = 2.0;
 /// Input held back for an activation whose signal has not arrived. Far above what one activation
 /// can produce before its signal; the excess is dropped.
 const EARLY_MAX: usize = 1024;
+/// Input that waited this long for an `Activated` that did not come means the signal was lost.
+pub(super) const EARLY_MAX_AGE: Duration = Duration::from_millis(250);
+/// A smooth scroll gesture with no event for this long is ended: mutter never sends the vertical
+/// finish flag (an upstream bug), so the gesture would otherwise never end.
+pub(super) const SCROLL_IDLE: Duration = Duration::from_millis(150);
 /// Activations this machine released whose `Deactivated` is still expected.
 const RELEASED_KEEP: usize = 8;
 
@@ -112,8 +140,20 @@ pub(super) enum Input {
 pub(super) enum Out {
     /// Deliver to the subscriber.
     Emit(CaptureEvent),
-    /// `Release(activation, cursor_position)` on the portal.
-    Release { activation: u32, at: (f64, f64) },
+    /// `Release(activation, cursor_position)` on the portal. `ups` are the releases of keys and
+    /// buttons that were down before the activation: the owner replays them locally once the
+    /// `Release` has returned, and never before (the compositor would capture them).
+    Release {
+        activation: u32,
+        at: (f64, f64),
+        ups: Vec<LocalUp>,
+    },
+    /// The compositor ended the activation on its own (no `Release` to wait for): replay these
+    /// ups locally now.
+    LocalUps(Vec<LocalUp>),
+    /// An activation the machine knows nothing about is held by the compositor: `Release` with no
+    /// id and no position (the owner decides how).
+    ReleaseUnknown,
     /// The compositor ended the activation or the session on its own: Disable, GetZones,
     /// SetPointerBarriers, Enable again.
     Rearm,
@@ -126,20 +166,30 @@ pub(super) struct Begin {
     pub result: Result<CaptureStart, PlatformError>,
 }
 
-/// Keys and buttons that went down since the activation.
+/// Keys and buttons that went down since the activation, and the ups of those that were already
+/// down before it.
 #[derive(Debug, Default)]
 struct Ledger {
     keys: BTreeSet<u16>,
     buttons: BTreeSet<u32>,
+    /// Keys whose up arrived without a down since the activation: they were pressed before it.
+    foreign_keys: BTreeSet<u16>,
+    foreign_buttons: BTreeSet<u32>,
 }
 
 impl Ledger {
-    /// Record a key change; `true` for a new down. An up is `true` when the key was down.
+    /// Record a key change; `true` for a new down. An up is `true` when the key was down since
+    /// the activation; any other up is the release of a key pressed earlier and is remembered for
+    /// [`Ledger::ups`].
     fn key(&mut self, code: u16, down: bool) -> bool {
         if down {
             self.keys.insert(code)
         } else {
-            self.keys.remove(&code)
+            let was_down = self.keys.remove(&code);
+            if !was_down {
+                self.foreign_keys.insert(code);
+            }
+            was_down
         }
     }
 
@@ -147,8 +197,27 @@ impl Ledger {
         if down {
             self.buttons.insert(code)
         } else {
-            self.buttons.remove(&code)
+            let was_down = self.buttons.remove(&code);
+            if !was_down {
+                self.foreign_buttons.insert(code);
+            }
+            was_down
         }
+    }
+
+    /// The releases to replay locally when the activation is over: keys first, then buttons, each
+    /// once, in code order. Codes with no Crosspane key or button cannot be injected and are left
+    /// out.
+    fn ups(&self) -> Vec<LocalUp> {
+        let keys = self
+            .foreign_keys
+            .iter()
+            .filter_map(|code| evdev_to_hid(*code).map(LocalUp::Key));
+        let buttons = self
+            .foreign_buttons
+            .iter()
+            .filter_map(|code| button_of(*code).map(LocalUp::Button));
+        keys.chain(buttons).collect()
     }
 
     /// The held keys that have a HID usage, in a stable order.
@@ -196,6 +265,8 @@ struct Active {
     ledger: Ledger,
     /// Smooth scrolling in progress on (x, y).
     scrolling: (bool, bool),
+    /// When the smooth gesture last moved (its idle end, [`SCROLL_IDLE`]).
+    last_scroll: MonoTime,
 }
 
 #[derive(Debug, Default)]
@@ -214,8 +285,8 @@ pub(super) struct Machine {
     newest: u32,
     /// Activations released by this machine whose `Deactivated` has not come yet.
     released: Vec<u32>,
-    /// Input for activations the signal has not announced yet.
-    early: Vec<(u32, Input)>,
+    /// Input for activations the signal has not announced yet, with the time it arrived.
+    early: Vec<(MonoTime, u32, Input)>,
     /// Input dropped as stale or unattributable (a count, for the log).
     dropped: u64,
 }
@@ -301,9 +372,16 @@ impl Pending {
         })
     }
 
-    /// Give the activation up: `Release`, and `EdgeReleased` if a press was reported.
+    /// Give the activation up: `Release` to its origin, and `EdgeReleased` if a press was
+    /// reported.
     fn abandon(&self, now: MonoTime, why: &'static str) -> Vec<Out> {
-        tracing::debug!(
+        self.abandon_to(now, why, self.release_at())
+    }
+
+    /// [`abandon`](Self::abandon) with the pointer put at `at`.
+    fn abandon_to(&self, now: MonoTime, why: &'static str, at: (f64, f64)) -> Vec<Out> {
+        // Counts and the reason only: never which keys or buttons.
+        tracing::info!(
             why,
             activation = self.activation,
             motions = self.counts.motions,
@@ -314,7 +392,8 @@ impl Pending {
         );
         let mut outs = vec![Out::Release {
             activation: self.activation,
-            at: self.release_at(),
+            at,
+            ups: self.ledger.ups(),
         }];
         if self.pressing {
             outs.push(self.edge_released(now));
@@ -363,7 +442,7 @@ impl Pending {
                 let (lo, hi) = self.entry.span;
                 if self.normal < -INWARD_BOX {
                     self.abandon(now, "moved inward")
-                } else if self.along < lo || self.along >= hi {
+                } else if self.along < lo - SPAN_SLACK || self.along >= hi + SPAN_SLACK {
                     self.abandon(now, "left the portal")
                 } else {
                     vec![self.press(now)]
@@ -424,13 +503,33 @@ impl Active {
                     None => return Vec::new(),
                 }
             }
-            Input::Scroll(scroll) => CaptureEvent::Scroll {
-                delta: self.scroll(scroll),
-                at: now,
-            },
+            Input::Scroll(scroll) => {
+                if matches!(scroll, Scroll::Smooth { .. }) {
+                    self.last_scroll = now;
+                }
+                CaptureEvent::Scroll {
+                    delta: self.scroll(scroll),
+                    at: now,
+                }
+            }
             Input::Frame => return Vec::new(),
         };
         vec![Out::Emit(event)]
+    }
+
+    /// End a smooth gesture that has been silent for [`SCROLL_IDLE`]: the end of a gesture is a
+    /// `Stop` the compositor should send, but mutter never sends the vertical one, so without
+    /// this the gesture would stay open (the next one would not begin, and the target would
+    /// never see it end).
+    fn idle_scroll(&mut self, now: MonoTime) -> Vec<Out> {
+        let (x, y) = self.scrolling;
+        if !(x || y) || now.saturating_duration_since(self.last_scroll) < SCROLL_IDLE {
+            return Vec::new();
+        }
+        vec![Out::Emit(CaptureEvent::Scroll {
+            delta: self.scroll(Scroll::Stop { x, y }),
+            at: now,
+        })]
     }
 
     /// The Crosspane scroll for an EIS one: EIS and Wayland count positive y as down, Crosspane
@@ -501,6 +600,7 @@ impl Machine {
         matches!(self.phase, Phase::Idle)
     }
 
+    #[cfg(test)]
     pub(super) fn is_active(&self) -> bool {
         matches!(self.phase, Phase::Active(_))
     }
@@ -524,9 +624,10 @@ impl Machine {
         }
     }
 
-    /// Whether the gate must be looked at often (something is pending or active).
+    /// Whether [`tick`](Self::tick) must run often: something is pending or active, or input is
+    /// waiting for an `Activated` signal that may never come.
     pub(super) fn busy(&self) -> bool {
-        !self.is_idle()
+        !self.is_idle() || !self.early.is_empty()
     }
 
     /// Input dropped as stale or unattributable so far.
@@ -554,10 +655,16 @@ impl Machine {
     ) -> Vec<Out> {
         let mut outs = Vec::new();
         // The compositor allows one activation at a time and orders its signals, so an earlier
-        // one still held here missed its `Deactivated`: it is over.
-        outs.extend(self.lost(now));
+        // one still held here missed its `Deactivated`: it is over. The compositor holds the new
+        // activation already, so the earlier one's local ups cannot be injected now (they would
+        // be captured): they are dropped.
+        outs.extend(
+            self.lost(now)
+                .into_iter()
+                .filter(|out| !matches!(out, Out::LocalUps(_))),
+        );
         self.newest = self.newest.max(activation);
-        self.early.retain(|(seq, _)| *seq >= activation);
+        self.early.retain(|(_, seq, _)| *seq >= activation);
         let Some((entry, position)) = found.filter(|_| accept) else {
             let at = found.map_or(cursor, |(entry, _)| nudged(&entry, cursor));
             tracing::debug!(
@@ -567,19 +674,24 @@ impl Machine {
                 "releasing a capture activation at once"
             );
             self.remember_release(activation);
-            self.early.retain(|(seq, _)| *seq != activation);
-            outs.push(Out::Release { activation, at });
+            self.early.retain(|(_, seq, _)| *seq != activation);
+            outs.push(Out::Release {
+                activation,
+                at,
+                ups: Vec::new(),
+            });
             return outs;
         };
         let mut pending = Pending::new(entry, activation, cursor, position, now);
         outs.push(pending.press(now));
         // Input that outran the signal.
         let early = std::mem::take(&mut self.early);
-        let (mine, later): (Vec<_>, Vec<_>) =
-            early.into_iter().partition(|(seq, _)| *seq == activation);
+        let (mine, later): (Vec<_>, Vec<_>) = early
+            .into_iter()
+            .partition(|(_, seq, _)| *seq == activation);
         self.early = later;
         self.phase = Phase::Pending(pending);
-        for (_, input) in mine {
+        for (_, _, input) in mine {
             outs.extend(self.route(now, input));
         }
         outs
@@ -624,7 +736,7 @@ impl Machine {
         }
         if seq > self.newest {
             if self.early.len() < EARLY_MAX {
-                self.early.push((seq, input));
+                self.early.push((now, seq, input));
             } else {
                 self.dropped = self.dropped.saturating_add(1);
             }
@@ -657,27 +769,56 @@ impl Machine {
         outs
     }
 
-    /// The pending activation timed out, or the gate closed; checked every few milliseconds while
+    /// Input that has waited too long for its `Activated` signal means the signal was lost (or
+    /// could not be read) and the compositor holds an activation nobody knows: drop the input and
+    /// ask the owner to release whatever is held.
+    fn expire_early(&mut self, now: MonoTime) -> Vec<Out> {
+        let stale = self
+            .early
+            .iter()
+            .any(|(at, _, _)| now.saturating_duration_since(*at) >= EARLY_MAX_AGE);
+        if !stale {
+            return Vec::new();
+        }
+        tracing::info!(
+            buffered = self.early.len(),
+            "capture input arrived for an activation that was never announced; releasing"
+        );
+        let waiting = u64::try_from(self.early.len()).unwrap_or(u64::MAX);
+        self.dropped = self.dropped.saturating_add(waiting);
+        self.early.clear();
+        vec![Out::ReleaseUnknown]
+    }
+
+    /// The pending activation timed out, or the gate closed; an unannounced activation's input
+    /// went stale; a smooth scroll went idle. Checked every few milliseconds while
     /// [`busy`](Self::busy).
     pub(super) fn tick(&mut self, now: MonoTime, accept: bool) -> Vec<Out> {
-        match &self.phase {
+        let mut outs = self.expire_early(now);
+        match &mut self.phase {
             Phase::Pending(p) => {
                 let why = if !accept {
                     "gate closed"
                 } else if now.saturating_duration_since(p.since) >= PENDING_MAX {
                     "no begin in time"
                 } else {
-                    return Vec::new();
+                    return outs;
                 };
-                let outs = p.abandon(now, why);
-                self.settle(outs)
+                let released = p.abandon(now, why);
+                outs.extend(self.settle(released));
             }
-            Phase::Active(a) if !accept => {
-                let outs = self.leave_active(now, a.release_at(), EndReason::Lost);
-                self.settle(outs)
+            Phase::Active(a) => {
+                if accept {
+                    outs.extend(a.idle_scroll(now));
+                } else {
+                    let at = a.release_at();
+                    let released = self.leave_active(now, at, EndReason::Lost);
+                    outs.extend(self.settle(released));
+                }
             }
-            _ => Vec::new(),
+            Phase::Idle => {}
         }
+        outs
     }
 
     /// `Release`, then `Ended { reason }` for the active capture, then `EdgeReleased`: the
@@ -690,6 +831,7 @@ impl Machine {
             Out::Release {
                 activation: a.activation,
                 at,
+                ups: a.ledger.ups(),
             },
             Out::Emit(CaptureEvent::Ended { id: a.id, reason }),
             Out::Emit(CaptureEvent::EdgeReleased {
@@ -766,8 +908,13 @@ impl Machine {
             ledger: Ledger {
                 keys: pending.ledger.keys,
                 buttons: BTreeSet::new(),
+                // The ups of keys and buttons pressed before the activation seen so far still
+                // owe a local release when the activation ends.
+                foreign_keys: pending.ledger.foreign_keys,
+                foreign_buttons: pending.ledger.foreign_buttons,
             },
             scrolling: (false, false),
+            last_scroll: now,
         });
         Begin {
             outs: vec![Out::Emit(CaptureEvent::Started { id })],
@@ -775,12 +922,15 @@ impl Machine {
         }
     }
 
-    /// `InputCapture::end`: release the active capture to `at`. Nothing active is a no-op.
+    /// `InputCapture::end`: release the active capture to `at`, or a pending activation (a
+    /// crossing the engine refused still leaves one; this is called only when the engine ends a
+    /// capture, so it releases it too). Nothing pending or active is a no-op.
     pub(super) fn end(&mut self, now: MonoTime, at: (f64, f64)) -> Vec<Out> {
-        if !self.is_active() {
-            return Vec::new();
-        }
-        let outs = self.leave_active(now, at, EndReason::Requested);
+        let outs = match &self.phase {
+            Phase::Idle => return Vec::new(),
+            Phase::Pending(p) => p.abandon_to(now, "ended", at),
+            Phase::Active(_) => self.leave_active(now, at, EndReason::Requested),
+        };
         self.settle(outs)
     }
 
@@ -803,28 +953,37 @@ impl Machine {
         }
     }
 
-    /// The session lost the activation without anything to release (closed, disabled, EIS gone).
+    /// The compositor ended the activation on its own, or the session did (closed, disabled):
+    /// there is nothing to release, and the ups owed to local clients can be replayed at once.
     pub(super) fn lost(&mut self, now: MonoTime) -> Vec<Out> {
-        match std::mem::take(&mut self.phase) {
-            Phase::Idle => Vec::new(),
+        let (mut outs, ups) = match std::mem::take(&mut self.phase) {
+            Phase::Idle => return Vec::new(),
             Phase::Pending(p) => {
-                if p.pressing {
+                let outs = if p.pressing {
                     vec![p.edge_released(now)]
                 } else {
                     Vec::new()
-                }
+                };
+                (outs, p.ledger.ups())
             }
-            Phase::Active(a) => vec![
-                Out::Emit(CaptureEvent::Ended {
-                    id: a.id,
-                    reason: EndReason::Lost,
-                }),
-                Out::Emit(CaptureEvent::EdgeReleased {
-                    portal: a.entry.portal,
-                    at: now,
-                }),
-            ],
+            Phase::Active(a) => (
+                vec![
+                    Out::Emit(CaptureEvent::Ended {
+                        id: a.id,
+                        reason: EndReason::Lost,
+                    }),
+                    Out::Emit(CaptureEvent::EdgeReleased {
+                        portal: a.entry.portal,
+                        at: now,
+                    }),
+                ],
+                a.ledger.ups(),
+            ),
+        };
+        if !ups.is_empty() {
+            outs.push(Out::LocalUps(ups));
         }
+        outs
     }
 
     /// `CaptureAbort`: end everything now; `Ended { Aborted }` for an active capture.
@@ -900,7 +1059,7 @@ mod tests {
     fn releases(outs: &[Out]) -> Vec<(u32, (f64, f64))> {
         outs.iter()
             .filter_map(|out| match out {
-                Out::Release { activation, at } => Some((*activation, *at)),
+                Out::Release { activation, at, .. } => Some((*activation, *at)),
                 _ => None,
             })
             .collect()
@@ -978,13 +1137,13 @@ mod tests {
     }
 
     #[test]
-    fn moving_inward_more_than_the_hit_box_releases_to_the_origin_and_reports_it() {
+    fn moving_inward_more_than_the_box_releases_to_the_origin_and_reports_it() {
         let (mut m, _) = pending();
-        // 1.5 px inward: inside the box.
-        assert_eq!(pressed(&motion(&mut m, 10, -1.5, 0.0)), vec![0.5]);
-        // Pushing back out first only clamps at the barrier, so the next 2.5 px inward is net -2.5.
-        let _ = motion(&mut m, 20, 40.0, 0.0);
-        let outs = motion(&mut m, 30, -2.5, 0.0);
+        // 31 px inward (an ordinary accelerated push-back): inside the 32 px box.
+        assert_eq!(pressed(&motion(&mut m, 10, -31.0, 0.0)), vec![0.5]);
+        // Pushing back out first only clamps at the barrier, so the next 33 px inward is net -33.
+        let _ = motion(&mut m, 20, 400.0, 0.0);
+        let outs = motion(&mut m, 30, -33.0, 0.0);
         assert_eq!(releases(&outs), vec![(1, (1078.0, 840.0))]);
         let events = emits(&outs);
         assert!(matches!(
@@ -1000,17 +1159,30 @@ mod tests {
     }
 
     #[test]
-    fn leaving_the_stretch_releases_it() {
+    fn leaving_the_stretch_by_more_than_the_slack_releases_it() {
         let (mut m, _) = pending();
-        // 240 px is the middle (840) to the end of the stretch (1080).
-        let outs = motion(&mut m, 10, 0.0, 239.0);
-        assert_eq!(pressed(&outs).len(), 1);
+        // 240 px is the middle (840) to the end of the stretch (1080); the slack allows 32 more.
+        let outs = motion(&mut m, 10, 0.0, 271.0);
+        assert_eq!(pressed(&outs).len(), 1, "1111 is inside the slack");
+        assert!(releases(&outs).is_empty());
         let outs = motion(&mut m, 20, 0.0, 2.0);
         assert_eq!(releases(&outs).len(), 1);
         assert!(matches!(
             emits(&outs).as_slice(),
             [CaptureEvent::EdgeReleased { .. }]
         ));
+        assert!(m.is_idle());
+    }
+
+    #[test]
+    fn the_slack_applies_at_the_start_of_the_stretch_too() {
+        // Start of the stretch is 600; 568 is the last position inside the slack.
+        let (mut m, _) = pending();
+        let outs = motion(&mut m, 10, 0.0, -272.0);
+        assert_eq!(pressed(&outs), vec![0.0], "the press position is clamped");
+        assert!(releases(&outs).is_empty());
+        let outs = motion(&mut m, 20, 0.0, -1.0);
+        assert_eq!(releases(&outs).len(), 1);
         assert!(m.is_idle());
     }
 
@@ -1029,8 +1201,9 @@ mod tests {
         );
         let outs = [outs, m.input(t(5), Some(1), Input::Frame)].concat();
         assert_eq!(pressed(&outs), vec![0.5]);
-        let mut outs = m.input(t(6), Some(1), Input::Motion { dx: 0.0, dy: 3.0 });
-        outs.extend(m.input(t(6), Some(1), Input::Frame));
+        // 31 px inward is inside the box, 2 more are not.
+        assert_eq!(pressed(&motion(&mut m, 6, 0.0, 31.0)).len(), 1);
+        let outs = motion(&mut m, 7, 0.0, 2.0);
         assert_eq!(releases(&outs), vec![(1, (200.0, 2.0))]);
     }
 
@@ -1297,7 +1470,8 @@ mod tests {
             vec![
                 Out::Release {
                     activation: 1,
-                    at: (1000.0, 700.0)
+                    at: (1000.0, 700.0),
+                    ups: Vec::new()
                 },
                 Out::Emit(CaptureEvent::Ended {
                     id: CaptureId(4),
@@ -1363,7 +1537,8 @@ mod tests {
             vec![
                 Out::Release {
                     activation: 1,
-                    at: (1078.0, 840.0)
+                    at: (1078.0, 840.0),
+                    ups: Vec::new()
                 },
                 Out::Emit(CaptureEvent::Ended {
                     id: CaptureId(4),
@@ -1520,5 +1695,333 @@ mod tests {
         let outs = m.abort(t(6));
         assert_eq!(releases(&outs).len(), 1);
         assert!(m.abort(t(7)).is_empty());
+    }
+
+    #[test]
+    fn end_releases_a_pending_activation_too() {
+        // A refused crossing leaves a pending activation and the engine sends no `end`; when it
+        // does call `end` the activation is given back all the same.
+        let (mut m, _) = pending();
+        let outs = m.end(t(40), (1000.0, 700.0));
+        assert_eq!(releases(&outs), vec![(1, (1000.0, 700.0))]);
+        assert!(matches!(
+            emits(&outs).as_slice(),
+            [CaptureEvent::EdgeReleased {
+                portal: PortalId(7),
+                ..
+            }]
+        ));
+        assert!(m.is_idle());
+        // Idempotent, and our own release is expected.
+        assert!(m.end(t(41), (0.0, 0.0)).is_empty());
+        assert!(m.deactivated(t(42), 1).is_empty());
+    }
+
+    // ---- local ups: keys and buttons held before the activation -----------------------------
+
+    const KEY_A_UP: LocalUp = LocalUp::Key(HidUsage::keyboard(0x04));
+    const CTRL_UP: LocalUp = LocalUp::Key(HidUsage::keyboard(0xE0));
+    const SHIFT_UP: LocalUp = LocalUp::Key(HidUsage::keyboard(0xE1));
+    const LEFT_UP: LocalUp = LocalUp::Button(MouseButton::PRIMARY);
+
+    fn key_in(m: &mut Machine, ms: u64, code: u16, down: bool) -> Vec<Out> {
+        m.input(t(ms), Some(1), Input::Key { code, down })
+    }
+
+    fn button_in(m: &mut Machine, ms: u64, code: u32, down: bool) -> Vec<Out> {
+        m.input(t(ms), Some(1), Input::Button { code, down })
+    }
+
+    /// The ups handed over with a release or on their own.
+    fn ups_of(outs: &[Out]) -> Vec<LocalUp> {
+        outs.iter()
+            .flat_map(|out| match out {
+                Out::Release { ups, .. } | Out::LocalUps(ups) => ups.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_ups_of_keys_and_buttons_held_before_the_activation_go_with_its_release() {
+        let (mut m, _) = pending();
+        // Shift and A were down before the activation: only their ups arrive (twice, for A).
+        for (code, ms) in [(42, 1), (30, 2), (30, 3)] {
+            assert!(key_in(&mut m, ms, code, false).is_empty());
+        }
+        // The left button too, and codes with no Crosspane equivalent cannot be replayed.
+        assert!(button_in(&mut m, 4, BTN_LEFT, false).is_empty());
+        assert!(key_in(&mut m, 4, 0x2FF, false).is_empty());
+        assert!(button_in(&mut m, 4, 0x150, false).is_empty());
+        // A key pressed after the activation and released again is not owed.
+        assert!(key_in(&mut m, 5, 31, true).is_empty());
+        assert!(key_in(&mut m, 6, 31, false).is_empty());
+        assert!(button_in(&mut m, 6, BTN_RIGHT, true).is_empty());
+        assert!(button_in(&mut m, 7, BTN_RIGHT, false).is_empty());
+        let outs = m.end(t(10), (1000.0, 800.0));
+        // Once each: keys in code order, then buttons.
+        assert_eq!(ups_of(&outs), vec![KEY_A_UP, SHIFT_UP, LEFT_UP]);
+        assert!(matches!(
+            outs.first(),
+            Some(Out::Release { activation: 1, .. })
+        ));
+        assert!(m.is_idle());
+    }
+
+    #[test]
+    fn a_key_pressed_after_the_activation_is_never_owed() {
+        let (mut m, _) = pending();
+        let _ = key_in(&mut m, 1, 30, true);
+        // Held at begin, released while captured: the router handles that one.
+        let begin = m.begin(t(5), CaptureId(1), PortalId(7), true, LOCKS);
+        assert_eq!(
+            begin.result.unwrap().held_keys,
+            vec![HidUsage::keyboard(0x04)]
+        );
+        let outs = key_in(&mut m, 6, 30, false);
+        assert_eq!(emits(&outs).len(), 1, "the up is still forwarded");
+        let _ = key_in(&mut m, 7, 31, true);
+        let outs = m.end(t(8), (1000.0, 800.0));
+        assert!(ups_of(&outs).is_empty());
+        assert!(matches!(
+            outs.first(),
+            Some(Out::Release { ups, .. }) if ups.is_empty()
+        ));
+    }
+
+    #[test]
+    fn ups_seen_before_and_after_begin_are_both_owed_when_the_capture_ends() {
+        let (mut m, _) = pending();
+        let _ = key_in(&mut m, 1, 29, false);
+        let _ = m.begin(t(5), CaptureId(1), PortalId(7), true, LOCKS);
+        // Forwarded for the router to drop, and remembered for the local release.
+        let outs = key_in(&mut m, 6, 42, false);
+        assert!(matches!(
+            emits(&outs).as_slice(),
+            [CaptureEvent::Key { down: false, .. }]
+        ));
+        let _ = button_in(&mut m, 7, BTN_LEFT, false);
+        let outs = m.end(t(8), (1000.0, 800.0));
+        assert_eq!(ups_of(&outs), vec![CTRL_UP, SHIFT_UP, LEFT_UP]);
+        // They are handed over once.
+        assert!(m.end(t(9), (0.0, 0.0)).is_empty());
+    }
+
+    #[test]
+    fn every_release_path_carries_the_ups() {
+        let owed = |m: &mut Machine| {
+            let _ = key_in(m, 1, 30, false);
+        };
+        // A pending activation: abandoned (gate, timeout, portal removed, abort, refused begin).
+        let (mut m, _) = pending();
+        owed(&mut m);
+        assert_eq!(ups_of(&m.tick(t(10), false)), vec![KEY_A_UP]);
+        let (mut m, _) = pending();
+        owed(&mut m);
+        assert_eq!(ups_of(&m.tick(t(3_000), true)), vec![KEY_A_UP]);
+        let (mut m, _) = pending();
+        owed(&mut m);
+        assert_eq!(ups_of(&m.portal_gone(t(10), |_| false)), vec![KEY_A_UP]);
+        let (mut m, _) = pending();
+        owed(&mut m);
+        assert_eq!(ups_of(&m.abort(t(10))), vec![KEY_A_UP]);
+        let (mut m, _) = pending();
+        owed(&mut m);
+        let _ = button_in(&mut m, 2, BTN_RIGHT, true);
+        let begin = m.begin(t(10), CaptureId(1), PortalId(7), true, LOCKS);
+        assert!(matches!(
+            begin.result,
+            Err(PlatformError::PointerButtonHeld)
+        ));
+        assert_eq!(ups_of(&begin.outs), vec![KEY_A_UP]);
+        // An active capture: closed gate, removed portal, abort.
+        let active = || {
+            let (mut m, _) = pending();
+            owed(&mut m);
+            let _ = m.begin(t(5), CaptureId(1), PortalId(7), true, LOCKS);
+            m
+        };
+        assert_eq!(ups_of(&active().tick(t(10), false)), vec![KEY_A_UP]);
+        assert_eq!(
+            ups_of(&active().portal_gone(t(10), |_| false)),
+            vec![KEY_A_UP]
+        );
+        assert_eq!(ups_of(&active().abort(t(10))), vec![KEY_A_UP]);
+    }
+
+    #[test]
+    fn an_activation_the_compositor_ended_owes_its_ups_without_a_release() {
+        // Active: Ended, EdgeReleased, the ups, then the re-arm.
+        let (mut m, _) = pending();
+        let _ = key_in(&mut m, 1, 42, false);
+        let _ = m.begin(t(5), CaptureId(4), PortalId(7), true, LOCKS);
+        let outs = m.deactivated(t(40), 1);
+        assert!(releases(&outs).is_empty());
+        assert!(matches!(
+            outs.as_slice(),
+            [
+                Out::Emit(CaptureEvent::Ended { .. }),
+                Out::Emit(CaptureEvent::EdgeReleased { .. }),
+                Out::LocalUps(ups),
+                Out::Rearm
+            ] if ups == &[SHIFT_UP]
+        ));
+        // Pending (the escape chord before the begin).
+        let (mut m, _) = pending();
+        let _ = key_in(&mut m, 1, 42, false);
+        let outs = m.deactivated(t(40), 1);
+        assert_eq!(ups_of(&outs), vec![SHIFT_UP]);
+        // The session going away does the same.
+        let (mut m, _) = pending();
+        let _ = key_in(&mut m, 1, 42, false);
+        assert_eq!(ups_of(&m.lost(t(50))), vec![SHIFT_UP]);
+        // Nothing owed, no event.
+        let (mut m, _) = pending();
+        assert!(!m.lost(t(50)).iter().any(|o| matches!(o, Out::LocalUps(_))));
+    }
+
+    #[test]
+    fn a_new_activation_drops_the_ups_of_one_whose_deactivation_was_missed() {
+        // The compositor holds the new activation already: an injected up would be captured.
+        let (mut m, _) = pending();
+        let _ = key_in(&mut m, 1, 30, false);
+        let outs = m.activated(t(100), 2, Some((right_entry(), 0.1)), (1080.0, 650.0), true);
+        assert!(ups_of(&outs).is_empty());
+        assert!(!outs.iter().any(|o| matches!(o, Out::LocalUps(_))));
+    }
+
+    #[test]
+    fn replayed_early_input_counts_for_the_ups_like_live_input() {
+        let mut m = Machine::new();
+        // A key up that outran the signal.
+        assert!(key_in(&mut m, 0, 30, false).is_empty());
+        let outs = m.activated(t(2), 1, Some((right_entry(), 0.5)), (1080.0, 840.0), true);
+        assert_eq!(pressed(&outs), vec![0.5]);
+        assert_eq!(ups_of(&m.end(t(5), (1000.0, 800.0))), vec![KEY_A_UP]);
+    }
+
+    // ---- input for an activation that never arrives -----------------------------------------
+
+    #[test]
+    fn input_for_an_activation_that_never_arrives_asks_to_release_after_250_ms() {
+        let mut m = Machine::new();
+        assert!(!m.busy());
+        assert!(
+            m.input(t(0), Some(1), Input::Motion { dx: 1.0, dy: 0.0 })
+                .is_empty()
+        );
+        assert!(
+            m.input(t(100), Some(1), Input::Frame).is_empty(),
+            "held back"
+        );
+        // Waiting input keeps the machine ticking even though nothing is pending.
+        assert!(m.is_idle() && m.busy());
+        assert!(m.tick(t(249), true).is_empty());
+        assert!(m.busy());
+        let outs = m.tick(t(250), true);
+        assert_eq!(outs, vec![Out::ReleaseUnknown]);
+        assert!(!m.busy());
+        assert_eq!(m.dropped(), 2);
+        // The buffer is gone, whatever the signal does later.
+        assert!(m.tick(t(260), true).is_empty());
+        let outs = m.activated(t(300), 1, Some((right_entry(), 0.5)), (1080.0, 840.0), true);
+        assert_eq!(emits(&outs).len(), 1);
+        assert!(matches!(m.live(), Some((1, _))));
+    }
+
+    #[test]
+    fn input_that_the_signal_claims_in_time_is_not_stale() {
+        let mut m = Machine::new();
+        assert!(
+            m.input(t(0), Some(1), Input::Motion { dx: 1.0, dy: 0.0 })
+                .is_empty()
+        );
+        let outs = m.activated(t(200), 1, Some((right_entry(), 0.5)), (1080.0, 840.0), true);
+        assert_eq!(emits(&outs).len(), 1);
+        assert!(m.tick(t(260), true).is_empty());
+        // A closed gate expires waiting input as well.
+        let mut m = Machine::new();
+        let _ = m.input(t(0), Some(1), Input::Frame);
+        assert_eq!(m.tick(t(400), false), vec![Out::ReleaseUnknown]);
+    }
+
+    // ---- smooth scrolling that never finishes ------------------------------------------------
+
+    fn scroll_phase(outs: &[Out]) -> Vec<(ScrollPhase, bool, bool)> {
+        outs.iter()
+            .filter_map(|out| match out {
+                Out::Emit(CaptureEvent::Scroll { delta, .. }) => {
+                    Some((delta.phase, delta.stop_x, delta.stop_y))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn smooth_in(m: &mut Machine, ms: u64, dx: f64, dy: f64) -> Vec<Out> {
+        m.input(t(ms), Some(1), Input::Scroll(Scroll::Smooth { dx, dy }))
+    }
+
+    #[test]
+    fn a_smooth_scroll_with_no_event_for_150_ms_is_ended() {
+        let (mut m, _) = pending();
+        let _ = m.begin(t(5), CaptureId(1), PortalId(7), true, LOCKS);
+        // No gesture, nothing to end.
+        assert!(m.tick(t(1_000), true).is_empty());
+        assert_eq!(
+            scroll_phase(&smooth_in(&mut m, 1_100, 0.0, 5.0)),
+            vec![(ScrollPhase::Began, false, false)]
+        );
+        // Another event refreshes the clock.
+        let _ = smooth_in(&mut m, 1_200, 0.0, 1.0);
+        assert!(m.tick(t(1_349), true).is_empty());
+        let outs = m.tick(t(1_350), true);
+        match outs.as_slice() {
+            [Out::Emit(CaptureEvent::Scroll { delta, at })] => {
+                assert_eq!(
+                    (delta.phase, delta.stop_x, delta.stop_y),
+                    (ScrollPhase::Ended, false, true)
+                );
+                assert_eq!(delta.pixels, Some(VectorLogical::new(0.0, 0.0)));
+                assert_eq!(*at, t(1_350));
+            }
+            other => panic!("expected the scroll end, got {other:?}"),
+        }
+        // Over: nothing more, and the next gesture begins again.
+        assert!(m.tick(t(1_400), true).is_empty());
+        assert_eq!(
+            scroll_phase(&smooth_in(&mut m, 1_500, 2.0, 0.0)),
+            vec![(ScrollPhase::Began, false, false)]
+        );
+        // Both axes end together.
+        let _ = smooth_in(&mut m, 1_510, 0.0, 1.0);
+        assert_eq!(
+            scroll_phase(&m.tick(t(1_700), true)),
+            vec![(ScrollPhase::Ended, true, true)]
+        );
+    }
+
+    #[test]
+    fn a_gesture_the_compositor_ended_or_a_wheel_needs_no_idle_end() {
+        let (mut m, _) = pending();
+        let _ = m.begin(t(5), CaptureId(1), PortalId(7), true, LOCKS);
+        let _ = smooth_in(&mut m, 10, 0.0, 5.0);
+        let _ = m.input(
+            t(20),
+            Some(1),
+            Input::Scroll(Scroll::Stop { x: false, y: true }),
+        );
+        assert!(m.tick(t(1_000), true).is_empty());
+        // Wheel detents are not gestures.
+        let _ = m.input(
+            t(1_010),
+            Some(1),
+            Input::Scroll(Scroll::Discrete { dx: 0, dy: 120 }),
+        );
+        assert!(m.tick(t(2_000), true).is_empty());
+        // A pending activation routes nothing, so it has no gesture either.
+        let (mut m, _) = pending();
+        let _ = smooth_in(&mut m, 10, 0.0, 5.0);
+        assert!(m.tick(t(1_000), true).is_empty());
     }
 }

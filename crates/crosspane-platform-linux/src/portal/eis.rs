@@ -29,6 +29,15 @@
 //! **Recovery.** A crashed process's EIS connection died with it and the compositor released its
 //! devices, so `recover_keys`/`recover_buttons` release only what this source holds and return Ok.
 //!
+//! **Local releases** (WP-G1.7). [`EisSource::release_local`] injects the *up* of a key or button
+//! this source never pressed: one that was held on the physical devices when an input-capture
+//! activation began, whose release the compositor swallowed (the capture backend reports them;
+//! the local clients would otherwise keep the key held and repeating). It is a release in every
+//! sense of the contract above: the gate is not consulted, only the up (with its `frame`, wrapped
+//! in `start_emulating`/`stop_emulating`) is sent, and a key or button this source holds itself is
+//! left alone (its owner releases it). [`EisSource::lock_keys`] is the source's latest lock-key
+//! state for the capture backend's `CaptureStart`.
+//!
 //! # How it works
 //!
 //! - **Handshake.** The context type is *sender*, the name `Crosspane`. On each announced seat the
@@ -92,6 +101,7 @@ use rustix::event::EventfdFlags;
 
 use self::conn::backend;
 use self::worker::{Action, Command, Inner};
+use super::input_capture::LocalUp;
 
 /// The frozen 50 ms input-path limit, less scheduling margin.
 const CALL_BUDGET: Duration = Duration::from_millis(45);
@@ -244,6 +254,27 @@ impl EisSource {
     /// Whether a connection with a resumed keyboard and pointer exists now.
     pub fn is_live(&self) -> bool {
         self.shared.inner.live.load(Ordering::Acquire)
+    }
+
+    /// The latest Caps/Num Lock state the compositor reported to this sender (what
+    /// `KeyInjector::lock_keys` reads), or `None` while neither is known (no connection yet, or
+    /// no report since it resumed: a compositor reports only when some lock is on).
+    pub fn lock_keys(&self) -> Option<LockKeys> {
+        let locks = worker::unpack_locks(self.shared.inner.locks.load(Ordering::Acquire));
+        (locks.caps_lock.is_some() || locks.num_lock.is_some() || locks.scroll_lock.is_some())
+            .then_some(locks)
+    }
+
+    /// Inject the release of a key or button this source did not press (see the module
+    /// documentation, "Local releases"). Releases only, so it goes through while the gate is
+    /// closed; with no connection there is nothing to release and it succeeds. A key or button
+    /// without an evdev code is `Unsupported`.
+    pub fn release_local(&self, up: LocalUp) -> Result<(), PlatformError> {
+        let action = match up {
+            LocalUp::Key(usage) => Action::ReleaseForeignKey(map::key_code(usage)?),
+            LocalUp::Button(button) => Action::ReleaseForeignButton(map::button_code(button)?),
+        };
+        self.shared.call_within(action)
     }
 
     /// Sets (replaces) the hook called with the target display **before every absolute pointer

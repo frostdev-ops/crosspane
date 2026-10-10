@@ -410,6 +410,7 @@ impl Worker {
         let mut retries = 0u32;
         let mut retry: Option<Pin<Box<Sleep>>> = None;
         loop {
+            shared.panic_point(super::WORKER_THREAD);
             // The work that is due, when nothing is held.
             if want_install && shared.machine_idle() {
                 let (generation, wanted) = shared.control.wanted();

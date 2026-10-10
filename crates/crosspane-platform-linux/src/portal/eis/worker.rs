@@ -111,6 +111,10 @@ pub(super) enum Action {
     Scroll(ScrollPlan),
     ReleaseButtons,
     RecoverButtons(Vec<u32>),
+    /// The up of a key this source did not press (WP-G1.7 local release).
+    ReleaseForeignKey(u16),
+    /// The up of a button this source did not press (WP-G1.7 local release).
+    ReleaseForeignButton(u32),
     /// Make the worker fail, to see what the handles report afterwards.
     #[cfg(test)]
     Panic,
@@ -228,6 +232,10 @@ fn execute(
         }
         Action::ReleaseButtons => release(conn, |c| c.release_buttons(deadline)),
         Action::RecoverButtons(codes) => release(conn, |c| c.recover_buttons(&codes, deadline)),
+        Action::ReleaseForeignKey(code) => release(conn, |c| c.release_foreign_key(code, deadline)),
+        Action::ReleaseForeignButton(code) => {
+            release(conn, |c| c.release_foreign_button(code, deadline))
+        }
         #[cfg(test)]
         Action::Panic => panic!("test: the EIS worker is made to fail"),
     }

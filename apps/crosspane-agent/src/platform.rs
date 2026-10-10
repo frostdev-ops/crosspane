@@ -2076,7 +2076,9 @@ fn create_portal(
     };
     use crosspane_platform_linux::logind::{LockerEvidence, LogindSession};
     use crosspane_platform_linux::permissions::LinuxPermissions;
-    use crosspane_platform_linux::portal::input_capture::{InputCaptureConfig, PortalInputCapture};
+    use crosspane_platform_linux::portal::input_capture::{
+        InputCaptureConfig, LocalUp, PortalInputCapture,
+    };
     use crosspane_platform_linux::portal::screencast::{PortalScreenCast, ScreenCastConfig};
     use crosspane_platform_linux::portal::{eis::EisSource, shortcuts::PortalHotkeys};
     use crosspane_platform_linux::wayland_outputs::WaylandOutputs;
@@ -2188,6 +2190,9 @@ fn create_portal(
         let source = source.clone();
         Arc::new(move || source.is_live()) as Arc<dyn Fn() -> bool + Send + Sync>
     });
+    // The capture backend shares the injection source: its lock-key state, and the local release
+    // of keys that were held when a capture began (releases only).
+    let capture_source = source.clone();
     // The consent may be asked now (the first time): this is the startup, off the input path.
     let portal_session = source.and_then(|source| start_portal_session(state_dir, source));
 
@@ -2200,10 +2205,17 @@ fn create_portal(
             PortalInputCapture::new(
                 InputCaptureConfig {
                     displays: displays_fn.clone(),
-                    // G1.7: lock keys. `EisSource::lock_keys` does not exist yet, so the lock-key
-                    // state is unknown: capture starts with it unset and the target's lock keys
-                    // are left alone.
-                    lock_keys: Arc::new(|| None),
+                    lock_keys: {
+                        let source = capture_source.clone();
+                        Arc::new(move || source.as_ref().and_then(EisSource::lock_keys))
+                    },
+                    local_release: capture_source.clone().map(|source| {
+                        Arc::new(move |up: LocalUp| {
+                            if let Err(error) = source.release_local(up) {
+                                tracing::debug!(%error, "replaying a held key's release failed");
+                            }
+                        }) as Arc<dyn Fn(LocalUp) + Send + Sync>
+                    }),
                     gate: gate.clone(),
                     // A5: the extension (bridge v2) hides the frozen local cursor while captured.
                     cursor: bridge.as_ref().filter(|b| b.version() >= 2).map(|bridge| {

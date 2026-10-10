@@ -30,6 +30,7 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use super::keymap::test_keymap_text;
 use super::worker::Action;
 use super::{DisplaysFn, EisKeyInjector, EisPointerInjector, EisSource};
+use crate::portal::input_capture::LocalUp;
 
 const WAIT: Duration = Duration::from_secs(3);
 
@@ -947,7 +948,10 @@ fn lock_keys_follow_the_compositor_and_taps_toggle() {
         ("keyboard", Seen::Key(69, false)),
         ("keyboard", Seen::Frame),
     ]);
-    assert_eq!(rig.keys.lock_keys().unwrap().num_lock, Some(true));
+    // The worker publishes the state after it has answered the call.
+    wait_until("the guess to be published", || {
+        rig.keys.lock_keys().unwrap().num_lock == Some(true)
+    });
     // The compositor's own report replaces the guess.
     rig.fake.send(Ctl::Modifiers {
         device: "keyboard",
@@ -1246,4 +1250,149 @@ fn recovery_releases_only_what_this_source_holds() {
         ("pointer", Seen::Stop),
     ]);
     rig.fake.quiet();
+}
+
+// ---- WP-G1.7 review round 1: local releases and the sender's lock-key state ------------------
+
+#[test]
+fn release_local_sends_only_the_up_of_a_key_or_button_this_source_never_pressed() {
+    let rig = rig();
+    rig.source.release_local(LocalUp::Key(KEY_A)).unwrap();
+    rig.fake.expect(&[
+        ("keyboard", Seen::Start(1)),
+        ("keyboard", Seen::Key(30, false)),
+        ("keyboard", Seen::Frame),
+        ("keyboard", Seen::Stop),
+    ]);
+    rig.source
+        .release_local(LocalUp::Button(MouseButton::PRIMARY))
+        .unwrap();
+    rig.fake.expect(&[
+        ("pointer", Seen::Start(2)),
+        ("pointer", Seen::Button(0x110, false)),
+        ("pointer", Seen::Frame),
+        ("pointer", Seen::Stop),
+    ]);
+    rig.fake.quiet();
+}
+
+#[test]
+fn release_local_goes_through_while_the_gate_is_closed() {
+    let mut rig = rig();
+    rig.gate.set_engine_permits(false);
+    rig.source.release_local(LocalUp::Key(KEY_B)).unwrap();
+    rig.fake.expect(&[
+        ("keyboard", Seen::Start(1)),
+        ("keyboard", Seen::Key(48, false)),
+        ("keyboard", Seen::Frame),
+        ("keyboard", Seen::Stop),
+    ]);
+    rig.source
+        .release_local(LocalUp::Button(MouseButton::SECONDARY))
+        .unwrap();
+    rig.fake.expect(&[
+        ("pointer", Seen::Start(2)),
+        ("pointer", Seen::Button(0x111, false)),
+        ("pointer", Seen::Frame),
+        ("pointer", Seen::Stop),
+    ]);
+    // A press is still refused.
+    assert!(matches!(
+        rig.keys.key(KEY_A, true),
+        Err(PlatformError::Locked)
+    ));
+}
+
+#[test]
+fn release_local_leaves_what_this_source_holds_to_its_owner() {
+    let mut rig = rig();
+    rig.keys.key(KEY_A, true).unwrap();
+    rig.pointer.button(MouseButton::PRIMARY, true).unwrap();
+    rig.fake.expect(&[
+        ("keyboard", Seen::Start(1)),
+        ("keyboard", Seen::Key(30, true)),
+        ("keyboard", Seen::Frame),
+        ("pointer", Seen::Start(2)),
+        ("pointer", Seen::Button(0x110, true)),
+        ("pointer", Seen::Frame),
+    ]);
+    // These are held by the injection itself (a peer controls this node): not the capture's.
+    rig.source.release_local(LocalUp::Key(KEY_A)).unwrap();
+    rig.source
+        .release_local(LocalUp::Button(MouseButton::PRIMARY))
+        .unwrap();
+    rig.fake.quiet();
+    // The owner's own release still goes out, once.
+    rig.keys.key(KEY_A, false).unwrap();
+    rig.fake.expect(&[
+        ("keyboard", Seen::Key(30, false)),
+        ("keyboard", Seen::Frame),
+    ]);
+    rig.fake.quiet();
+}
+
+#[test]
+fn release_local_without_a_connection_succeeds_and_unmapped_input_is_refused() {
+    let (_gate, source, _keys, _pointer) = source_with(two_displays());
+    source.release_local(LocalUp::Key(KEY_A)).unwrap();
+    source
+        .release_local(LocalUp::Button(MouseButton::PRIMARY))
+        .unwrap();
+    let unmapped = HidUsage {
+        page: 0x0c,
+        id: 0xfff0,
+    };
+    assert!(matches!(
+        source.release_local(LocalUp::Key(unmapped)),
+        Err(PlatformError::Unsupported(_))
+    ));
+    assert!(matches!(
+        source.release_local(LocalUp::Button(MouseButton(0))),
+        Err(PlatformError::Unsupported(_))
+    ));
+    source.detach();
+}
+
+#[test]
+fn the_source_reports_the_lock_keys_its_sender_last_knew() {
+    // Nothing is known before a connection, or without a keymap to read the report against.
+    let (_gate, source, _keys, _pointer) = source_with(two_displays());
+    assert_eq!(source.lock_keys(), None);
+    let plain = rig();
+    assert_eq!(plain.source.lock_keys(), None);
+    drop(plain);
+
+    let Some(text) = test_keymap_text() else {
+        eprintln!("skipped: the xkb data files are not installed");
+        return;
+    };
+    let rig = rig_with(
+        vec![
+            keyboard(Some(text)),
+            absolute("absolute", vec![(0, 0, 1920, 1080)]),
+        ],
+        two_displays(),
+    );
+    assert_eq!(rig.source.lock_keys(), None);
+    rig.fake.send(Ctl::Modifiers {
+        device: "keyboard",
+        locked: 1 << 1,
+    });
+    wait_until("caps lock to be reported", || {
+        rig.source.lock_keys().is_some()
+    });
+    assert_eq!(
+        rig.source.lock_keys(),
+        Some(LockKeys {
+            caps_lock: Some(true),
+            num_lock: Some(false),
+            scroll_lock: None,
+        })
+    );
+    assert_eq!(rig.source.lock_keys(), Some(rig.keys.lock_keys().unwrap()));
+    // The state goes with the connection.
+    rig.source.detach();
+    wait_until("the lock state to be cleared", || {
+        rig.source.lock_keys().is_none()
+    });
 }

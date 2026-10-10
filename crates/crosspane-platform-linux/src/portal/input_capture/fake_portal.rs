@@ -169,6 +169,8 @@ struct Inner {
     activation_counter: u32,
     eis: Option<fake_eis::Fake>,
     tokens: u32,
+    /// `Release` answers this late (to see what the backend does when the portal is slow).
+    release_delay: Option<Duration>,
 }
 
 struct Fake {
@@ -475,6 +477,10 @@ impl FakeInputCapture {
             activation: option_u32(&options, "activation_id"),
             cursor,
         });
+        let delay = self.0.lock().release_delay;
+        if let Some(delay) = delay {
+            super::sleep::Sleep::new(delay).await;
+        }
         let id = {
             let mut inner = self.0.lock();
             let Some(id) = inner.activated.take() else {
@@ -602,6 +608,7 @@ impl Portal {
                 activation_counter: 0,
                 eis: None,
                 tokens: 0,
+                release_delay: None,
             }),
         });
         let connection = zbus::block_on(async {
@@ -932,6 +939,9 @@ struct Rig {
     cursor: Arc<Mutex<Vec<bool>>>,
     /// How many of the next "show" calls of the cursor hook fail.
     cursor_failures: Arc<AtomicUsize>,
+    /// The local releases the backend replayed, and whether the fake compositor still held the
+    /// activation at that moment (an injected up would be captured then).
+    ups: Arc<Mutex<Vec<(LocalUp, bool)>>>,
     dir: TempDir,
 }
 
@@ -947,6 +957,7 @@ impl Rig {
             displays: Arc::new(Mutex::new(layout(600.0))),
             cursor: Arc::new(Mutex::new(Vec::new())),
             cursor_failures: Arc::new(AtomicUsize::new(0)),
+            ups: Arc::new(Mutex::new(Vec::new())),
             dir: TempDir::new(),
         };
         rig.gate.set_session_permits(true);
@@ -964,6 +975,8 @@ impl Rig {
         let displays = Arc::clone(&self.displays);
         let cursor = Arc::clone(&self.cursor);
         let failures = Arc::clone(&self.cursor_failures);
+        let ups = Arc::clone(&self.ups);
+        let fake = Arc::clone(&self.portal.fake);
         let config = InputCaptureConfig {
             displays: Arc::new(move || displays.lock().unwrap().clone()),
             lock_keys: Arc::new(|| {
@@ -981,6 +994,10 @@ impl Rig {
                 }
                 cursor.lock().unwrap().push(hidden);
                 Ok(())
+            })),
+            local_release: Some(Arc::new(move |up| {
+                let held = fake.lock().activated.is_some();
+                ups.lock().unwrap().push((up, held));
             })),
             token_path: self.dir.token_path(),
             quirks,
@@ -1289,9 +1306,20 @@ fn a_pending_activation_the_pointer_leaves_is_released_to_its_origin() {
     let mut rig = rig!(1, false);
     rig.arm(&[hdmi_right()]);
     rig.press();
-    // Push outwards, then move 3 px back in: net inward beyond the hit box.
+    // An ordinary push-back (30 px inward, accelerated EIS motion) keeps the crossing pending.
     rig.eis_motion(20.0, 0.0);
-    rig.eis_motion(-3.0, 0.0);
+    rig.eis_motion(-30.0, 0.0);
+    rig.events
+        .wait_for("the press", |events| pressed(events) >= 3);
+    assert!(
+        !rig.portal
+            .calls()
+            .iter()
+            .any(|c| matches!(c, Call::Release { .. }))
+    );
+    // Push outwards again, then 40 px back in: net inward beyond the 32 px box.
+    rig.eis_motion(40.0, 0.0);
+    rig.eis_motion(-40.0, 0.0);
     let calls = rig.portal.wait_calls("the release", |calls| {
         calls.iter().any(|c| matches!(c, Call::Release { .. }))
     });
@@ -1698,4 +1726,328 @@ fn an_unreadable_activation_is_released_anyway() {
         "{calls:?}"
     );
     assert!(pressed(&rig.events.all()) == 0);
+}
+
+// ---- review round 1: local ups, stale early input, thread death -----------------------------
+
+impl Rig {
+    fn eis_key(&self, code: u32, down: bool) {
+        self.portal.eis(Cmd::Key(code, down));
+        self.portal.eis(Cmd::Frame(Target::Keyboard));
+    }
+
+    fn eis_button(&self, code: u32, down: bool) {
+        self.portal.eis(Cmd::Button(code, down));
+        self.portal.eis(Cmd::Frame(Target::Pointer));
+    }
+
+    fn wait_ups(&self, count: usize) -> Vec<(LocalUp, bool)> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let ups = self.ups.lock().unwrap().clone();
+            if ups.len() >= count {
+                return ups;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {count} local releases: {ups:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn releases(&self) -> usize {
+        self.portal
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::Release { .. }))
+            .count()
+    }
+}
+
+const UP_CTRL: LocalUp = LocalUp::Key(HidUsage::keyboard(0xE0));
+const UP_A: LocalUp = LocalUp::Key(HidUsage::keyboard(0x04));
+const UP_SHIFT: LocalUp = LocalUp::Key(HidUsage::keyboard(0xE1));
+const UP_LEFT: LocalUp = LocalUp::Button(crosspane_types::hid::MouseButton::PRIMARY);
+
+#[test]
+fn the_releases_of_keys_held_before_the_activation_are_replayed_after_the_capture_ends() {
+    let mut rig = rig!(1, false);
+    rig.arm(&[hdmi_right()]);
+    rig.press();
+    // A and the left button were down before the activation; only their ups arrive. A key
+    // pressed (and released) after the activation is not owed.
+    rig.eis_key(30, false);
+    rig.eis_button(0x110, false);
+    rig.eis_key(31, true);
+    rig.eis_key(31, false);
+    rig.eis_motion(0.0, 24.0);
+    rig.events
+        .wait_for("a press after the input", |events| pressed(events) >= 2);
+    rig.capture().begin(CaptureId(7), PortalId(1)).unwrap();
+    // Ctrl and Shift were held too; their ups arrive while captured and are forwarded.
+    rig.eis_key(29, false);
+    rig.eis_key(42, false);
+    rig.events.wait_for("the forwarded ups", |events| {
+        events
+            .iter()
+            .filter(|e| matches!(e, Ev::Key { down: false, .. }))
+            .count()
+            >= 2
+    });
+    // While the capture lasts nothing is injected (the compositor would capture it).
+    thread::sleep(Duration::from_millis(100));
+    assert!(rig.ups.lock().unwrap().is_empty());
+    rig.capture().end(None).unwrap();
+    let ups = rig.wait_ups(4);
+    // Once each, keys in code order then buttons; the activation was already released.
+    assert_eq!(
+        ups.iter().map(|(up, _)| *up).collect::<Vec<_>>(),
+        vec![UP_CTRL, UP_A, UP_SHIFT, UP_LEFT]
+    );
+    assert!(ups.iter().all(|(_, held)| !held), "{ups:?}");
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(rig.ups.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn the_ups_of_an_abandoned_pending_activation_are_replayed_after_its_release() {
+    let mut rig = rig!(1, false);
+    rig.arm(&[hdmi_right()]);
+    rig.press();
+    rig.eis_key(42, false);
+    // A press after the key shows the key was processed (a closed gate drops later input).
+    rig.eis_motion(0.0, 10.0);
+    rig.events
+        .wait_for("a press after the input", |events| pressed(events) >= 2);
+    rig.gate.set_session_permits(false);
+    let ups = rig.wait_ups(1);
+    assert_eq!(ups, vec![(UP_SHIFT, false)]);
+    assert_eq!(rig.releases(), 1);
+}
+
+#[test]
+fn the_ups_of_an_activation_the_compositor_ended_are_replayed() {
+    let mut rig = rig!(1, false);
+    rig.arm(&[hdmi_right()]);
+    rig.press();
+    rig.capture().begin(CaptureId(5), PortalId(1)).unwrap();
+    rig.eis_key(29, false);
+    rig.events.wait_for("the forwarded up", |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, Ev::Key { down: false, .. }))
+    });
+    rig.portal.cancel_externally();
+    rig.events.wait_for("Ended Lost", |events| {
+        ended(events) == vec![(CaptureId(5), EndReason::Lost)]
+    });
+    assert_eq!(rig.wait_ups(1), vec![(UP_CTRL, false)]);
+    assert_eq!(rig.releases(), 0, "the compositor let go by itself");
+}
+
+#[test]
+fn the_ups_are_replayed_after_an_abort_released_the_activation() {
+    let mut rig = rig!(1, false);
+    rig.arm(&[hdmi_right()]);
+    rig.press();
+    rig.eis_key(30, false);
+    rig.eis_motion(0.0, 10.0);
+    rig.events
+        .wait_for("a press after the input", |events| pressed(events) >= 2);
+    rig.capture().begin(CaptureId(4), PortalId(1)).unwrap();
+    rig.capture().abort_handle().abort();
+    assert_eq!(rig.wait_ups(1), vec![(UP_A, false)]);
+    rig.events.wait_for("Ended Aborted", |events| {
+        ended(events) == vec![(CaptureId(4), EndReason::Aborted)]
+    });
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(rig.ups.lock().unwrap().len(), 1, "replayed once");
+}
+
+#[test]
+fn nothing_is_replayed_when_the_release_failed() {
+    let mut rig = rig!(1, false);
+    rig.arm(&[hdmi_right()]);
+    rig.press();
+    rig.eis_key(30, false);
+    rig.eis_motion(0.0, 10.0);
+    rig.events
+        .wait_for("a press after the input", |events| pressed(events) >= 2);
+    // The portal answers `Release` far too late: the activation may still be held when the
+    // call gives up, and an injected up would be captured, so none is replayed.
+    rig.portal.fake.lock().release_delay = Some(Duration::from_secs(1));
+    rig.capture().abort_handle().abort();
+    rig.portal.wait_calls("the release", |calls| {
+        calls.iter().any(|c| matches!(c, Call::Release { .. }))
+    });
+    thread::sleep(Duration::from_millis(400));
+    assert!(rig.ups.lock().unwrap().is_empty());
+    // The same for the release thread's own releases (here: the gate closing).
+    let mut rig = rig!(1, false);
+    rig.arm(&[hdmi_right()]);
+    rig.press();
+    rig.eis_key(30, false);
+    rig.eis_motion(0.0, 10.0);
+    rig.events
+        .wait_for("a press after the input", |events| pressed(events) >= 2);
+    rig.portal.fake.lock().release_delay = Some(Duration::from_secs(1));
+    rig.gate.set_session_permits(false);
+    rig.portal.wait_calls("the release", |calls| {
+        calls.iter().any(|c| matches!(c, Call::Release { .. }))
+    });
+    thread::sleep(Duration::from_millis(600));
+    assert!(rig.ups.lock().unwrap().is_empty());
+}
+
+#[test]
+fn end_gives_back_a_pending_activation() {
+    let mut rig = rig!(1, false);
+    rig.arm(&[hdmi_right()]);
+    rig.press();
+    // The engine refused the crossing and later ends it: the activation is released, at the
+    // warp point when there is one.
+    rig.capture()
+        .end(Some((DisplayId(3), PointDevice::new(500.0, 100.0))))
+        .unwrap();
+    let calls = rig.portal.calls();
+    assert!(
+        calls.contains(&Call::Release {
+            activation: Some(1),
+            cursor: Some((500.0, 700.0))
+        }),
+        "{calls:?}"
+    );
+    rig.events.wait_for("EdgeReleased", |events| {
+        events.iter().any(|e| {
+            matches!(
+                e,
+                Ev::EdgeReleased {
+                    portal: PortalId(1),
+                    ..
+                }
+            )
+        })
+    });
+    assert!(matches!(
+        rig.capture().begin(CaptureId(1), PortalId(1)),
+        Err(PlatformError::NotFound)
+    ));
+    // Nothing is held any more.
+    rig.capture().end(None).unwrap();
+    assert_eq!(rig.releases(), 1);
+}
+
+#[test]
+fn input_for_an_activation_that_is_never_announced_is_released_after_250_ms() {
+    let mut rig = rig!(1, false);
+    rig.arm(&[hdmi_right()]);
+    // The compositor holds an activation whose `Activated` signal never reaches us: only its
+    // devices start emulating.
+    rig.portal.fake.lock().activated = Some(7);
+    let started = Instant::now();
+    rig.portal.eis(Cmd::Start(Target::Pointer, 7));
+    rig.eis_motion(3.0, 1.0);
+    let calls = rig.portal.wait_calls("the release", |calls| {
+        calls.iter().any(|c| matches!(c, Call::Release { .. }))
+    });
+    let waited = started.elapsed();
+    assert!(
+        calls.contains(&Call::Release {
+            activation: None,
+            cursor: None
+        }),
+        "{calls:?}"
+    );
+    assert!(
+        waited >= Duration::from_millis(240),
+        "released after {waited:?}"
+    );
+    assert!(waited < Duration::from_secs(2), "released after {waited:?}");
+    assert_eq!(pressed(&rig.events.all()), 0);
+}
+
+/// Make `thread` panic at its next pass and wake it.
+fn kill(rig: &mut Rig, thread: &'static str) {
+    let shared = Arc::clone(&rig.capture().shared);
+    *shared.panic_in.lock().unwrap() = Some(thread);
+    match thread {
+        super::EIS_THREAD => shared.eis.wake.wake(),
+        super::ABORT_THREAD => shared.abort_wake.wake(),
+        super::CALLER_THREAD => shared.caller.wake.wake(),
+        super::CURSOR_THREAD => shared.cursor_wake.wake(),
+        _ => shared.control.poke(),
+    }
+}
+
+#[test]
+fn a_thread_that_dies_never_leaves_the_compositor_activated() {
+    for thread in [
+        super::EIS_THREAD,
+        super::ABORT_THREAD,
+        super::CALLER_THREAD,
+        super::CURSOR_THREAD,
+        super::WORKER_THREAD,
+    ] {
+        let mut rig = rig!(1, false);
+        rig.arm(&[hdmi_right()]);
+        rig.press();
+        rig.eis_key(30, false);
+        rig.eis_motion(0.0, 10.0);
+        rig.events
+            .wait_for("a press after the input", |events| pressed(events) >= 2);
+        rig.capture().begin(CaptureId(3), PortalId(1)).unwrap();
+        rig.portal.fake.lock().calls.clear();
+        let before = Instant::now();
+        kill(&mut rig, thread);
+        // The activation is released and the session closed, whatever thread died.
+        let calls = rig.portal.wait_calls(thread, |calls| {
+            calls.iter().any(|c| matches!(c, Call::Release { .. })) && calls.contains(&Call::Close)
+        });
+        let close = rig
+            .portal
+            .timed_calls()
+            .into_iter()
+            .find(|(_, call)| *call == Call::Close)
+            .map(|(at, _)| at.saturating_duration_since(before))
+            .unwrap();
+        assert!(
+            close < Duration::from_millis(500),
+            "{thread}: Close took {close:?} ({calls:?})"
+        );
+        assert!(
+            rig.portal.fake.lock().activated.is_none(),
+            "{thread}: still activated"
+        );
+        rig.events.wait_for("Ended Aborted", |events| {
+            ended(events) == vec![(CaptureId(3), EndReason::Aborted)]
+        });
+        rig.statuses.wait_for(CaptureStatus::Closed);
+        assert!(!rig.capture().is_ready(), "{thread}");
+        // The local cursor is not left hidden, even when the thread that shows it is the one that
+        // died (it may never have been hidden at all: the hide is asynchronous).
+        let deadline = Instant::now() + WAIT;
+        while rig.cursor.lock().unwrap().last() == Some(&true) {
+            assert!(
+                Instant::now() < deadline,
+                "{thread}: the cursor stayed hidden"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        // The backend is closed for good: no capture, and the portals are refused.
+        assert!(matches!(
+            rig.capture().begin(CaptureId(4), PortalId(1)),
+            Err(PlatformError::NotFound | PlatformError::Locked)
+        ));
+        assert!(matches!(
+            rig.capture().set_portals(&[hdmi_right()]),
+            Err(PlatformError::Backend(_))
+        ));
+        // The held key's release was still replayed once the activation was gone.
+        assert_eq!(rig.wait_ups(1), vec![(UP_A, false)], "{thread}");
+        // Dropping a backend that died is prompt and clean.
+        let dropped = Instant::now();
+        rig.capture = None;
+        assert!(dropped.elapsed() < Duration::from_secs(2), "{thread}");
+    }
 }

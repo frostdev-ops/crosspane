@@ -562,6 +562,28 @@ impl Conn {
         self.flush_release(deadline)
     }
 
+    /// The up of a key this source did not press: one that was down on the physical keyboard
+    /// when an input capture began and whose release the capture swallowed (WP-G1.7). Only the
+    /// up goes out. A key this source holds itself is left to its owner, and with no resumed
+    /// keyboard there is nothing to release to.
+    pub(super) fn release_foreign_key(
+        &mut self,
+        code: u16,
+        deadline: Instant,
+    ) -> Result<(), PlatformError> {
+        if self.ledger.key_device(code).is_some() {
+            return Ok(());
+        }
+        let Some((index, keyboard)) = self.keyboard() else {
+            return Ok(());
+        };
+        self.start(index);
+        keyboard.key(u32::from(code), KeyState::Released);
+        self.frame(index);
+        self.settle();
+        self.flush_release(deadline)
+    }
+
     /// Release every key held, then let go of devices with nothing left.
     pub(super) fn release_keys(&mut self, deadline: Instant) -> Result<(), PlatformError> {
         for (id, codes) in self.ledger.keys_by_device() {
@@ -715,6 +737,26 @@ impl Conn {
         deadline: Instant,
     ) -> Result<(), PlatformError> {
         self.queue_button_up(code);
+        self.flush_release(deadline)
+    }
+
+    /// The up of a button this source did not press (see
+    /// [`release_foreign_key`](Self::release_foreign_key)).
+    pub(super) fn release_foreign_button(
+        &mut self,
+        code: u32,
+        deadline: Instant,
+    ) -> Result<(), PlatformError> {
+        if self.ledger.button_device(code).is_some() {
+            return Ok(());
+        }
+        let Some((index, button)) = self.pick(|d| d.button.clone()) else {
+            return Ok(());
+        };
+        self.start(index);
+        button.button(code, ButtonState::Released);
+        self.frame(index);
+        self.settle();
         self.flush_release(deadline)
     }
 

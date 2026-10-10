@@ -11,14 +11,23 @@
 //! - **A1 pressure** (`pressure.rs`). An activation is reported as `EdgePressed` (repeated once per
 //!   EIS frame that moved the pointer) and routed nowhere: every event until `begin` is consumed
 //!   and only counted. The activation is released to its origin (moved inward) when the virtual
-//!   pointer moves back inward or off the portal's stretch, when the I/O gate closes, when the
-//!   portal is removed, and in any case after 3 s without a `begin`.
+//!   pointer moves back inward (more than 32 logical px) or off the portal's stretch (more than
+//!   32 logical px past either end), when the I/O gate closes, when the portal is removed, when
+//!   `end` is called, and in any case after 3 s without a `begin`. A crossing the engine refuses
+//!   sends no `end` (nothing started), so its activation stays pending until one of those
+//!   happens: a documented limitation, nothing is routed meanwhile.
 //! - **A2 synchronous begin.** `begin` adopts the pending activation: `Ok` means capture is
 //!   effective, `Started` precedes every capture event, and any failure releases the activation.
 //!   `end(warp)` is `Release(activation_id, cursor_position)`.
-//! - **A3 held keys.** Keys held before the activation are unknown to the compositor; `held_keys`
-//!   are the keys pressed since the activation, and releases of earlier ones are delivered as
-//!   `down: false` for the router to drop.
+//! - **A3 held keys (amended).** Keys held before the activation are unknown to the compositor;
+//!   `held_keys` are the keys pressed since the activation, and releases of earlier ones are
+//!   delivered as `down: false` for the router to drop. The compositor does not deliver those
+//!   releases to its local clients either, which would keep the keys held (and repeating), so
+//!   they are also **replayed locally**: [`InputCaptureConfig::local_release`] is called once per
+//!   such key or button, right after the activation ended (after our `Release` returned, or when
+//!   the compositor ended it on its own, or after an abort), never while the compositor still
+//!   holds the activation (the injected release would be captured too), and never for a key
+//!   pressed after the activation. The hook injects releases only.
 //! - **A4 indicator.** GNOME shows its screen-sharing indicator at activation; the engine's HUD
 //!   still precedes `begin`.
 //! - **A5 cursor.** The compositor leaves the local cursor visible and frozen at the edge. The
@@ -51,6 +60,17 @@
 //! thread wakes, reads the live activation from atomics (no lock), issues `Release` within a few
 //! milliseconds, then emits `Ended { Aborted }` through the machine when it can take the lock. It
 //! never drops the EIS fd: mutter keeps consuming input after an EIS-only disconnect.
+//!
+//! # Thread death
+//!
+//! Every backend thread body runs under `catch_unwind`. A panic must never leave the compositor
+//! holding input for a backend that no longer serves it (the EIS thread's death even closes the
+//! fd, which does not release anything): the panicking thread logs at error (the thread name, no
+//! data), bumps the abort epoch (the shutdown thread releases and reports `Ended { Aborted }`; if
+//! it is the one that died, the handler does that itself) and waits for that for up to 40 ms,
+//! sets `closing`, closes the portal session within about 30 ms (which ends any activation on
+//! the compositor's side, whatever the release did), reports `Closed`, and stops the EIS
+//! thread. The backend is not restarted.
 //!
 //! # Logging
 //!
@@ -87,6 +107,7 @@ use crosspane_platform::{
     IoGate, PlatformError, PortalId,
 };
 use crosspane_types::geom::PointDevice;
+use crosspane_types::hid::{HidUsage, MouseButton};
 use crosspane_types::id::DisplayId;
 use crosspane_types::input::LockKeys;
 use crosspane_types::time::MonoTime;
@@ -116,10 +137,30 @@ const RELEASE_BOUND: Duration = Duration::from_millis(300);
 const ABORT_RELEASE_BOUND: Duration = Duration::from_millis(30);
 /// The abort path waits this long for the machine's lock to report `Ended`.
 const ABORT_FENCE: Duration = Duration::from_millis(12);
+/// The backend's thread names (also what a panic report says).
+const WORKER_THREAD: &str = "portal-capture";
+const ABORT_THREAD: &str = "portal-capture-shutdown";
+const CALLER_THREAD: &str = "portal-capture-release";
+const CURSOR_THREAD: &str = "portal-capture-cursor";
+const EIS_THREAD: &str = "portal-capture-eis";
+/// A thread that died waits at most this long for the shutdown thread to release the activation
+/// before it closes the portal session.
+const DEATH_ABORT_WAIT: Duration = Duration::from_millis(40);
+/// A thread that died closes the portal session within this long.
+const DEATH_CLOSE_BOUND: Duration = Duration::from_millis(30);
 /// Dropping the handle waits this long for the abort to be acted on before closing the session.
 const ABORT_SETTLE: Duration = Duration::from_millis(150);
 /// Dropping the handle waits this long for the threads.
 const JOIN_BOUND: Duration = Duration::from_secs(2);
+
+/// The release of a key or button that was already down when a capture activation began, to be
+/// replayed locally ([`InputCaptureConfig::local_release`]). Releases only: nothing here ever
+/// presses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalUp {
+    Key(HidUsage),
+    Button(MouseButton),
+}
 
 /// What the backend needs from its host.
 pub struct InputCaptureConfig {
@@ -131,6 +172,12 @@ pub struct InputCaptureConfig {
     /// Hide (true) / show (false) the local cursor during capture (Shell bridge v2 `InhibitCursor`).
     #[allow(clippy::type_complexity)]
     pub cursor: Option<Arc<dyn Fn(bool) -> Result<(), PlatformError> + Send + Sync>>,
+    /// Replays the release of a key or button that was down before an activation and went up
+    /// during it (the compositor swallowed that up), through the RemoteDesktop EIS sender
+    /// (`EisSource::release_local`). Called on the backend's release thread, once per key or
+    /// button, only after the compositor no longer holds the activation; it must not block for
+    /// long and must not press anything. `None`: those keys stay held for the local clients.
+    pub local_release: Option<Arc<dyn Fn(LocalUp) + Send + Sync>>,
     /// `<state_dir>/portal-input-capture.token`, used only when the portal is version >= 2.
     pub token_path: PathBuf,
     /// Desktop quirks (KDE: xdp-kde `Disable` bug, research §5).
@@ -143,6 +190,7 @@ impl fmt::Debug for InputCaptureConfig {
             .field("token_path", &self.token_path)
             .field("quirks", &self.quirks)
             .field("cursor", &self.cursor.is_some())
+            .field("local_release", &self.local_release.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -518,9 +566,20 @@ enum Request {
     Release {
         activation: u32,
         at: (f64, f64),
+        /// Replayed locally once the portal answered the release (and not before).
+        ups: Vec<LocalUp>,
         reply: Option<SyncSender<Result<(), PlatformError>>>,
     },
+    /// The compositor ended the activation on its own: replay these at once.
+    LocalUps(Vec<LocalUp>),
     Stop,
+}
+
+/// The `Release` the machine asked for that the abort path issues itself.
+struct SkippedRelease {
+    activation: u32,
+    at: (f64, f64),
+    ups: Vec<LocalUp>,
 }
 
 enum EisCmd {
@@ -551,8 +610,12 @@ struct Shared {
     lock_keys: Arc<dyn Fn() -> Option<LockKeys> + Send + Sync>,
     gate: Arc<IoGate>,
     cursor: Option<CursorHook>,
+    local_release: Option<Arc<dyn Fn(LocalUp) + Send + Sync>>,
     token_path: PathBuf,
     quirks: Quirks,
+    /// Test only: the thread that panics at its next pass (see [`Shared::panic_point`]).
+    #[cfg(test)]
+    panic_in: Mutex<Option<&'static str>>,
     /// `None`: the session bus. Tests give a private bus.
     bus_address: Option<String>,
     core: Mutex<Core>,
@@ -613,13 +676,31 @@ impl Shared {
                         sink.send(event);
                     }
                 }
-                Out::Release { activation, at } => {
+                Out::Release {
+                    activation,
+                    at,
+                    ups,
+                } => {
+                    // Without `release` the caller issues the `Release` itself and takes the ups
+                    // along (the abort path).
                     if release {
                         self.caller.push(Request::Release {
                             activation,
                             at,
+                            ups,
                             reply: None,
                         });
+                    }
+                    poke = true;
+                }
+                Out::LocalUps(ups) => {
+                    if release {
+                        self.caller.push(Request::LocalUps(ups));
+                    }
+                }
+                Out::ReleaseUnknown => {
+                    if release {
+                        self.release_unknown();
                     }
                     poke = true;
                 }
@@ -800,7 +881,7 @@ impl Shared {
     /// shutdown thread issues it itself and passes `false`; the `Release` the machine asked for
     /// is then returned, so one for an activation that appeared after the shutdown thread looked
     /// is not lost).
-    fn abort_locked(&self, core: &mut Core, release: bool) -> Option<(u32, (f64, f64))> {
+    fn abort_locked(&self, core: &mut Core, release: bool) -> Option<SkippedRelease> {
         let epoch = self.abort_epoch.load(Ordering::Acquire);
         if core.handled_abort >= epoch {
             return None;
@@ -808,7 +889,15 @@ impl Shared {
         core.handled_abort = epoch;
         let outs = core.machine.abort(mono_now());
         let skipped = outs.iter().find_map(|out| match out {
-            Out::Release { activation, at } if !release => Some((*activation, *at)),
+            Out::Release {
+                activation,
+                at,
+                ups,
+            } if !release => Some(SkippedRelease {
+                activation: *activation,
+                at: *at,
+                ups: ups.clone(),
+            }),
             _ => None,
         });
         self.apply(core, outs, release);
@@ -817,7 +906,7 @@ impl Shared {
 
     /// The abort path's second step: tell the machine, if its lock can be had in time. The EIS
     /// thread does the same on its next pass when it cannot. `None`: the lock was busy.
-    fn fence_abort(&self, wait: Duration) -> Option<Option<(u32, (f64, f64))>> {
+    fn fence_abort(&self, wait: Duration) -> Option<Option<SkippedRelease>> {
         let deadline = Instant::now() + wait;
         loop {
             match self.core.try_lock() {
@@ -838,35 +927,76 @@ impl Shared {
     fn run_abort(&self) {
         // Straight from the atomics: no lock a stuck thread could hold.
         let mut releases: Vec<(u32, (f64, f64))> = self.live.get().into_iter().collect();
+        // The local ups of the activation(s) released here, replayed after every release was
+        // answered and not before (the compositor would capture them).
+        let mut ups: Vec<LocalUp> = Vec::new();
+        let mut released_all = true;
         // Tell the machine first when its lock is free (it usually is): it then knows the
         // `Deactivated` that our `Release` causes is expected, not a loss.
-        let mut fence = self.fence_abort(Duration::from_millis(3));
-        let note = |skipped: Option<(u32, (f64, f64))>, releases: &mut Vec<_>| {
-            if let Some(skipped) = skipped
-                && !releases.iter().any(|(id, _)| *id == skipped.0)
-            {
-                releases.push(skipped);
+        let fence = self.fence_abort(Duration::from_millis(3));
+        let fenced = fence.is_some();
+        let note = |skipped: Option<SkippedRelease>,
+                    releases: &mut Vec<(u32, (f64, f64))>,
+                    ups: &mut Vec<LocalUp>| {
+            if let Some(skipped) = skipped {
+                if !releases.iter().any(|(id, _)| *id == skipped.activation) {
+                    releases.push((skipped.activation, skipped.at));
+                }
+                ups.extend(skipped.ups);
             }
         };
-        if let Some(skipped) = fence {
-            note(skipped, &mut releases);
-        }
+        note(fence.flatten(), &mut releases, &mut ups);
         for (activation, at) in std::mem::take(&mut releases) {
             if let Err(error) = self.portal_release(activation, at, ABORT_RELEASE_BOUND) {
+                released_all = false;
                 tracing::warn!(%error, "releasing the capture on abort failed");
             }
         }
-        if fence.is_none() {
-            fence = self.fence_abort(ABORT_FENCE);
-            if let Some(skipped) = fence.flatten() {
-                note(Some(skipped), &mut releases);
-                for (activation, at) in releases {
-                    let _ = self.portal_release(activation, at, ABORT_RELEASE_BOUND);
+        let mut fenced_late = false;
+        if !fenced {
+            let late = self.fence_abort(ABORT_FENCE);
+            fenced_late = late.is_some();
+            note(late.flatten(), &mut releases, &mut ups);
+            for (activation, at) in releases {
+                if self
+                    .portal_release(activation, at, ABORT_RELEASE_BOUND)
+                    .is_err()
+                {
+                    released_all = false;
                 }
             }
         }
-        if fence.is_none() {
+        if !fenced && !fenced_late {
             tracing::warn!("the capture state is busy; the EIS thread will report the abort");
+        }
+        if released_all {
+            self.replay_ups(ups);
+        } else if !ups.is_empty() {
+            tracing::warn!(
+                count = ups.len(),
+                "the release failed; not replaying the held keys' releases"
+            );
+        }
+    }
+
+    /// Replay the releases of keys and buttons that were down before an activation (see
+    /// [`InputCaptureConfig::local_release`]). Only counts are logged.
+    fn replay_ups(&self, ups: Vec<LocalUp>) {
+        if ups.is_empty() {
+            return;
+        }
+        let Some(hook) = &self.local_release else {
+            tracing::debug!(count = ups.len(), "no hook to replay the held releases");
+            return;
+        };
+        tracing::info!(
+            count = ups.len(),
+            "replaying releases of keys and buttons held before the capture"
+        );
+        for up in ups {
+            if catch_unwind(AssertUnwindSafe(|| hook(up))).is_err() {
+                tracing::warn!("the local release hook panicked");
+            }
         }
     }
 
@@ -909,8 +1039,76 @@ impl Shared {
         self.caller.push(Request::Release {
             activation: 0,
             at: (f64::NAN, f64::NAN),
+            ups: Vec::new(),
             reply: None,
         });
+    }
+
+    /// Test only: panic here when a test asked this thread to (the thread-death tests).
+    #[cfg(test)]
+    fn panic_point(&self, thread: &'static str) {
+        let mut slot = lock(&self.panic_in);
+        if *slot == Some(thread) {
+            *slot = None;
+            drop(slot);
+            panic!("test: {thread} is made to panic");
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn panic_point(&self, _thread: &'static str) {}
+
+    /// A backend thread panicked. The compositor may be holding input for a backend that no
+    /// longer serves it, and the death of the EIS thread even closes the fd (which releases
+    /// nothing), so: have the activation released (the shutdown thread; this thread itself when
+    /// it was the shutdown thread), stop everything, close the portal session (which ends any
+    /// activation on the compositor's side) within [`DEATH_CLOSE_BOUND`], and report `Closed`.
+    /// Never logs anything about the input.
+    fn thread_died(&self, thread: &'static str) {
+        tracing::error!(
+            thread,
+            "an input capture thread panicked; giving the input back and closing the session"
+        );
+        let epoch = self.abort_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.abort_wake.wake();
+        if thread == ABORT_THREAD {
+            if catch_unwind(AssertUnwindSafe(|| self.run_abort())).is_err() {
+                tracing::error!("the emergency release panicked as well");
+            }
+        } else {
+            // The release goes first (the worker would drop the portal handle it uses as soon as
+            // it sees `closing`), for as long as it takes the shutdown thread, which is a few
+            // milliseconds.
+            let wait = Instant::now() + DEATH_ABORT_WAIT;
+            while self.abort_done.load(Ordering::Acquire) < epoch && Instant::now() < wait {
+                thread::sleep(Duration::from_micros(500));
+            }
+        }
+        self.closing.store(true, Ordering::Release);
+        self.control.close();
+        // The activation's end on the compositor's side does not depend on anything else.
+        if let Some(handle) = lock(&self.handle).clone() {
+            match zbus::block_on(sleep::timeout(handle.session.close(), DEATH_CLOSE_BOUND)) {
+                Some(Ok(())) => {}
+                Some(Err(error)) => tracing::debug!(%error, "closing the capture session failed"),
+                None => tracing::warn!("closing the capture session timed out"),
+            }
+        }
+        self.enabled.store(false, Ordering::Release);
+        self.recompute_ready();
+        self.status.set(CaptureStatus::Closed);
+        self.cursor_wake.wake();
+        self.caller.push(Request::Stop);
+        self.eis.push(EisCmd::Stop);
+        // The cursor thread shows the cursor again on its way out; when it is the one that died
+        // nobody would, and the cursor would stay hidden (best effort).
+        if thread == CURSOR_THREAD
+            && let Some(hook) = &self.cursor
+            && catch_unwind(AssertUnwindSafe(|| hook(false))).is_err()
+        {
+            tracing::warn!("the cursor hook panicked");
+        }
     }
 
     fn release_failed(&self) {
@@ -948,6 +1146,7 @@ fn answered(error: &ashpd::Error) -> bool {
 /// abort path has a thread of its own).
 fn caller_main(shared: &Shared) {
     loop {
+        shared.panic_point(CALLER_THREAD);
         let mut fds = [PollFd::new(&shared.caller.wake.0, PollFlags::IN)];
         let _ = poll(&mut fds, Some(&timespec(Duration::from_millis(250))));
         shared.caller.wake.drain();
@@ -956,6 +1155,7 @@ fn caller_main(shared: &Shared) {
                 Request::Release {
                     activation,
                     at,
+                    ups,
                     reply,
                 } => {
                     let result = shared.portal_release(activation, at, RELEASE_BOUND);
@@ -970,7 +1170,19 @@ fn caller_main(shared: &Shared) {
                         };
                         let _ = reply.try_send(report);
                     }
+                    // After the answer (the caller of `end` does not wait for the replay), and
+                    // only when the portal let go: an up injected while the compositor still
+                    // holds the activation would be captured too.
+                    if result.is_ok() {
+                        shared.replay_ups(ups);
+                    } else if !ups.is_empty() {
+                        tracing::warn!(
+                            count = ups.len(),
+                            "the release failed; not replaying the held keys' releases"
+                        );
+                    }
                 }
+                Request::LocalUps(ups) => shared.replay_ups(ups),
                 Request::Stop => return,
             }
         }
@@ -989,6 +1201,7 @@ fn abort_main(shared: &Shared) {
         let mut fds = [PollFd::new(&shared.abort_wake.0, PollFlags::IN)];
         let _ = poll(&mut fds, Some(&timespec(Duration::from_millis(250))));
         shared.abort_wake.drain();
+        shared.panic_point(ABORT_THREAD);
         let epoch = shared.abort_epoch.load(Ordering::Acquire);
         if epoch != handled {
             handled = epoch;
@@ -1006,6 +1219,7 @@ fn eis_main(shared: &Shared) {
     let mut receiver: Option<Receiver> = None;
     loop {
         shared.eis.wake.drain();
+        shared.panic_point(EIS_THREAD);
         while let Some(command) = shared.eis.pop() {
             match command {
                 EisCmd::Attach { fd, reply } => {
@@ -1081,6 +1295,7 @@ fn cursor_main(shared: &Shared) {
         let mut fds = [PollFd::new(&shared.cursor_wake.0, PollFlags::IN)];
         let _ = poll(&mut fds, Some(&timespec(Duration::from_millis(500))));
         shared.cursor_wake.drain();
+        shared.panic_point(CURSOR_THREAD);
         let closing = shared.closing.load(Ordering::Acquire);
         let want = shared.cursor_hidden.load(Ordering::Acquire) && !closing;
         if want != wished {
@@ -1149,8 +1364,11 @@ impl PortalInputCapture {
             lock_keys: config.lock_keys,
             gate: config.gate,
             cursor: config.cursor,
+            local_release: config.local_release,
             token_path: config.token_path,
             quirks: config.quirks,
+            #[cfg(test)]
+            panic_in: Mutex::new(None),
             bus_address,
             core: Mutex::new(Core {
                 machine: Machine::new(),
@@ -1186,39 +1404,42 @@ impl PortalInputCapture {
             threads: Vec::new(),
             subscribed: false,
         };
+        // Every body runs under `catch_unwind`: a thread that dies must give the input back.
         let spawn = |name: &'static str, body: Box<dyn FnOnce() + Send>| {
+            let shared = Arc::clone(&shared);
             thread::Builder::new()
                 .name(name.to_owned())
-                .spawn(body)
+                .spawn(move || {
+                    if catch_unwind(AssertUnwindSafe(body)).is_err() {
+                        shared.thread_died(name);
+                    }
+                })
                 .map(|handle| (name, handle))
                 .map_err(|error| PlatformError::Backend(format!("cannot start {name}: {error}")))
         };
         let worker = session::Worker::new(Arc::clone(&shared));
         capture
             .threads
-            .push(spawn("portal-capture", Box::new(move || worker.run()))?);
+            .push(spawn(WORKER_THREAD, Box::new(move || worker.run()))?);
         let s = Arc::clone(&shared);
-        capture.threads.push(spawn(
-            "portal-capture-shutdown",
-            Box::new(move || abort_main(&s)),
-        )?);
+        capture
+            .threads
+            .push(spawn(ABORT_THREAD, Box::new(move || abort_main(&s)))?);
         let s = Arc::clone(&shared);
-        capture.threads.push(spawn(
-            "portal-capture-release",
-            Box::new(move || caller_main(&s)),
-        )?);
+        capture
+            .threads
+            .push(spawn(CALLER_THREAD, Box::new(move || caller_main(&s)))?);
         if shared.cursor.is_some() {
             let s = Arc::clone(&shared);
-            capture.threads.push(spawn(
-                "portal-capture-cursor",
-                Box::new(move || cursor_main(&s)),
-            )?);
+            capture
+                .threads
+                .push(spawn(CURSOR_THREAD, Box::new(move || cursor_main(&s)))?);
         }
         // Last: it is the last to stop (see `Drop`).
         let s = Arc::clone(&shared);
         capture
             .threads
-            .push(spawn("portal-capture-eis", Box::new(move || eis_main(&s)))?);
+            .push(spawn(EIS_THREAD, Box::new(move || eis_main(&s)))?);
         Ok(capture)
     }
 
@@ -1351,8 +1572,10 @@ impl InputCapture for PortalInputCapture {
         let now = mono_now();
         let (release, rest) = {
             let mut core = shared.core();
-            let Some((_, origin)) = core.machine.live().filter(|_| core.machine.is_active()) else {
-                // Nothing is captured (already ended, lost or aborted): nothing to give back.
+            // A capture, or an activation still pending (a crossing the engine refused leaves
+            // one): both are given back.
+            let Some((_, origin)) = core.machine.live() else {
+                // Nothing is held (already ended, lost or aborted): nothing to give back.
                 return Ok(());
             };
             let at = barriers::release_point(warp, &displays, origin);
@@ -1361,7 +1584,11 @@ impl InputCapture for PortalInputCapture {
             let mut rest = Vec::new();
             for out in outs {
                 match out {
-                    Out::Release { activation, at } => release = Some((activation, at)),
+                    Out::Release {
+                        activation,
+                        at,
+                        ups,
+                    } => release = Some((activation, at, ups)),
                     other => rest.push(other),
                 }
             }
@@ -1370,11 +1597,12 @@ impl InputCapture for PortalInputCapture {
         };
         // The release is made, and answered, before `Ended` tells the engine the input is back.
         let result = match release {
-            Some((activation, at)) => {
+            Some((activation, at, ups)) => {
                 let (reply, answer) = mpsc::sync_channel(1);
                 shared.caller.push(Request::Release {
                     activation,
                     at,
+                    ups,
                     reply: Some(reply),
                 });
                 answer
@@ -1418,8 +1646,12 @@ impl Drop for PortalInputCapture {
         // portal session before the worker closes it.
         let epoch = shared.abort_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         shared.abort_wake.wake();
+        // A backend a dead thread already shut down has nothing to settle.
         let settle = Instant::now() + ABORT_SETTLE;
-        while shared.abort_done.load(Ordering::Acquire) < epoch && Instant::now() < settle {
+        while !shared.closing.load(Ordering::Acquire)
+            && shared.abort_done.load(Ordering::Acquire) < epoch
+            && Instant::now() < settle
+        {
             thread::sleep(Duration::from_micros(500));
         }
         shared.closing.store(true, Ordering::Release);
@@ -1429,7 +1661,7 @@ impl Drop for PortalInputCapture {
         shared.cursor_wake.wake();
         let deadline = Instant::now() + JOIN_BOUND;
         for (name, handle) in self.threads.drain(..) {
-            if name == "portal-capture-eis" {
+            if name == EIS_THREAD {
                 // The EIS connection closes last: input is given back (the release thread) and
                 // the session closed (the worker) first, never by dropping the fd.
                 shared.eis.push(EisCmd::Stop);
