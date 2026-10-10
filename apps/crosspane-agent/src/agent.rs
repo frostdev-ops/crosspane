@@ -614,6 +614,9 @@ pub struct Agent {
     notices: VecDeque<String>,
     last_trust_check: Instant,
     last_rtt_poll: Instant,
+    /// The `Platform::input_live` value the grants last sent were computed with; housekeeping
+    /// sends them again when it changes (WP-G1.6). `true` for backends without the hook.
+    input_live_sent: bool,
     /// Watches the OS grants against those the backends were created with (they are created
     /// once, at start) and decides the one restart that puts a change to use (WP-4.33).
     grant_watch: Option<crate::os_permissions::GrantWatch>,
@@ -926,6 +929,7 @@ impl Agent {
             notices: VecDeque::new(),
             last_trust_check: Instant::now(),
             last_rtt_poll: Instant::now(),
+            input_live_sent: true,
             grant_watch: None,
             last_permission_check: Instant::now(),
             last_permission_raw: None,
@@ -4437,6 +4441,11 @@ impl Agent {
                 Err(e) => tracing::warn!(error = %e, "trust store reload failed"),
             }
         }
+        // A portal backend's input authorization can end at any time (the user revokes it in the
+        // desktop's indicator, the portal restarts): the grants follow within one tick (WP-G1.6).
+        if self.input_live_now() != self.input_live_sent {
+            self.send_grants();
+        }
         if self.last_rtt_poll.elapsed() >= HOUSEKEEPING {
             self.last_rtt_poll = Instant::now();
             let rtts: Vec<_> = self
@@ -4453,13 +4462,25 @@ impl Agent {
         }
     }
 
+    /// Whether the platform's input authorization is live now (`Platform::input_live`); `true` for
+    /// backends without that hook, whose injectors are usable whenever they exist.
+    fn input_live_now(&self) -> bool {
+        self.platform.input_live.as_ref().is_none_or(|live| live())
+    }
+
     fn send_grants(&mut self) {
         // A node that can't inject (e.g. macOS without the Accessibility grant) refuses control
         // rather than accept a session whose input would go nowhere.
         // The same while a release bind of an earlier run can't be confirmed gone (amendment A1):
         // its keys would be injected into a seat that has a bind on them.
-        let can_inject =
-            self.platform.keys.is_some() && self.platform.pointer.is_some() && !self.home.fence;
+        // And on a portal backend (GNOME, KDE) while the RemoteDesktop session is not live: the
+        // injectors exist from startup but inject nothing until the desktop's consent is in.
+        let input_live = self.input_live_now();
+        self.input_live_sent = input_live;
+        let can_inject = self.platform.keys.is_some()
+            && self.platform.pointer.is_some()
+            && !self.home.fence
+            && input_live;
         // Likewise a node without an audio worker grants neither the speakers nor the microphone:
         // it never advertised `audio`, so nothing could be admitted anyway.
         let can_play = self.audio.is_some();
@@ -7184,6 +7205,16 @@ mod installer {
                     down(name, "failed", "construction_failed")
                 }
             };
+            // The injectors of a portal backend exist from startup but inject only while the
+            // desktop's input authorization is live (WP-G1.6): not ready until then.
+            let input_live = self.input_live_now();
+            let injector = |name, present: bool| {
+                if present && !input_live && !blocked(&[Accessibility]) {
+                    down(name, "failed", "unknown")
+                } else {
+                    built(name, present, &[Accessibility])
+                }
+            };
             // A backend only some OSes or compositors have.
             let optional = |name, present: bool| {
                 if present {
@@ -7249,8 +7280,8 @@ mod installer {
                     p.capture.is_some(),
                     &[InputMonitoring, Accessibility],
                 ),
-                built("keys", p.keys.is_some(), &[Accessibility]),
-                built("pointer", p.pointer.is_some(), &[Accessibility]),
+                injector("keys", p.keys.is_some()),
+                injector("pointer", p.pointer.is_some()),
                 built("overlay", p.overlay.is_some(), &[]),
                 optional("hotkeys", p.hotkeys.is_some()),
                 keystore,
@@ -9479,6 +9510,9 @@ mod audio_tests {
             #[cfg(target_os = "macos")]
             own_windows: || Ok(Vec::new()),
             startup_recovery: crate::platform::StartupRecovery::None,
+            input_live: None,
+            #[cfg(target_os = "linux")]
+            portal_session: None,
             #[cfg(windows)]
             acceptance_scratch: false,
             #[cfg(windows)]
@@ -16039,6 +16073,54 @@ mod home_tests {
             h.compositor.lock().unwrap().installs,
             installs,
             "home never engages"
+        );
+    }
+
+    /// WP-G1.6: a portal backend's injectors exist from startup, but `InputAccept` is granted only
+    /// while its input authorization is live, and the grants follow within one housekeeping tick.
+    #[test]
+    fn input_accept_follows_the_platforms_input_liveness_within_a_housekeeping_tick() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut h = home();
+        let peer = h.rig.peer;
+        h.rig
+            .agent
+            .trust
+            .update(|t| {
+                t.set_grant(peer, Capability::InputAccept, true)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .unwrap();
+        let live = Arc::new(AtomicBool::new(false));
+        let hook = live.clone();
+        h.rig.agent.platform.input_live = Some(Arc::new(move || hook.load(Ordering::SeqCst)));
+
+        h.rig.agent.send_grants();
+        assert!(
+            !grants_of(&h, peer).contains(&Capability::InputAccept),
+            "no consent yet: control is refused"
+        );
+
+        live.store(true, Ordering::SeqCst);
+        h.rig.agent.housekeeping();
+        assert!(
+            grants_of(&h, peer).contains(&Capability::InputAccept),
+            "the session went live"
+        );
+
+        live.store(false, Ordering::SeqCst);
+        h.rig.agent.housekeeping();
+        assert!(
+            !grants_of(&h, peer).contains(&Capability::InputAccept),
+            "the portal closed: InputAccept is retired"
+        );
+        let (backends, _) = h.rig.agent.backends_now();
+        assert!(
+            backends
+                .iter()
+                .any(|b| b.name == "keys" && b.state == "failed"),
+            "keys are not ready while input is not live"
         );
     }
 

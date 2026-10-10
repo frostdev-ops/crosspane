@@ -43,6 +43,9 @@ pub(super) struct App {
     pending: VecDeque<HostCommand>,
     pending_arms: HashMap<u64, (Instant, std::sync::mpsc::SyncSender<bool>, bool)>,
     importer: Option<PictureImporter>,
+    /// No compositor IPC supplies the proxies' placement: winit is the only geometry source, so
+    /// every geometry and focus event re-samples the window (`ProxyHost::set_native_geometry`).
+    native_geometry: bool,
     #[cfg(target_os = "windows")]
     placement_mapping: Option<HostPlacementMapping>,
     #[cfg(target_os = "windows")]
@@ -91,12 +94,14 @@ impl App {
         proxy: EventLoopProxy<HostCommand>,
         events: Box<dyn FnMut(HostEvent)>,
         importer: Option<PictureImporter>,
+        native_geometry: bool,
         #[cfg(target_os = "windows")] placement_mapping: Option<HostPlacementMapping>,
         #[cfg(target_os = "windows")] decode_device_observer: Option<WindowsDecodeDeviceObserver>,
         #[cfg(target_os = "windows")] decode_progress: Option<WindowsDecodeProgress>,
     ) -> Self {
         Self {
             importer,
+            native_geometry,
             #[cfg(target_os = "windows")]
             placement_mapping,
             #[cfg(target_os = "windows")]
@@ -208,12 +213,23 @@ impl App {
         window.set_ime_allowed(false);
         let scale = window.scale_factor();
         if scale != initial_scale {
-            let _ = window.request_inner_size(fit(
-                logical_size(size, scale),
-                screen(window.current_monitor().as_ref()),
-            ));
+            // A Wayland monitor's scale is `wl_output.scale`, a whole number, while the window's is
+            // the compositor's preferred (fractional) one, which is what its content is sized by.
+            // A window that isn't mapped yet is on no output, so with the toolkit as the only
+            // geometry source the screen to fit is the monitor chosen above, in the window's scale.
+            let screen = if self.native_geometry {
+                screen_at(
+                    window.current_monitor().as_ref().or(monitor.as_ref()),
+                    scale,
+                )
+            } else {
+                screen(window.current_monitor().as_ref())
+            };
+            let _ = window.request_inner_size(fit(logical_size(size, scale), screen));
         }
-        // Wayland ignores placement: the destination agent floats/moves it by IPC (WP-2.58).
+        // Wayland ignores placement: a client cannot position itself. Hyprland's agent floats and
+        // moves the proxy by IPC (WP-2.58); on GNOME/KDE the compositor places it and the
+        // position stays unknown.
         #[cfg(target_os = "macos")]
         let scale = if let Some(place) = place {
             place_content(
@@ -320,6 +336,16 @@ impl App {
         if gpu.failed.load(Ordering::Acquire) {
             return Err("GPU failed while opening proxy".into());
         }
+        // What the window system gave, to compare with what the source asked for: the toolkit's
+        // size and (on Wayland, fractional) scale are what the source is resized to.
+        tracing::info!(
+            id,
+            requested = ?size,
+            actual = ?pixel_size(actual_size),
+            scale,
+            native_geometry = self.native_geometry,
+            "proxy window opened"
+        );
         self.ids.insert(proxy.window.id(), id);
         self.windows.insert(id, proxy);
         (self.events)(HostEvent::Opened {
@@ -335,7 +361,7 @@ impl App {
     /// now and only if it differs from what was last said. Which events call this on which
     /// platform is [`Trigger::applies`].
     fn report_placement(&mut self, id: u64, trigger: Trigger) {
-        if !trigger.applies(TRACKS_GEOMETRY) {
+        if !trigger.applies(tracks_geometry(self.native_geometry)) {
             return;
         }
         let Some(window) = self.windows.get_mut(&id) else {
@@ -1538,6 +1564,14 @@ fn pixel_size(size: PhysicalSize<u32>) -> PixelSize {
 /// whether the proxy is visible, and the agent's own placement producer supplies the rest.
 const TRACKS_GEOMETRY: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
+/// Whether geometry and focus events re-sample the window: on the platforms that track geometry,
+/// and on a host the agent told that no compositor IPC places the proxies (`native`), where
+/// winit is the only geometry source. On Wayland that source knows the size and visibility but
+/// not the place, which the report then leaves as "can't tell" ([`placement`]).
+fn tracks_geometry(native: bool) -> bool {
+    TRACKS_GEOMETRY || native
+}
+
 /// Why `HostEvent::Placed` is being considered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Trigger {
@@ -1894,6 +1928,17 @@ fn logical_size(size: PixelSize, scale: f64) -> LogicalSize<f64> {
 /// A monitor's size in logical units.
 fn screen(monitor: Option<&MonitorHandle>) -> Option<LogicalSize<f64>> {
     monitor.map(|monitor| monitor.size().to_logical(monitor.scale_factor()))
+}
+
+/// A monitor's size in logical units at `scale`, which isn't necessarily the monitor's own: a
+/// Wayland window's scale is the compositor's preferred fractional one, a monitor's a whole number.
+fn screen_at(monitor: Option<&MonitorHandle>, scale: f64) -> Option<LogicalSize<f64>> {
+    monitor.and_then(|monitor| logical_screen(monitor.size(), scale))
+}
+
+/// `physical` pixels as logical units at `scale`; nothing for a scale that can't be divided by.
+fn logical_screen(physical: PhysicalSize<u32>, scale: f64) -> Option<LogicalSize<f64>> {
+    (scale.is_finite() && scale > 0.0).then(|| physical.to_logical(scale))
 }
 
 /// `size`, scaled down (keeping its shape) to fit comfortably on `screen`. Proxies start at the
@@ -2925,6 +2970,68 @@ mod tests {
     }
 
     #[test]
+    fn a_host_told_the_toolkit_is_the_only_source_tracks_geometry() {
+        // The default is each platform's own: only macOS and Windows track geometry by themselves.
+        assert_eq!(tracks_geometry(false), TRACKS_GEOMETRY);
+        // A Wayland desktop without compositor IPC for placement (GNOME, KDE) turns it on, and
+        // then every trigger re-samples the window, as on macOS and Windows.
+        for trigger in [
+            Trigger::Opened,
+            Trigger::Occlusion,
+            Trigger::Geometry,
+            Trigger::Focus,
+        ] {
+            assert!(trigger.applies(tracks_geometry(true)), "{trigger:?}");
+        }
+    }
+
+    #[test]
+    fn toolkit_only_wayland_reports_size_and_visibility_and_invents_no_place() {
+        // winit on Wayland: no window position, no nameable monitor, can't tell if minimised, and
+        // (0.30) no `Occluded`, so the window stays "visible". (Wayland's start: not covered.)
+        let mut tracker = PlacementTracker::new(false);
+        let opened = tracker
+            .update(&wayland_sample((640, 480)))
+            .expect("the first report is sent");
+        let unknown = Placement {
+            visible: true,
+            monitor: None,
+            origin: PointDevice::zero(),
+            size: PixelSize::new(640, 480),
+        };
+        assert_eq!(opened, unknown);
+        // The same window re-sampled by a focus change or a repeated configure says nothing new.
+        assert_eq!(tracker.update(&wayland_sample((640, 480))), None);
+        // A user resize, and a scale change that keeps the logical size (the content is
+        // physically bigger), are new reports: the size follows the toolkit.
+        assert_eq!(
+            tracker.update(&wayland_sample((800, 600))),
+            Some(Placement {
+                size: PixelSize::new(800, 600),
+                ..unknown
+            })
+        );
+        let rescaled = Sample {
+            inner_size: PhysicalSize::new(1200, 900),
+            scale: 1.5,
+            ..wayland_sample((800, 600))
+        };
+        let placed = tracker
+            .update(&rescaled)
+            .expect("a bigger content is reported");
+        // The size is in the window's own device pixels, whatever the scale; the place is still
+        // unknown, never a guess from the monitor list or the size.
+        assert_eq!(placed.size, PixelSize::new(1200, 900));
+        assert_eq!((placed.monitor, placed.origin), (None, PointDevice::zero()));
+        // An occlusion event (other toolkits, or a later winit) is reported like any other.
+        tracker.set_occluded(true);
+        assert_eq!(
+            tracker.update(&rescaled).map(|placed| placed.visible),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn a_placement_becomes_the_host_event_for_its_window() {
         let placed = Placement {
             visible: false,
@@ -2943,6 +3050,26 @@ mod tests {
                 size: PixelSize::new(1280, 720),
             }
         );
+    }
+
+    #[test]
+    fn a_fractional_scale_fits_the_window_to_the_real_screen_not_the_rounded_one() {
+        // A 3840x2160 monitor at 1.5: wl_output says 2, the window's own scale says 1.5.
+        let monitor = PhysicalSize::new(3840, 2160);
+        let rounded = logical_screen(monitor, 2.0);
+        let fractional = logical_screen(monitor, 1.5);
+        assert_eq!(rounded, Some(LogicalSize::new(1920.0, 1080.0)));
+        assert_eq!(fractional, Some(LogicalSize::new(2560.0, 1440.0)));
+        // A 3000x1000 pixel source window shown 1:1 at 1.5 is 2000x666 logical: it fits the real
+        // screen untouched, where the rounded screen would shrink it for no reason.
+        let wanted = logical_size(PixelSize::new(3000, 1000), 1.5);
+        assert_eq!(fit(wanted, fractional), LogicalSize::new(2000.0, 666.0));
+        assert_ne!(fit(wanted, rounded), fit(wanted, fractional));
+        // A scale nothing can be divided by names no screen, and the window is left as it is.
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(logical_screen(monitor, scale), None);
+        }
+        assert_eq!(fit(wanted, None), wanted);
     }
 
     #[test]
