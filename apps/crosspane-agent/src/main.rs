@@ -568,6 +568,10 @@ fn start_agent(
         net.dial(peer.addr);
     }
 
+    // Where a proxy is comes from the compositor's window list through the Hyprland placement
+    // seat; every other destination (macOS, Windows, and Linux without that seat: GNOME, KDE)
+    // takes the proxy host's own geometry reports (WP-G2.1).
+    let native_placement = cfg!(not(target_os = "linux")) || platform.proxy_placement.is_none();
     // E2: the proxy window host owns the main thread (winit's rule on macOS); without a display
     // the node can still project its own windows, just not show others'.
     #[cfg(not(windows))]
@@ -583,8 +587,7 @@ fn start_agent(
             // winit's own events are their only geometry source (WP-G2.1). Hyprland keeps the
             // default, and its host behaves as before.
             #[cfg(target_os = "linux")]
-            host.0
-                .set_native_geometry(platform.proxy_placement.is_none());
+            host.0.set_native_geometry(native_placement);
             Some(host)
         }
         Err(e) => {
@@ -654,6 +657,7 @@ fn start_agent(
         identity,
         port: config.port,
         revocations: revocations::Issued::load(revocations::file_beside(&paths.trust_file())),
+        native_placement,
     };
     let mut agent = agent::Agent::new(
         node,

@@ -232,10 +232,14 @@ impl AudioPlane for AudioWorker {
     }
 }
 
-/// Whether this build produces `ProxyEvent::Placed` from the compositor's window list (the
-/// Hyprland placement source). Wayland tells a client neither its position nor its output; macOS
-/// does (`HostEvent::Placed { monitor: Some(..) }`) and keeps the host's own report.
-const HYPRLAND_PLACEMENT: bool = cfg!(target_os = "linux");
+/// Winit's Wayland window title limit in bytes. Every Linux proxy is a Wayland window, whichever
+/// compositor places it, so the limit is a build fact and not part of the runtime placement choice
+/// (`Agent::native_placement`).
+const WAYLAND_TITLE_LIMIT: Option<usize> = if cfg!(target_os = "linux") {
+    Some(1024)
+} else {
+    None
+};
 
 /// How often the home bind is verified while it is wanted (also at once on a config reload).
 const BIND_CHECK: Duration = Duration::from_secs(1);
@@ -705,6 +709,15 @@ pub struct Agent {
     /// can move one.
     placement: PlacementSource,
     placement_dirty: bool,
+    /// Whether the host's own geometry reports are the only source of where a proxy is (macOS,
+    /// Windows, and Linux without a Hyprland placement seat: GNOME and KDE, WP-G2.1). `false`
+    /// means the Hyprland placement source is active: `placement` turns the compositor's window
+    /// list into every `ProxyEvent::Placed`, the host's `Placed { monitor: None }` says only
+    /// whether the proxy is visible, and the drag gesture places the proxy by compositor IPC.
+    /// Wayland tells a client neither its position nor its output; on a native-placement Linux
+    /// destination the host's report (`monitor: None`, a zero origin: "can't tell") is forwarded
+    /// as it is.
+    native_placement: bool,
     /// Native IDs currently admitted to the engine's external-window catalog.
     projectable_windows: BTreeSet<WindowId>,
     drag_places: BTreeMap<ProjectionKey, ProxyPlacement>,
@@ -753,6 +766,9 @@ pub struct E2Wiring {
     pub identity: Arc<crosspane_security::identity::DeviceIdentity>,
     pub port: u16,
     pub revocations: crate::revocations::Issued,
+    /// The host's own geometry reports are the only placement source: `false` only where the
+    /// Hyprland placement source (compositor IPC) places and reports the proxies (WP-G2.1).
+    pub native_placement: bool,
 }
 
 /// Returned after the consumed agent has shut down; the caller writes its final receipt.
@@ -991,6 +1007,7 @@ impl Agent {
             home: HomeAgent::new(),
             placement: PlacementSource::new(std::process::id()),
             placement_dirty: false,
+            native_placement: e2.native_placement,
             projectable_windows: BTreeSet::new(),
             drag_places: BTreeMap::new(),
             drag_label: None,
@@ -1384,11 +1401,17 @@ impl Agent {
         }
     }
 
+    /// Whether the Hyprland placement source is the one producer of `ProxyEvent::Placed` and
+    /// places the proxies by compositor IPC: the opposite of `native_placement`.
+    fn hyprland_placement(&self) -> bool {
+        !self.native_placement
+    }
+
     /// Report every proxy whose placement changed (the Hyprland placement source). Each report is
     /// an input of its own, queued behind whatever is being handled.
     #[cfg(not(target_os = "macos"))]
     fn flush_placements(&mut self) {
-        if !std::mem::take(&mut self.placement_dirty) || !HYPRLAND_PLACEMENT {
+        if !std::mem::take(&mut self.placement_dirty) || !self.hyprland_placement() {
             return;
         }
         let keys: Vec<_> = self.placement.proxies.keys().copied().collect();
@@ -2702,7 +2725,9 @@ impl Agent {
                 };
                 #[cfg(windows)]
                 let host_place = self.windows_proxy_place(place);
-                if HYPRLAND_PLACEMENT && let Some(place) = place {
+                if self.hyprland_placement()
+                    && let Some(place) = place
+                {
                     self.drag_places.insert(key, place);
                     self.placement.blocked.insert(key);
                 }
@@ -4925,16 +4950,18 @@ impl Agent {
                 self.placement_dirty = true;
             }
         }
-        // Where the host can't say which display a proxy is on (Wayland), it says only whether the
-        // proxy is visible; the placement source supplies the rest and is the only producer of
-        // `ProxyEvent::Placed` there, so the host's own origin and size aren't used.
+        // Where the host can't say which display a proxy is on (Wayland) and the Hyprland placement
+        // source is active, the host says only whether the proxy is visible; the placement source
+        // supplies the rest and is the only producer of `ProxyEvent::Placed` there, so the host's
+        // own origin and size aren't used. Without it (macOS, Windows, GNOME, KDE) the host's
+        // report is the only one and is forwarded below.
         if let HostEvent::Placed {
             id,
             visible,
             monitor: None,
             ..
         } = &event
-            && HYPRLAND_PLACEMENT
+            && self.hyprland_placement()
         {
             if let Some(key) = self.proxy_ids.key(*id) {
                 self.placement.set_visible(key, *visible);
@@ -6087,7 +6114,7 @@ fn proxy_title(title: String) -> String {
 /// Keep the plain mirror badge visible within the existing title limit; the cached base title
 /// stays undecorated so a later hiding geometry restores it without stripping window content.
 fn proxy_title_badge(title: String, badge: &str) -> String {
-    proxy_title_badge_limit(title, badge, HYPRLAND_PLACEMENT.then_some(1024))
+    proxy_title_badge_limit(title, badge, WAYLAND_TITLE_LIMIT)
 }
 
 fn proxy_title_badge_limit(mut title: String, badge: &str, limit: Option<usize>) -> String {
@@ -9532,6 +9559,10 @@ mod audio_tests {
             identity,
             port: 0,
             revocations: crate::revocations::Issued::load(dir.0.join("revocations.json")),
+            // Explicit, not derived from `proxy_placement` (which the rigs leave `None`): the
+            // rigs keep each OS's behaviour from before the runtime choice, the Hyprland
+            // placement source on Linux and the host's own reports elsewhere (WP-G2.1).
+            native_placement: !cfg!(target_os = "linux"),
         };
         let calls = Arc::new(Mutex::new(Vec::new()));
         let audio = local_audio.then(|| Box::new(Recorder(calls.clone())) as Box<dyn AudioPlane>);
@@ -17609,6 +17640,138 @@ mod home_tests {
             assert!(
                 h.rig.agent.pending.is_empty(),
                 "no duplicate native ID or placement"
+            );
+        }
+    }
+
+    /// WP-G2.1: where there is no Hyprland placement seat (GNOME, KDE) the host's own
+    /// `Placed { monitor: None }` is the only report and reaches the engine as it is ("can't
+    /// tell": no display, a zero origin); with the seat (the rig's Linux default) the host only
+    /// says whether the proxy is visible and the placement source reports instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_placement_forwards_the_hosts_placed_report_and_hyprland_placement_swallows_it() {
+        for native in [true, false] {
+            let mut h = home();
+            assert!(
+                h.rig.agent.hyprland_placement(),
+                "the rig defaults to the Hyprland placement source on Linux"
+            );
+            h.rig.agent.native_placement = native;
+            let key = proxy_key(1);
+            h.rig.agent.titles.insert(key, ("one".into(), 0));
+            let id = h.rig.agent.proxy_ids.open(key);
+            h.rig.agent.observe(&Input::ProxyOpened {
+                key,
+                result: Ok((PixelSize::new(800, 600), 1.0)),
+            });
+            h.rig.agent.fed.clear();
+            h.rig.agent.pending.clear();
+            h.rig.agent.on_host(HostEvent::Placed {
+                id,
+                window_number: None,
+                visible: true,
+                monitor: None,
+                origin: PointDevice::new(0.0, 0.0),
+                size: PixelSize::new(800, 600),
+            });
+            let forwarded: Vec<_> = h
+                .rig
+                .agent
+                .fed
+                .iter()
+                .filter_map(|input| match input {
+                    Input::Proxy {
+                        key: k,
+                        event:
+                            ProxyEvent::Placed {
+                                display,
+                                origin,
+                                size,
+                            },
+                    } if *k == key => Some((*display, *origin, *size)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                forwarded,
+                if native {
+                    vec![(None, PointDevice::new(0.0, 0.0), PixelSize::new(800, 600))]
+                } else {
+                    vec![]
+                },
+                "native {native}"
+            );
+        }
+    }
+
+    /// WP-G2.1: with native placement the compositor's window list is not a placement source (the
+    /// agent has no seat to read it for), a proxy's window is not bound from it, and a drag
+    /// placement request is not held back waiting for a placement that never comes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_placement_neither_flushes_the_window_list_nor_blocks_a_drag_placed_proxy() {
+        for native in [true, false] {
+            let mut h = home();
+            h.rig.agent.native_placement = native;
+            command_host(&mut h, None);
+            let key = proxy_key(1);
+            h.rig.agent.execute_one(Output::OpenProxy {
+                key,
+                title: "one".into(),
+                app_id: "app".into(),
+                size: PixelSize::new(800, 600),
+                place: Some(ProxyPlacement {
+                    display: DisplayId(1),
+                    x: 10,
+                    y: 20,
+                    drag: true,
+                }),
+            });
+            assert_eq!(
+                (
+                    h.rig.agent.drag_places.contains_key(&key),
+                    h.rig.agent.placement.blocked.contains(&key)
+                ),
+                (!native, !native),
+                "native {native}: the drag placement is held only for the Hyprland source"
+            );
+            let title = h.rig.agent.titles[&key].0.clone();
+            h.rig.agent.placement = PlacementSource::new(PID);
+            h.rig.agent.placement.opened(key, &title);
+            h.rig.agent.local_displays = vec![display(1, 2.0, (10.0, 20.0), (3000, 2000))];
+            h.rig
+                .agent
+                .placement
+                .set_displays(&h.rig.agent.local_displays);
+            h.rig.agent.placement.set_visible(key, true);
+            h.rig
+                .agent
+                .placement
+                .window_event(&WindowEvent::Added(window(
+                    0x123,
+                    &title,
+                    PID,
+                    Some(1),
+                    (500.0, 300.0, 400.0, 300.0),
+                    WindowState::Normal,
+                )));
+            h.rig.agent.pending.clear();
+            h.rig.agent.placement_dirty = true;
+            h.rig.agent.flush_placements();
+            assert!(
+                !h.rig.agent.placement_dirty,
+                "the dirty flag is consumed either way"
+            );
+            assert_eq!(
+                h.rig.agent.pending.is_empty(),
+                native,
+                "native {native}: the compositor's window list reports only for the Hyprland source"
+            );
+            assert_eq!(
+                h.rig.agent.placement.native.contains_key(&key),
+                !native,
+                "native {native}"
             );
         }
     }
