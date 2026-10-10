@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Crosspane
+Comment=One keyboard and mouse across computers; projected windows
+Exec=crosspane-agent
+Icon=crosspane
+NoDisplay=true
+Terminal=false
+Categories=Utility;
+X-GNOME-UsesNotifications=false

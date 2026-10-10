@@ -5,4 +5,6 @@
 //! overlays drawn through it.
 
 pub mod overlay;
+pub mod parking;
 pub mod shell;
+pub mod windows;
