@@ -1704,11 +1704,49 @@ fn portal_glue(
     source.detach();
 }
 
+/// One parking backend's startup `recover()` (04 §8 invariant 4): how many windows it put back, or
+/// `Err(())` once the failure is logged. The loop body of `create_hyprland`, for the portal
+/// backends.
+#[cfg(target_os = "linux")]
+fn recover_parked(backend: &mut dyn WindowParking) -> Result<usize, ()> {
+    match backend.recover() {
+        Ok(restored) => {
+            if !restored.is_empty() {
+                tracing::warn!(
+                    count = restored.len(),
+                    "restored windows a previous run left parked"
+                );
+            }
+            Ok(restored.len())
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "could not restore parked windows");
+            Err(())
+        }
+    }
+}
+
 /// GNOME and KDE (WP-G1.6): E1 target and E2 destination through portals, EIS and public Wayland
-/// protocols, with no compositor-specific control API. Everything the Hyprland backend adds on
-/// top is absent here: input capture (this node cannot control others yet), window source,
-/// parking, frame capture, GPU capture, home on the twin and proxy placement. The agent grants
-/// `InputAccept` only while the portal session is live (`Platform::input_live`).
+/// protocols. Input capture (this node cannot control others yet), GPU capture, home on the twin
+/// and proxy placement are absent. The agent grants `InputAccept` only while the portal session is
+/// live (`Platform::input_live`).
+///
+/// **GNOME as an E2 source** (WP-G2.3/G2.2) needs the Crosspane Shell extension: one
+/// `ShellBridge` is shared (cloned) by the overlay, the window source, the mirror parking and the
+/// window capture. Without the extension,
+/// and on KDE, there is no window source, parking or frame capture, and the node stays a
+/// destination. The order is fixed:
+///
+/// 1. connect the bridge;
+/// 2. build the M1 mirror parking and run its `recover()`, before anything else can park (04 §8
+///    invariant 4) and before the consent dialogs below. A failing recovery (or an unreadable
+///    journal) is `StartupRecovery::Failed` and leaves no parking backend, so nothing is parked
+///    on top of entries that could not be undone;
+/// 3. the injection and RemoteDesktop session, hotkeys and overlay (as on KDE);
+/// 4. the window source;
+/// 5. frame capture, only with both a window source and a parking backend: the ScreenCast session
+///    (its consent dialog is the caller-prepared one, shown at most once) wrapped by the window
+///    capture. A failure leaves `frames` empty.
 #[cfg(target_os = "linux")]
 fn create_portal(
     state_dir: &std::path::Path,
@@ -1717,9 +1755,13 @@ fn create_portal(
 ) -> anyhow::Result<Platform> {
     use anyhow::Context;
     use crosspane_platform_linux::desktop::LinuxDesktop;
-    use crosspane_platform_linux::gnome::{overlay::GnomeOverlay, shell::ShellBridge};
+    use crosspane_platform_linux::gnome::{
+        overlay::GnomeOverlay, parking::GnomeMirrorParking, shell::ShellBridge,
+        window_capture::GnomeWindowCapture, windows::GnomeWindows,
+    };
     use crosspane_platform_linux::logind::{LockerEvidence, LogindSession};
     use crosspane_platform_linux::permissions::LinuxPermissions;
+    use crosspane_platform_linux::portal::screencast::{PortalScreenCast, ScreenCastConfig};
     use crosspane_platform_linux::portal::{eis::EisSource, shortcuts::PortalHotkeys};
     use crosspane_platform_linux::wayland_outputs::WaylandOutputs;
 
@@ -1734,6 +1776,54 @@ fn create_portal(
     let outputs = WaylandOutputs::new().context("Wayland outputs")?;
     let (displays, displays_fn) =
         CachedDisplays::new(outputs).context("Wayland outputs: first snapshot")?;
+
+    // The Crosspane Shell extension's bridge (GNOME only), shared by everything that needs the
+    // Shell: the overlay, the window source, the mirror parking and the window capture.
+    let bridge = match desktop {
+        LinuxDesktop::Gnome => match ShellBridge::connect() {
+            Ok(bridge) => Some(bridge),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "the Crosspane Shell extension is unavailable: no overlay, and GNOME source \
+                     projection (window list, parking, capture) needs it; this node stays a \
+                     destination"
+                );
+                None
+            }
+        },
+        LinuxDesktop::Kde | LinuxDesktop::Hyprland => None,
+    };
+
+    // No window is lost (04 §8 invariant 4): undo a previous run's parking before anything else,
+    // including the consent dialogs below. Windows are mirrored in place (M1); a failed recovery,
+    // or a journal that can't be read (it is the only record of the original frames), is reported
+    // and leaves no parking backend, so nothing is parked on top of it.
+    let mut recoveries: Vec<Result<usize, ()>> = Vec::new();
+    let parking: Option<Box<dyn WindowParking>> = bridge.as_ref().and_then(|bridge| {
+        match GnomeMirrorParking::new(
+            bridge.clone(),
+            displays_fn.clone(),
+            state_dir.join("gnome-mirror.json"),
+        ) {
+            Ok(mut backend) => match recover_parked(&mut backend) {
+                Ok(count) => {
+                    recoveries.push(Ok(count));
+                    Some(Box::new(backend) as Box<dyn WindowParking>)
+                }
+                Err(()) => {
+                    recoveries.push(Err(()));
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::error!(%error, "the mirror journal can't be read: windows are not parked");
+                recoveries.push(Err(()));
+                None
+            }
+        }
+    });
+    let startup_recovery = StartupRecovery::combine(&recoveries);
 
     // Portals know this non-sandboxed process by a registered app id; the shared connection
     // (GlobalShortcuts) is registered here, the RemoteDesktop worker registers its own.
@@ -1771,11 +1861,37 @@ fn create_portal(
         });
     // The indicator comes from the Crosspane Shell extension, on GNOME only; without it GNOME's
     // own remote-desktop indicator is the only visible sign. KDE's comes later.
-    let overlay = match desktop {
-        LinuxDesktop::Gnome => optional("Shell bridge", ShellBridge::connect()).map(|bridge| {
-            Box::new(GnomeOverlay::new(bridge, displays_fn.clone())) as Box<dyn OverlayHost>
+    let overlay = bridge.as_ref().map(|bridge| {
+        Box::new(GnomeOverlay::new(bridge.clone(), displays_fn.clone())) as Box<dyn OverlayHost>
+    });
+
+    // E2 source (GNOME with the extension only): the window list, then frame capture. Capture
+    // needs the other two: with no window source or no parking backend a projection can't start,
+    // and the ScreenCast session (and its consent dialog) would be asked for nothing.
+    let windows = bridge.as_ref().and_then(|bridge| {
+        optional(
+            "windows",
+            GnomeWindows::new(bridge.clone(), displays_fn.clone()),
+        )
+    });
+    let frames = match (&bridge, &windows, &parking) {
+        (Some(bridge), Some(_), Some(_)) => optional(
+            "ScreenCast portal",
+            PortalScreenCast::new(
+                gate.clone(),
+                ScreenCastConfig {
+                    token_path: state_dir.join("portal-screencast.token"),
+                },
+                displays_fn.clone(),
+            ),
+        )
+        .and_then(|inner| {
+            optional(
+                "frame capture",
+                GnomeWindowCapture::new(inner, bridge.clone(), displays_fn.clone()),
+            )
         }),
-        LinuxDesktop::Kde | LinuxDesktop::Hyprland => None,
+        _ => None,
     };
     Ok(Platform {
         gate,
@@ -1789,19 +1905,20 @@ fn create_portal(
         hotkeys: hotkeys.map(|h| Box::new(h) as Box<dyn GlobalHotkeys>),
         keystore: keystore(),
         permissions: Box::new(LinuxPermissions),
-        windows: None,
-        parking: None,
-        frames: None,
+        windows: windows.map(|w| Box::new(w) as Box<dyn WindowSource>),
+        parking,
+        frames: frames.map(|f| Box::new(f) as Box<dyn FrameCapture>),
         tray: optional("tray", crosspane_platform_linux::tray::SniTray::new())
             .map(|t| Box::new(t) as Box<dyn TrayHost>),
         links: Some(Box::new(
             crosspane_platform_linux::link::SysfsLinkInfo::new(),
         )),
+        // CPU frames from the ScreenCast stream: no GPU capture on the portal backends yet.
         gpu: None,
         home: None,
         proxy_placement: None,
-        // No parking backend, so nothing was recovered (and nothing was left parked).
-        startup_recovery: StartupRecovery::None,
+        // What the mirror parking's startup recovery came to (`None` without a bridge).
+        startup_recovery,
         input_live,
         portal_session,
     })
