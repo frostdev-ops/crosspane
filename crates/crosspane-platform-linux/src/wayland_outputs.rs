@@ -12,6 +12,8 @@
 //!   mode's width and height first, and the physical size with them). `physical_size` from
 //!   `wl_output.geometry`, or 96 DPI from the pixel size when it reports 0.
 //! - **Colour.** `ColorSpace::Srgb`, `hdr: false`.
+//! - **Virtual monitors.** Outputs named `Meta-*` (Mutter's virtual monitors, WP-G2.4) are not
+//!   displays: `assemble` drops them (`is_twin_output`) before validating or waiting for anything.
 //! - **Threading.** One worker thread owns its own Wayland connection and event queue. `displays`
 //!   returns its latest complete snapshot (every output has `done` after its xdg-output). Changes
 //!   (outputs added/removed, mode, scale, position) produce one new snapshot after a 100 ms
@@ -394,16 +396,30 @@ fn positive(value: i32) -> Option<u32> {
     u32::try_from(value).ok().filter(|v| *v > 0)
 }
 
-/// Turn per-output records (in a stable order) into the display list.
+/// Whether `name` is the connector of a Mutter virtual monitor (`Meta-0`, ...): the twin a
+/// projected window is parked on (WP-G2.4). It is not one of the user's displays, so it is never
+/// reported by [`WaylandOutputs`] (peers would be offered it and E1 would build edges on it); the
+/// twin's own `DisplayInfo` is built from the DisplayConfig client where it is needed.
+pub fn is_twin_output(name: &str) -> bool {
+    name.starts_with(crate::gnome::display_config::TWIN_PREFIX)
+}
+
+/// Turn per-output records (in a stable order) into the display list. Mutter's virtual monitors
+/// ([`is_twin_output`]) are left out before anything else, so an incomplete or odd twin never
+/// delays or spoils the snapshot of the real displays.
 fn assemble(records: &[OutputRecord]) -> Result<Vec<DisplayInfo>, SnapshotError> {
+    let records: Vec<&OutputRecord> = records
+        .iter()
+        .filter(|record| !record.name.as_deref().is_some_and(is_twin_output))
+        .collect();
     let parts = records
         .iter()
-        .map(OutputRecord::settled)
+        .map(|record| record.settled())
         .collect::<Option<Vec<_>>>()
         .ok_or(SnapshotError::Incomplete)?;
     let mut displays = Vec::with_capacity(records.len());
     let mut taken: BTreeMap<DisplayId, &str> = BTreeMap::new();
-    for (record, settled) in records.iter().zip(parts) {
+    for (record, settled) in records.into_iter().zip(parts) {
         let display = display_info(record, settled)?;
         // `display_info` checked the name.
         let name = record.name.as_deref().unwrap_or_default();
@@ -1034,6 +1050,66 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), 3);
         assert_eq!(assemble(&[]).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn mutter_virtual_monitors_are_not_displays() {
+        let twin = record("Meta-0", (1800, 1169, 60_000), (4520, 1080, 1800, 1169));
+        let displays = assemble(&[
+            record("DP-3", (3440, 1440, 165_000), (1080, 1080, 3440, 1440)),
+            twin.clone(),
+            record("DP-2", (1920, 1080, 75_000), (1817, 0, 1920, 1080)),
+        ])
+        .unwrap();
+        let names: Vec<_> = displays.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["DP-3", "DP-2"]);
+        // Only the twin: no displays at all, not an error.
+        assert_eq!(assemble(std::slice::from_ref(&twin)).unwrap(), Vec::new());
+        // A twin that is not fully described yet does not hold the real displays back ...
+        let mut unfinished = twin.clone();
+        unfinished.xdg_done = false;
+        unfinished.logical_size = None;
+        let displays = assemble(&[
+            record("DP-3", (3440, 1440, 165_000), (1080, 1080, 3440, 1440)),
+            unfinished,
+        ])
+        .unwrap();
+        assert_eq!(displays.len(), 1);
+        // ... nor does a second twin with a broken size or the same name spoil them.
+        let mut broken = twin.clone();
+        broken.logical_size = Some((0, 0));
+        let displays = assemble(&[
+            record("DP-3", (3440, 1440, 165_000), (1080, 1080, 3440, 1440)),
+            twin.clone(),
+            twin,
+            broken,
+        ])
+        .unwrap();
+        assert_eq!(displays.len(), 1);
+        // The prefix match is on the whole connector name's start: other names stay displays.
+        assert_eq!(
+            assemble(&[record(
+                "eDP-Meta-1",
+                (1920, 1080, 60_000),
+                (0, 0, 1920, 1080)
+            )])
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn is_twin_output_matches_mutter_virtual_connectors() {
+        assert!(is_twin_output("Meta-0"));
+        assert!(is_twin_output("Meta-17"));
+        assert!(is_twin_output("Meta-"));
+        assert!(!is_twin_output("DP-3"));
+        assert!(!is_twin_output("eDP-1"));
+        assert!(!is_twin_output("HDMI-A-1"));
+        assert!(!is_twin_output("meta-0"));
+        assert!(!is_twin_output("eDP-Meta-1"));
+        assert!(!is_twin_output(""));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! `packaging/gnome-shell-extension/crosspane@frostdev.io/io.frostdev.Crosspane.Shell1.xml`) and the
 //! overlays drawn through it.
 
+pub mod display_config;
 pub mod overlay;
 pub mod parking;
 pub mod shell;
