@@ -44,6 +44,28 @@
 //!   the extension, and a restarted Shell may reuse ids), so every entry carries the epoch of the
 //!   bridge that wrote it and every lookup is keyed by `(epoch, window id)`.
 //!
+//! # Bridge loss
+//!
+//! A bridge dies with its Shell (restart) or its extension (disabled, re-enabled), and every call
+//! on it then fails: `Shell bridge lost`, `the extension is not running`, or a `ListWindows` answer
+//! from `another epoch` (the three messages `bridge_lost` recognises). The parking therefore owns
+//! its connection and replaces it:
+//!
+//! - A call that fails that way is followed by **one** attempt to connect again
+//!   ([`ShellBridge::connect`], bounded at 2 s by the bridge itself), at most once per second
+//!   (`RECONNECT_GAP`) across all calls; inside the gap, or if the attempt fails, the call returns
+//!   the original error. Otherwise it is **retried once** on the new bridge, and that result is
+//!   final.
+//! - If the new bridge has the **same epoch** (a dropped connection, not a restart), window ids
+//!   still mean the same windows and nothing else changes.
+//! - If it has a **new epoch**, the window ids the caller holds belong to a Shell that is gone (a
+//!   new epoch may hand an old number to a different window), so the call is **not** retried: `park`,
+//!   `resize` and `geometry` answer `NotFound`, and `restore`/`restore_at` answer `Ok` (as for a
+//!   closed window). The journal entries of the old epoch are retired with a warning, exactly as
+//!   `recover` does it, at the end of that call or, if the switch happened in `geometry` (which
+//!   cannot write the journal), at the start of the next one. M1 never moved a window off-screen, so
+//!   none is lost; a window that was left resized stays so.
+//!
 //! # Journal format
 //!
 //! One JSON object, `{"version": 1, "entries": [...]}`, entries sorted by `(epoch, window)`:
@@ -71,6 +93,7 @@
 //! in a new process whose bridge has the same epoch if the Shell kept running, so the windows are
 //! still identifiable; across a Shell restart no window survives anyway.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
@@ -103,6 +126,16 @@ const SETTLE: Settle = Settle {
     budget: Duration::from_millis(300),
 };
 const NO_FULLSCREEN: &str = "fullscreen through the GNOME Shell bridge v1";
+/// The least time between two attempts to connect to a lost bridge again.
+const RECONNECT_GAP: Duration = Duration::from_secs(1);
+/// What `ShellBridge` says when it can no longer serve the Shell it connected to (shell.rs): the
+/// bridge was marked lost by its signal thread, `ListWindows` answered for another epoch, and the
+/// bus name has no owner.
+const LOST_MESSAGES: [&str; 3] = [
+    "Shell bridge lost",
+    "Shell bridge: window list from another epoch",
+    "Shell bridge: the extension is not running",
+];
 
 /// In-place (M1) parking through the Shell bridge.
 #[derive(Debug)]
@@ -112,14 +145,15 @@ pub struct GnomeMirrorParking {
 
 impl GnomeMirrorParking {
     /// Load the journal at `journal` (a missing file is empty; the directory is created with mode
-    /// 0700 at the first write). Call [`WindowParking::recover`] before parking anything.
+    /// 0700 at the first write). Call [`WindowParking::recover`] before parking anything. When the
+    /// bridge is lost later, the parking connects again by itself (see the module documentation).
     pub fn new(
         bridge: ShellBridge,
         displays: DisplaysFn,
         journal: PathBuf,
     ) -> Result<GnomeMirrorParking, PlatformError> {
         Ok(GnomeMirrorParking {
-            core: Core::open(bridge, displays, journal)?,
+            core: Core::open(bridge, Box::new(ShellBridge::connect), displays, journal)?,
         })
     }
 }
@@ -218,11 +252,71 @@ struct Placement {
     origin: PointDevice,
 }
 
+/// Opens a new connection to the bridge: [`ShellBridge::connect`], or a fake in tests.
+type Connect<S> = Box<dyn Fn() -> Result<S, PlatformError> + Send>;
+
+/// Whether `error` says the bridge can no longer serve the Shell it connected to. Only the bridge's
+/// own messages count; any other failure (a timeout, a refused argument) is not a loss.
+fn bridge_lost(error: &PlatformError) -> bool {
+    matches!(error, PlatformError::Backend(text) if LOST_MESSAGES.contains(&text.as_str()))
+}
+
+/// The connection and what is known about it. Behind a `RefCell` because `geometry` takes `&self`
+/// and may still have to replace a lost bridge.
+struct Link<S> {
+    shell: S,
+    /// The epoch the bridge in `shell` was connected at: every entry this run writes or looks up
+    /// carries it.
+    epoch: u64,
+    /// When the last reconnect attempt ended (successful or not).
+    last_attempt: Option<Instant>,
+    /// A reconnect found a new epoch and the journal's old-epoch entries are not retired yet.
+    switched: bool,
+}
+
+/// What a reconnect attempt came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reconnect {
+    /// Too soon after the last attempt, or the attempt failed: the old bridge stays.
+    Declined,
+    /// Connected again to the same epoch: window ids still mean the same windows.
+    SameEpoch,
+    /// Connected to a different epoch: the window ids the caller holds are void.
+    NewEpoch,
+}
+
+/// Why a bridge call produced no value.
+#[derive(Debug)]
+enum Failure {
+    Error(PlatformError),
+    /// The bridge was lost and the Shell has a new epoch, so the window ids the caller holds belong
+    /// to a Shell that is gone. The call was not retried.
+    Stale,
+}
+
+impl From<PlatformError> for Failure {
+    fn from(error: PlatformError) -> Failure {
+        Failure::Error(error)
+    }
+}
+
+type Outcome<T> = Result<T, Failure>;
+
+/// What a caller of the `WindowParking` methods gets for a call that went stale: the window it
+/// names no longer exists as far as the new Shell is concerned.
+fn or_not_found<T>(outcome: Outcome<T>) -> Result<T, PlatformError> {
+    outcome.map_err(|failure| match failure {
+        Failure::Error(error) => error,
+        Failure::Stale => PlatformError::NotFound,
+    })
+}
+
 /// All the parking logic, generic over the bridge so tests can drive it with a fake.
 struct Core<S: Shell> {
-    shell: S,
-    /// The bridge's epoch: every entry this run writes or looks up carries it.
-    epoch: u64,
+    link: RefCell<Link<S>>,
+    connect: Connect<S>,
+    /// The least time between two reconnect attempts.
+    reconnect_gap: Duration,
     displays: DisplaysFn,
     path: PathBuf,
     journal: Journal,
@@ -232,7 +326,7 @@ struct Core<S: Shell> {
 impl<S: Shell> fmt::Debug for Core<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Core")
-            .field("epoch", &self.epoch)
+            .field("epoch", &self.epoch())
             .field("journal", &self.path)
             .field("entries", &self.journal.len())
             .finish_non_exhaustive()
@@ -240,11 +334,22 @@ impl<S: Shell> fmt::Debug for Core<S> {
 }
 
 impl<S: Shell> Core<S> {
-    fn open(shell: S, displays: DisplaysFn, path: PathBuf) -> Result<Core<S>, PlatformError> {
+    fn open(
+        shell: S,
+        connect: Connect<S>,
+        displays: DisplaysFn,
+        path: PathBuf,
+    ) -> Result<Core<S>, PlatformError> {
         let journal = read_journal(&path)?;
         Ok(Core {
-            epoch: shell.epoch(),
-            shell,
+            link: RefCell::new(Link {
+                epoch: shell.epoch(),
+                shell,
+                last_attempt: None,
+                switched: false,
+            }),
+            connect,
+            reconnect_gap: RECONNECT_GAP,
             displays,
             path,
             journal,
@@ -252,8 +357,93 @@ impl<S: Shell> Core<S> {
         })
     }
 
+    /// The epoch of the current bridge.
+    fn epoch(&self) -> u64 {
+        self.link.borrow().epoch
+    }
+
     fn key(&self, window: WindowId) -> Key {
-        (self.epoch, window.0)
+        (self.epoch(), window.0)
+    }
+
+    /// One bridge call. If it fails because the bridge is lost, connects again (once, and not
+    /// within `reconnect_gap` of the last attempt) and tries the call once more on the new bridge,
+    /// unless the Shell has a new epoch: then the window ids this call carries are void and it
+    /// ends as [`Failure::Stale`].
+    fn call<T>(&self, op: impl Fn(&S) -> Result<T, PlatformError>) -> Outcome<T> {
+        // Bound before the match: the borrow must be gone before `reconnect` takes it mutably.
+        let first = op(&self.link.borrow().shell);
+        let error = match first {
+            Err(error) if bridge_lost(&error) => error,
+            other => return other.map_err(Failure::Error),
+        };
+        match self.reconnect() {
+            Reconnect::Declined => Err(Failure::Error(error)),
+            Reconnect::SameEpoch => op(&self.link.borrow().shell).map_err(Failure::Error),
+            Reconnect::NewEpoch => Err(Failure::Stale),
+        }
+    }
+
+    /// Replaces the bridge with a new connection, if the gap since the last attempt allows one and
+    /// connecting works. The attempt is bounded by the bridge's own setup timeout (2 s).
+    fn reconnect(&self) -> Reconnect {
+        let mut link = self.link.borrow_mut();
+        if link
+            .last_attempt
+            .is_some_and(|at| at.elapsed() < self.reconnect_gap)
+        {
+            return Reconnect::Declined;
+        }
+        let connected = (self.connect)();
+        link.last_attempt = Some(Instant::now());
+        let shell = match connected {
+            Ok(shell) => shell,
+            Err(error) => {
+                tracing::warn!(%error, "could not connect to the Shell bridge again");
+                return Reconnect::Declined;
+            }
+        };
+        let epoch = shell.epoch();
+        let changed = epoch != link.epoch;
+        link.shell = shell;
+        link.epoch = epoch;
+        if changed {
+            tracing::warn!("the Shell bridge came back with a new epoch");
+            link.switched = true;
+            Reconnect::NewEpoch
+        } else {
+            tracing::info!("the Shell bridge is connected again");
+            Reconnect::SameEpoch
+        }
+    }
+
+    /// Retires the journal's entries of every epoch but the current one. `true` if none is left.
+    fn retire_stale(&mut self) -> bool {
+        let (current, stale) = self.journal.split_stale(self.epoch());
+        if stale == 0 {
+            return true;
+        }
+        // Not restorable: those windows cannot be identified in this epoch. M1 moved nothing
+        // off-screen, so retiring them loses no window.
+        tracing::warn!(
+            count = stale,
+            "retiring mirror journal entries from another Shell epoch"
+        );
+        match self.commit(current) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "could not retire stale mirror journal entries");
+                false
+            }
+        }
+    }
+
+    /// After a reconnect to a new epoch, retires the old epoch's entries. Run at the start and the
+    /// end of every call that can write the journal.
+    fn sync_epoch(&mut self) {
+        if self.link.get_mut().switched && self.retire_stale() {
+            self.link.get_mut().switched = false;
+        }
     }
 
     /// Writes `next` to disk and, only when that worked, makes it the current journal.
@@ -269,8 +459,9 @@ impl<S: Shell> Core<S> {
     }
 
     /// A fresh `ListWindows` read of one window (`None`: it is not listed).
-    fn window(&self, id: u64) -> Result<Option<ShellWindow>, PlatformError> {
-        Ok(self.shell.list_windows()?.into_iter().find(|w| w.id == id))
+    fn window(&self, id: u64) -> Outcome<Option<ShellWindow>> {
+        let windows = self.call(|shell| shell.list_windows())?;
+        Ok(windows.into_iter().find(|w| w.id == id))
     }
 
     fn park(
@@ -279,26 +470,35 @@ impl<S: Shell> Core<S> {
         size: PixelSize,
         scale: f64,
     ) -> Result<Parked, PlatformError> {
+        self.sync_epoch();
+        let outcome = self.park_op(window, size, scale);
+        self.sync_epoch();
+        or_not_found(outcome)
+    }
+
+    fn park_op(&mut self, window: WindowId, size: PixelSize, scale: f64) -> Outcome<Parked> {
         if self.journal.contains(self.key(window)) {
-            return self.resize(window, size, scale);
+            return self.resize_op(window, size, scale);
         }
         check_size(size)?;
         let current = self.window(window.0)?.ok_or(PlatformError::NotFound)?;
         let frame = Frame::of(&current);
         if !frame.is_valid() {
-            return Err(backend("the window has no usable frame"));
+            return Err(backend("the window has no usable frame").into());
         }
         // Everything that can be computed without touching the window is computed before the
         // journal write, so a refusal here leaves neither journal nor window changed.
         let displays = (self.displays)();
         let target = plan_resize(&current, size, &displays)?;
         parked(&current, &displays)?;
-        let entry = Entry::new(self.epoch, window.0, frame, current.fullscreen);
+        let entry = Entry::new(self.epoch(), window.0, frame, current.fullscreen);
         let next = self.journal.with(entry);
         self.commit(next)?;
         match self.apply(&current, target) {
             Ok(parked) => Ok(parked),
-            Err(PlatformError::Timeout) => {
+            // A new epoch: the entry is of the old one and `sync_epoch` retires it.
+            Err(Failure::Stale) => Err(Failure::Stale),
+            Err(Failure::Error(PlatformError::Timeout)) => {
                 // The Shell may still carry out the request it did not answer, so a read now
                 // could show the old rect and a rollback could retire the entry too early. The
                 // entry stays; if the window was not changed, `recover` finds nothing to undo.
@@ -306,13 +506,13 @@ impl<S: Shell> Core<S> {
                     window = window.0,
                     "mirror park timed out; journal retained for recovery"
                 );
-                Err(PlatformError::Timeout)
+                Err(Failure::Error(PlatformError::Timeout))
             }
-            Err(error) => {
+            Err(Failure::Error(error)) => {
                 // The window may or may not have changed. Put it back if it did; if that fails
                 // too, the entry stays for `recover`.
                 self.rollback(window.0);
-                Err(error)
+                Err(Failure::Error(error))
             }
         }
     }
@@ -321,10 +521,17 @@ impl<S: Shell> Core<S> {
         &mut self,
         window: WindowId,
         size: PixelSize,
-        _scale: f64,
+        scale: f64,
     ) -> Result<Parked, PlatformError> {
+        self.sync_epoch();
+        let outcome = self.resize_op(window, size, scale);
+        self.sync_epoch();
+        or_not_found(outcome)
+    }
+
+    fn resize_op(&self, window: WindowId, size: PixelSize, _scale: f64) -> Outcome<Parked> {
         if !self.journal.contains(self.key(window)) {
-            return Err(PlatformError::NotFound);
+            return Err(PlatformError::NotFound.into());
         }
         check_size(size)?;
         let current = self.window(window.0)?.ok_or(PlatformError::NotFound)?;
@@ -337,35 +544,38 @@ impl<S: Shell> Core<S> {
         Err(PlatformError::Unsupported(NO_FULLSCREEN))
     }
 
+    /// Takes `&self` like the trait does, so it cannot write the journal: a reconnect to a new
+    /// epoch in here only flags the switch, and the next call that can write retires the old
+    /// epoch's entries.
     fn geometry(&self, window: WindowId) -> Result<Parked, PlatformError> {
+        or_not_found(self.geometry_op(window))
+    }
+
+    fn geometry_op(&self, window: WindowId) -> Outcome<Parked> {
         if !self.journal.contains(self.key(window)) {
-            return Err(PlatformError::NotFound);
+            return Err(PlatformError::NotFound.into());
         }
         let current = self.window(window.0)?.ok_or(PlatformError::NotFound)?;
-        parked(&current, &(self.displays)())
+        Ok(parked(&current, &(self.displays)())?)
     }
 
     /// Carries out a planned resize (`None`: nothing to change) and reports what the window took.
-    fn apply(&self, current: &ShellWindow, target: Option<Frame>) -> Result<Parked, PlatformError> {
+    fn apply(&self, current: &ShellWindow, target: Option<Frame>) -> Outcome<Parked> {
         let after = match target {
             None => current.clone(),
             Some(target) => {
-                self.shell.move_resize(
-                    current.id,
-                    target.x,
-                    target.y,
-                    target.width,
-                    target.height,
-                )?;
+                self.call(|shell| {
+                    shell.move_resize(current.id, target.x, target.y, target.width, target.height)
+                })?;
                 self.settle(current.id, target)?
             }
         };
-        parked(&after, &(self.displays)())
+        Ok(parked(&after, &(self.displays)())?)
     }
 
     /// Reads the window back until it reports `target`'s size or the budget runs out; the Shell
     /// applies a `MoveResize` asynchronously and the app may refuse the size.
-    fn settle(&self, id: u64, target: Frame) -> Result<ShellWindow, PlatformError> {
+    fn settle(&self, id: u64, target: Frame) -> Outcome<ShellWindow> {
         let deadline = Instant::now() + self.settle.budget;
         loop {
             let window = self.window(id)?.ok_or(PlatformError::NotFound)?;
@@ -379,17 +589,19 @@ impl<S: Shell> Core<S> {
     }
 
     fn rollback(&mut self, id: u64) {
-        if let Err(error) = self.restore_with(id, None) {
-            tracing::warn!(
+        match self.restore_op(id, None) {
+            // Stale: the entry is of a Shell that is gone, and `sync_epoch` retires it.
+            Ok(_) | Err(Failure::Stale) => {}
+            Err(Failure::Error(error)) => tracing::warn!(
                 window = id,
                 %error,
                 "failed mirror park rollback; journal retained for recovery"
-            );
+            ),
         }
     }
 
     fn restore(&mut self, window: WindowId) -> Result<(), PlatformError> {
-        self.restore_with(window.0, None).map(|_| ())
+        self.restore_checked(window.0, None)
     }
 
     fn restore_at(
@@ -398,19 +610,29 @@ impl<S: Shell> Core<S> {
         display: DisplayId,
         origin: PointDevice,
     ) -> Result<(), PlatformError> {
-        self.restore_with(window.0, Some(Placement { display, origin }))
-            .map(|_| ())
+        self.restore_checked(window.0, Some(Placement { display, origin }))
+    }
+
+    /// `restore` and `restore_at`: a window of a Shell that has since gone is as good as closed.
+    fn restore_checked(
+        &mut self,
+        id: u64,
+        placement: Option<Placement>,
+    ) -> Result<(), PlatformError> {
+        self.sync_epoch();
+        let outcome = self.restore_op(id, placement);
+        self.sync_epoch();
+        match outcome {
+            Ok(_) | Err(Failure::Stale) => Ok(()),
+            Err(Failure::Error(error)) => Err(error),
+        }
     }
 
     /// Puts one window back (at `placement` when given and resolvable) and retires its entry.
     /// `Ok(true)`: the window exists and is back; `Ok(false)`: there was no entry, or the window
     /// is gone (and its entry is retired). Any bridge failure keeps the entry.
-    fn restore_with(
-        &mut self,
-        id: u64,
-        placement: Option<Placement>,
-    ) -> Result<bool, PlatformError> {
-        let key = (self.epoch, id);
+    fn restore_op(&mut self, id: u64, placement: Option<Placement>) -> Outcome<bool> {
+        let key = self.key(WindowId(id));
         let Some(entry) = self.journal.get(key).copied() else {
             return Ok(false);
         };
@@ -438,16 +660,16 @@ impl<S: Shell> Core<S> {
             _ => entry.frame(),
         };
         if !untouched && (current.fullscreen || Frame::of(&current) != target) {
-            match self
-                .shell
-                .move_resize(id, target.x, target.y, target.width, target.height)
-            {
+            let moved = self.call(|shell| {
+                shell.move_resize(id, target.x, target.y, target.width, target.height)
+            });
+            match moved {
                 Ok(()) => {}
-                Err(PlatformError::NotFound) => {
+                Err(Failure::Error(PlatformError::NotFound)) => {
                     self.retire(key)?;
                     return Ok(false);
                 }
-                Err(error) => return Err(error),
+                Err(failure) => return Err(failure),
             }
         }
         self.retire(key)?;
@@ -455,13 +677,17 @@ impl<S: Shell> Core<S> {
     }
 
     fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+        self.sync_epoch();
         let mut restored = Vec::new();
         let mut failure = None;
-        for id in self.journal.windows_of(self.epoch) {
-            match self.restore_with(id, None) {
+        for id in self.journal.windows_of(self.epoch()) {
+            match self.restore_op(id, None) {
                 Ok(true) => restored.push(WindowId(id)),
                 Ok(false) => {}
-                Err(error) => {
+                // The Shell has a new epoch: the entries still to do belong to windows that cannot
+                // be identified any more, and are retired below with the other stale ones.
+                Err(Failure::Stale) => break,
+                Err(Failure::Error(error)) => {
                     tracing::warn!(window = id, %error, "mirror window not restored; journal retained");
                     let timed_out = matches!(error, PlatformError::Timeout);
                     failure.get_or_insert(error);
@@ -474,16 +700,7 @@ impl<S: Shell> Core<S> {
         }
         // Entries of another epoch name windows that cannot be identified any more. M1 moved
         // nothing off-screen, so retiring them loses no window.
-        let (current, stale) = self.journal.split_stale(self.epoch);
-        if stale > 0 {
-            tracing::warn!(
-                count = stale,
-                "retiring mirror journal entries from another Shell epoch"
-            );
-            if let Err(error) = self.commit(current) {
-                tracing::warn!(%error, "could not retire stale mirror journal entries");
-            }
-        }
+        self.retire_stale();
         match failure {
             Some(error) => Err(error),
             None => Ok(restored),
@@ -890,7 +1107,7 @@ fn journal_io(error: &io::Error) -> PlatformError {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use crosspane_types::color::ColorSpace;
@@ -979,25 +1196,37 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum Fault {
         Timeout,
+        /// Some other failure reported by the bridge: not a loss.
         Backend,
         NotFound,
+        /// The bridge is lost, as the real one says it.
+        Lost,
     }
 
     impl Fault {
         fn error(self) -> PlatformError {
             match self {
                 Fault::Timeout => PlatformError::Timeout,
-                Fault::Backend => PlatformError::Backend("Shell bridge lost".into()),
+                Fault::Backend => {
+                    PlatformError::Backend("Shell bridge: org.freedesktop.DBus.Error.Failed".into())
+                }
                 Fault::NotFound => PlatformError::NotFound,
+                Fault::Lost => PlatformError::Backend("Shell bridge lost".into()),
             }
         }
     }
 
-    /// What the fake Shell holds. A `MoveResize` takes effect after `lag` more `ListWindows`
-    /// calls, like the real Shell, and ends fullscreen at once.
+    /// What the fake Shell holds: its current epoch and windows, shared by every connection to it.
+    /// A `MoveResize` takes effect after `lag` more `ListWindows` calls, like the real Shell, and
+    /// ends fullscreen at once.
     #[derive(Default)]
     struct World {
         epoch: u64,
+        /// The epoch the Shell switches to when a connection that was told to `die_after` dies.
+        epoch_on_loss: Option<u64>,
+        /// Connection attempts made so far (`FakeShell::connect`), and whether they are refused.
+        connects: usize,
+        refuse_connect: bool,
         windows: Vec<ShellWindow>,
         pending: Vec<(u64, Frame, usize)>,
         lag: usize,
@@ -1014,20 +1243,97 @@ mod tests {
         fail_move: Option<(Fault, bool)>,
     }
 
+    /// One connection's own state; clones of a `FakeShell` share it, like clones of a bridge.
+    #[derive(Default)]
+    struct Conn {
+        lost: AtomicBool,
+        /// Calls the connection still answers before it is lost (`None`: no limit).
+        calls_left: Mutex<Option<usize>>,
+    }
+
+    /// A connection to the fake Shell. Its epoch is the Shell's at the time it connected; once the
+    /// Shell's epoch moves on, `ListWindows` on it fails like the real bridge's does.
     #[derive(Clone)]
-    struct FakeShell(Arc<Mutex<World>>);
+    struct FakeShell {
+        world: Arc<Mutex<World>>,
+        epoch: u64,
+        conn: Arc<Conn>,
+    }
 
     impl FakeShell {
         fn new(epoch: u64, windows: Vec<ShellWindow>) -> FakeShell {
-            FakeShell(Arc::new(Mutex::new(World {
+            let world = Arc::new(Mutex::new(World {
                 epoch,
                 windows,
                 ..World::default()
-            })))
+            }));
+            FakeShell::attach(&world)
+        }
+
+        /// A fresh connection to the Shell as it is now.
+        fn attach(world: &Arc<Mutex<World>>) -> FakeShell {
+            let epoch = world.lock().unwrap().epoch;
+            FakeShell {
+                world: world.clone(),
+                epoch,
+                conn: Arc::new(Conn::default()),
+            }
+        }
+
+        /// What a reconnect does: counted, and refused while the Shell has no extension.
+        fn connect(world: &Arc<Mutex<World>>) -> Result<FakeShell, PlatformError> {
+            {
+                let mut shell = world.lock().unwrap();
+                shell.connects += 1;
+                if shell.refuse_connect {
+                    return Err(PlatformError::Unsupported(
+                        "the Crosspane Shell extension is not running",
+                    ));
+                }
+            }
+            Ok(FakeShell::attach(world))
+        }
+
+        /// This connection is lost from now on.
+        fn lose(&self) {
+            self.conn.lost.store(true, Ordering::SeqCst);
+        }
+
+        /// This connection answers `calls` more calls and is lost on the next one. The Shell
+        /// moves to `World::epoch_on_loss` then, if that is set.
+        fn die_after(&self, calls: usize) {
+            *self.conn.calls_left.lock().unwrap() = Some(calls);
+        }
+
+        /// Every call on a connection starts here: lost connections fail fast.
+        fn gate(&self) -> Result<(), PlatformError> {
+            if self.conn.lost.load(Ordering::SeqCst) {
+                return Err(Fault::Lost.error());
+            }
+            let mut left = self.conn.calls_left.lock().unwrap();
+            match *left {
+                Some(0) => {
+                    self.conn.lost.store(true, Ordering::SeqCst);
+                    let mut world = self.world();
+                    if let Some(epoch) = world.epoch_on_loss.take() {
+                        world.epoch = epoch;
+                    }
+                    Err(Fault::Lost.error())
+                }
+                Some(n) => {
+                    *left = Some(n - 1);
+                    Ok(())
+                }
+                None => Ok(()),
+            }
         }
 
         fn world(&self) -> std::sync::MutexGuard<'_, World> {
-            self.0.lock().unwrap()
+            self.world.lock().unwrap()
+        }
+
+        fn connects(&self) -> usize {
+            self.world().connects
         }
 
         /// The window's frame once the Shell has applied every move asked of it so far.
@@ -1076,11 +1382,17 @@ mod tests {
 
     impl Shell for FakeShell {
         fn epoch(&self) -> u64 {
-            self.world().epoch
+            self.epoch
         }
 
         fn list_windows(&self) -> Result<Vec<ShellWindow>, PlatformError> {
+            self.gate()?;
             let mut world = self.world();
+            if world.epoch != self.epoch {
+                return Err(PlatformError::Backend(
+                    "Shell bridge: window list from another epoch".into(),
+                ));
+            }
             let call = world.lists;
             world.lists += 1;
             if world.fail_list_at == Some(call) {
@@ -1108,6 +1420,7 @@ mod tests {
             width: i32,
             height: i32,
         ) -> Result<(), PlatformError> {
+            self.gate()?;
             let mut world = self.world();
             let target = frame(x, y, width, height);
             world.moves.push((id, target));
@@ -1150,21 +1463,40 @@ mod tests {
         core: Core<FakeShell>,
     }
 
+    /// What a `Core` calls to connect again: a new connection to `world`'s Shell.
+    fn connector(world: &Arc<Mutex<World>>) -> Connect<FakeShell> {
+        let world = world.clone();
+        Box::new(move || FakeShell::connect(&world))
+    }
+
+    /// A `Core` as the tests use it: quick read-backs and no wait between reconnect attempts.
+    fn core_over(
+        shell: FakeShell,
+        displays: Vec<DisplayInfo>,
+        journal: PathBuf,
+    ) -> Result<Core<FakeShell>, PlatformError> {
+        let connect = connector(&shell.world);
+        let mut core = Core::open(shell, connect, displays_fn(displays), journal)?;
+        core.settle = FAST;
+        core.reconnect_gap = Duration::ZERO;
+        Ok(core)
+    }
+
     impl Harness {
         fn open(&self) -> Core<FakeShell> {
-            let mut core = Core::open(
-                self.shell.clone(),
-                displays_fn(self.displays.clone()),
-                self.dir.journal(),
-            )
-            .unwrap();
-            core.settle = FAST;
-            core
+            let shell = FakeShell::attach(&self.shell.world);
+            core_over(shell, self.displays.clone(), self.dir.journal()).unwrap()
         }
 
-        /// A new `Core` over the same Shell and journal, as after an agent restart.
+        /// A new `Core` over the same Shell and journal, as after an agent restart: it connects
+        /// to the Shell as it is now.
         fn restart(&mut self) {
             self.core = self.open();
+        }
+
+        /// The connection the current `Core` holds.
+        fn connection(&self) -> FakeShell {
+            self.core.link.borrow().shell.clone()
         }
     }
 
@@ -1178,14 +1510,12 @@ mod tests {
         let dir = TempDir::new();
         let shell = FakeShell::new(41, windows);
         shell.world().journal_path = Some(dir.journal());
-        let mut harness = Harness {
-            core: Core::open(shell.clone(), displays_fn(displays.clone()), dir.journal()).unwrap(),
+        Harness {
+            core: core_over(shell.clone(), displays.clone(), dir.journal()).unwrap(),
             dir,
             shell,
             displays,
-        };
-        harness.core.settle = FAST;
-        harness
+        }
     }
 
     fn harness() -> Harness {
@@ -1525,7 +1855,7 @@ mod tests {
         assert_eq!(read_journal(&dir.journal()).unwrap(), Journal::default());
         fs::write(dir.journal(), "{ torn").unwrap();
         let shell = FakeShell::new(1, vec![]);
-        assert!(Core::open(shell, displays_fn(vec![]), dir.journal()).is_err());
+        assert!(core_over(shell, vec![], dir.journal()).is_err());
         // The corrupt file is left for the owner to look at.
         assert_eq!(fs::read_to_string(dir.journal()).unwrap(), "{ torn");
     }
@@ -1939,15 +2269,12 @@ mod tests {
     #[test]
     fn a_park_that_fails_after_the_move_with_a_dead_bridge_keeps_the_entry_for_recover() {
         let mut h = harness();
-        // The bridge answers the park's first `ListWindows` and then dies: the move went through,
-        // the read-back and the rollback cannot reach the bridge.
-        let flaky = FlakyShell {
-            inner: h.shell.clone(),
-            lists_left: Mutex::new(1),
-        };
-        let mut core = Core::open(flaky, displays_fn(h.displays.clone()), h.dir.journal()).unwrap();
-        core.settle = FAST;
-        assert!(core.park(WindowId(W), px(500, 300), 1.0).is_err());
+        // The bridge answers the park's first two calls (the read and the move) and then dies for
+        // good: the move went through, and neither the read-back nor the rollback can reach the
+        // Shell, nor can a new connection (the extension is gone).
+        h.shell.world().refuse_connect = true;
+        h.shell.die_after(2);
+        assert!(h.core.park(WindowId(W), px(500, 300), 1.0).is_err());
         // The window is resized and the entry is still on disk.
         assert!(read_journal(&h.dir.journal()).unwrap().contains((41, W)));
         assert_eq!(h.shell.moves().len(), 1);
@@ -1958,38 +2285,6 @@ mod tests {
         assert_eq!(h.core.recover().unwrap(), vec![WindowId(W)]);
         assert_eq!(h.shell.frame_of(W), Some(frame(100, 100, 800, 600)));
         assert_eq!(read_journal(&h.dir.journal()).unwrap(), Journal::default());
-    }
-
-    /// A Shell that answers `lists_left` calls to `list_windows` and then fails them all.
-    struct FlakyShell {
-        inner: FakeShell,
-        lists_left: Mutex<usize>,
-    }
-
-    impl Shell for FlakyShell {
-        fn epoch(&self) -> u64 {
-            self.inner.epoch()
-        }
-
-        fn list_windows(&self) -> Result<Vec<ShellWindow>, PlatformError> {
-            let mut left = self.lists_left.lock().unwrap();
-            if *left == 0 {
-                return Err(Fault::Backend.error());
-            }
-            *left -= 1;
-            self.inner.list_windows()
-        }
-
-        fn move_resize(
-            &self,
-            id: u64,
-            x: i32,
-            y: i32,
-            width: i32,
-            height: i32,
-        ) -> Result<(), PlatformError> {
-            self.inner.move_resize(id, x, y, width, height)
-        }
     }
 
     #[test]
@@ -2148,6 +2443,242 @@ mod tests {
         assert!(h.core.recover().unwrap().is_empty());
         assert_eq!(h.shell.frame_of(W), Some(frame(700, 700, 300, 300)));
         assert_eq!(h.shell.moves().len(), 1);
+        assert_eq!(read_journal(&h.dir.journal()).unwrap(), Journal::default());
+    }
+
+    // ---- a lost bridge ----
+
+    #[test]
+    fn bridge_lost_recognises_only_the_bridges_own_messages() {
+        for text in LOST_MESSAGES {
+            assert!(bridge_lost(&PlatformError::Backend(text.into())));
+        }
+        assert!(bridge_lost(&Fault::Lost.error()));
+        assert!(!bridge_lost(&Fault::Backend.error()));
+        assert!(!bridge_lost(&PlatformError::Timeout));
+        assert!(!bridge_lost(&PlatformError::NotFound));
+        assert!(!bridge_lost(&PlatformError::Backend(
+            "Shell bridge: invalid size".into()
+        )));
+        assert!(!bridge_lost(&PlatformError::Backend(
+            "Shell bridge lost, probably".into()
+        )));
+        assert!(!bridge_lost(&PlatformError::Unsupported(
+            "the Crosspane Shell extension is not running"
+        )));
+    }
+
+    #[test]
+    fn a_lost_bridge_is_replaced_and_the_call_retried_on_the_new_one() {
+        let mut h = harness();
+        h.core.park(WindowId(W), px(500, 300), 1.0).unwrap();
+        h.shell.lose();
+        // `geometry` takes `&self` and still gets a new bridge.
+        let geometry = h.core.geometry(WindowId(W)).unwrap();
+        assert_eq!(geometry.content, rect((100, 100), (600, 400)));
+        assert_eq!(h.shell.connects(), 1);
+        // The new bridge serves the next calls; losing it too means one more connection.
+        h.core.geometry(WindowId(W)).unwrap();
+        assert_eq!(h.shell.connects(), 1);
+        h.connection().lose();
+        h.core.restore(WindowId(W)).unwrap();
+        assert_eq!(h.shell.connects(), 2);
+        assert_eq!(h.shell.frame_of(W), Some(frame(100, 100, 800, 600)));
+        assert_eq!(read_journal(&h.dir.journal()).unwrap(), Journal::default());
+        assert_eq!(h.core.epoch(), 41);
+    }
+
+    #[test]
+    fn a_lost_bridge_with_a_new_epoch_retires_the_old_entries_and_does_not_retry() {
+        let mut h = harness();
+        h.core.park(WindowId(W), px(500, 300), 1.0).unwrap();
+        let sent = h.shell.moves().len();
+        // The extension was re-enabled: a new epoch, the same windows.
+        h.shell.world().epoch = 42;
+        h.shell.lose();
+        h.core.restore(WindowId(W)).unwrap();
+        // The entry named a window of another epoch: nothing was moved, and it is retired.
+        assert_eq!(h.shell.moves().len(), sent);
+        assert_eq!(h.shell.frame_of(W), Some(frame(100, 100, 500, 300)));
+        assert_eq!(read_journal(&h.dir.journal()).unwrap(), Journal::default());
+        assert_eq!(h.core.epoch(), 42);
+        assert_eq!(h.shell.connects(), 1);
+        // From here on entries carry the new epoch.
+        h.core.park(WindowId(W), px(400, 300), 1.0).unwrap();
+        let journal = read_journal(&h.dir.journal()).unwrap();
+        assert_eq!(journal.len(), 1);
+        assert_eq!(
+            journal.get((42, W)).unwrap().frame(),
+            frame(100, 100, 500, 300)
+        );
+    }
+
+    #[test]
+    fn a_list_answered_for_another_epoch_is_a_loss_too() {
+        let mut h = harness();
+        h.core.park(WindowId(W), px(500, 300), 1.0).unwrap();
+        let sent = h.shell.moves().len();
+        // Nothing marks the connection lost; its next `ListWindows` is answered for epoch 42.
+        h.shell.world().epoch = 42;
+        h.core.restore(WindowId(W)).unwrap();
+        assert_eq!(h.shell.connects(), 1);
+        assert_eq!(h.shell.moves().len(), sent);
+        assert_eq!(h.core.epoch(), 42);
+        assert_eq!(read_journal(&h.dir.journal()).unwrap(), Journal::default());
+    }
+
+    #[test]
+    fn resize_on_a_window_of_a_gone_shell_is_not_found_and_retires_the_entry() {
+        let mut h = harness();
+        h.core.park(WindowId(W), px(500, 300), 1.0).unwrap();
+        h.shell.world().epoch = 42;
+        h.shell.lose();
+        let sent = h.shell.moves().len();
+        assert!(matches!(
+            h.core.resize(WindowId(W), px(400, 300), 1.0),
+            Err(PlatformError::NotFound)
+        ));
+        assert_eq!(h.shell.moves().len(), sent);
+        assert_eq!(read_journal(&h.dir.journal()).unwrap(), Journal::default());
+    }
+
+    #[test]
+    fn park_on_a_window_of_a_gone_shell_is_not_found_and_writes_nothing() {
+        let mut h = harness();
+        h.shell.world().epoch = 42;
+        h.shell.lose();
+        assert!(matches!(
+            h.core.park(WindowId(W), px(500, 300), 1.0),
+            Err(PlatformError::NotFound)
+        ));
+        assert!(h.shell.moves().is_empty());
+        assert!(!h.dir.journal().exists());
+        assert_eq!(h.core.epoch(), 42);
+    }
+
+    #[test]
+    fn geometry_cannot_write_the_journal_so_the_next_call_retires_the_old_entries() {
+        let mut h = harness();
+        h.core.park(WindowId(W), px(500, 300), 1.0).unwrap();
+        h.shell.world().epoch = 42;
+        h.shell.lose();
+        let sent = h.shell.moves().len();
+        assert!(matches!(
+            h.core.geometry(WindowId(W)),
+            Err(PlatformError::NotFound)
+        ));
+        // `geometry` only noticed: the old entry is still on disk.
+        assert!(read_journal(&h.dir.journal()).unwrap().contains((41, W)));
+        // The next call that can write retires it before doing anything else.
+        h.core.restore(WindowId(W)).unwrap();
+        assert_eq!(read_journal(&h.dir.journal()).unwrap(), Journal::default());
+        assert_eq!(h.shell.moves().len(), sent);
+        assert_eq!(h.shell.connects(), 1);
+    }
+
+    #[test]
+    fn reconnects_are_attempted_once_per_call_and_not_within_the_gap() {
+        let mut h = harness();
+        h.core.park(WindowId(W), px(500, 300), 1.0).unwrap();
+        h.core.reconnect_gap = Duration::from_secs(3600);
+        h.shell.world().refuse_connect = true;
+        h.shell.lose();
+        // One attempt, refused: the call fails with the bridge's own error.
+        let error = h.core.restore(WindowId(W)).unwrap_err();
+        assert!(bridge_lost(&error));
+        assert_eq!(h.shell.connects(), 1);
+        // Inside the gap there is no attempt at all.
+        assert!(h.core.restore(WindowId(W)).is_err());
+        assert!(h.core.geometry(WindowId(W)).is_err());
+        assert!(h.core.park(WindowId(W), px(400, 300), 1.0).is_err());
+        assert_eq!(h.shell.connects(), 1);
+        // The entry survived all of that.
+        assert!(read_journal(&h.dir.journal()).unwrap().contains((41, W)));
+
+        // The gap passes (really) and the extension is back: one attempt, and the call succeeds.
+        h.core.reconnect_gap = Duration::from_millis(30);
+        h.shell.world().refuse_connect = false;
+        thread::sleep(Duration::from_millis(40));
+        h.core.restore(WindowId(W)).unwrap();
+        assert_eq!(h.shell.connects(), 2);
+        assert_eq!(h.shell.frame_of(W), Some(frame(100, 100, 800, 600)));
+        assert_eq!(read_journal(&h.dir.journal()).unwrap(), Journal::default());
+    }
+
+    #[test]
+    fn a_failed_reconnect_keeps_the_old_bridge_and_its_epoch() {
+        let mut h = harness();
+        h.core.park(WindowId(W), px(500, 300), 1.0).unwrap();
+        h.shell.world().refuse_connect = true;
+        h.shell.world().epoch = 42;
+        h.shell.lose();
+        assert!(h.core.restore(WindowId(W)).is_err());
+        assert_eq!(h.core.epoch(), 41);
+        assert!(read_journal(&h.dir.journal()).unwrap().contains((41, W)));
+    }
+
+    #[test]
+    fn a_bridge_lost_during_a_park_is_retried_on_the_new_bridge() {
+        let mut h = harness();
+        // The read works; the move finds the bridge gone.
+        h.shell.die_after(1);
+        let parked = h.core.park(WindowId(W), px(500, 300), 1.0).unwrap();
+        assert_eq!(parked.content, rect((100, 100), (600, 400)));
+        // The dead call sent nothing; the retry moved once, with the journal already written.
+        assert_eq!(h.shell.moves(), vec![(W, frame(100, 100, 500, 300))]);
+        assert!(h.shell.world().journal_at_move[0].is_some());
+        assert_eq!(h.shell.connects(), 1);
+        assert!(read_journal(&h.dir.journal()).unwrap().contains((41, W)));
+    }
+
+    #[test]
+    fn a_bridge_lost_during_a_park_with_a_new_epoch_is_not_retried() {
+        let mut h = harness();
+        h.shell.world().epoch_on_loss = Some(42);
+        h.shell.die_after(1);
+        assert!(matches!(
+            h.core.park(WindowId(W), px(500, 300), 1.0),
+            Err(PlatformError::NotFound)
+        ));
+        assert!(h.shell.moves().is_empty());
+        assert_eq!(h.shell.frame_of(W), Some(frame(100, 100, 800, 600)));
+        // The entry written before the move was of the old epoch: retired.
+        assert_eq!(read_journal(&h.dir.journal()).unwrap(), Journal::default());
+        assert_eq!(h.core.epoch(), 42);
+        assert_eq!(h.shell.connects(), 1);
+    }
+
+    #[test]
+    fn recover_connects_again_and_restores_when_the_epoch_is_the_same() {
+        let mut h = harness();
+        h.core.park(WindowId(W), px(500, 300), 1.0).unwrap();
+        h.restart();
+        h.connection().lose();
+        assert_eq!(h.core.recover().unwrap(), vec![WindowId(W)]);
+        assert_eq!(h.shell.connects(), 1);
+        assert_eq!(h.shell.frame_of(W), Some(frame(100, 100, 800, 600)));
+        assert_eq!(read_journal(&h.dir.journal()).unwrap(), Journal::default());
+    }
+
+    #[test]
+    fn recover_after_a_new_epoch_retires_what_it_can_no_longer_identify() {
+        let mut h = harness_with(
+            default_displays(),
+            vec![
+                shell_window(7, frame(100, 100, 800, 600)),
+                shell_window(8, frame(10, 10, 300, 200)),
+            ],
+        );
+        h.core.park(WindowId(7), px(500, 300), 1.0).unwrap();
+        h.core.park(WindowId(8), px(100, 100), 1.0).unwrap();
+        h.restart();
+        let sent = h.shell.moves().len();
+        // The Shell moved on while the agent was down.
+        h.shell.world().epoch = 42;
+        assert_eq!(h.core.recover().unwrap(), Vec::<WindowId>::new());
+        assert_eq!(h.shell.moves().len(), sent);
+        assert_eq!(h.shell.connects(), 1);
+        assert_eq!(h.core.epoch(), 42);
         assert_eq!(read_journal(&h.dir.journal()).unwrap(), Journal::default());
     }
 
