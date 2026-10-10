@@ -1,0 +1,8 @@
+{
+  "uuid": "crosspane@frostdev.io",
+  "name": "Crosspane",
+  "description": "Lets the Crosspane agent list and place windows and show its on-screen indicators. It talks only to the Crosspane agent of the same user over the session bus (io.frostdev.Crosspane.Shell) and does nothing else.",
+  "shell-version": ["48", "49", "50"],
+  "version": 1,
+  "version-name": "0.1.0"
+}

@@ -28,9 +28,58 @@
 //!
 //! **Recovery.** A crashed process's EIS connection died with it and the compositor released its
 //! devices, so `recover_keys`/`recover_buttons` release only what this source holds and return Ok.
+//!
+//! # How it works
+//!
+//! - **Handshake.** The context type is *sender*, the name `Crosspane`. On each announced seat the
+//!   worker binds keyboard, pointer, absolute pointer, button and scroll. A device of `ei_device`
+//!   version 3 is sent `ready` when it is announced; the compositor then resumes it. Input goes
+//!   only to resumed devices: `start_emulating` (with a sequence number that only goes up) before
+//!   a device's first event after it resumes, `frame` after every request group, and
+//!   `stop_emulating` when a release-all leaves nothing held on the device. A device the
+//!   compositor pauses or removes has had its keys and buttons reset, so the ledger forgets it.
+//! - **Ledger.** An entry is made before the down is queued, so a down that may have been sent
+//!   counts as held even when the call times out; it is removed when the up is queued. A write
+//!   that finds the socket full leaves the requests queued and the worker retries on writability;
+//!   a release returns `Timeout` (and is owed again on the next call) until that write is done.
+//!   Attaching a new connection, detaching, and dropping the last handle first queue the old
+//!   connection's releases, then close it.
+//! - **Gate.** Checked in the worker right before each press, move, scroll or lock tap. While
+//!   anything is held the worker also looks at the gate every 10 ms, and a closed gate releases all
+//!   held keys and buttons and ends any smooth scroll, because the compositor repeats a held key
+//!   (there is no repeat to manage here) and it must not run on into a lock screen.
+//! - **Scroll.** `pixels` go to `ei_scroll.scroll` for gestures, `v120` to `scroll_discrete` for
+//!   wheel detents (never both for one event). Both axes are negated relative to
+//!   `ScrollDelta`'s HID convention, like the Hyprland backend. A stop goes in a frame of its own
+//!   after the displacement (EIS forbids a displacement and a stop on one axis in a frame); a
+//!   `Cancelled` phase is a cancel, every other end a plain stop.
+//! - **Buttons and scrolling** use the device absolute motion went to last when it has the
+//!   capability, else the first resumed device that has it.
+//! - **Absolute motion** targets the region containing the point in the compositor's logical
+//!   space; the offset is part of the coordinate. A point within one logical pixel outside every
+//!   region (the rounding between a fractional-scale display and its integer region) is moved onto
+//!   the nearest region's edge, anything further is `NotFound`.
+//! - **Lock keys.** The compositor reports the locked-modifier mask; Caps and Num Lock are the
+//!   keymap's `Lock` and `Mod2` bits. A compositor sends modifiers after a resume only when some
+//!   are set, so `set_lock_keys` treats "no report yet" as off (the tap is applied, and the state
+//!   updated until the compositor's own report arrives), while `lock_keys` still says `None`.
 
+mod conn;
+mod keymap;
+mod ledger;
+mod map;
+mod regions;
+mod worker;
+
+#[cfg(test)]
+mod tests;
+
+use std::fmt;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
+use std::time::{Duration, Instant};
 
 use crosspane_platform::{IoGate, KeyInjector, PlatformError, PointerInjector};
 use crosspane_types::display::DisplayInfo;
@@ -38,21 +87,94 @@ use crosspane_types::geom::PointDevice;
 use crosspane_types::hid::{HidUsage, MouseButton};
 use crosspane_types::id::DisplayId;
 use crosspane_types::input::{LockKeys, ScrollDelta};
+use rustix::event::EventfdFlags;
+
+use self::conn::backend;
+use self::worker::{Action, Command, Inner};
+
+/// The frozen 50 ms input-path limit, less scheduling margin.
+const CALL_BUDGET: Duration = Duration::from_millis(45);
+/// `attach` waits for the handshake (2 s) plus the worker's turn.
+const ATTACH_BUDGET: Duration = Duration::from_millis(2_500);
+/// `detach` waits for the old connection to write out its releases.
+const DETACH_BUDGET: Duration = Duration::from_millis(300);
+/// Commands that can wait for the worker; more than this means it is wedged.
+const COMMAND_QUEUE: usize = 64;
 
 /// The displays snapshot used for region mapping (the platform's `Displays::displays`).
 pub type DisplaysFn = Arc<dyn Fn() -> Vec<DisplayInfo> + Send + Sync>;
 
+/// What the three handles share. When the last one goes, the worker releases what is held, says
+/// goodbye to the compositor and stops.
+struct Shared {
+    commands: SyncSender<Command>,
+    inner: Arc<Inner>,
+    displays: DisplaysFn,
+}
+
+impl fmt::Debug for Shared {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Shared")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        self.inner.closing.store(true, Ordering::Release);
+        self.inner.wake();
+    }
+}
+
+impl Shared {
+    /// Queue `action` for the worker and wait for its answer until `deadline`. A command the
+    /// worker runs after the deadline is refused there if it presses, moves or scrolls; a down
+    /// that was already submitted when the wait ran out stays in the worker's ledger.
+    fn call(&self, action: Action, deadline: Instant) -> Result<(), PlatformError> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        let command = Command {
+            action,
+            deadline,
+            reply,
+        };
+        match self.commands.try_send(command) {
+            Ok(()) => {
+                self.inner.wake();
+                answer
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|error| match error {
+                        RecvTimeoutError::Timeout => PlatformError::Timeout,
+                        RecvTimeoutError::Disconnected => backend("EIS worker stopped"),
+                    })?
+            }
+            Err(TrySendError::Full(_)) => Err(PlatformError::Timeout),
+            Err(TrySendError::Disconnected(_)) => Err(backend("EIS worker stopped")),
+        }
+    }
+
+    fn call_within(&self, action: Action) -> Result<(), PlatformError> {
+        self.call(action, Instant::now() + CALL_BUDGET)
+    }
+}
+
 /// The shared injection source. Cloning gives another handle to the same worker.
 #[derive(Clone, Debug)]
-pub struct EisSource {}
+pub struct EisSource {
+    shared: Arc<Shared>,
+}
 
 /// The keyboard half.
 #[derive(Debug)]
-pub struct EisKeyInjector {}
+pub struct EisKeyInjector {
+    shared: Arc<Shared>,
+}
 
 /// The pointer half.
 #[derive(Debug)]
-pub struct EisPointerInjector {}
+pub struct EisPointerInjector {
+    shared: Arc<Shared>,
+}
 
 impl EisSource {
     /// Start the worker, not yet connected.
@@ -60,9 +182,25 @@ impl EisSource {
         gate: Arc<IoGate>,
         displays: DisplaysFn,
     ) -> Result<(EisSource, EisKeyInjector, EisPointerInjector), PlatformError> {
-        let _ = (gate, displays);
-        Err(PlatformError::Unsupported(
-            "EIS injection not implemented yet",
+        let wake = rustix::event::eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)
+            .map_err(|_| backend("could not create the EIS worker wake-up"))?;
+        let inner = Arc::new(Inner::new(wake));
+        let (commands, queue) = mpsc::sync_channel(COMMAND_QUEUE);
+        worker::spawn(gate, inner.clone(), queue)
+            .map_err(|_| backend("could not start the EIS worker"))?;
+        let shared = Arc::new(Shared {
+            commands,
+            inner,
+            displays,
+        });
+        Ok((
+            EisSource {
+                shared: shared.clone(),
+            },
+            EisKeyInjector {
+                shared: shared.clone(),
+            },
+            EisPointerInjector { shared },
         ))
     }
 
@@ -70,80 +208,109 @@ impl EisSource {
     /// keyboard, pointer, absolute pointer, button and scroll capabilities). Returns once the
     /// handshake is done or failed (bounded: 2 s). Replaces the previous connection.
     pub fn attach(&self, fd: OwnedFd) -> Result<(), PlatformError> {
-        let _ = fd;
-        Err(PlatformError::Unsupported(
-            "EIS injection not implemented yet",
-        ))
+        self.shared
+            .call(Action::Attach(fd), Instant::now() + ATTACH_BUDGET)
     }
 
-    /// Drop the connection (the portal session closed). Idempotent.
-    pub fn detach(&self) {}
+    /// Drop the connection (the portal session closed). Idempotent. What the connection held is
+    /// released first; this waits up to 300 ms for that to be written.
+    pub fn detach(&self) {
+        let _ = self
+            .shared
+            .call(Action::Detach, Instant::now() + DETACH_BUDGET);
+    }
 
     /// Whether a connection with a resumed keyboard and pointer exists now.
     pub fn is_live(&self) -> bool {
-        false
+        self.shared.inner.live.load(Ordering::Acquire)
     }
 }
 
 impl KeyInjector for EisKeyInjector {
     fn key(&mut self, usage: HidUsage, down: bool) -> Result<(), PlatformError> {
-        let _ = (usage, down);
-        Err(PlatformError::Unsupported(
-            "EIS injection not implemented yet",
-        ))
+        let code = map::key_code(usage)?;
+        self.shared.call_within(Action::Key { code, down })
     }
 
     fn lock_keys(&self) -> Result<LockKeys, PlatformError> {
-        Err(PlatformError::Unsupported(
-            "EIS injection not implemented yet",
+        Ok(worker::unpack_locks(
+            self.shared.inner.locks.load(Ordering::Acquire),
         ))
     }
 
     fn set_lock_keys(&mut self, wanted: LockKeys) -> Result<(), PlatformError> {
-        let _ = wanted;
-        Err(PlatformError::Unsupported(
-            "EIS injection not implemented yet",
-        ))
+        if wanted.caps_lock.is_none() && wanted.num_lock.is_none() {
+            return Ok(());
+        }
+        self.shared.call_within(Action::SetLocks(wanted))
     }
 
     fn release_all(&mut self) -> Result<(), PlatformError> {
-        Ok(())
+        self.shared.call_within(Action::ReleaseKeys)
     }
 
     fn recover_keys(&mut self, keys: &[HidUsage]) -> Result<(), PlatformError> {
-        let _ = keys;
-        Ok(())
+        // A usage with no evdev code can't have been pressed by this source.
+        let codes: Vec<u16> = keys
+            .iter()
+            .filter_map(|usage| map::key_code(*usage).ok())
+            .collect();
+        if codes.is_empty() {
+            return Ok(());
+        }
+        self.shared.call_within(Action::RecoverKeys(codes))
     }
 }
 
 impl PointerInjector for EisPointerInjector {
     fn move_to(&mut self, display: DisplayId, position: PointDevice) -> Result<(), PlatformError> {
-        let _ = (display, position);
-        Err(PlatformError::Unsupported(
-            "EIS injection not implemented yet",
-        ))
+        let deadline = Instant::now() + CALL_BUDGET;
+        let displays = (self.shared.displays)();
+        let info = displays
+            .iter()
+            .find(|info| info.id == display)
+            .ok_or(PlatformError::NotFound)?;
+        let (x, y) = regions::logical_point(&info.geometry, position)?;
+        self.shared.call(Action::Move { x, y }, deadline)
     }
 
     fn button(&mut self, button: MouseButton, down: bool) -> Result<(), PlatformError> {
-        let _ = (button, down);
-        Err(PlatformError::Unsupported(
-            "EIS injection not implemented yet",
-        ))
+        let code = map::button_code(button)?;
+        self.shared.call_within(Action::Button { code, down })
     }
 
     fn scroll(&mut self, delta: ScrollDelta) -> Result<(), PlatformError> {
-        let _ = delta;
-        Err(PlatformError::Unsupported(
-            "EIS injection not implemented yet",
-        ))
+        let plan = map::plan_scroll(&delta)?;
+        if plan.motion.is_none() && plan.stop.is_none() {
+            return Ok(());
+        }
+        self.shared.call_within(Action::Scroll(plan))
     }
 
     fn release_all(&mut self) -> Result<(), PlatformError> {
-        Ok(())
+        self.shared.call_within(Action::ReleaseButtons)
     }
 
     fn recover_buttons(&mut self, buttons: &[MouseButton]) -> Result<(), PlatformError> {
-        let _ = buttons;
-        Ok(())
+        let codes: Vec<u32> = buttons
+            .iter()
+            .filter_map(|button| map::button_code(*button).ok())
+            .collect();
+        if codes.is_empty() {
+            return Ok(());
+        }
+        self.shared.call_within(Action::RecoverButtons(codes))
+    }
+}
+
+impl Drop for EisKeyInjector {
+    fn drop(&mut self) {
+        let _ = self.shared.call_within(Action::ReleaseKeys);
+    }
+}
+
+impl Drop for EisPointerInjector {
+    fn drop(&mut self) {
+        let _ = self.shared.call_within(Action::ReleaseButtons);
     }
 }
