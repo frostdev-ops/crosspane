@@ -2642,9 +2642,13 @@ mod local_activity {
             // Release the pending read only after stop publishes its flag, without a sleep.
             woken.recv_timeout(Duration::from_secs(2)).unwrap();
             assert!(flag.load(Ordering::Acquire));
-            assert!(generation.0.try_lock().is_ok());
+            assert!(
+                !stopping.is_finished(),
+                "stop must wait for the pending read"
+            );
             release.send(()).unwrap();
             stopping.join().unwrap();
+            assert!(!*generation.0.lock().unwrap());
             h.drain();
             assert_eq!(h.reports.count(), 0);
         }

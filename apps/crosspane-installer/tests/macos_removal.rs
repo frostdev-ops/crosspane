@@ -2663,12 +2663,12 @@ mod a2_tests {
         let o = r.observer();
         let app = r.io.target().app_path();
         let scratch = r.scratch.clone();
-        let counter = Arc::new(AtomicU64::new(0));
-        let hits = counter.clone();
+        let changed = Arc::new(AtomicBool::new(false));
+        let injected = changed.clone();
         *r.hook.lock().unwrap() = Some(Arc::new(move |stage, p| {
-            // The hook runs after stat. Change the directory after the initial walk snapshot,
-            // before the final stat, rather than after that final observation was already read.
-            if stage == "metadata" && p == app && hits.fetch_add(1, Ordering::AcqRel) == 2 {
+            // Mutate after enumeration, between the observer's two directory snapshots.
+            // Earlier payload-recovery metadata reads must not move the injection point.
+            if stage == "entries-read" && p == app && !injected.swap(true, Ordering::AcqRel) {
                 scratch.put(&app.join("created-during-observation"), b"foreign", 0o600);
             }
             Ok(())
@@ -2677,7 +2677,7 @@ mod a2_tests {
             o.observe(None, 1, OperationId(1), &r.d()).unwrap_err(),
             NativeError::Foreign
         );
-        assert!(counter.load(Ordering::Acquire) >= 4);
+        assert!(changed.load(Ordering::Acquire));
     }
     #[test]
     fn a2_noncooperative_workers_keep_four_admission_slots_after_timeout() {

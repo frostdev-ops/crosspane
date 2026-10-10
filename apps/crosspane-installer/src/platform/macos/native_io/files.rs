@@ -333,6 +333,8 @@ impl MacNativeIo {
             ))?);
             result.push((name.to_owned(), identity));
         }
+        #[cfg(test)]
+        self.target.observe("entries-read", path, None)?;
         anchor.revalidate(self)?;
         result.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(result)

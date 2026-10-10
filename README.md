@@ -154,6 +154,8 @@ The [CircleCI pipeline](.circleci/config.yml) runs on pushes, including pull-req
 
 The hosted macOS test profile explicitly excludes hardware VideoToolbox encode/decode cases that cannot run in CircleCI's VM. Pure codec validation, display enumeration and offscreen GPU tests still run. The default test profile retains the hardware cases for a Mac with working VideoToolbox acceleration.
 
+With an authenticated [CircleCI CLI](https://cli.circleci.com/), inspect a failed pipeline using `circleci run get <pipeline-id> --failure-report`. The macOS job uses the [`circleci-macos` nextest profile](.config/nextest.toml) to make its hardware exclusions explicit.
+
 ## Documentation
 
 | | Start here |
