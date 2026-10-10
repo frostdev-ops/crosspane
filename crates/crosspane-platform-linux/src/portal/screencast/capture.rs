@@ -145,7 +145,7 @@ pub(super) struct StartRequest {
 
 /// Why a stream must end, decided in a callback and acted on by the loop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fault {
+pub(in crate::portal) enum Fault {
     Ended(StreamEndReason),
     /// The stream or its node went away on its own; the loop picks `TargetGone` or `Failed`.
     Lost,
@@ -202,7 +202,7 @@ impl Cached {
 }
 
 /// Why a buffer gave no frame.
-enum BufferFault {
+pub(in crate::portal) enum BufferFault {
     /// Nothing new in it (no data, or the producer marked it corrupt/empty): skipped silently.
     Empty,
     /// Not usable: counted, and the stream is given up after too many in a row.
@@ -220,8 +220,22 @@ fn pixel_error_text(error: PixelError) -> &'static str {
     }
 }
 
+/// What one buffer says it changed, independent of any capture (a stream shared by several captures
+/// reads it once and hands it to each).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::portal) enum BufferDamage {
+    /// Nothing usable: the whole image counts as changed.
+    Unknown,
+    /// These regions, clipped to the image and never empty.
+    Regions(Vec<PixelRect>),
+}
+
 /// One capture stream's state. Touched by its callbacks and by the loop, never concurrently.
-struct Capture {
+///
+/// `portal::virtual_screen` also drives it: one PipeWire stream feeds several of these through
+/// [`accept`](Capture::accept) and [`apply_damage`](Capture::apply_damage) and never uses the
+/// format callbacks.
+pub(in crate::portal) struct Capture {
     id: StreamId,
     sink: Arc<dyn EventSink<FrameEvent>>,
     gate: Arc<IoGate>,
@@ -245,7 +259,7 @@ struct Capture {
 }
 
 impl Capture {
-    fn new(
+    pub(in crate::portal) fn new(
         id: StreamId,
         sink: Arc<dyn EventSink<FrameEvent>>,
         gate: Arc<IoGate>,
@@ -274,12 +288,22 @@ impl Capture {
         }
     }
 
-    fn mark(&mut self, fault: Fault) {
+    pub(in crate::portal) fn mark(&mut self, fault: Fault) {
         self.fault.get_or_insert(fault);
     }
 
+    /// The fault the capture has marked, if any (cleared).
+    pub(in crate::portal) fn take_fault(&mut self) -> Option<Fault> {
+        self.fault.take()
+    }
+
+    /// Where this capture's events go.
+    pub(in crate::portal) fn sink(&self) -> &Arc<dyn EventSink<FrameEvent>> {
+        &self.sink
+    }
+
     /// Forget every pixel and what changed since: the next frame is whole.
-    fn forget_pixels(&mut self) {
+    pub(in crate::portal) fn forget_pixels(&mut self) {
         self.cache = None;
         self.held = None;
         self.damage.add_unknown();
@@ -380,28 +404,15 @@ impl Capture {
 
     /// Add what `buffer` says it changed to the damage the next frame reports.
     fn note_damage(&mut self, buffer: &pw::buffer::Buffer<'_>, size: PixelSize) {
-        if let Some(header) = buffer.find_meta::<MetaHeader>()
-            && header.flags().contains(MetaHeaderFlags::DISCONT)
-        {
-            self.damage.add_unknown();
+        self.apply_damage(&buffer_damage(buffer, size));
+    }
+
+    /// Add `damage` to what the next frame reports.
+    pub(in crate::portal) fn apply_damage(&mut self, damage: &BufferDamage) {
+        match damage {
+            BufferDamage::Unknown => self.damage.add_unknown(),
+            BufferDamage::Regions(rects) => self.damage.add(rects),
         }
-        let Some(meta) = buffer.find_meta::<MetaVideoDamage>() else {
-            self.damage.add_unknown();
-            return;
-        };
-        let (Ok(width), Ok(height)) = (i32::try_from(size.width), i32::try_from(size.height))
-        else {
-            self.damage.add_unknown();
-            return;
-        };
-        let rects: Vec<PixelRect> = meta
-            .iter()
-            .take(MAX_DAMAGE_REGIONS)
-            .filter_map(region_rect)
-            .collect();
-        let bounds = PixelRect::new(point2(0, 0), point2(width, height));
-        // Nothing usable left (or none sent) means unknown, never "unchanged".
-        self.damage.add(&clip_damage(&rects, bounds));
     }
 
     /// Turn the newest buffer into the held frame and deliver it if its slot has come.
@@ -425,7 +436,13 @@ impl Capture {
     }
 
     /// `full` (tight BGRA of `size`) is the stream's newest image.
-    fn accept(&mut self, full: impl Into<Arc<[u8]>>, size: PixelSize, at: MonoTime, now: Instant) {
+    pub(in crate::portal) fn accept(
+        &mut self,
+        full: impl Into<Arc<[u8]>>,
+        size: PixelSize,
+        at: MonoTime,
+        now: Instant,
+    ) {
         self.bad_buffers = 0;
         self.cache = Some(Cached {
             size,
@@ -450,7 +467,7 @@ impl Capture {
         }
     }
 
-    fn bad_buffer(&mut self, why: &'static str) {
+    pub(in crate::portal) fn bad_buffer(&mut self, why: &'static str) {
         self.bad_buffers = self.bad_buffers.saturating_add(1);
         if self.bad_buffers == 1 || self.bad_buffers.is_multiple_of(100) {
             tracing::warn!(
@@ -467,7 +484,7 @@ impl Capture {
 
     /// Send the held frame if the gate is open and the pacer allows it. A closed gate drops it
     /// and ends the stream.
-    fn deliver_due(&mut self, now: Instant) {
+    pub(in crate::portal) fn deliver_due(&mut self, now: Instant) {
         if self.held.is_none() {
             return;
         }
@@ -508,7 +525,7 @@ impl Capture {
     }
 
     /// A new crop: the next frame is whole, and the cache gives one at once.
-    fn set_crop(&mut self, crop: Option<PixelRect>, now: Instant) {
+    pub(in crate::portal) fn set_crop(&mut self, crop: Option<PixelRect>, now: Instant) {
         self.crop = crop;
         self.held = None;
         self.damage.add_unknown();
@@ -517,10 +534,41 @@ impl Capture {
     }
 
     /// When the loop should look at this stream again (a frame is waiting for its slot).
-    fn wake_at(&self, now: Instant) -> Option<Instant> {
+    pub(in crate::portal) fn wake_at(&self, now: Instant) -> Option<Instant> {
         self.held
             .as_ref()
             .map(|_| self.pacer.deadline().unwrap_or(now))
+    }
+}
+
+/// What `buffer` says it changed within an image of `size`. A discontinuity, missing or unusable
+/// metadata, or no region left after clipping is `Unknown`, never "unchanged".
+pub(in crate::portal) fn buffer_damage(
+    buffer: &pw::buffer::Buffer<'_>,
+    size: PixelSize,
+) -> BufferDamage {
+    if let Some(header) = buffer.find_meta::<MetaHeader>()
+        && header.flags().contains(MetaHeaderFlags::DISCONT)
+    {
+        return BufferDamage::Unknown;
+    }
+    let Some(meta) = buffer.find_meta::<MetaVideoDamage>() else {
+        return BufferDamage::Unknown;
+    };
+    let (Ok(width), Ok(height)) = (i32::try_from(size.width), i32::try_from(size.height)) else {
+        return BufferDamage::Unknown;
+    };
+    let rects: Vec<PixelRect> = meta
+        .iter()
+        .take(MAX_DAMAGE_REGIONS)
+        .filter_map(region_rect)
+        .collect();
+    let bounds = PixelRect::new(point2(0, 0), point2(width, height));
+    let clipped = clip_damage(&rects, bounds);
+    if clipped.is_empty() {
+        BufferDamage::Unknown
+    } else {
+        BufferDamage::Regions(clipped)
     }
 }
 
@@ -539,7 +587,7 @@ fn region_rect(region: &MetaRegion) -> Option<PixelRect> {
 }
 
 /// The buffer's pixels as tight BGRA, honouring the chunk's offset and the row stride.
-fn read_image(
+pub(in crate::portal) fn read_image(
     buffer: &mut pw::buffer::Buffer<'_>,
     negotiated: Negotiated,
 ) -> Result<Arc<[u8]>, BufferFault> {
@@ -602,14 +650,17 @@ fn with<R>(capture: &Rc<RefCell<Capture>>, f: impl FnOnce(&mut Capture) -> R) ->
     }
 }
 
-fn emit(sink: &Arc<dyn EventSink<FrameEvent>>, event: FrameEvent) {
+pub(in crate::portal) fn emit(sink: &Arc<dyn EventSink<FrameEvent>>, event: FrameEvent) {
     if catch_unwind(AssertUnwindSafe(|| sink.send(event))).is_err() {
         tracing::warn!("frame event sink panicked");
     }
 }
 
 /// Answer a negotiated format with the buffer and metadata parameters.
-fn send_params(stream: &pw::stream::Stream, params: &[Vec<u8>]) -> Result<(), ()> {
+pub(in crate::portal) fn send_params(
+    stream: &pw::stream::Stream,
+    params: &[Vec<u8>],
+) -> Result<(), ()> {
     let mut pods: Vec<&Pod> = Vec::with_capacity(params.len());
     for bytes in params {
         pods.push(Pod::from_bytes(bytes).ok_or(())?);
@@ -1373,6 +1424,30 @@ mod tests {
         assert!(capture.fault.is_none());
         capture.bad_buffer("test");
         assert_eq!(capture.fault, Some(Fault::Ended(StreamEndReason::Failed)));
+    }
+
+    #[test]
+    fn buffer_damage_is_applied_as_regions_or_as_unknown() {
+        let (mut capture, sink, _gate) = capture(30, None);
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        capture.accept(image(4, 2, 1), size(4, 2), MonoTime::ZERO, t0);
+        // Regions add up between two delivered frames.
+        capture.apply_damage(&BufferDamage::Regions(vec![rect(0, 0, 1, 1)]));
+        capture.apply_damage(&BufferDamage::Regions(vec![rect(2, 1, 4, 2)]));
+        capture.accept(image(4, 2, 2), size(4, 2), MonoTime::ZERO, t0 + ms(40));
+        // One unknown makes the whole interval unknown, whatever else was reported.
+        capture.apply_damage(&BufferDamage::Regions(vec![rect(0, 0, 1, 1)]));
+        capture.apply_damage(&BufferDamage::Unknown);
+        capture.apply_damage(&BufferDamage::Regions(vec![rect(1, 1, 2, 2)]));
+        capture.accept(image(4, 2, 3), size(4, 2), MonoTime::ZERO, t0 + ms(80));
+        let frames = sink.frames();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(
+            frames[1].damage,
+            Some(vec![rect(0, 0, 1, 1), rect(2, 1, 4, 2)])
+        );
+        assert_eq!(frames[2].damage, None);
     }
 
     #[test]
