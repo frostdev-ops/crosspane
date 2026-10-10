@@ -23,8 +23,16 @@
 //! - **Session loss.** If the session closes or the portal's bus name changes owner, the worker
 //!   emits `Released` if pressed, then retries creating a session and rebinding the last chord
 //!   with a backoff of 1 s doubling to 30 s (the backoff restarts once a session stayed bound for
-//!   30 s). A dialog the user denied or dismissed is not retried automatically (it would nag); it
-//!   is asked again on the next `set_chord` with a different chord.
+//!   30 s). A dialog the user denied or dismissed is not retried automatically (it would nag); the
+//!   session stays open and the chord is asked for again on the next `set_chord` with a different
+//!   chord.
+//! - **Stored bindings.** The desktop keeps a bound shortcut across runs (GNOME stores it in
+//!   dconf per app id) and refuses to bind it again. So the session's first request lists the
+//!   app's shortcuts (`ListShortcuts`); if `crosspane-release` is there it counts as bound and
+//!   `BindShortcuts` is not called. The chord is bound only when the shortcut is absent (first
+//!   run, or the desktop forgot it) or when `set_chord` changes it during the run. A failed
+//!   rebind never tears down a binding that already works. Every bind failure is logged at `warn`
+//!   with the portal's error text.
 //! - **Triggers are hints.** The desktop owns the final binding: `preferred_trigger` is only used
 //!   when the shortcut is first bound, and the user may rebind it in the desktop's settings. The
 //!   portal reports activations for whatever trigger the user ended up with. The portal's
@@ -40,8 +48,8 @@
 //!   can't spell (never a silent weakening). The tray and `crosspanectl` keep release and panic
 //!   available.
 //! - **App id.** The portal identifies a non-sandboxed client by an app id registered for the
-//!   process's bus connection (`ashpd::register_host_app`). That is process-wide, so the agent
-//!   registers it once at startup, before any portal call; this module does not.
+//!   process's bus connection. That is process-wide: the agent calls
+//!   `portal::register_host_app` once at startup, before any portal call; this module does not.
 
 use std::convert::Infallible;
 use std::fmt::{self, Display};
@@ -54,7 +62,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use ashpd::desktop::global_shortcuts::{
-    Activated, BindShortcuts, BindShortcutsOptions, Deactivated, GlobalShortcuts, NewShortcut,
+    Activated, BindShortcutsOptions, Deactivated, GlobalShortcuts, ListShortcutsOptions,
+    NewShortcut, Shortcut,
 };
 use ashpd::desktop::{CreateSessionOptions, ResponseError, Session};
 use ashpd::{Error as AshpdError, PortalError};
@@ -368,11 +377,12 @@ impl Backoff {
 }
 
 /// What a failed bind means for the retry policy.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BindFailure {
-    /// The user (or the desktop's policy) said no: don't ask again until the chord changes.
+    /// The desktop said no (the user dismissed the dialog, or its policy refused, or it considers
+    /// the shortcut already bound): don't ask again until the chord changes.
     Denied,
-    /// Anything else (portal restarting, bus error): retry with backoff.
+    /// Anything else (portal restarting, bus error): end the session and retry with backoff.
     Retry,
 }
 
@@ -383,6 +393,103 @@ fn classify_bind_error(error: &AshpdError) -> BindFailure {
             BindFailure::Denied
         }
         _ => BindFailure::Retry,
+    }
+}
+
+/// What the desktop reports for our shortcut (from `ListShortcuts` or the `BindShortcuts` answer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShortcutState {
+    /// Not in the list: never bound for this app, or the desktop forgot it.
+    Absent,
+    /// In the list. `has_trigger` is false if the user cleared its trigger in the desktop's
+    /// settings (the shortcut exists but nothing can activate it).
+    Present { has_trigger: bool },
+}
+
+/// The state of our shortcut among `(id, trigger_description)` pairs.
+fn shortcut_state<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str)>) -> ShortcutState {
+    entries
+        .into_iter()
+        .find(|(id, _)| *id == SHORTCUT_ID)
+        .map_or(ShortcutState::Absent, |(_, trigger)| {
+            ShortcutState::Present {
+                has_trigger: !trigger.is_empty(),
+            }
+        })
+}
+
+/// Does the shortcut still have to be bound? Only if the desktop doesn't already hold it: a
+/// stored shortcut, even one whose trigger the user cleared, is not bound again.
+fn needs_bind(state: ShortcutState) -> bool {
+    state == ShortcutState::Absent
+}
+
+/// What the session does next after a bind request ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BindNext {
+    /// Nothing more to ask; keep serving signals.
+    Idle,
+    /// The chord changed while the request was in flight: ask again for the newest chord.
+    Rebind,
+    /// Nothing is bound and the failure is not the desktop's refusal: end the session and retry.
+    EndSession,
+}
+
+/// Bookkeeping for the session's bind requests: at most one in flight, the newest chord wins, and
+/// a binding the desktop already holds is never torn down by a later failure.
+#[derive(Debug, Default)]
+struct Binder {
+    /// The desktop holds a binding for our shortcut: found by `ListShortcuts` or bound.
+    has_binding: bool,
+    /// The chord generation of the request in flight.
+    in_flight: Option<u64>,
+    /// The newest chord generation seen.
+    wanted: u64,
+    /// A request has been started in this session.
+    started: bool,
+}
+
+impl Binder {
+    /// A request for `generation` starts now. Returns whether it should look the shortcut up
+    /// first: only the session's first request does, because a shortcut the desktop stored from
+    /// an earlier run is already bound and must not be bound again (GNOME refuses that).
+    fn begin(&mut self, generation: u64) -> bool {
+        let first = !self.started;
+        self.started = true;
+        self.in_flight = Some(generation);
+        self.wanted = generation;
+        first
+    }
+
+    /// The chord changed to `generation`. Returns whether to start a request now; if one is in
+    /// flight (it may be waiting on the user) the newer chord is asked for when it ends.
+    fn changed(&mut self, generation: u64) -> bool {
+        self.wanted = generation;
+        self.in_flight.is_none()
+    }
+
+    fn has_binding(&self) -> bool {
+        self.has_binding
+    }
+
+    /// The request ended. `Ok` means the desktop holds the binding (found or bound).
+    fn finished(&mut self, result: Result<(), BindFailure>) -> BindNext {
+        let done = self.in_flight.take();
+        let retry_needed = done.is_some_and(|done| done != self.wanted);
+        match result {
+            Ok(()) => self.has_binding = true,
+            // A failed rebind keeps the binding that already works. Without one, only a
+            // refusal keeps the session: signals for a binding the desktop stored itself still
+            // arrive, and the session is the place the next chord is bound.
+            Err(BindFailure::Denied) => {}
+            Err(BindFailure::Retry) if self.has_binding => {}
+            Err(BindFailure::Retry) => return BindNext::EndSession,
+        }
+        if retry_needed {
+            BindNext::Rebind
+        } else {
+            BindNext::Idle
+        }
     }
 }
 
@@ -625,11 +732,6 @@ async fn interruptible<F: Future>(shared: &Shared, fut: F) -> Option<F::Output> 
 #[derive(Debug)]
 enum SessionEnd {
     Shutdown,
-    /// The desktop refused the binding (or the user dismissed its dialog) for the chord of this
-    /// generation.
-    Denied {
-        generation: u64,
-    },
     Lost {
         reason: String,
         /// The session object is already gone (closed by the portal, or the portal itself is),
@@ -697,14 +799,6 @@ fn run_worker(shared: &Shared) {
         shared.hub.lost();
         match end {
             SessionEnd::Shutdown => return,
-            SessionEnd::Denied { generation } => {
-                tracing::warn!(
-                    "the desktop did not bind the Crosspane release chord; change the chord to ask again"
-                );
-                if shared.wait_for_change(generation, None) == Wake::Shutdown {
-                    return;
-                }
-            }
             SessionEnd::Lost { reason, .. } => {
                 failures = if bound_at.is_some() {
                     1
@@ -774,8 +868,7 @@ async fn run_session(shared: &Shared, bound_at: &mut Option<Instant>) -> Session
         SessionEnd::Shutdown => {
             let _ = session.close().await;
         }
-        SessionEnd::Denied { .. }
-        | SessionEnd::Lost {
+        SessionEnd::Lost {
             session_gone: false,
             ..
         } => {
@@ -786,22 +879,85 @@ async fn run_session(shared: &Shared, bound_at: &mut Option<Instant>) -> Session
     end
 }
 
-type BindFuture<'a> = Pin<Box<dyn Future<Output = Result<BindShortcuts, AshpdError>> + 'a>>;
+/// What a bind request found out.
+struct BindOutcome {
+    /// The shortcuts the desktop reported (all of this app's, from the list or the bind answer).
+    shortcuts: Vec<Shortcut>,
+    /// The shortcut was already bound (stored by the desktop from an earlier run), so
+    /// `BindShortcuts` was not called.
+    existing: bool,
+}
 
+type BindFuture<'a> = Pin<Box<dyn Future<Output = Result<BindOutcome, AshpdError>> + 'a>>;
+
+/// Make sure the desktop holds the shortcut. With `lookup_first` (the session's first request) the
+/// app's shortcuts are listed and, if ours is among them, it counts as bound and `BindShortcuts`
+/// is not called: the desktop stores a bound shortcut across runs and refuses to bind it again.
+/// Otherwise (first run, a changed chord, or a failed lookup) the chord is bound.
 fn start_bind<'a>(
     portal: &'a GlobalShortcuts,
     session: &'a Session<GlobalShortcuts>,
     trigger: String,
+    lookup_first: bool,
 ) -> BindFuture<'a> {
     Box::pin(async move {
+        if lookup_first {
+            let listed = match portal
+                .list_shortcuts(session, ListShortcutsOptions::default())
+                .await
+            {
+                Ok(request) => request.response(),
+                Err(error) => Err(error),
+            };
+            match listed {
+                Ok(listed) => {
+                    let shortcuts = listed.shortcuts().to_vec();
+                    let state = shortcut_state(shortcuts.iter().map(entry));
+                    if !needs_bind(state) {
+                        return Ok(BindOutcome {
+                            shortcuts,
+                            existing: true,
+                        });
+                    }
+                }
+                // Not fatal: bind as if nothing were stored.
+                Err(error) => {
+                    tracing::warn!(%error, "listing the desktop's shortcuts failed; binding the release chord instead");
+                }
+            }
+        }
         let shortcuts =
             [NewShortcut::new(SHORTCUT_ID, SHORTCUT_DESCRIPTION)
                 .preferred_trigger(trigger.as_str())];
         let request = portal
             .bind_shortcuts(session, &shortcuts, None, BindShortcutsOptions::default())
             .await?;
-        request.response()
+        let bound = request.response()?;
+        Ok(BindOutcome {
+            shortcuts: bound.shortcuts().to_vec(),
+            existing: false,
+        })
     })
+}
+
+/// A shortcut as `(id, trigger_description)`.
+fn entry(shortcut: &Shortcut) -> (&str, &str) {
+    (shortcut.id(), shortcut.trigger_description())
+}
+
+/// Start the next bind request for the newest chord.
+fn begin_bind<'a>(
+    shared: &Shared,
+    portal: &'a GlobalShortcuts,
+    session: &'a Session<GlobalShortcuts>,
+    binder: &mut Binder,
+    seen: &mut u64,
+) -> Option<BindFuture<'a>> {
+    let (trigger, generation) = shared.snapshot();
+    let trigger = trigger?;
+    *seen = generation;
+    let lookup_first = binder.begin(generation);
+    Some(start_bind(portal, session, trigger, lookup_first))
 }
 
 enum Event {
@@ -810,7 +966,7 @@ enum Event {
     SessionClosed,
     OwnerChanged,
     Signal(Option<zbus::Message>),
-    Bind(Result<BindShortcuts, AshpdError>),
+    Bind(Result<BindOutcome, AshpdError>),
 }
 
 /// Bind the chord and serve the session's signals. Never returns normally: every exit is an end.
@@ -827,17 +983,16 @@ async fn serve(
     let mut signals = pin!(signals);
     let mut owner = pin!(owner);
 
-    let (trigger, generation) = shared.snapshot();
-    let Some(trigger) = trigger else {
+    // `seen` is the newest chord generation acted on; `binder` tracks the request in flight.
+    let mut seen = 0;
+    let mut binder = Binder::default();
+    let mut bind = begin_bind(shared, portal, session, &mut binder, &mut seen);
+    if bind.is_none() {
         return Err(SessionEnd::Lost {
             reason: "no release chord set".into(),
             session_gone: false,
         });
-    };
-    // The generation the in-flight bind was started for, and the newest one acted on.
-    let mut bound_generation = generation;
-    let mut seen = generation;
-    let mut bind: Option<BindFuture<'_>> = Some(start_bind(portal, session, trigger));
+    }
 
     loop {
         let event = poll_fn(|cx| {
@@ -886,66 +1041,88 @@ async fn serve(
             }
             Event::Signal(Some(message)) => handle_signal(&shared.hub, &message),
             Event::Changed => {
-                let (trigger, generation) = shared.snapshot();
+                let (_, generation) = shared.snapshot();
                 seen = generation;
                 // The replaced chord's release may never arrive.
                 shared.hub.lost();
-                // A bind in flight finishes first (it may be waiting on the user); the newer
-                // chord is bound right after it.
-                if bind.is_none()
-                    && let Some(trigger) = trigger
-                {
-                    bound_generation = generation;
-                    bind = Some(start_bind(portal, session, trigger));
+                // A request in flight finishes first (it may be waiting on the user); the newer
+                // chord is asked for right after it.
+                if binder.changed(generation) {
+                    bind = begin_bind(shared, portal, session, &mut binder, &mut seen);
                 }
             }
-            Event::Bind(Ok(bound)) => {
+            Event::Bind(result) => {
                 bind = None;
-                bound_at.get_or_insert_with(Instant::now);
-                log_bound(&bound);
-                if seen != bound_generation {
-                    let (trigger, generation) = shared.snapshot();
-                    seen = generation;
-                    if let Some(trigger) = trigger {
-                        bound_generation = generation;
-                        bind = Some(start_bind(portal, session, trigger));
+                let (next, failure) = match result {
+                    Ok(outcome) => {
+                        bound_at.get_or_insert_with(Instant::now);
+                        log_outcome(&outcome);
+                        (binder.finished(Ok(())), None)
+                    }
+                    Err(error) => {
+                        let failure = classify_bind_error(&error);
+                        tracing::warn!(
+                            %error,
+                            ?failure,
+                            has_binding = binder.has_binding(),
+                            "binding the release chord failed"
+                        );
+                        (binder.finished(Err(failure)), Some(error))
+                    }
+                };
+                if failure.is_some() && !binder.has_binding() && next != BindNext::EndSession {
+                    tracing::warn!(
+                        "the Crosspane release chord is not bound; the session stays open in case the desktop holds a binding for it, and changing the chord asks again"
+                    );
+                }
+                match next {
+                    BindNext::Idle => {}
+                    BindNext::Rebind => {
+                        bind = begin_bind(shared, portal, session, &mut binder, &mut seen);
+                    }
+                    BindNext::EndSession => {
+                        let reason = failure.map_or_else(
+                            || "bind the release chord failed".to_string(),
+                            |error| format!("bind the release chord: {error}"),
+                        );
+                        return Err(SessionEnd::Lost {
+                            reason,
+                            session_gone: false,
+                        });
                     }
                 }
-            }
-            Event::Bind(Err(error)) => {
-                return Err(match classify_bind_error(&error) {
-                    BindFailure::Denied => {
-                        tracing::debug!(%error, "binding the release chord was refused");
-                        SessionEnd::Denied {
-                            generation: bound_generation,
-                        }
-                    }
-                    BindFailure::Retry => SessionEnd::Lost {
-                        reason: format!("bind the release chord: {error}"),
-                        session_gone: false,
-                    },
-                });
             }
         }
     }
 }
 
-/// Say what the desktop actually bound. A missing or trigger-less shortcut leaves the emergency
-/// control unreachable from the keyboard, so that is a warning.
-fn log_bound(bound: &BindShortcuts) {
-    match bound.shortcuts().iter().find(|s| s.id() == SHORTCUT_ID) {
-        Some(shortcut) if !shortcut.trigger_description().is_empty() => {
+/// Say what the desktop holds for the shortcut. A missing or trigger-less shortcut leaves the
+/// emergency control unreachable from the keyboard, so that is a warning. The trigger text is the
+/// chord's configuration, never typed input.
+fn log_outcome(outcome: &BindOutcome) {
+    let state = shortcut_state(outcome.shortcuts.iter().map(entry));
+    match state {
+        ShortcutState::Present { has_trigger: true } => {
+            let trigger = outcome
+                .shortcuts
+                .iter()
+                .map(entry)
+                .find(|(id, _)| *id == SHORTCUT_ID)
+                .map_or("", |(_, trigger)| trigger);
             tracing::debug!(
-                trigger = shortcut.trigger_description(),
-                "release chord bound by the desktop"
+                trigger,
+                existing = outcome.existing,
+                "release chord is bound by the desktop"
             );
         }
-        Some(_) => tracing::warn!(
-            "the desktop bound the Crosspane release shortcut without a trigger; assign one in its shortcut settings"
+        ShortcutState::Present { has_trigger: false } => tracing::warn!(
+            existing = outcome.existing,
+            "the desktop holds the Crosspane release shortcut without a trigger; assign one in its shortcut settings"
         ),
-        None => {
-            tracing::warn!("the desktop did not report the Crosspane release shortcut as bound")
-        }
+        ShortcutState::Absent => tracing::warn!(
+            existing = outcome.existing,
+            "the desktop did not report the Crosspane release shortcut as bound"
+        ),
     }
 }
 
@@ -1234,6 +1411,120 @@ mod tests {
             AshpdError::Zbus(zbus::Error::Failure("gone".into())),
         ] {
             assert_eq!(classify_bind_error(&error), BindFailure::Retry, "{error}");
+        }
+    }
+
+    // Stored bindings and the bind requests.
+
+    #[test]
+    fn a_stored_shortcut_is_found_among_the_apps_shortcuts() {
+        assert_eq!(shortcut_state([]), ShortcutState::Absent);
+        assert_eq!(shortcut_state([("other", "Ctrl+A")]), ShortcutState::Absent);
+        assert_eq!(
+            shortcut_state([("crosspane-release", "Shift+Ctrl+Alt+Esc")]),
+            ShortcutState::Present { has_trigger: true }
+        );
+        assert_eq!(
+            shortcut_state([("other", ""), ("crosspane-release", "Ctrl+B"), ("x", "")]),
+            ShortcutState::Present { has_trigger: true }
+        );
+        // The user cleared the trigger: still stored.
+        assert_eq!(
+            shortcut_state([("crosspane-release", "")]),
+            ShortcutState::Present { has_trigger: false }
+        );
+    }
+
+    #[test]
+    fn only_an_absent_shortcut_is_bound() {
+        assert!(needs_bind(ShortcutState::Absent));
+        assert!(!needs_bind(ShortcutState::Present { has_trigger: true }));
+        assert!(!needs_bind(ShortcutState::Present { has_trigger: false }));
+    }
+
+    #[test]
+    fn only_the_sessions_first_request_looks_the_shortcut_up() {
+        let mut binder = Binder::default();
+        assert!(binder.begin(1));
+        assert_eq!(binder.finished(Ok(())), BindNext::Idle);
+        assert!(binder.changed(2));
+        assert!(!binder.begin(2));
+        assert_eq!(binder.finished(Ok(())), BindNext::Idle);
+    }
+
+    #[test]
+    fn a_shortcut_stored_by_an_earlier_run_counts_as_bound_without_a_rebind() {
+        // The first request found it listed: an Ok result, no chord change pending.
+        let mut binder = Binder::default();
+        assert!(binder.begin(1));
+        assert!(!binder.has_binding());
+        assert_eq!(binder.finished(Ok(())), BindNext::Idle);
+        assert!(binder.has_binding());
+    }
+
+    #[test]
+    fn a_chord_change_during_a_request_is_asked_after_it_ends() {
+        let mut binder = Binder::default();
+        binder.begin(1);
+        // Never two requests at once: the dialog may be waiting on the user.
+        assert!(!binder.changed(2));
+        assert!(!binder.changed(3));
+        assert_eq!(binder.finished(Ok(())), BindNext::Rebind);
+        binder.begin(3);
+        assert_eq!(binder.finished(Ok(())), BindNext::Idle);
+    }
+
+    #[test]
+    fn a_chord_change_while_idle_starts_a_request() {
+        let mut binder = Binder::default();
+        binder.begin(1);
+        binder.finished(Ok(()));
+        assert!(binder.changed(2));
+        binder.begin(2);
+        assert!(!binder.changed(3));
+    }
+
+    #[test]
+    fn a_refusal_without_a_binding_keeps_the_session_for_the_next_chord() {
+        let mut binder = Binder::default();
+        binder.begin(1);
+        assert_eq!(binder.finished(Err(BindFailure::Denied)), BindNext::Idle);
+        assert!(!binder.has_binding());
+        // Changing the chord asks again, in the same session.
+        assert!(binder.changed(2));
+        binder.begin(2);
+        assert_eq!(binder.finished(Ok(())), BindNext::Idle);
+        assert!(binder.has_binding());
+    }
+
+    #[test]
+    fn a_refusal_after_the_chord_moved_on_asks_for_the_newer_chord() {
+        let mut binder = Binder::default();
+        binder.begin(1);
+        binder.changed(2);
+        assert_eq!(binder.finished(Err(BindFailure::Denied)), BindNext::Rebind);
+    }
+
+    #[test]
+    fn a_bus_failure_without_a_binding_ends_the_session_for_a_retry() {
+        let mut binder = Binder::default();
+        binder.begin(1);
+        assert_eq!(
+            binder.finished(Err(BindFailure::Retry)),
+            BindNext::EndSession
+        );
+    }
+
+    #[test]
+    fn a_failed_rebind_never_tears_down_a_working_binding() {
+        for failure in [BindFailure::Denied, BindFailure::Retry] {
+            let mut binder = Binder::default();
+            binder.begin(1);
+            binder.finished(Ok(()));
+            assert!(binder.changed(2));
+            binder.begin(2);
+            assert_eq!(binder.finished(Err(failure)), BindNext::Idle, "{failure:?}");
+            assert!(binder.has_binding());
         }
     }
 
