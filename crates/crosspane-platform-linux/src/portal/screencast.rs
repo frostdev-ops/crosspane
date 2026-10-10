@@ -64,11 +64,13 @@
 //! touch the desktop's portal or PipeWire server; neither is a compositor, so mutter's and KWin's
 //! own buffers and timing remain a live check.
 
-mod capture;
+// The internals `portal::virtual_screen` shares (the capture state, the format pods, frame
+// bookkeeping, the token file) are visible to `portal`; they keep their behaviour.
+pub(super) mod capture;
 #[cfg(test)]
-mod fake_portal;
-mod format;
-mod frames;
+pub(super) mod fake_portal;
+pub(super) mod format;
+pub(super) mod frames;
 // Compiled a second time on purpose (see the module docs): `lifecycle` names this module's own
 // `SessionStatus` through `super`, so it cannot be shared as one module with `portal::session`.
 #[allow(clippy::duplicate_mod)]
@@ -76,12 +78,12 @@ mod frames;
 mod lifecycle;
 mod pixels;
 #[cfg(test)]
-mod private_server;
+pub(super) mod private_server;
 #[allow(clippy::duplicate_mod)]
 #[path = "session/sleep.rs"]
 mod sleep;
 mod streams;
-mod token;
+pub(super) mod token;
 mod worker;
 
 use std::path::PathBuf;

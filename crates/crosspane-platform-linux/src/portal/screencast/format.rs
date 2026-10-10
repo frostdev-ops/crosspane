@@ -28,7 +28,7 @@ use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle, SpaTy
 use super::pixels::{MAX_PIXELS, PixelFormat};
 
 /// Largest width or height offered.
-pub(super) const MAX_DIMENSION: u32 = 16384;
+pub(in crate::portal) const MAX_DIMENSION: u32 = 16384;
 /// Highest frame rate offered as a maximum.
 const MAX_FRAMERATE: u32 = 1000;
 /// `SPA_DATA_MemFd` and `SPA_DATA_MemPtr` as a `dataType` bit mask. DMA-BUF is left out.
@@ -40,14 +40,14 @@ const REGION_BYTES: i32 = size_of::<spa::sys::spa_meta_region>() as i32;
 
 /// The format a stream settled on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Negotiated {
+pub(in crate::portal) struct Negotiated {
     pub format: PixelFormat,
     pub size: PixelSize,
 }
 
 /// Why a pod could not be built or a negotiated format is not usable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum FormatError {
+pub(in crate::portal) enum FormatError {
     /// Serializing a pod failed.
     Build,
     /// The pod is not raw video.
@@ -61,7 +61,7 @@ pub(super) enum FormatError {
 }
 
 /// The pixel layout of an SPA video format, for the formats this module offers.
-pub(super) fn pixel_format(format: VideoFormat) -> Option<PixelFormat> {
+pub(in crate::portal) fn pixel_format(format: VideoFormat) -> Option<PixelFormat> {
     match format {
         VideoFormat::BGRx => Some(PixelFormat::Bgrx),
         VideoFormat::BGRA => Some(PixelFormat::Bgra),
@@ -78,27 +78,39 @@ fn serialize(object: Object) -> Result<Vec<u8>, FormatError> {
         .map_err(|_| FormatError::Build)
 }
 
+/// The video sizes an `EnumFormat` offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::portal) enum OfferedSize {
+    /// Any size up to [`MAX_DIMENSION`] (monitor capture takes whatever the compositor streams).
+    Any,
+    /// Exactly this size and no other: the consumer of a virtual monitor decides its size
+    /// (`portal::virtual_screen`).
+    Fixed(PixelSize),
+}
+
+/// Whether a stream of this size is one this module reads: both sides within `1..=MAX_DIMENSION`
+/// and at most `MAX_PIXELS` pixels.
+pub(in crate::portal) fn size_supported(size: PixelSize) -> bool {
+    let in_range = |v: u32| (1..=MAX_DIMENSION).contains(&v);
+    in_range(size.width)
+        && in_range(size.height)
+        && u64::from(size.width) * u64::from(size.height) <= MAX_PIXELS
+}
+
 /// The `EnumFormat` pod for a stream limited to `max_fps` frames per second (1 to 1000).
-pub(super) fn enum_format(max_fps: u32) -> Result<Vec<u8>, FormatError> {
+pub(in crate::portal) fn enum_format(max_fps: u32) -> Result<Vec<u8>, FormatError> {
+    enum_format_sized(max_fps, OfferedSize::Any)
+}
+
+/// [`enum_format`] with the offered sizes chosen. A `Fixed` size outside [`size_supported`] is
+/// [`FormatError::BadSize`].
+pub(in crate::portal) fn enum_format_sized(
+    max_fps: u32,
+    sizes: OfferedSize,
+) -> Result<Vec<u8>, FormatError> {
     let max_fps = i32::try_from(max_fps.clamp(1, MAX_FRAMERATE)).unwrap_or(1);
-    serialize(pod::object!(
-        SpaTypes::ObjectParamFormat,
-        ParamType::EnumFormat,
-        pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
-        pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
-        pod::property!(
-            FormatProperties::VideoFormat,
-            Choice,
-            Enum,
-            Id,
-            VideoFormat::BGRx,
-            VideoFormat::BGRx,
-            VideoFormat::BGRA,
-            VideoFormat::RGBx,
-            VideoFormat::RGBA,
-            VideoFormat::xRGB
-        ),
-        pod::property!(
+    let size = match sizes {
+        OfferedSize::Any => pod::property!(
             FormatProperties::VideoSize,
             Choice,
             Range,
@@ -116,6 +128,34 @@ pub(super) fn enum_format(max_fps: u32) -> Result<Vec<u8>, FormatError> {
                 height: MAX_DIMENSION
             }
         ),
+        OfferedSize::Fixed(size) if size_supported(size) => pod::property!(
+            FormatProperties::VideoSize,
+            Rectangle,
+            Rectangle {
+                width: size.width,
+                height: size.height
+            }
+        ),
+        OfferedSize::Fixed(_) => return Err(FormatError::BadSize),
+    };
+    serialize(pod::object!(
+        SpaTypes::ObjectParamFormat,
+        ParamType::EnumFormat,
+        pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+        pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+        pod::property!(
+            FormatProperties::VideoFormat,
+            Choice,
+            Enum,
+            Id,
+            VideoFormat::BGRx,
+            VideoFormat::BGRx,
+            VideoFormat::BGRA,
+            VideoFormat::RGBx,
+            VideoFormat::RGBA,
+            VideoFormat::xRGB
+        ),
+        size,
         pod::property!(
             FormatProperties::VideoFramerate,
             Choice,
@@ -147,7 +187,7 @@ pub(super) fn enum_format(max_fps: u32) -> Result<Vec<u8>, FormatError> {
 }
 
 /// The `Buffers` pod answering a negotiated format: memory-backed buffers only.
-pub(super) fn buffers_param() -> Result<Vec<u8>, FormatError> {
+pub(in crate::portal) fn buffers_param() -> Result<Vec<u8>, FormatError> {
     serialize(Object {
         type_: SpaTypes::ObjectParamBuffers.as_raw(),
         id: ParamType::Buffers.as_raw(),
@@ -181,7 +221,7 @@ pub(super) fn buffers_param() -> Result<Vec<u8>, FormatError> {
 }
 
 /// The `Meta` pods for the buffer header and for video damage.
-pub(super) fn meta_params() -> Result<Vec<Vec<u8>>, FormatError> {
+pub(in crate::portal) fn meta_params() -> Result<Vec<Vec<u8>>, FormatError> {
     let header = serialize(Object {
         type_: SpaTypes::ObjectParamMeta.as_raw(),
         id: ParamType::Meta.as_raw(),
@@ -221,7 +261,7 @@ pub(super) fn meta_params() -> Result<Vec<Vec<u8>>, FormatError> {
 }
 
 /// Read the `Format` the stream settled on.
-pub(super) fn parse_negotiated(format: &Pod) -> Result<Negotiated, FormatError> {
+pub(in crate::portal) fn parse_negotiated(format: &Pod) -> Result<Negotiated, FormatError> {
     let (media_type, media_subtype) = parse_format(format).map_err(|_| FormatError::NotVideoRaw)?;
     if media_type != MediaType::Video || media_subtype != MediaSubtype::Raw {
         return Err(FormatError::NotVideoRaw);
@@ -229,17 +269,13 @@ pub(super) fn parse_negotiated(format: &Pod) -> Result<Negotiated, FormatError> 
     let mut info = VideoInfoRaw::new();
     info.parse(format).map_err(|_| FormatError::Unparseable)?;
     let pixel = pixel_format(info.format()).ok_or(FormatError::UnsupportedFormat)?;
-    let size = info.size();
-    let in_range = |v: u32| (1..=MAX_DIMENSION).contains(&v);
-    if !in_range(size.width)
-        || !in_range(size.height)
-        || u64::from(size.width) * u64::from(size.height) > MAX_PIXELS
-    {
+    let size = PixelSize::new(info.size().width, info.size().height);
+    if !size_supported(size) {
         return Err(FormatError::BadSize);
     }
     Ok(Negotiated {
         format: pixel,
-        size: PixelSize::new(size.width, size.height),
+        size,
     })
 }
 

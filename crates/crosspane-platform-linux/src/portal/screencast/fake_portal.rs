@@ -123,7 +123,7 @@ impl Drop for Daemon {
 
 /// One stream a `Start` grants.
 #[derive(Clone, Copy, Debug)]
-struct Granted {
+pub(in crate::portal) struct Granted {
     node: u32,
     position: (i32, i32),
     size: (i32, i32),
@@ -137,36 +137,50 @@ const MONITOR: Granted = Granted {
 
 /// What the next `Start` does.
 #[derive(Clone, Debug)]
-enum StartScript {
+pub(in crate::portal) enum StartScript {
     /// Grant these streams and a fresh restore token.
     Grant(Vec<Granted>),
+    /// Grant one virtual stream on this PipeWire node (no position or size, `source_type` 4) and a
+    /// fresh restore token.
+    GrantVirtual(u32),
+    /// Grant one stream of another source type than the virtual one was asked for.
+    GrantVirtualAs { node: u32, source_type: u32 },
     /// Respond with this non-success response code (1 cancelled, 2 other).
     Respond(u32),
+    /// Never respond (a consent dialog is up).
+    Silent,
 }
 
 /// What a `SelectSources` call carried.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Select {
-    types: Option<u32>,
-    multiple: Option<bool>,
-    cursor_mode: Option<u32>,
-    persist_mode: Option<u32>,
-    restore_token: Option<String>,
+pub(in crate::portal) struct Select {
+    pub types: Option<u32>,
+    pub multiple: Option<bool>,
+    pub cursor_mode: Option<u32>,
+    pub persist_mode: Option<u32>,
+    pub restore_token: Option<String>,
 }
 
 #[derive(Default)]
-struct Inner {
+pub(in crate::portal) struct Inner {
     version: u32,
+    /// The `AvailableSourceTypes` property.
+    source_types: u32,
     scripts: VecDeque<StartScript>,
     selects: Vec<Select>,
     sessions: Vec<String>,
     closed_by_client: Vec<String>,
+    /// `CreateSession`, `Start` and `OpenPipeWireRemote` calls seen.
+    starts: u32,
+    opened: u32,
     /// The portal's end of each `OpenPipeWireRemote` socket.
     peers: Vec<UnixStream>,
+    /// A PipeWire server `OpenPipeWireRemote` connects its caller to, instead of a silent socket.
+    remote: Option<PathBuf>,
     tokens: u32,
 }
 
-struct Fake {
+pub(in crate::portal) struct Fake {
     inner: Mutex<Inner>,
 }
 
@@ -239,12 +253,34 @@ struct GrantedResults {
 #[derive(Serialize, Type)]
 #[zvariant(signature = "dict")]
 struct StreamProps {
-    #[serde(with = "as_value")]
-    position: (i32, i32),
-    #[serde(with = "as_value")]
-    size: (i32, i32),
+    #[serde(with = "as_value::optional", skip_serializing_if = "Option::is_none")]
+    position: Option<(i32, i32)>,
+    #[serde(with = "as_value::optional", skip_serializing_if = "Option::is_none")]
+    size: Option<(i32, i32)>,
     #[serde(with = "as_value")]
     source_type: u32,
+}
+
+/// Grant one stream with no position and size, as the desktop does for a virtual source.
+async fn grant_without_geometry(
+    connection: &Connection,
+    request: &str,
+    node: u32,
+    source_type: u32,
+    restore_token: String,
+) -> fdo::Result<()> {
+    let results = GrantedResults {
+        streams: vec![(
+            node,
+            StreamProps {
+                position: None,
+                size: None,
+                source_type,
+            },
+        )],
+        restore_token,
+    };
+    respond(connection, request, 0, results).await
 }
 
 struct FakeScreenCast(Arc<Fake>);
@@ -254,6 +290,11 @@ impl FakeScreenCast {
     #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
         self.0.lock().version
+    }
+
+    #[zbus(property, name = "AvailableSourceTypes")]
+    fn available_source_types(&self) -> u32 {
+        self.0.lock().source_types
     }
 
     async fn create_session(
@@ -324,6 +365,7 @@ impl FakeScreenCast {
         let (script, token) = {
             let mut inner = self.0.lock();
             inner.tokens += 1;
+            inner.starts += 1;
             (
                 inner
                     .scripts
@@ -341,8 +383,8 @@ impl FakeScreenCast {
                             (
                                 g.node,
                                 StreamProps {
-                                    position: g.position,
-                                    size: g.size,
+                                    position: Some(g.position),
+                                    size: Some(g.size),
                                     source_type: 1,
                                 },
                             )
@@ -352,6 +394,14 @@ impl FakeScreenCast {
                 };
                 respond(connection, &request, 0, results).await?;
             }
+            StartScript::GrantVirtual(node) => {
+                grant_without_geometry(connection, &request, node, 4, token).await?;
+            }
+            StartScript::GrantVirtualAs { node, source_type } => {
+                grant_without_geometry(connection, &request, node, source_type, token).await?;
+            }
+            // The dialog is up: the request exists and nothing ever answers it.
+            StartScript::Silent => {}
             StartScript::Respond(code) => {
                 respond(
                     connection,
@@ -371,6 +421,17 @@ impl FakeScreenCast {
         _session: ObjectPath<'_>,
         _options: HashMap<String, OwnedValue>,
     ) -> fdo::Result<zbus::zvariant::OwnedFd> {
+        let remote = {
+            let mut inner = self.0.lock();
+            inner.opened += 1;
+            inner.remote.clone()
+        };
+        if let Some(socket) = remote {
+            // A real (private) PipeWire server stands behind this remote.
+            let stream =
+                UnixStream::connect(socket).map_err(|e| fdo::Error::Failed(e.to_string()))?;
+            return Ok(std::os::fd::OwnedFd::from(stream).into());
+        }
         let (ours, theirs) = UnixStream::pair().map_err(|e| fdo::Error::Failed(e.to_string()))?;
         self.0.lock().peers.push(ours);
         Ok(std::os::fd::OwnedFd::from(theirs).into())
@@ -388,7 +449,7 @@ impl FakeSession {
 }
 
 /// The fake portal, its bus and its connection.
-struct Portal {
+pub(in crate::portal) struct Portal {
     daemon: Daemon,
     connection: Connection,
     fake: Arc<Fake>,
@@ -396,11 +457,13 @@ struct Portal {
 
 impl Portal {
     /// A portal that owns the portal name, or `None` when there is no `dbus-daemon`.
-    fn start(version: u32) -> Option<Portal> {
+    pub(in crate::portal) fn start(version: u32) -> Option<Portal> {
         let daemon = Daemon::start()?;
         let fake = Arc::new(Fake {
             inner: Mutex::new(Inner {
                 version,
+                // Monitor, window and virtual sources.
+                source_types: 7,
                 ..Inner::default()
             }),
         });
@@ -422,12 +485,42 @@ impl Portal {
         })
     }
 
-    fn script(&self, scripts: &[StartScript]) {
+    pub(in crate::portal) fn script(&self, scripts: &[StartScript]) {
         self.fake.lock().scripts.extend(scripts.iter().cloned());
     }
 
+    /// The bus the fake portal is on.
+    pub(in crate::portal) fn address(&self) -> String {
+        self.daemon.address.clone()
+    }
+
+    /// Hand a PipeWire server (its socket) to whoever calls `OpenPipeWireRemote` from now on.
+    pub(in crate::portal) fn serve_remote(&self, socket: PathBuf) {
+        self.fake.lock().remote = Some(socket);
+    }
+
+    /// Change the `AvailableSourceTypes` property (1 monitor, 2 window, 4 virtual).
+    pub(in crate::portal) fn set_source_types(&self, types: u32) {
+        self.fake.lock().source_types = types;
+    }
+
+    /// `Start` calls seen (answered or not).
+    pub(in crate::portal) fn starts(&self) -> u32 {
+        self.fake.lock().starts
+    }
+
+    /// `OpenPipeWireRemote` calls seen.
+    pub(in crate::portal) fn remotes_opened(&self) -> u32 {
+        self.fake.lock().opened
+    }
+
+    /// The sessions the client closed, in order.
+    pub(in crate::portal) fn closed_by_client(&self) -> Vec<String> {
+        self.fake.lock().closed_by_client.clone()
+    }
+
     /// The portal revokes the last session (the user pressed Stop).
-    fn emit_closed(&self) {
+    pub(in crate::portal) fn emit_closed(&self) {
         let session = self.fake.lock().sessions.last().cloned().unwrap();
         zbus::block_on(self.connection.emit_signal(
             None::<&str>,
@@ -439,11 +532,11 @@ impl Portal {
         .unwrap();
     }
 
-    fn selects(&self) -> Vec<Select> {
+    pub(in crate::portal) fn selects(&self) -> Vec<Select> {
         self.fake.lock().selects.clone()
     }
 
-    fn sessions(&self) -> usize {
+    pub(in crate::portal) fn sessions(&self) -> usize {
         self.fake.lock().sessions.len()
     }
 }

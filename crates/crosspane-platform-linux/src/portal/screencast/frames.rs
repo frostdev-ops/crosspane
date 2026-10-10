@@ -15,7 +15,7 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// Reject a crop without area (max <= min on either axis). Negative origins and rectangles that
 /// stick out of the buffer are fine here: they are clamped when a frame arrives.
-pub(super) fn validate_crop(crop: Option<PixelRect>) -> Result<(), PlatformError> {
+pub(in crate::portal) fn validate_crop(crop: Option<PixelRect>) -> Result<(), PlatformError> {
     match crop {
         Some(rect) if rect.is_empty() => Err(PlatformError::Backend(
             "screencast: crop must be nonempty".into(),
@@ -179,7 +179,7 @@ impl Pacer {
 
 /// A buffer timestamp on this node's CLOCK_MONOTONIC: the producer's `pts` (nanoseconds) when it
 /// is positive, not in the future of `now`, and at most 1 s older; otherwise `now`.
-pub(super) fn frame_time(pts: Option<i64>, now: MonoTime) -> MonoTime {
+pub(in crate::portal) fn frame_time(pts: Option<i64>, now: MonoTime) -> MonoTime {
     let now_ns = now.as_nanos();
     match pts.and_then(|pts| u64::try_from(pts).ok()) {
         Some(pts) if pts > 0 && pts <= now_ns && now_ns - pts <= NANOS_PER_SECOND => {
@@ -192,7 +192,7 @@ pub(super) fn frame_time(pts: Option<i64>, now: MonoTime) -> MonoTime {
 /// CLOCK_MONOTONIC now, the same clock the Hyprland backend stamps frames with
 /// (rustix::time::clock_gettime(ClockId::Monotonic)); never panics (saturating/try_from, 0 on an
 /// impossible value).
-pub(super) fn mono_now() -> MonoTime {
+pub(in crate::portal) fn mono_now() -> MonoTime {
     let time = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     let seconds = u64::try_from(time.tv_sec).unwrap_or(0);
     let nanos = u64::try_from(time.tv_nsec).unwrap_or(0);

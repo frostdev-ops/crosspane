@@ -1,6 +1,7 @@
 //! Compositor-neutral XDG desktop portal adapters (WP-G0.1), shared by the GNOME and KDE backends:
-//! the RemoteDesktop session and its EIS socket, EIS key and pointer injection, and the
-//! GlobalShortcuts release chord.
+//! the RemoteDesktop session and its EIS socket, EIS key and pointer injection, the
+//! GlobalShortcuts release chord, and (WP-G2.4) a Mutter virtual monitor through the ScreenCast
+//! portal (`virtual_screen`).
 //!
 //! Consent is caller-prepared: the agent starts a portal session at startup, off the input path.
 //! The first start may show the desktop's consent dialog; the persisted restore token makes later
@@ -13,6 +14,7 @@ pub mod eis;
 pub mod screencast;
 pub mod session;
 pub mod shortcuts;
+pub mod virtual_screen;
 
 /// The app id portals know this process by. A non-sandboxed process has none of its own, so it is
 /// registered through `org.freedesktop.host.portal.Registry` on every bus connection that talks to

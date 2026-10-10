@@ -17,7 +17,7 @@ const MAX_TOKEN_BYTES: u64 = 4096;
 /// Read the stored token, if there is a usable one. A missing file is the normal first-run case.
 /// An unreadable, oversized, non-UTF-8 or otherwise malformed file is logged (never its content)
 /// and treated as no token, so consent is simply asked again.
-pub(super) fn read(path: &Path) -> Option<String> {
+pub(in crate::portal) fn read(path: &Path) -> Option<String> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
@@ -53,7 +53,7 @@ pub(super) fn read(path: &Path) -> Option<String> {
 /// Store `token`: the parent directory is created with mode 0700 if missing, and the file is
 /// written (mode 0600) to a temporary name in the same directory, synced, and renamed over `path`,
 /// so a reader never sees a partial token.
-pub(super) fn write(path: &Path, token: &str) -> io::Result<()> {
+pub(in crate::portal) fn write(path: &Path, token: &str) -> io::Result<()> {
     if !is_valid(token) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -99,6 +99,18 @@ pub(super) fn write(path: &Path, token: &str) -> io::Result<()> {
         let _ = dir_file.sync_all();
     }
     Ok(())
+}
+
+/// Delete the stored token (the grant it stood for is gone). A missing file is fine; any other
+/// failure is logged and leaves the file, so the next start tries the same token again.
+pub(in crate::portal) fn remove(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "cannot remove the ScreenCast restore token");
+        }
+    }
 }
 
 /// A token is non-empty, bounded and free of control characters (which also rules out NUL).
@@ -186,5 +198,17 @@ mod tests {
         assert!(write(&fresh, "a\nb").is_err());
         assert!(!fresh.exists());
         assert!(write(Path::new("/"), "token").is_err());
+    }
+
+    #[test]
+    fn remove_deletes_the_file_and_tolerates_a_missing_one() {
+        let dir = TempDir::new();
+        let path = dir.0.join("state").join("portal-virtual.token");
+        remove(&path);
+        write(&path, "tok-1").unwrap();
+        remove(&path);
+        assert!(!path.exists());
+        assert_eq!(read(&path), None);
+        remove(&path);
     }
 }

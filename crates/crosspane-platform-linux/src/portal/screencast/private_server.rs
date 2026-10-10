@@ -64,14 +64,14 @@ const RED: u8 = 0x77;
 // ---- the private server ------------------------------------------------------------------------
 
 /// A `pipewire` daemon on a private socket, killed on drop.
-struct Server {
+pub(in crate::portal) struct Server {
     child: Child,
     dir: PathBuf,
     socket: PathBuf,
 }
 
 impl Server {
-    fn start() -> Option<Server> {
+    pub(in crate::portal) fn start() -> Option<Server> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let name = format!(
             "cpg22-{}-{}",
@@ -157,8 +157,13 @@ impl Server {
     }
 
     /// A new connection to the server, as the portal's `OpenPipeWireRemote` would hand over.
-    fn connection(&self) -> OwnedFd {
+    pub(in crate::portal) fn connection(&self) -> OwnedFd {
         OwnedFd::from(UnixStream::connect(&self.socket).unwrap())
+    }
+
+    /// The server's socket: what a fake portal's `OpenPipeWireRemote` connects its callers to.
+    pub(in crate::portal) fn socket(&self) -> PathBuf {
+        self.socket.clone()
     }
 }
 
@@ -379,19 +384,24 @@ fn produce(fd: OwnedFd, stop: &AtomicBool, painted: Arc<AtomicU64>, memory: i32)
 // ---- the linker --------------------------------------------------------------------------------
 
 /// Another client: learns the nodes' ids and, once both exist, links them.
-struct Linker {
+pub(in crate::portal) struct Linker {
     nodes: Arc<Mutex<HashMap<String, u32>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Linker {
-    fn start(fd: OwnedFd) -> Linker {
+    /// Links the node named `producer` to the one named `consumer` once both exist.
+    pub(in crate::portal) fn start(
+        fd: OwnedFd,
+        producer: &'static str,
+        consumer: &'static str,
+    ) -> Linker {
         let nodes = Arc::new(Mutex::new(HashMap::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let (nodes, stop) = (Arc::clone(&nodes), Arc::clone(&stop));
-            thread::spawn(move || link_when_ready(fd, &nodes, &stop))
+            thread::spawn(move || link_when_ready(fd, &nodes, &stop, producer, consumer))
         };
         Linker {
             nodes,
@@ -400,7 +410,7 @@ impl Linker {
         }
     }
 
-    fn node(&self, name: &str) -> Option<u32> {
+    pub(in crate::portal) fn node(&self, name: &str) -> Option<u32> {
         self.nodes.lock().unwrap().get(name).copied()
     }
 }
@@ -414,13 +424,23 @@ impl Drop for Linker {
     }
 }
 
-fn link_when_ready(fd: OwnedFd, nodes: &Arc<Mutex<HashMap<String, u32>>>, stop: &AtomicBool) {
+fn link_when_ready(
+    fd: OwnedFd,
+    nodes: &Arc<Mutex<HashMap<String, u32>>>,
+    stop: &AtomicBool,
+    producer_name: &str,
+    consumer_name: &str,
+) {
     let mainloop = pw::main_loop::MainLoopRc::new(None).unwrap();
     let context = pw::context::ContextRc::new(&mainloop, None).unwrap();
     let core = context.connect_fd_rc(fd, None).unwrap();
     let registry = core.get_registry_rc().unwrap();
     let seen = Arc::clone(nodes);
     let gone = Arc::clone(nodes);
+    // Counts the named nodes that were removed: PipeWire reuses ids, so a replaced node can come
+    // back under the id it had.
+    let removals = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&removals);
     let _listener = registry
         .add_listener_local()
         .global(move |global| {
@@ -431,30 +451,44 @@ fn link_when_ready(fd: OwnedFd, nodes: &Arc<Mutex<HashMap<String, u32>>>, stop: 
                 seen.lock().unwrap().insert(name.to_owned(), global.id);
             }
         })
-        .global_remove(move |id| gone.lock().unwrap().retain(|_, node| *node != id))
+        .global_remove(move |id| {
+            let mut nodes = gone.lock().unwrap();
+            let before = nodes.len();
+            nodes.retain(|_, node| *node != id);
+            if nodes.len() != before {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
+        })
         .register();
-    let mut link: Option<pw::link::Link> = None;
+    // The link and how many removals had happened when it was made: a node that is replaced by a
+    // new one of the same name (a second screen) gets linked again.
+    let mut link: Option<(pw::link::Link, u64)> = None;
     while !stop.load(Ordering::Acquire) {
         mainloop
             .loop_()
             .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(10)));
-        if link.is_none() {
-            let (producer, capture) = {
-                let nodes = nodes.lock().unwrap();
-                (nodes.get(PRODUCER).copied(), nodes.get(CAPTURE).copied())
-            };
-            if let (Some(producer), Some(capture)) = (producer, capture) {
-                link = core
-                    .create_object::<pw::link::Link>(
-                        "link-factory",
-                        &pw::properties::properties! {
-                            "link.output.node" => producer.to_string(),
-                            "link.input.node" => capture.to_string(),
-                            "object.linger" => "false",
-                        },
-                    )
-                    .ok();
-            }
+        let (producer, capture) = {
+            let nodes = nodes.lock().unwrap();
+            (
+                nodes.get(producer_name).copied(),
+                nodes.get(consumer_name).copied(),
+            )
+        };
+        let removed = removals.load(Ordering::Relaxed);
+        if let (Some(producer), Some(capture)) = (producer, capture)
+            && link.as_ref().is_none_or(|(_, made_at)| *made_at != removed)
+        {
+            link = core
+                .create_object::<pw::link::Link>(
+                    "link-factory",
+                    &pw::properties::properties! {
+                        "link.output.node" => producer.to_string(),
+                        "link.input.node" => capture.to_string(),
+                        "object.linger" => "false",
+                    },
+                )
+                .ok()
+                .map(|made| (made, removed));
         }
     }
 }
@@ -535,7 +569,7 @@ impl Graph {
     fn start_with(memory: i32) -> Option<Graph> {
         let server = Server::start()?;
         let producer = Producer::start(server.connection(), memory);
-        let linker = Linker::start(server.connection());
+        let linker = Linker::start(server.connection(), PRODUCER, CAPTURE);
         let gate = IoGate::new();
         gate.set_session_permits(true);
         gate.set_engine_permits(true);

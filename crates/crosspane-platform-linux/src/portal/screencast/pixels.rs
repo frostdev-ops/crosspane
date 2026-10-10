@@ -12,7 +12,7 @@ use crosspane_types::geom::PixelRect;
 
 /// 32-bit packed layouts, named by byte order in memory (`Bgrx` is bytes B, G, R, x).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum PixelFormat {
+pub(in crate::portal) enum PixelFormat {
     Bgrx, // bytes B G R x
     Bgra, // bytes B G R A
     Rgbx, // bytes R G B x
