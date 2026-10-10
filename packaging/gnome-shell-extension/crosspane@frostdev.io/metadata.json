@@ -1,8 +1,8 @@
 {
   "uuid": "crosspane@frostdev.io",
   "name": "Crosspane",
-  "description": "Lets the Crosspane agent list and place windows and show its on-screen indicators. It talks only to the Crosspane agent of the same user over the session bus (io.frostdev.Crosspane.Shell) and does nothing else.",
+  "description": "Lets the Crosspane agent list and place windows, show its on-screen indicators, fence the pointer out of its virtual monitor, snapshot and restore the window layout, and hide the cursor while it captures input. It talks only to the Crosspane agent of the same user over the session bus (io.frostdev.Crosspane.Shell) and does nothing else.",
   "shell-version": ["48", "49", "50"],
-  "version": 1,
-  "version-name": "0.1.0"
+  "version": 2,
+  "version-name": "0.2.0"
 }

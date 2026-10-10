@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Crosspane GNOME Shell extension (WP-G1.2, WP-G1.5 overlay half). Owner-approved 2026-10-09 as an
-// isolated, opt-in module.
+// Crosspane GNOME Shell extension (WP-G1.2, WP-G1.5 overlay half; v2 WP-G2.4 task C). Owner-approved
+// 2026-10-09 as an isolated, opt-in module; the v2 methods (pointer fence, layout snapshot, cursor
+// hiding) were approved on 2026-10-10 with the virtual twin monitor.
 //
 // It exports io.frostdev.Crosspane.Shell1 (io.frostdev.Crosspane.Shell1.xml next to this file is
 // the one source of truth for the interface) on the session bus under io.frostdev.Crosspane.Shell
-// so the Crosspane agent can list and place the user's windows and show its on-screen indicators.
+// so the Crosspane agent can list and place the user's windows, show its on-screen indicators,
+// fence the local pointer out of its virtual twin monitor, snapshot and put back the window
+// layout around a monitor change, and hide the local pointer while it captures input.
 //
 // Rules this file keeps:
 //  - Typed methods only. No eval, no Function(), no Shell.Eval, no property access by name from
@@ -15,8 +18,11 @@
 //    override-redirect and not skip-taskbar.
 //  - Overlays never take input or focus and sit above everything, fullscreen windows included.
 //  - Window titles and overlay text are never logged.
+//  - The pointer fence and the hidden cursor belong to the D-Bus connection that set them: when
+//    that connection goes away (the agent crashed) the fence is removed and the cursor shown
+//    again, so a dead agent can never leave the user without a pointer.
 //  - disable() undoes everything: the bus name, the exported object, the timers, every signal
-//    connection and every overlay actor.
+//    connection, every overlay actor, the fence, the layout snapshots and the cursor inhibition.
 
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -32,16 +38,22 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 const BUS_NAME = 'io.frostdev.Crosspane.Shell';
 const OBJECT_PATH = '/io/frostdev/Crosspane/Shell';
 const INTERFACE_XML_FILE = 'io.frostdev.Crosspane.Shell1.xml';
-const INTERFACE_VERSION = 1;
+const INTERFACE_VERSION = 2;
 
 // WindowsChanged is coalesced: at most one per this many milliseconds.
 const COALESCE_MS = 50;
 // An overlay that is not painted within this long after ShowOverlay never reports visible.
 const PAINT_TIMEOUT_MS = 1000;
 const MAX_OVERLAYS = 16;
+// SaveLayout keeps this many snapshots; a further one drops the oldest.
+const MAX_SNAPSHOTS = 4;
+// The most window ids one RestoreLayout call may skip.
+const MAX_SKIP_IDS = 4096;
 const MAX_TEXT_CHARS = 200;
 const MAX_EXTENT = 32768;
 const MAX_COORD = 1 << 20;
+// Meta.Barrier coordinates are 0..G_MAXSHORT.
+const MAX_BARRIER_COORD = 32767;
 const MAX_UINT32 = 0xffffffff;
 const MAX_RGB = 0xffffff;
 const OVERLAY_MARGIN = 16;
@@ -136,19 +148,62 @@ function isEligible(window) {
     }
 }
 
+/**
+ * The app id ListWindows reports: the Shell's id of the matching application (for example
+ * "org.gnome.Nautilus.desktop"), else the window class, else "". The Shell invents "window:N" ids
+ * for windows no application matches; those are never reported.
+ *
+ * @param {Shell.WindowTracker} tracker the window tracker
+ * @param {Meta.Window} window the window
+ * @returns {string} the app id
+ */
 function appIdOf(tracker, window) {
     try {
-        const id = tracker.get_window_app(window)?.get_id();
-        if (id)
+        const app = tracker.get_window_app(window);
+        const id = app && !app.is_window_backed() ? app.get_id() : '';
+        if (id && !id.startsWith('window:'))
             return id;
     } catch {
         // Fall through to the window class.
     }
-    return window.get_wm_class() || '';
+    try {
+        return window.get_wm_class() || '';
+    } catch {
+        return '';
+    }
+}
+
+/**
+ * The maximize flags of a window (Meta.MaximizeFlags bits; 0 when not maximized).
+ *
+ * @param {Meta.Window} window the window
+ * @returns {number} the flags
+ */
+function maximizeFlagsOf(window) {
+    // Mutter 49 and later: get_maximize_flags(). Mutter 48: get_maximized().
+    if (typeof window.get_maximize_flags === 'function')
+        return window.get_maximize_flags();
+    return window.get_maximized();
+}
+
+/**
+ * Maximize a window in the given directions. Mutter asserts on empty flags, so 0 does nothing.
+ *
+ * @param {Meta.Window} window the window
+ * @param {number} flags Meta.MaximizeFlags bits
+ */
+function applyMaximizeFlags(window, flags) {
+    if (flags === 0)
+        return;
+    // Mutter 49 and later: set_maximize_flags(). Mutter 48: maximize(directions).
+    if (typeof window.set_maximize_flags === 'function')
+        window.set_maximize_flags(flags);
+    else
+        window.maximize(flags);
 }
 
 function unmaximize(window) {
-    if (!window.maximized_horizontally && !window.maximized_vertically)
+    if (maximizeFlagsOf(window) === 0)
         return;
     try {
         // Mutter 49 and later: no flags.
@@ -156,6 +211,78 @@ function unmaximize(window) {
     } catch {
         // Mutter 48: the directions to unmaximize.
         window.unmaximize(Meta.MaximizeFlags.BOTH);
+    }
+}
+
+/**
+ * The four barriers of a pointer fence around one rectangle. Each lets the pointer pass only
+ * outward (Meta.Barrier `directions` are the directions of motion that pass), so the pointer
+ * cannot enter the rectangle but can leave it.
+ *
+ * A pointer stopped by a barrier rests exactly on the barrier's line, and the pixel under a
+ * pointer at position p is floor(p). The rectangle covers the pixels x..x+width-1, so the right
+ * and bottom lines (x+width, y+height) already rest the pointer on the first pixel outside it. The
+ * left and top lines are one pixel further out (x-1, y-1): on x itself the pointer would rest on
+ * the rectangle's own first column and hover whatever window is there.
+ *
+ * Meta.Barrier takes coordinates 0..MAX_BARRIER_COORD only (a value outside that is replaced by
+ * the property's default, silently misplacing the barrier), so the caller checks the rectangle
+ * against that range; the left and top lines stop at 0, past which there is no screen anyway.
+ */
+class PointerFence {
+    constructor(x, y, width, height) {
+        const left = Math.max(0, x - 1);
+        const top = Math.max(0, y - 1);
+        const right = x + width;
+        const bottom = y + height;
+        const {NEGATIVE_X, NEGATIVE_Y, POSITIVE_X, POSITIVE_Y} = Meta.BarrierDirection;
+        const edges = [
+            [left, top, left, bottom, NEGATIVE_X],
+            [left, top, right, top, NEGATIVE_Y],
+            [right, top, right, bottom, POSITIVE_X],
+            [left, bottom, right, bottom, POSITIVE_Y],
+        ];
+        this._barriers = [];
+        try {
+            for (const [x1, y1, x2, y2, directions] of edges) {
+                this._barriers.push(new Meta.Barrier({
+                    backend: global.backend,
+                    x1, y1, x2, y2, directions,
+                }));
+            }
+        } catch (error) {
+            this.destroy();
+            throw error;
+        }
+    }
+
+    destroy() {
+        for (const barrier of this._barriers) {
+            try {
+                barrier.destroy();
+            } catch {
+                // Already gone.
+            }
+        }
+        this._barriers = [];
+    }
+}
+
+/**
+ * Calls `onVanished` once when the D-Bus connection `name` (a unique name) leaves the bus.
+ */
+class SenderWatch {
+    constructor(name, onVanished) {
+        this.name = name;
+        this._id = Gio.bus_watch_name_on_connection(
+            Gio.DBus.session, name, Gio.BusNameWatcherFlags.NONE, null, () => onVanished());
+    }
+
+    destroy() {
+        if (this._id) {
+            Gio.bus_unwatch_name(this._id);
+            this._id = 0;
+        }
     }
 }
 
@@ -377,6 +504,14 @@ class Bridge {
         this._overlays = new Map();
         this._changedSource = 0;
         this._stopped = false;
+        // v2: the pointer fence, the layout snapshots and the cursor inhibition.
+        this._fence = null;
+        this._fenceWatch = null;
+        // token -> [{key, x, y, width, height, flags, fullscreen}], oldest first.
+        this._snapshots = new Map();
+        this._nextToken = 1;
+        this._cursorInhibited = false;
+        this._cursorWatch = null;
     }
 
     // Properties.
@@ -421,6 +556,15 @@ class Bridge {
         // Overlays first, while the object is still exported, so clients see them go.
         for (const id of [...this._overlays.keys()])
             this._dropOverlay(id, true);
+
+        // The pointer is free, the cursor is shown and no snapshot outlives the extension.
+        this._clearFence();
+        try {
+            this._setCursorInhibited(false, null);
+        } catch (error) {
+            console.debug(`Crosspane: could not show the cursor again: ${error.message}`);
+        }
+        this._snapshots.clear();
 
         for (const [object, id] of this._connections) {
             try {
@@ -632,6 +776,213 @@ class Bridge {
         overlay.destroy();
         if (report)
             this.emitOverlayState(id, false);
+    }
+
+    // v2: pointer fence, layout snapshot, cursor hiding.
+
+    // SetPointerFence and InhibitCursor are written in GJS's "<Name>Async" form: they receive the
+    // method invocation, which names the calling D-Bus connection. They answer through _answer.
+
+    SetPointerFenceAsync([x, y, width, height], invocation) {
+        this._answer(invocation, () =>
+            this._setPointerFence(x, y, width, height, invocation.get_sender()));
+    }
+
+    ClearPointerFence() {
+        this._clearFence();
+    }
+
+    SaveLayout() {
+        if (this._nextToken > MAX_UINT32)
+            throw dbusError(Gio.DBusError.LIMITS_EXCEEDED, 'out of layout tokens');
+        const windows = [];
+        for (const [key, entry] of this._windows) {
+            const window = entry.window;
+            if (!isEligible(window))
+                continue;
+            const rect = window.get_frame_rect();
+            windows.push({
+                key,
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+                flags: maximizeFlagsOf(window),
+                fullscreen: window.is_fullscreen(),
+            });
+        }
+        // At most MAX_SNAPSHOTS are kept; a new one drops the oldest. Tokens count up from 1 and
+        // are never reused within this epoch.
+        while (this._snapshots.size >= MAX_SNAPSHOTS)
+            this._snapshots.delete(this._snapshots.keys().next().value);
+        const token = this._nextToken++;
+        this._snapshots.set(token, windows);
+        return token;
+    }
+
+    RestoreLayout(token, skip) {
+        checkInt('token', token, 1, MAX_UINT32);
+        if (!Array.isArray(skip) || skip.length > MAX_SKIP_IDS)
+            throw invalidArgs('skip must be an array of at most 4096 window ids');
+        const skipped = new Set();
+        for (const id of skip) {
+            const key = windowKey(id);
+            if (Number.isNaN(key))
+                throw invalidArgs('skip holds an invalid window id');
+            skipped.add(key);
+        }
+        const snapshot = this._snapshots.get(token);
+        if (!snapshot)
+            throw invalidArgs('unknown layout token');
+        // The snapshot is used up whatever happens to the windows.
+        this._snapshots.delete(token);
+
+        let restored = 0;
+        for (const saved of snapshot) {
+            if (skipped.has(saved.key))
+                continue;
+            const entry = this._windows.get(saved.key);
+            if (!entry || !isEligible(entry.window))
+                continue;
+            try {
+                if (this._restoreWindow(entry.window, saved))
+                    restored++;
+            } catch (error) {
+                console.debug(`Crosspane: could not restore a window: ${error.message}`);
+            }
+        }
+        return restored;
+    }
+
+    InhibitCursorAsync([inhibit], invocation) {
+        this._answer(invocation, () => {
+            checkBool('inhibit', inhibit);
+            this._setCursorInhibited(inhibit, invocation.get_sender());
+        });
+    }
+
+    /**
+     * Answer a method written in the "<Name>Async" form: an empty reply, or the D-Bus error for a
+     * GLib.Error thrown by `action` (bad arguments). Anything else is an internal error whose
+     * text is not sent back.
+     */
+    _answer(invocation, action) {
+        try {
+            action();
+        } catch (error) {
+            if (error instanceof GLib.Error) {
+                invocation.return_gerror(error);
+            } else {
+                console.debug(`Crosspane: a method failed: ${error?.message}`);
+                invocation.return_dbus_error('org.freedesktop.DBus.Error.Failed', 'internal error');
+            }
+            return;
+        }
+        invocation.return_value(null);
+    }
+
+    _setPointerFence(x, y, width, height, sender) {
+        checkInt('x', x, -MAX_COORD, MAX_COORD);
+        checkInt('y', y, -MAX_COORD, MAX_COORD);
+        checkInt('width', width, 1, MAX_EXTENT);
+        checkInt('height', height, 1, MAX_EXTENT);
+        // Mutter's layouts never reach negative coordinates and Meta.Barrier takes 0..32767 only:
+        // a rectangle outside that cannot be fenced, and must not be fenced wrongly.
+        if (x < 0 || y < 0 || x + width > MAX_BARRIER_COORD || y + height > MAX_BARRIER_COORD)
+            throw invalidArgs('the fence must lie within 0..32767 on both axes');
+        // The old fence goes first, so a failure below leaves the pointer free rather than fenced
+        // by something stale.
+        this._clearFence();
+        try {
+            this._fence = new PointerFence(x, y, width, height);
+        } catch (error) {
+            console.debug(`Crosspane: could not create the pointer fence: ${error.message}`);
+            throw dbusError(Gio.DBusError.FAILED, 'the pointer fence could not be created');
+        }
+        // The fence belongs to its caller: it goes when that connection does.
+        if (sender)
+            this._fenceWatch = new SenderWatch(sender, () => this._clearFence());
+    }
+
+    _clearFence() {
+        this._fenceWatch?.destroy();
+        this._fenceWatch = null;
+        this._fence?.destroy();
+        this._fence = null;
+    }
+
+    /**
+     * Hide or show the local pointer. Idempotent per state: Mutter counts inhibitions, so a second
+     * `true` must not add another one. `sender` is the calling connection, which owns the
+     * inhibition until it asks for the cursor back or leaves the bus.
+     */
+    _setCursorInhibited(inhibit, sender) {
+        if (inhibit) {
+            if (!this._cursorInhibited) {
+                global.backend.get_cursor_tracker().inhibit_cursor_visibility();
+                this._cursorInhibited = true;
+            }
+            if (sender && this._cursorWatch?.name !== sender) {
+                this._cursorWatch?.destroy();
+                this._cursorWatch =
+                    new SenderWatch(sender, () => this._setCursorInhibited(false, null));
+            }
+            return;
+        }
+        this._cursorWatch?.destroy();
+        this._cursorWatch = null;
+        if (this._cursorInhibited) {
+            this._cursorInhibited = false;
+            global.backend.get_cursor_tracker().uninhibit_cursor_visibility();
+        }
+    }
+
+    /**
+     * Put one window back as the snapshot had it, in this order: fullscreen again if it was;
+     * maximized with the saved flags if it was; otherwise unfullscreen/unmaximize if it changed
+     * and move_resize_frame(false, saved rect). Tiling cannot be restored through public API: a
+     * tiled window gets its tiled rect back as a floating window.
+     *
+     * @returns {boolean} whether anything was changed
+     */
+    _restoreWindow(window, saved) {
+        const fullscreen = window.is_fullscreen();
+        const flags = maximizeFlagsOf(window);
+        let changed = false;
+        if (saved.fullscreen) {
+            if (!fullscreen) {
+                window.make_fullscreen();
+                changed = true;
+            }
+        } else if (saved.flags !== 0) {
+            if (fullscreen) {
+                window.unmake_fullscreen();
+                changed = true;
+            }
+            if (flags !== saved.flags) {
+                // set_maximize_flags only adds directions, so drop extra ones first.
+                if ((flags & ~saved.flags) !== 0)
+                    unmaximize(window);
+                applyMaximizeFlags(window, saved.flags);
+                changed = true;
+            }
+        } else {
+            if (fullscreen) {
+                window.unmake_fullscreen();
+                changed = true;
+            }
+            if (flags !== 0) {
+                unmaximize(window);
+                changed = true;
+            }
+            const rect = window.get_frame_rect();
+            if (rect.x !== saved.x || rect.y !== saved.y ||
+                rect.width !== saved.width || rect.height !== saved.height) {
+                window.move_resize_frame(false, saved.x, saved.y, saved.width, saved.height);
+                changed = true;
+            }
+        }
+        return changed;
     }
 
     _monitorsChanged() {
