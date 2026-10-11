@@ -61,6 +61,8 @@ struct Fake {
     archives: usize,
     archive_full: bool,
     verify_failure: Option<Failure>,
+    /// When set, `observe` fails with it.
+    observe_failure: Option<Failure>,
     first_refusal: Option<&'static str>,
     /// Shared with the test; see `ElevatedLog`.
     elevated: Arc<Mutex<ElevatedLog>>,
@@ -89,6 +91,7 @@ impl Fake {
             archives: 0,
             archive_full: false,
             verify_failure: None,
+            observe_failure: None,
             first_refusal: None,
             elevated: Arc::default(),
             elevated_plans: Vec::new(),
@@ -100,6 +103,9 @@ impl Fake {
 }
 impl Domains for Fake {
     fn observe(&mut self) -> Result<Snapshot, Failure> {
+        if let Some(failure) = self.observe_failure {
+            return Err(failure);
+        }
         Ok(self.observed.clone())
     }
     fn settle(&mut self, _op: Operation) -> Result<bool, Failure> {
@@ -728,7 +734,7 @@ fn terminal_artifact_settlement_reopens_without_replay() {
     }
 }
 #[test]
-fn healthy_detect_and_deferred_features_never_claim_mutation_or_ready() {
+fn windows_description_orders_four_native_steps_without_deferrals() {
     let mut c = Coordinator::new(Fake::new());
     assert!(c.detect().unwrap().healthy());
     c.domains.observed.terminal_history = true;
@@ -736,21 +742,24 @@ fn healthy_detect_and_deferred_features_never_claim_mutation_or_ready() {
     assert_eq!(c.verify(Operation::Upgrade), Outcome::Verified);
     assert_eq!((c.domains.applications, c.domains.mutations), (0, 0));
     let description = integration::description();
-    assert!(
-        description
-            .steps
-            .iter()
-            .all(|s| (10..=59).contains(&s.id.0))
+    let ids: Vec<u16> = description.steps.iter().map(|s| s.id.0).collect();
+    assert_eq!(ids, vec![10, 20, 30, 55]);
+    assert_eq!(
+        description.connect_after,
+        vec![crosspane_installer_core::StepId(30)]
     );
-    for label in DEFERRED {
-        let step = description
-            .steps
-            .iter()
-            .find(|s| s.label == *label)
-            .unwrap();
-        assert!(step.required_for_ready);
-        assert!(description.ready_after.contains(&step.id));
-        assert!(!step.required_for_installed);
+    assert_eq!(
+        description.ready_after,
+        vec![
+            crosspane_installer_core::StepId(30),
+            crosspane_installer_core::StepId(55)
+        ]
+    );
+    assert_eq!(description.resume_note, None);
+    for step in &description.steps {
+        assert!(!step.label.contains("W4."), "{}", step.label);
+        assert!(!step.label.contains("W6."), "{}", step.label);
+        assert!(!step.label.contains("deferred"), "{}", step.label);
     }
     struct NoAgent;
     impl agent_contract::AgentPort for NoAgent {
@@ -800,6 +809,198 @@ fn healthy_detect_and_deferred_features_never_claim_mutation_or_ready() {
     }
 }
 
+#[test]
+fn no_native_step_sits_on_a_screen_before_its_prerequisites() {
+    // The shared controller's screen order (live/controller.rs ORDER). A copy, because it is private.
+    const ORDER: [view::ScreenId; 12] = [
+        view::ScreenId::Welcome,
+        view::ScreenId::Compatibility,
+        view::ScreenId::InstallPlan,
+        view::ScreenId::Installing,
+        view::ScreenId::Permissions,
+        view::ScreenId::AudioComponent,
+        view::ScreenId::Network,
+        view::ScreenId::HidingChoice,
+        view::ScreenId::Connect,
+        view::ScreenId::Grants,
+        view::ScreenId::Layout,
+        view::ScreenId::Summary,
+    ];
+    let position = |screen: view::ScreenId| ORDER.iter().position(|s| *s == screen).unwrap();
+    let description = integration::description();
+    for step in &description.steps {
+        for prerequisite in &step.prerequisites {
+            let before = description
+                .steps
+                .iter()
+                .find(|s| s.id == *prerequisite)
+                .unwrap();
+            assert!(
+                position(before.screen) <= position(step.screen),
+                "{:?} is shown before its prerequisite {:?}",
+                step.id,
+                prerequisite
+            );
+        }
+    }
+}
+#[test]
+fn install_plan_names_the_reason_instead_of_planning_a_refused_install() {
+    use crosspane_installer_core::JobStage;
+    // Without the payload folder the install is refused: the plan stores nothing, so Apply is refunded.
+    let mut fake = fresh(Cold::Eligible);
+    fake.observed.sources = false;
+    let elevated = fake.elevated.clone();
+    let reports = run_jobs(
+        fake,
+        vec![
+            (1, step_job(20, 1, JobStage::Plan, None)),
+            (2, step_job(20, 2, JobStage::Apply, Some(consent_for(1, 2)))),
+        ],
+    );
+    assert_eq!(reports.len(), 2);
+    let planned = step_of(&reports[0]);
+    assert_eq!(planned.outcome, live::NativeOutcome::Failed);
+    assert_eq!(planned.detail, integration::NO_PAYLOAD);
+    assert_eq!(
+        step_of(&reports[1]).outcome,
+        live::NativeOutcome::NotSubmitted
+    );
+    let seen = locked(&elevated);
+    assert!(seen.requests.is_empty());
+    assert!(seen.applied.is_empty());
+}
+#[test]
+fn detect_and_plan_errors_wait_or_fail_and_never_report_unsupported() {
+    use crosspane_installer_core::{JobStage, WaitKind};
+    let mut fake = Fake::new();
+    fake.observe_failure = Some(Failure::Unknown);
+    let reports = run_jobs(
+        fake,
+        vec![
+            (1, step_job(10, 1, JobStage::Detect, None)),
+            (2, step_job(20, 2, JobStage::Detect, None)),
+            (3, step_job(30, 3, JobStage::Detect, None)),
+            (4, step_job(20, 4, JobStage::Plan, None)),
+            (5, step_job(55, 5, JobStage::Plan, None)),
+            (6, step_job(55, 6, JobStage::Detect, None)),
+            (7, step_job(20, 7, JobStage::Verify, None)),
+        ],
+    );
+    let expected = [
+        (
+            live::NativeOutcome::Waiting(WaitKind::Contract),
+            integration::OBSERVATION_UNAVAILABLE,
+        ),
+        (
+            live::NativeOutcome::Waiting(WaitKind::Contract),
+            integration::OBSERVATION_UNAVAILABLE,
+        ),
+        (
+            live::NativeOutcome::Waiting(WaitKind::Contract),
+            integration::OBSERVATION_UNAVAILABLE,
+        ),
+        (live::NativeOutcome::Failed, integration::PLAN_UNAVAILABLE),
+        (live::NativeOutcome::Failed, integration::PLAN_UNAVAILABLE),
+        (
+            live::NativeOutcome::Waiting(WaitKind::Contract),
+            ELEVATED_UNCHECKED,
+        ),
+        (
+            live::NativeOutcome::Waiting(WaitKind::Contract),
+            integration::INSTALL_UNVERIFIED,
+        ),
+    ];
+    assert_eq!(reports.len(), expected.len());
+    for (report, (outcome, detail)) in reports.iter().zip(expected) {
+        let step = step_of(report);
+        assert_eq!(step.outcome, outcome);
+        assert_eq!(step.detail, detail);
+    }
+}
+#[test]
+fn admin_plan_without_a_planned_step_waits_with_its_reason() {
+    use crosspane_installer_core::{JobStage, WaitKind};
+    let reason = "Windows Defender Firewall is turned off.";
+    let mut unavailable = Fake::new();
+    unavailable.elevated_plans.push((
+        ElevatedRequest::Setup,
+        Ok(ElevatedPlanning::Unavailable(reason)),
+    ));
+    // A failed planning read is the same Unavailable state, with the worker's own reason.
+    let mut failed = Fake::new();
+    failed
+        .elevated_plans
+        .push((ElevatedRequest::Setup, Err(Failure::Unknown)));
+    // Nothing to ask for: no plan, and the reason is the not-checked wording.
+    let not_needed = Fake::new();
+    // Facts that refuse the administrator step: the refusal is named, and no plan is stored.
+    let mut refused = Fake::new();
+    refused.observed.unsettled = true;
+    let cases = [
+        (unavailable, WaitKind::User, reason.to_owned()),
+        (failed, WaitKind::User, ELEVATED_UNCHECKED.to_owned()),
+        (
+            not_needed,
+            WaitKind::Contract,
+            ELEVATED_UNCHECKED.to_owned(),
+        ),
+        (refused, WaitKind::User, integration::UNSETTLED.to_owned()),
+    ];
+    for (fake, wait, detail) in cases {
+        let reports = run_jobs(fake, vec![(1, step_job(55, 1, JobStage::Plan, None))]);
+        assert_eq!(reports.len(), 1);
+        let planned = step_of(&reports[0]);
+        assert_eq!(planned.outcome, live::NativeOutcome::Waiting(wait));
+        assert_eq!(planned.detail, detail);
+    }
+}
+#[test]
+fn install_verify_checks_installed_files_not_agent_health() {
+    use crosspane_installer_core::{JobStage, WaitKind};
+    // The files and the sign-in task are in place; the agent has not answered yet.
+    let mut installed = Fake::new();
+    installed.observed.agent = State::Missing;
+    let reports = run_jobs(
+        installed,
+        vec![(2, step_job(20, 2, JobStage::Verify, None))],
+    );
+    assert_eq!(reports.len(), 1);
+    assert!(matches!(
+        step_of(&reports[0]).outcome,
+        live::NativeOutcome::Verified { .. }
+    ));
+    assert_eq!(step_of(&reports[0]).detail, integration::STEP_CHECKED);
+    // A missing program is not confirmed, whatever the agent says.
+    let mut missing = Fake::new();
+    missing.observed.payload = State::Missing;
+    let reports = run_jobs(missing, vec![(2, step_job(20, 2, JobStage::Verify, None))]);
+    assert_eq!(
+        step_of(&reports[0]).outcome,
+        live::NativeOutcome::Waiting(WaitKind::Contract)
+    );
+    assert_eq!(step_of(&reports[0]).detail, integration::INSTALL_UNVERIFIED);
+}
+#[test]
+fn removed_step_ids_are_refused_by_the_platform() {
+    use crosspane_installer_core::JobStage;
+    let mut platform =
+        integration::platform_fixture(Fake::new(), Arc::new(|| 1), Box::new(NoAgent));
+    for id in [40, 50, 56] {
+        assert_eq!(
+            platform.submit(step_job(id, 1, JobStage::Detect, None)),
+            Err(live::NativeRefusal::UnknownStep)
+        );
+    }
+}
+#[test]
+fn payload_beside_the_installer_is_the_default_payload_folder() {
+    let installer = std::path::Path::new("kit").join("crosspane-installer.exe");
+    assert_eq!(
+        integration::payload_beside(&installer),
+        Some(std::path::Path::new("kit").join("payload"))
+    );
+}
 #[test]
 fn first_install_apply_uses_worker_consent_fresh_verify_and_keeps_parent_open() {
     let mut fake = Fake::new();
@@ -1556,18 +1757,17 @@ fn elevated_is_never_requested_for_upgrade_or_a_non_eligible_install() {
         assert!(seen.requests.is_empty());
         assert_eq!(seen.applied, vec![(Operation::Install, None)]);
     }
-    // An Install operation on an existing installation is not eligible: nothing is planned and
-    // Apply is not admitted, so no administrator step is ever requested.
+    // An Install operation on an existing installation is not eligible: the plan is refused with its
+    // reason, stores nothing, and Apply is refunded, so no administrator step is ever requested.
     let mut existing = Fake::new();
     existing.observed.payload = State::Missing;
     let elevated = existing.elevated.clone();
     let reports = run_jobs(existing, plan_and_apply());
     assert_eq!(reports.len(), 2);
+    assert_eq!(step_of(&reports[0]).outcome, live::NativeOutcome::Failed);
     assert_eq!(
-        step_of(&reports[0]).outcome,
-        live::NativeOutcome::Planned {
-            preview: integration::install_preview(Cold::Existing).to_owned(),
-        }
+        step_of(&reports[0]).detail,
+        integration::install_preview(Cold::Existing)
     );
     assert_eq!(
         step_of(&reports[1]).outcome,
@@ -1578,7 +1778,7 @@ fn elevated_is_never_requested_for_upgrade_or_a_non_eligible_install() {
         assert!(seen.requests.is_empty());
         assert!(seen.applied.is_empty());
     }
-    // Recovery and unknown admissions are planned without the administrator step.
+    // Recovery is planned without the administrator step; an unknown or denied admission is refused.
     for cold in [
         Cold::Partial,
         Cold::Stale,
@@ -1589,16 +1789,23 @@ fn elevated_is_never_requested_for_upgrade_or_a_non_eligible_install() {
         fake.observed.cold = cold;
         let elevated = fake.elevated.clone();
         let reports = run_jobs(fake, vec![(1, step_job(20, 1, JobStage::Plan, None))]);
-        let expected = match cold {
-            Cold::Partial => "Roll back / remove the partial first install".to_owned(),
-            Cold::Stale => "Settle the stale first-install record".to_owned(),
-            _ => integration::install_preview(cold).to_owned(),
-        };
         assert_eq!(reports.len(), 1);
-        assert_eq!(
-            step_of(&reports[0]).outcome,
-            live::NativeOutcome::Planned { preview: expected }
-        );
+        let expected = match cold {
+            Cold::Partial => live::NativeOutcome::Planned {
+                preview: "Roll back / remove the partial first install".to_owned(),
+            },
+            Cold::Stale => live::NativeOutcome::Planned {
+                preview: "Settle the stale first-install record".to_owned(),
+            },
+            _ => live::NativeOutcome::Failed,
+        };
+        assert_eq!(step_of(&reports[0]).outcome, expected);
+        if !matches!(cold, Cold::Partial | Cold::Stale) {
+            assert_eq!(
+                step_of(&reports[0]).detail,
+                integration::install_preview(cold)
+            );
+        }
         assert!(locked(&elevated).requests.is_empty());
     }
 }
@@ -1695,7 +1902,7 @@ fn admin_detect_needs_action_only_when_the_step_is_not_configured() {
 #[test]
 fn elevated_report_lines_join_the_apply_detail_only_when_present() {
     use crosspane_installer_core::JobStage;
-    let base = "Windows operation checked; deferred capabilities remain unavailable";
+    let base = integration::STEP_CHECKED;
     for (lines, expected) in [
         (Vec::new(), base.to_owned()),
         (
@@ -1897,7 +2104,7 @@ fn teardown_not_submitted_refunds_keeps_the_report_lines_and_a_fresh_removal_sti
 #[test]
 fn elevated_report_survives_verify_until_the_next_detect_or_plan_clears_it() {
     use crosspane_installer_core::{JobStage, WaitKind};
-    let base = "Windows operation checked; deferred capabilities remain unavailable";
+    let base = integration::STEP_CHECKED;
     let lines = || {
         vec![
             "Windows Defender Firewall rule added.".to_owned(),

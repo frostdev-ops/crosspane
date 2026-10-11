@@ -319,12 +319,6 @@ pub(crate) fn settle_artifacts<P: ArtifactSettlement>(
     Ok(repair_work || outer_terminal)
 }
 
-pub(crate) const DEFERRED: &[&str] = &[
-    "Windows practice and UI verification (W4.1b)",
-    "Windows Firewall rule and display driver",
-    "Signing and distribution (W4.2)",
-    "Attended Windows checks (W6.2/W6.4)",
-];
 /// Said after an install or an administrator step when only the optional display driver is missing.
 pub(crate) const DRIVER_OPTIONAL_NOTE: &str =
     "The display driver is optional: without it, Crosspane mirrors windows in place.";

@@ -20,7 +20,7 @@ use crate::{
 use crosspane_installer_core::elevated::step::INSTALL_DECLINE_NOTE;
 use crosspane_installer_core::{ApplyOutcome, JobStage, ObservationSource, StepId, WaitKind};
 use domains::{Domains, ElevatedPlanning, ElevatedRequest, Failure, Operation};
-use ports::{AgentSlot, CloseState, Command};
+use ports::{CloseState, Command};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -34,10 +34,35 @@ use worker::{Coordinator, ELEVATED_UNCHECKED, Fence, Outcome};
 const SUPPORT: StepId = StepId(10);
 const INSTALL: StepId = StepId(20);
 const AGENT: StepId = StepId(30);
-const PRACTICE: StepId = StepId(40);
-const DISTRIBUTION: StepId = StepId(50);
 const ADMIN: StepId = StepId(55);
-const ATTENDED: StepId = StepId(56);
+/// The detail of a step that was checked and has nothing more to say.
+pub(crate) const STEP_CHECKED: &str = "Checked.";
+/// Shown when a Windows observation fails; nothing was changed.
+pub(crate) const OBSERVATION_UNAVAILABLE: &str =
+    "Windows couldn't be checked just now. Nothing was changed. Check again.";
+/// Shown when the plan for a change can't be prepared; nothing was changed.
+pub(crate) const PLAN_UNAVAILABLE: &str =
+    "Setup couldn't prepare this change. Nothing was changed. Try again.";
+/// Shown while the agent has not answered its status check yet.
+pub(crate) const AGENT_STARTING: &str =
+    "Crosspane isn't answering yet. Setup checks again by itself.";
+/// Shown when an installed step's files and sign-in task can't be confirmed yet.
+pub(crate) const INSTALL_UNVERIFIED: &str =
+    "Setup couldn't confirm Crosspane's files and sign-in task yet. Check again.";
+/// The support refusal: the account, the Windows build or the folders can't run Crosspane.
+pub(crate) const NOT_SUPPORTED: &str = "Setup couldn't confirm that this Windows account can run Crosspane. It needs your own signed-in session without administrator rights, with your folders on this PC's local drive. Nothing was changed.";
+/// The refusal of a build that carries no approved inventory.
+pub(crate) const NO_INVENTORY: &str = "This installer build has no approved inventory, so nothing will be copied, started or removed.";
+/// The refusal while an earlier change is unsettled.
+pub(crate) const UNSETTLED: &str = "An earlier Crosspane change hasn't finished. Open \"Remove or repair Crosspane…\" to settle it first. Nothing was changed.";
+/// The refusal when the payload folder is missing.
+pub(crate) const NO_PAYLOAD: &str = "This installer can't find its payload folder. Run crosspane-installer.exe from the unpacked Crosspane folder that also holds the payload folder. Nothing was changed.";
+/// The refusal when the sign-in task was changed outside setup.
+pub(crate) const TASK_PRESERVED: &str = "Crosspane's sign-in task was turned off or changed outside setup, so setup leaves it as it is. Nothing was changed.";
+/// The refusal when no more specific reason is known.
+pub(crate) const NOT_YET: &str = "Windows facts don't allow this change right now. Nothing was changed. Check again, or open \"Remove or repair Crosspane…\".";
+/// The refusal when the process is elevated, impersonating or outside the user's own session.
+pub(crate) const NOT_OWN_SESSION: &str = "Crosspane Setup runs only in your own signed-in Windows session, without administrator rights. Close it and open crosspane-installer.exe again normally, not with \"Run as administrator\".";
 /// The removal choice that also tears down the firewall rule and the display driver.
 const TEARDOWN_CHOICE: u16 = 2;
 pub(crate) const TEARDOWN_LABEL: &str = "Also remove the Windows Defender Firewall rule and the Crosspane display driver (Windows asks for administrator approval)";
@@ -49,99 +74,76 @@ pub(crate) fn take_parent_exit() -> bool {
     PARENT_EXIT.swap(false, Ordering::AcqRel)
 }
 
+/// The Windows readiness graph: four native steps, in the order the screens show them.
 pub(crate) fn description() -> live::PlatformDescription {
-    let specs = [
-        (
-            SUPPORT,
-            Vec::new(),
-            true,
-            true,
-            ScreenId::Compatibility,
-            "Check this computer",
-        ),
-        (
-            INSTALL,
-            vec![SUPPORT],
-            true,
-            true,
-            ScreenId::InstallPlan,
-            "Install or update Crosspane",
-        ),
-        (
-            AGENT,
-            vec![INSTALL],
-            true,
-            true,
-            ScreenId::InstallPlan,
-            "Verify the running agent",
-        ),
-        (
-            PRACTICE,
-            vec![AGENT],
-            false,
-            true,
-            ScreenId::Compatibility,
-            domains::DEFERRED[0],
-        ),
-        (
-            DISTRIBUTION,
-            vec![SUPPORT],
-            false,
-            true,
-            ScreenId::Compatibility,
-            domains::DEFERRED[2],
-        ),
-        (
-            ADMIN,
-            vec![INSTALL],
-            false,
-            true,
-            ScreenId::Compatibility,
-            domains::DEFERRED[1],
-        ),
-        (
-            ATTENDED,
-            vec![AGENT],
-            false,
-            true,
-            ScreenId::Compatibility,
-            domains::DEFERRED[3],
-        ),
-    ];
     live::PlatformDescription {
         platform: AgentPlatform::Windows,
         machine_label: "Windows PC".into(),
-        steps: specs
-            .into_iter()
-            .map(
-                |(id, prerequisites, required_for_installed, required_for_ready, screen, label)| {
-                    live::NativeStep {
-                        id,
-                        prerequisites,
-                        required_for_installed,
-                        required_for_ready,
-                        screen,
-                        group: ProgressGroup::Install,
-                        label: label.into(),
-                        action_label: "Review".into(),
-                        uses_status: false,
-                        settles_with_peer: false,
-                        agent_apply: None,
-                    }
-                },
-            )
-            .collect(),
+        steps: vec![
+            live::NativeStep {
+                id: SUPPORT,
+                prerequisites: Vec::new(),
+                required_for_installed: true,
+                required_for_ready: true,
+                screen: ScreenId::Compatibility,
+                group: ProgressGroup::Install,
+                label: "This computer can run Crosspane".into(),
+                action_label: "Check this computer".into(),
+                uses_status: false,
+                settles_with_peer: false,
+                agent_apply: None,
+            },
+            live::NativeStep {
+                id: INSTALL,
+                prerequisites: vec![SUPPORT],
+                required_for_installed: true,
+                required_for_ready: true,
+                screen: ScreenId::InstallPlan,
+                group: ProgressGroup::Install,
+                label: "Crosspane is installed and starts when you sign in".into(),
+                action_label: "Install".into(),
+                uses_status: false,
+                settles_with_peer: false,
+                agent_apply: None,
+            },
+            live::NativeStep {
+                id: AGENT,
+                prerequisites: vec![INSTALL],
+                required_for_installed: false,
+                required_for_ready: true,
+                screen: ScreenId::Installing,
+                group: ProgressGroup::Install,
+                label: "Crosspane is running on this PC".into(),
+                action_label: "Check Crosspane".into(),
+                uses_status: true,
+                settles_with_peer: false,
+                agent_apply: None,
+            },
+            live::NativeStep {
+                id: ADMIN,
+                prerequisites: vec![AGENT],
+                required_for_installed: false,
+                required_for_ready: true,
+                screen: ScreenId::Network,
+                group: ProgressGroup::PermissionsNetwork,
+                label: "Crosspane is allowed through Windows Defender Firewall".into(),
+                action_label: "Allow with administrator approval".into(),
+                uses_status: false,
+                settles_with_peer: true,
+                agent_apply: None,
+            },
+        ],
         connect_after: vec![AGENT],
-        ready_after: vec![AGENT, PRACTICE, DISTRIBUTION, ADMIN, ATTENDED],
+        ready_after: vec![AGENT, ADMIN],
         hiding_choice: false,
-        resume_note: Some(domains::DEFERRED[3].into()),
+        resume_note: None,
     }
 }
 
 struct WindowsPlatform {
     sender: Option<mpsc::SyncSender<Command>>,
     reports: mpsc::Receiver<NativeReport>,
-    agent: AgentSlot,
+    agent: Box<dyn AgentPort>,
     fences: BTreeMap<u16, Fence>,
     stop: Arc<AtomicBool>,
 }
@@ -157,18 +159,7 @@ impl Platform for WindowsPlatform {
             NativeJob::Step { job, .. } => (job.step.0, job.operation.0),
             NativeJob::Maintenance(req) => (100, maintenance_id(req).0),
         };
-        if slot != 100
-            && ![
-                SUPPORT.0,
-                INSTALL.0,
-                AGENT.0,
-                PRACTICE.0,
-                DISTRIBUTION.0,
-                ADMIN.0,
-                ATTENDED.0,
-            ]
-            .contains(&slot)
-        {
+        if slot != 100 && ![SUPPORT.0, INSTALL.0, AGENT.0, ADMIN.0].contains(&slot) {
             return Err(NativeRefusal::UnknownStep);
         }
         let fence = self.fences.entry(slot).or_default().clone();
@@ -188,7 +179,7 @@ impl Platform for WindowsPlatform {
         self.reports.try_iter().take(32).collect()
     }
     fn agent(&mut self) -> &mut dyn AgentPort {
-        &mut self.agent
+        self.agent.as_mut()
     }
     fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -249,10 +240,29 @@ impl InstallerController for WindowsController {
 pub(crate) fn open(
     payload: Option<PathBuf>,
 ) -> anyhow::Result<(eframe::egui::FontDefinitions, Box<dyn InstallerController>)> {
-    // The original GUI caller's Limited/impersonation guard precedes the font and worker.
-    super::native_io::identity::native::refuse_impersonation()?;
-    let token = super::native_io::identity::native::observe()?;
-    super::native_io::identity::LimitedIdentity::admit(token)?;
+    // The Limited/impersonation guard precedes the font, the worker and the port. Every failure in
+    // the chain is the same refusal, and nothing else runs before it.
+    if super::native_io::identity::native::refuse_impersonation()
+        .and_then(|()| super::native_io::identity::native::observe())
+        .and_then(super::native_io::identity::LimitedIdentity::admit)
+        .is_err()
+    {
+        anyhow::bail!(NOT_OWN_SESSION);
+    }
+    // An explicit --payload must be a folder. Without one, the payload folder beside the installer
+    // is the default; the embedded inventory still pins every byte, so the default adds no trust.
+    let payload = match payload {
+        Some(folder) if folder.is_dir() => Some(folder),
+        Some(folder) => anyhow::bail!(
+            "The --payload folder {} doesn't exist or isn't a folder. Nothing was changed.",
+            folder.display()
+        ),
+        None => std::env::current_exe()
+            .ok()
+            .as_deref()
+            .and_then(payload_beside)
+            .filter(|folder| folder.is_dir()),
+    };
     let root = std::env::var_os("SystemRoot")
         .ok_or_else(|| anyhow::anyhow!("Windows system font location unavailable"))?;
     let fonts =
@@ -281,7 +291,12 @@ pub(crate) fn open(
                 worker_clock,
             )
         })?;
-    let agent = AgentSlot::new(sender.clone(), agent_rx, clock.clone());
+    // The slot keeps the agent's reply receiver alive for as long as the platform lives.
+    let agent: Box<dyn AgentPort> = Box::new(ports::AgentSlot::new(
+        sender.clone(),
+        agent_rx,
+        clock.clone(),
+    ));
     let platform = WindowsPlatform {
         sender: Some(sender),
         reports,
@@ -297,6 +312,41 @@ pub(crate) fn open(
     _payload: Option<PathBuf>,
 ) -> anyhow::Result<(eframe::egui::FontDefinitions, Box<dyn InstallerController>)> {
     anyhow::bail!("Native integration is unavailable in the test graph")
+}
+/// A platform over `domains` and `agent`, with the same worker as `open` and no identity check, font
+/// or native domain. The agent's reply channel lives with the worker here, because no `AgentSlot`
+/// holds it in this graph.
+#[cfg(test)]
+pub(crate) fn platform_fixture<D: Domains + 'static>(
+    domains: D,
+    clock: Clock,
+    agent: Box<dyn AgentPort>,
+) -> Box<dyn live::Platform> {
+    let (sender, commands) = mpsc::sync_channel(32);
+    let (reports_tx, reports) = mpsc::sync_channel(32);
+    let (agent_tx, agent_rx) = mpsc::sync_channel(32);
+    let stop = Arc::new(AtomicBool::new(false));
+    let close = Arc::new(CloseState::default());
+    let worker_stop = stop.clone();
+    std::thread::spawn(move || {
+        let _replies = agent_rx;
+        run(
+            domains,
+            commands,
+            reports_tx,
+            agent_tx,
+            worker_stop,
+            close,
+            clock,
+        )
+    });
+    Box::new(WindowsPlatform {
+        sender: Some(sender),
+        reports,
+        agent,
+        fences: BTreeMap::new(),
+        stop,
+    })
 }
 
 pub(crate) fn run<D: Domains>(
@@ -328,17 +378,13 @@ pub(crate) fn run<D: Domains>(
             Ok(Command::Job { job, fence }) => {
                 let result = match job {
                     NativeJob::Step { job, consent, .. } => {
-                        let mut detail =
-                            "Windows operation checked; deferred capabilities remain unavailable"
-                                .to_owned();
+                        let mut detail = STEP_CHECKED.to_owned();
                         let slot = job.step.0;
                         if matches!(job.stage, JobStage::Detect | JobStage::Plan) {
                             elevated_reports.remove(&slot);
                         }
                         let outcome = if !fence.admits(job.operation.0) {
                             NativeOutcome::NotSubmitted
-                        } else if [PRACTICE, DISTRIBUTION, ATTENDED].contains(&job.step) {
-                            NativeOutcome::Unsupported
                         } else if job.step == SUPPORT || job.step == AGENT {
                             match coordinator.detect() {
                                 Ok(snapshot)
@@ -362,7 +408,19 @@ pub(crate) fn run<D: Domains>(
                                         JobStage::Apply => NativeOutcome::NotSubmitted,
                                     }
                                 }
-                                _ => NativeOutcome::Waiting(WaitKind::Contract),
+                                Ok(snapshot) => {
+                                    // The support refusal names the reason; the agent is still starting.
+                                    detail = if job.step == SUPPORT {
+                                        plan_refusal(&snapshot, Operation::Install).to_owned()
+                                    } else {
+                                        AGENT_STARTING.to_owned()
+                                    };
+                                    NativeOutcome::Waiting(WaitKind::Contract)
+                                }
+                                Err(_) => {
+                                    detail = OBSERVATION_UNAVAILABLE.to_owned();
+                                    NativeOutcome::Waiting(WaitKind::Contract)
+                                }
                             }
                         } else {
                             match job.stage {
@@ -374,56 +432,112 @@ pub(crate) fn run<D: Domains>(
                                                 needs_action: !check.configured,
                                             }
                                         }
-                                        Err(_) => NativeOutcome::Unsupported,
+                                        Err(_) => {
+                                            detail = ELEVATED_UNCHECKED.to_owned();
+                                            NativeOutcome::Waiting(WaitKind::Contract)
+                                        }
                                     }
                                 }
                                 JobStage::Detect => match coordinator.detect() {
                                     Ok(v) => NativeOutcome::Detected {
-                                        needs_action: !v.healthy(),
+                                        needs_action: !v.installed(),
                                     },
-                                    Err(_) => NativeOutcome::Unsupported,
+                                    Err(_) => {
+                                        detail = OBSERVATION_UNAVAILABLE.to_owned();
+                                        NativeOutcome::Waiting(WaitKind::Contract)
+                                    }
                                 },
-                                JobStage::Plan if job.step == ADMIN => match coordinator
-                                    .plan_elevated(
-                                        slot,
-                                        job.operation.0,
-                                        Operation::Elevated,
-                                        Some(ElevatedRequest::Setup),
-                                    ) {
-                                    Ok(v) => NativeOutcome::Planned {
-                                        preview: compose_preview(
-                                            &preview(Operation::Elevated, v.snapshot.cold),
-                                            v.elevated.as_ref(),
-                                            false,
-                                        ),
-                                    },
-                                    Err(_) => NativeOutcome::Unsupported,
-                                },
-                                JobStage::Plan => match coordinator.detect().and_then(|v| {
-                                    let operation = v.install_operation();
-                                    if install_setup_requested(operation, v.cold) {
-                                        coordinator.plan_elevated(
+                                JobStage::Plan if job.step == ADMIN => {
+                                    // Admission is read first, so a refused administrator step stores no plan.
+                                    match coordinator.detect() {
+                                        Err(_) => {
+                                            detail = PLAN_UNAVAILABLE.to_owned();
+                                            NativeOutcome::Failed
+                                        }
+                                        Ok(snapshot) if !snapshot.allowed(Operation::Elevated) => {
+                                            detail = plan_refusal(&snapshot, Operation::Elevated)
+                                                .to_owned();
+                                            NativeOutcome::Waiting(WaitKind::User)
+                                        }
+                                        Ok(_) => match coordinator.plan_elevated(
                                             slot,
                                             job.operation.0,
-                                            operation,
+                                            Operation::Elevated,
                                             Some(ElevatedRequest::Setup),
-                                        )
-                                    } else {
-                                        coordinator.plan(slot, job.operation.0, operation)
-                                    }
-                                }) {
-                                    Ok(v) => NativeOutcome::Planned {
-                                        preview: if v.operation == Operation::Install {
-                                            compose_preview(
-                                                install_preview(v.snapshot.cold),
-                                                v.elevated.as_ref(),
-                                                true,
-                                            )
-                                        } else {
-                                            preview(v.operation, v.snapshot.cold)
+                                        ) {
+                                            Ok(v) => match &v.elevated {
+                                                Some(ElevatedPlanning::Planned(_)) => {
+                                                    NativeOutcome::Planned {
+                                                        preview: compose_preview(
+                                                            &preview(
+                                                                Operation::Elevated,
+                                                                v.snapshot.cold,
+                                                            ),
+                                                            v.elevated.as_ref(),
+                                                            false,
+                                                        ),
+                                                    }
+                                                }
+                                                Some(ElevatedPlanning::Unavailable(reason)) => {
+                                                    detail = (*reason).to_owned();
+                                                    NativeOutcome::Waiting(WaitKind::User)
+                                                }
+                                                Some(ElevatedPlanning::NotNeeded) | None => {
+                                                    detail = ELEVATED_UNCHECKED.to_owned();
+                                                    NativeOutcome::Waiting(WaitKind::Contract)
+                                                }
+                                            },
+                                            Err(_) => {
+                                                detail = PLAN_UNAVAILABLE.to_owned();
+                                                NativeOutcome::Failed
+                                            }
                                         },
-                                    },
-                                    Err(_) => NativeOutcome::Unsupported,
+                                    }
+                                }
+                                JobStage::Plan => match coordinator.detect() {
+                                    Err(_) => {
+                                        detail = PLAN_UNAVAILABLE.to_owned();
+                                        NativeOutcome::Failed
+                                    }
+                                    Ok(snapshot) => {
+                                        let operation = snapshot.install_operation();
+                                        if !snapshot.allowed(operation) {
+                                            // A refused change stores no plan and no consent, so a later Apply is refunded.
+                                            detail = plan_refusal(&snapshot, operation).to_owned();
+                                            NativeOutcome::Failed
+                                        } else {
+                                            let planned = if install_setup_requested(
+                                                operation,
+                                                snapshot.cold,
+                                            ) {
+                                                coordinator.plan_elevated(
+                                                    slot,
+                                                    job.operation.0,
+                                                    operation,
+                                                    Some(ElevatedRequest::Setup),
+                                                )
+                                            } else {
+                                                coordinator.plan(slot, job.operation.0, operation)
+                                            };
+                                            match planned {
+                                                Ok(v) => NativeOutcome::Planned {
+                                                    preview: if v.operation == Operation::Install {
+                                                        compose_preview(
+                                                            install_preview(v.snapshot.cold),
+                                                            v.elevated.as_ref(),
+                                                            true,
+                                                        )
+                                                    } else {
+                                                        preview(v.operation, v.snapshot.cold)
+                                                    },
+                                                },
+                                                Err(_) => {
+                                                    detail = PLAN_UNAVAILABLE.to_owned();
+                                                    NativeOutcome::Failed
+                                                }
+                                            }
+                                        }
+                                    }
                                 },
                                 JobStage::Apply => {
                                     let applied =
@@ -472,8 +586,11 @@ pub(crate) fn run<D: Domains>(
                                     let checked = coordinator.verify(if job.step == ADMIN {
                                         Operation::Elevated
                                     } else {
-                                        Operation::Upgrade
+                                        Operation::Install
                                     });
+                                    if checked != Outcome::Verified && job.step != ADMIN {
+                                        detail = INSTALL_UNVERIFIED.to_owned();
+                                    }
                                     // The controller replaces the step detail with this one, so the
                                     // remembered report is joined on, as the Apply path joins it.
                                     if let Some(report) = elevated_reports.get(&slot) {
@@ -805,6 +922,41 @@ pub(crate) fn install_setup_requested(operation: Operation, cold: domains::Cold)
             cold,
             domains::Cold::Eligible | domains::Cold::CompletedRemoval
         )
+}
+/// The reason a change can't be planned now, checked in a fixed order. Only a refused plan gets a
+/// reason; the caller stores no plan and no consent for it.
+pub(crate) fn plan_refusal(snapshot: &domains::Snapshot, operation: Operation) -> &'static str {
+    if !snapshot.supported {
+        NOT_SUPPORTED
+    } else if !snapshot.inventory {
+        NO_INVENTORY
+    } else if snapshot.unsettled {
+        UNSETTLED
+    } else if matches!(
+        operation,
+        Operation::Install | Operation::Upgrade | Operation::PayloadRepair
+    ) && !snapshot.sources
+    {
+        NO_PAYLOAD
+    } else if operation == Operation::Install
+        && matches!(
+            snapshot.cold,
+            domains::Cold::Unknown | domains::Cold::AccessDenied | domains::Cold::Existing
+        )
+    {
+        install_preview(snapshot.cold)
+    } else if matches!(
+        snapshot.task,
+        domains::State::Disabled | domains::State::Mismatch
+    ) {
+        TASK_PRESERVED
+    } else {
+        NOT_YET
+    }
+}
+/// The payload folder the installer expects beside itself: `payload` in the installer's folder.
+pub(crate) fn payload_beside(installer: &std::path::Path) -> Option<PathBuf> {
+    installer.parent().map(|folder| folder.join("payload"))
 }
 /// `base`, then the administrator step's block or its reason. A block in an install is followed
 /// by the decline note, so a declined step still lets the install complete.
