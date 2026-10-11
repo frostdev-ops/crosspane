@@ -1,4 +1,8 @@
 //! The per-session daemon wiring engine, platform, and transport (WP-1.37).
+#![cfg_attr(
+    all(windows, not(debug_assertions), not(test)),
+    windows_subsystem = "windows"
+)]
 
 mod agent;
 mod audio;
@@ -115,6 +119,9 @@ static RESTART: AtomicBool = AtomicBool::new(false);
 static INSTALLER_STOP_ACCEPTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static APPKIT_STOPPED: AtomicBool = AtomicBool::new(false);
+/// Set when the release/panic hotkey observer stopped without its owner dropping it (WP-W1.11 G4).
+#[cfg(windows)]
+static WINDOWS_HOTKEY_LOST: AtomicBool = AtomicBool::new(false);
 
 /// The exit status after a clean stop: 75 (`EX_TEMPFAIL`) for a restart or AppKit termination.
 #[cfg(unix)]
@@ -144,8 +151,11 @@ fn stop_for_restart(events: &std::sync::mpsc::Sender<agent::Event>) {
 fn main() -> Result<()> {
     #[cfg(windows)]
     windows::process::wait_for_restart_parent()?;
+    #[cfg(windows)]
+    windows::process::attach_console_for_cli();
     #[cfg(target_os = "linux")]
     platform::prepare_exit_diagnostics();
+    #[cfg(not(windows))]
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -153,6 +163,8 @@ fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+    #[cfg(windows)]
+    windows::log::init_tracing();
     #[cfg(unix)]
     let elevated = is_elevated();
     #[cfg(windows)]
@@ -175,7 +187,13 @@ fn main() -> Result<()> {
             return Err(error);
         }
     }
-    dispatch(command.unwrap_or(Command::Run), run, one_shot)
+    let result = dispatch(command.unwrap_or(Command::Run), run, one_shot);
+    // A release Windows agent has no stderr, so the final error is recorded in the log file too.
+    #[cfg(windows)]
+    if let Err(error) = &result {
+        tracing::error!(error = %format!("{error:#}"), "the agent exited with an error");
+    }
+    result
 }
 
 fn dispatch(
@@ -317,12 +335,21 @@ fn run_with_startup(
             lock_path.display()
         )
     })?;
+    #[cfg(windows)]
+    match windows::log::AGENT_LOG.open(&paths.state_dir) {
+        Ok(()) => tracing::info!(version = env!("CARGO_PKG_VERSION"), "agent log opened"),
+        Err(error) => tracing::warn!(%error, "no agent log file; logging to stderr only"),
+    }
     let mut lifecycle = lifecycle::Lifecycle::start(paths)?;
     let mut failure = lifecycle::Failure::Other;
     let started = start(paths, &mut lifecycle, &mut failure);
     let Some(started) = (match started {
         Ok(started) => started,
         Err(error) => {
+            // A release agent has no stderr, so the log file is the only record of this failure.
+            // It is logged before the phase write, which can itself fail.
+            #[cfg(windows)]
+            tracing::error!(error = %format!("{error:#}"), "the agent failed to start");
             if !lifecycle.ready() {
                 lifecycle.phase(lifecycle::Phase::Failed, Some(failure))?;
             }
@@ -462,12 +489,13 @@ fn start_agent(
     {
         *failure = lifecycle::Failure::Platform;
         let hotkey_tx = tx.clone();
-        platform.hotkeys = Some(
+        let (hotkeys, hotkey_health) =
             platform::windows_hotkeys_after_host(Arc::new(move |event| {
                 let _ = hotkey_tx.send(agent::Event::Input(crosspane_engine::Input::Hotkey(event)));
             }))
-            .context("Windows release/panic hotkeys (required for startup)")?,
-        );
+            .context("Windows release/panic hotkeys (required for startup)")?;
+        platform.hotkeys = Some(hotkeys);
+        watch_windows_hotkeys(hotkey_health, tx.clone())?;
         tracing::info!(backends = ?platform, "platform ready");
         *failure = lifecycle::Failure::Other;
     }
@@ -1019,6 +1047,15 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
         .stopped(stopped.outcomes)
         .context("write exit receipt")?;
     drop(shutdown_watch);
+    if hotkey_exit_wanted(
+        WINDOWS_HOTKEY_LOST.load(Ordering::Acquire),
+        INSTALLER_STOP_ACCEPTED.load(Ordering::Acquire),
+    ) {
+        // Never self-restart here: a failing exit with an empty job is the supervisor's crash path.
+        bail!(
+            "the release/panic hotkey observer stopped; exiting with failure so the agent is started again"
+        );
+    }
     if restart_after_stop(stopped.restart || RESTART.load(Ordering::Acquire)) {
         agent::restart();
     }
@@ -1028,6 +1065,60 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
 /// Final replacement/exit policy observes sticky intent even after a later host failure.
 fn restart_after_stop(restart_requested: bool) -> bool {
     restart_requested && !INSTALLER_STOP_ACCEPTED.load(Ordering::Acquire)
+}
+
+/// A lost release/panic observer ends the process with failure, unless an accepted installer stop
+/// already owns the exit (that exit is 0).
+#[cfg(any(windows, test))]
+fn hotkey_exit_wanted(lost: bool, installer_stop: bool) -> bool {
+    lost && !installer_stop
+}
+
+/// Polls the release/panic observer. A lost observer can no longer release held keys or see the
+/// panic chord, so the agent stops. It never restarts itself: the exit is the supervisor's crash
+/// path, and the next start has a new observer. A dropped observer is this process's own teardown,
+/// so it never exits the agent.
+#[cfg(windows)]
+fn watch_windows_hotkeys(
+    health: crosspane_platform_windows::hotkey::HotkeyHealth,
+    events: std::sync::mpsc::Sender<agent::Event>,
+) -> Result<()> {
+    use crosspane_platform_windows::hotkey::HotkeyHealthState;
+    std::thread::Builder::new()
+        .name("hotkey-health".into())
+        .spawn(move || {
+            loop {
+                match health.state() {
+                    HotkeyHealthState::Live => {}
+                    HotkeyHealthState::Dropped => return,
+                    HotkeyHealthState::Lost => {
+                        WINDOWS_HOTKEY_LOST.store(true, Ordering::Release);
+                        tracing::error!(
+                            "the release/panic hotkey observer stopped; stopping the agent so it is started again with a new one"
+                        );
+                        platform::exit_deadline(std::time::Duration::from_secs(5));
+                        let _ = events.send(agent::Event::Shutdown);
+                        return;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        })
+        .context("spawn hotkey health observer")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod hotkey_observer_tests {
+    use super::hotkey_exit_wanted;
+
+    #[test]
+    fn hotkey_exit_only_when_lost_without_installer_stop() {
+        assert!(hotkey_exit_wanted(true, false));
+        assert!(!hotkey_exit_wanted(true, true));
+        assert!(!hotkey_exit_wanted(false, false));
+        assert!(!hotkey_exit_wanted(false, true));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1289,8 +1380,9 @@ fn platform_permissions() -> Box<dyn Permissions> {
 
 #[cfg(windows)]
 fn platform_permissions() -> Box<dyn Permissions> {
-    // The agent watches only required(): an empty set has no notices/retries/backend failures.
-    Box::new(crosspane_platform_windows::stubs::UnsupportedWindows)
+    // Nothing to grant on Windows (v0). The agent watches only required(): an empty set has no
+    // notices/retries/backend failures.
+    Box::new(crosspane_platform_windows::permissions::WindowsPermissions)
 }
 
 #[cfg(target_os = "macos")]

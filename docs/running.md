@@ -37,6 +37,28 @@ For the opt-in virtual-display window hiding on the Mac, build with
 `--features private-vdisplay` and set `mac_virtual_display = true` (below). Without it, projected
 Mac windows stay visible in place (M1 mirror).
 
+**Windows.** Install Visual Studio 2022 Build Tools with the MSVC C++ tools, a Windows SDK and the
+CMake component, and Rust through rustup (`rust-toolchain.toml` selects the pinned toolchain). Two
+settings must be visible to the build:
+
+- `cmake.exe` on `PATH`, or the `CMAKE` environment variable set to its full path (`audiopus_sys`
+  needs CMake);
+- `AWS_LC_SYS_PREBUILT_NASM=1`, so `aws-lc-sys` uses its shipped prebuilt objects instead of an
+  installed NASM.
+
+Set them yourself, or dot-source the helper in the PowerShell session that builds
+(`. .\scripts\windows\dev-env.ps1`). The helper adds the Build Tools' CMake and sets the NASM flag for
+that session only.
+
+```powershell
+cargo build --release -p crosspane-agent -p crosspanectl -p crosspane-ui
+```
+
+For H.264 through Media Foundation, build the agent with `--features video`:
+`cargo build --release -p crosspane-agent --features video`. Release builds of the agent have no
+console window, so its logs go to the log file only (see Install, start and stop). A debug build
+(`cargo build`, or `cargo run -p crosspane-agent`) keeps its console, and its logs also appear there.
+
 ## One-time setup
 
 **Mac**, System Settings › Privacy & Security, turn on **Crosspane** under:
@@ -58,10 +80,23 @@ agent connects.
 **Linux**: the firewall must allow UDP 47811 (agent) and 47812 (pairing) from the LAN, e.g.
 `sudo ufw allow from 192.168.1.0/24 to any port 47811:47812 proto udp` (replace the subnet with your LAN).
 
+**Windows** has no per-app permissions to grant. The installer asks once for administrator approval
+(one UAC prompt) for two things:
+
+- a Windows Defender Firewall rule, `Crosspane.Agent.UDP.Private.<install id>`, that lets the
+  installed agent receive UDP from the local subnet on private networks;
+- the Crosspane display driver (preview): one virtual display adapter that shows no display until
+  Crosspane needs one. The driver is optional. Without it, projected Windows windows stay visible in
+  place (mirror).
+
+If you decline the prompt, Crosspane is still installed. Until the firewall rule exists, other
+computers may not reach this PC.
+
 ## Configuration
 
-`config.toml`, created with defaults on first run, at `~/.config/crosspane/config.toml` (Linux) or
-`~/Library/Application Support/Crosspane/config.toml` (Mac):
+`config.toml`, created with defaults on first run, at `~/.config/crosspane/config.toml` (Linux),
+`~/Library/Application Support/Crosspane/config.toml` (Mac) or `%APPDATA%\Crosspane\config.toml`
+(Windows):
 
 ```toml
 name = "desktop"          # what peers see
@@ -87,6 +122,13 @@ agent then connects only to the `[[peers]]` addresses and to `crosspanectl dial`
 "discovery off" at start. Test scripts that run agents set it, so they never contact the agents of
 the machine they run on.
 
+On Windows, `config.toml` and `trust.json` (the paired machines, their public keys and what each may
+do here) are in `%APPDATA%\Crosspane`. The agent's state (its journals, instance lock and `logs`
+folder) is in `%LOCALAPPDATA%\Crosspane`. Its control channel is a named pipe,
+`\\.\pipe\Crosspane-<hash>`, private to your user and logon session. The pipe name is derived from
+the `%LOCALAPPDATA%\Crosspane\runtime` folder, which holds the agent's runtime files. The device key
+is kept in Windows Credential Manager, and the key-file fallback is off on Windows by default.
+
 ## Install, start and stop
 
 - **Linux:** `cargo install --locked --path apps/crosspane-agent --root ~/.local --features video`
@@ -106,6 +148,17 @@ the machine they run on.
   `--features private-vdisplay,video`, for the D7 window hiding) builds, signs and installs `~/Applications/Crosspane.app` (with the settings app
   inside), starts it at login (LaunchAgent `io.frostdev.crosspane.agent`) and puts `crosspanectl`
   in `~/.cargo/bin`. Logs: `~/Library/Logs/Crosspane/agent.log`. Re-run it to upgrade.
+- **Windows:** run the per-user installer, `crosspane-installer.exe`. It installs
+  `crosspane-agent.exe`, `crosspane-ui.exe` and `crosspanectl.exe` in
+  `%LOCALAPPDATA%\Programs\Crosspane`, keeps its own state in `%LOCALAPPDATA%\Crosspane\Installer`,
+  asks once for administrator approval (see One-time setup), and creates the logon task
+  `\Crosspane\Agent` (Task Scheduler, Crosspane folder, Agent) for your account. At each sign-in that
+  task starts the agent under a supervisor. The supervisor starts the agent again after a crash (a
+  nonzero exit), five seconds later, and stops restarting it after three restarts within ten
+  minutes. The agent refuses to run elevated. Its logs are `%LOCALAPPDATA%\Crosspane\logs\agent.log`.
+  Each run starts a fresh file and moves the previous run's log to `agent.log.1` (and `agent.log.1`
+  to `agent.log.2`). Each file is capped at 4 MiB, and the live file rotates the same way when a line
+  would pass that cap. `crosspanectl diag` includes the tail of each file.
 - **Arch:** `packaging/arch/PKGBUILD` builds all three and installs the user unit and a
   "Crosspane Settings" launcher entry.
 - **Stop** with SIGTERM (`systemctl --user stop crosspane-agent`, or `launchctl bootout
@@ -115,6 +168,10 @@ the machine they run on.
 - **Restart** with `crosspanectl restart`. The agent also restarts by itself when macOS
   permissions change, so new grants take effect; if a grant doesn't show up in
   `crosspanectl status`, restart it.
+- **Windows quit and restart:** **Quit Crosspane** in the tray stops the agent until your next
+  sign-in, because the supervisor doesn't restart a clean exit. **Restart Crosspane** in the tray, or
+  `crosspanectl restart`, starts a replacement that the supervisor follows. Signing out or shutting
+  Windows down also stops the agent. In a debug build's terminal, Ctrl+C stops it.
 - **Locked key store:** if the OS key store (Secret Service or Keychain) is still locked when the
   agent starts at login, `crosspane-agent run` waits for it, retrying every 2 s and logging once a
   minute, and SIGTERM still stops it while it waits.
@@ -137,7 +194,8 @@ window projection only. Both machines then show the peer in `crosspanectl status
 
 ## Use
 
-**The tray / menu-bar icon** (Waybar on Linux, the menu bar on the Mac) is the main control:
+**The tray / menu-bar icon** (Waybar on Linux, the menu bar on the Mac, the notification area on
+Windows) is the main control:
 - the status, and **Take input back** while this machine drives another;
 - **Show a window of ⟨peer⟩ here** and **Send a window to ⟨peer⟩**;
 - **Projected windows**, to give any of them back;
@@ -176,8 +234,10 @@ Everything is also available from the command line:
 Pixel-only scrolling uses an approximate conversion based on the target's wheel settings and
 20 logical pixels per line or character; applications may scroll by different amounts. Windows
 precision-touchpad capture and AltGr interoperability still need attended native validation.
-Lock-state snapshots are unknown in this preview, so crossing from Windows leaves the target's
-lock states unchanged. A target refuses to guess a requested toggle when its own state is unknown.
+Caps Lock, Num Lock and Scroll Lock states sync both ways. A target that can't confirm its own lock
+state (for about 100 ms after Crosspane presses a lock key there) leaves that lock unchanged rather
+than guessing. If the release/panic shortcut's observer is lost, the agent stops, and the installed
+agent is started again (after about five seconds, and at most three times in ten minutes).
 Win+L locks the local Windows machine. Ctrl-Alt-Del opens Windows security locally by design;
 interact with the security or lock screen on that machine. Remote secure-desktop control is
 unsupported, and Crosspane closes its input gate there.
@@ -186,7 +246,9 @@ unsupported, and Crosspane closes its input gate there.
 - From the machine that has it: `crosspanectl windows` lists this machine's windows, and
   `crosspanectl project <id> <peer>` moves one to the peer.
 - From the machine where you want it: `crosspanectl pick --from <peer>` shows the peer's windows
-  in a menu (walker, fuzzel, wofi or rofi on Linux; a list on the Mac) and pulls the chosen one.
+  in a menu (walker, fuzzel, wofi or rofi on Linux; a list on the Mac; on Windows, a numbered list in
+  the terminal where you type the number, unless `--menu` names a command, which runs through
+  `cmd /c`) and pulls the chosen one.
   Bind it to a key, e.g. in Hyprland `crosspanectl pick --from macbook`. The scriptable form is
   `crosspanectl windows --from <peer>` and `crosspanectl pull <peer> <id>`.
   - The peer must allow it once: on the peer, `crosspanectl allow <this machine> browse` (or the
@@ -254,6 +316,10 @@ Speakers only: microphones are not shared yet.
   speakers", once the owner has installed it). Pick it in the system's sound settings or in an app.
   Sound reaches the peer only while an app plays into it, and comes out of the peer's default
   output.
+- **On Windows** there is no virtual output yet, so the peer's speakers don't appear in the sound
+  settings. A Windows machine plays a peer's sound on its default output (shared playback). As a
+  source, it sends the sound of the app behind a window projected to that peer, captured from that
+  app's process tree. Capturing doesn't mute the app: its sound still plays on this machine too.
 - **The speakers' owner decides.** Both sides are off by default: on the machine whose speakers
   should play, run `crosspanectl allow <peer> speaker` (`--off` to withdraw). Withdrawing it,
   locking the screen, `crosspanectl panic`, a lost connection or revoking the peer stops the sound
@@ -264,7 +330,8 @@ Speakers only: microphones are not shared yet.
 - **See it:** `crosspanectl status` shows, per peer, what it may do here (`speaker`, `mic`, ...) and
   whether it is playing on this machine's speakers; the tray / menu-bar menu lists the peers
   playing now, and its icon shows the active state.
-- **Needs** PipeWire (Linux) or CoreAudio (Mac) at agent start; the agent logs "audio sharing on"
+- **Needs** an audio backend at agent start: PipeWire (Linux), CoreAudio (Mac) or the Windows audio
+  stack (process-tree capture needs Windows build 20348 or later). The agent logs "audio sharing on"
   (or why not) and then advertises the `audio` feature. `CROSSPANE_AUDIO=0` in the agent's
   environment turns audio off and never touches the audio server. Every script under
   `scripts/e2e/` that starts agents sets it (and `CROSSPANE_DISCOVERY=0`), except
@@ -272,6 +339,8 @@ Speakers only: microphones are not shared yet.
 - **Limits (v0):** the Mac resamples the 48 kHz stream to its default output's rate (44.1, 48,
   88.2, 96, 176.4 or 192 kHz); the Mac's driver serves one peer at a time;
   an agent whose audio worker died keeps audio refused until it restarts.
+- **Windows limits (v0):** a change of the default output or audio device ends the stream, and sound
+  resumes only once an app starts playing again.
 - **Check it without touching your audio:** `scripts/test-env.sh scripts/e2e/audio-private.sh`
   runs two agents, each on its own private PipeWire server, plays a 1 kHz tone into one's "speakers"
   and records what comes out of the other's output.

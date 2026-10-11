@@ -344,6 +344,10 @@ pub struct Platform {
     /// Fresh Windows placement rows. The refresh closure is weak; `displays` owns its worker.
     #[cfg(windows)]
     pub host_placement_mapping: Option<crosspane_render::proxy::HostPlacementMapping>,
+    /// The same fresh observation as `host_placement_mapping`, with each monitor's work area, for
+    /// the agent's own proxy placement (WP-W1.11 B2). Same weak refresh; never cached.
+    #[cfg(windows)]
+    pub windows_placement_rows: Option<WindowsPlacementRows>,
 }
 
 /// A wgpu device for the source side's GPU work.
@@ -630,13 +634,28 @@ fn acceptance_e1(
     Ok(true)
 }
 
+/// One monitor of a fresh Windows placement observation (WP-W1.11 B2). `mapping` is the render
+/// host's row; `rc_monitor` and `rc_work` are the same probe's physical rectangles, which only the
+/// agent's proxy placement reads (it keeps the proxy inside the work area).
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowsPlacementRow {
+    pub mapping: crosspane_render::proxy::HostMonitorMapping,
+    pub rc_monitor: [i32; 4],
+    pub rc_work: [i32; 4],
+}
+
+/// Each call takes one fresh observation of [`WindowsPlacementRow`]s (see `windows_placement_rows`).
+#[cfg(windows)]
+pub type WindowsPlacementRows = Arc<dyn Fn() -> Option<Vec<WindowsPlacementRow>> + Send + Sync>;
+
 /// Each call takes one bounded observation on the retained display worker. Called on the
 /// host event-loop thread (and the engine thread for explicit placement), without agent locks.
 /// Never cache geometry: a dead owner or failed observation yields OS-selected placement.
 #[cfg(windows)]
-fn windows_placement_mapping(
+fn windows_placement_rows(
     refresh: crosspane_platform_windows::inject::MonitorRefresh,
-) -> crosspane_render::proxy::HostPlacementMapping {
+) -> WindowsPlacementRows {
     Arc::new(move || {
         let (probes, ids) = refresh().ok()?;
         match windows_monitor_rows(&probes, ids) {
@@ -652,11 +671,23 @@ fn windows_placement_mapping(
     })
 }
 
+/// The render host's view of one `windows_placement_rows` observation: the same monitors, without
+/// the physical rectangles the agent uses.
+#[cfg(windows)]
+fn windows_placement_mapping(
+    rows: WindowsPlacementRows,
+) -> crosspane_render::proxy::HostPlacementMapping {
+    Arc::new(move || {
+        let rows = rows()?;
+        Some(rows.into_iter().map(|row| row.mapping).collect::<Vec<_>>())
+    })
+}
+
 #[cfg(windows)]
 fn windows_monitor_rows(
     probes: &[crosspane_platform_windows::model::geometry::MonitorProbe],
     mut ids: crosspane_platform_windows::model::geometry::DisplayIds,
-) -> Result<Vec<crosspane_render::proxy::HostMonitorMapping>, PlatformError> {
+) -> Result<Vec<WindowsPlacementRow>, PlatformError> {
     use crosspane_platform_windows::model::geometry;
     use std::collections::BTreeSet;
     let refused = || PlatformError::Backend("invalid Windows placement observation".into());
@@ -677,11 +708,15 @@ fn windows_monitor_rows(
         if !display.geometry.is_valid() {
             return Err(refused());
         }
-        rows.push(crosspane_render::proxy::HostMonitorMapping {
-            id: id.0,
-            native_id: probe.name.clone(),
-            geometry: display.geometry,
-            physical_origin: (probe.rc_monitor[0], probe.rc_monitor[1]).into(),
+        rows.push(WindowsPlacementRow {
+            mapping: crosspane_render::proxy::HostMonitorMapping {
+                id: id.0,
+                native_id: probe.name.clone(),
+                geometry: display.geometry,
+                physical_origin: (probe.rc_monitor[0], probe.rc_monitor[1]).into(),
+            },
+            rc_monitor: probe.rc_monitor,
+            rc_work: probe.rc_work,
         });
     }
     if rows.is_empty() || rows.len() != layout.displays.len() {
@@ -849,17 +884,29 @@ fn owned_source_claim(
 
 /// Required release/panic observer, only after the host has relinquished Raw Input.
 /// Configuration and the initial-state subscription must both succeed before startup commits.
+/// The health view is taken before the backend is boxed, so the agent can watch for loss.
 #[cfg(windows)]
 pub fn windows_hotkeys_after_host(
     sink: Arc<dyn crosspane_platform::EventSink<crosspane_platform::HotkeyEvent>>,
-) -> Result<Box<dyn GlobalHotkeys>, PlatformError> {
-    windows_hotkeys_after_host_with(
+) -> Result<
+    (
+        Box<dyn GlobalHotkeys>,
+        crosspane_platform_windows::hotkey::HotkeyHealth,
+    ),
+    PlatformError,
+> {
+    let mut health = None;
+    let backend = windows_hotkeys_after_host_with(
         || {
-            crosspane_platform_windows::hotkey::WindowsHotkeys::new()
-                .map(|backend| Box::new(backend) as Box<dyn GlobalHotkeys>)
+            let backend = crosspane_platform_windows::hotkey::WindowsHotkeys::new()?;
+            health = Some(backend.health());
+            Ok(Box::new(backend) as Box<dyn GlobalHotkeys>)
         },
         sink,
-    )
+    )?;
+    let health =
+        health.ok_or_else(|| PlatformError::Backend("Windows hotkey health missing".into()))?;
+    Ok((backend, health))
 }
 
 #[cfg(windows)]
@@ -1045,8 +1092,8 @@ pub fn create(
     use anyhow::Context;
     use crosspane_platform_windows::{
         capture::WindowsCapture, displays::WindowsDisplays, frame_capture::WindowsFrameCapture,
-        inject, link::WindowsLinkInfo, overlay::WindowsOverlay, session::WindowsSession,
-        stubs::UnsupportedWindows, tray::WindowsTray, window::WindowsWindowSource,
+        inject, link::WindowsLinkInfo, overlay::WindowsOverlay, permissions::WindowsPermissions,
+        session::WindowsSession, tray::WindowsTray, window::WindowsWindowSource,
     };
     let e1_only = acceptance_e1(state_dir, config)?;
     let e2_destination = acceptance_e2_destination(state_dir, config)?;
@@ -1058,14 +1105,18 @@ pub fn create(
         .context("Windows session state (required: Crosspane fails closed without it)")?;
     let displays = WindowsDisplays::new().context("Windows displays")?;
     let snapshot = displays.snapshot().context("Windows display snapshot")?;
-    let host_placement_mapping = Some(windows_placement_mapping(displays.monitor_refresh()));
+    // One refresh source feeds both the host's mapping and the agent's rows (WP-W1.11 B2).
+    let placement_rows = windows_placement_rows(displays.monitor_refresh());
+    let host_placement_mapping = Some(windows_placement_mapping(placement_rows.clone()));
     let mut ids = snapshot.ids;
     let capture = if source_only {
         None
     } else {
+        // set_portals re-reads the monitor table through this refresh (WP-W1.11 G2).
         optional(
             "capture",
-            WindowsCapture::new(gate.clone(), &snapshot.probes, &mut ids),
+            WindowsCapture::new(gate.clone(), &snapshot.probes, &mut ids)
+                .map(|capture| capture.with_monitor_refresh(displays.monitor_refresh())),
         )
         .map(|backend| Box::new(backend) as Box<dyn InputCapture>)
     };
@@ -1193,8 +1244,9 @@ pub fn create(
         // relinquished winit's keyboard/mouse registrations. A failure aborts startup.
         hotkeys: None,
         keystore: if scratch_only { None } else { keystore() },
+        // Nothing to grant on Windows (v0).
         // required=[] is benign in the agent: no OS request/subscription, notice or retry.
-        permissions: Box::new(UnsupportedWindows),
+        permissions: Box::new(WindowsPermissions),
         windows: windows.map(|backend| Box::new(backend) as Box<dyn WindowSource>),
         parking,
         frames: frames.map(|backend| Box::new(backend) as Box<dyn FrameCapture>),
@@ -1209,6 +1261,7 @@ pub fn create(
         acceptance_scratch: scratch_only,
         acceptance_source: source_only,
         host_placement_mapping,
+        windows_placement_rows: Some(placement_rows),
     })
 }
 
@@ -2148,13 +2201,20 @@ mod windows_destination_tests {
         }
     }
 
+    /// The render host's rows only; the work areas are checked by the agent's placement test.
+    fn mappings(
+        rows: Vec<WindowsPlacementRow>,
+    ) -> Vec<crosspane_render::proxy::HostMonitorMapping> {
+        rows.into_iter().map(|row| row.mapping).collect()
+    }
+
     #[test]
     fn windows_destination_rows_join_retained_ids_and_mixed_dpi_seams() {
         let a = probe("a", "A", [0, 0, 1920, 1080], 96, true);
         let b = probe("b", "B", [1920, 0, 3840, 2160], 192, false);
         let mut ids = DisplayIds::default();
         let b_id = ids.assign("b").unwrap();
-        let rows = windows_monitor_rows(&[b.clone(), a], ids.clone()).unwrap();
+        let rows = mappings(windows_monitor_rows(&[b.clone(), a], ids.clone()).unwrap());
         let b_row = rows.iter().find(|row| row.id == b_id.0).unwrap();
         assert_eq!(b_row.native_id, "B");
         assert_eq!(b_row.physical_origin, (1920, 0).into());
@@ -2163,27 +2223,31 @@ mod windows_destination_tests {
             b_row.geometry.device_to_logical((200.0, 200.0).into()),
             (2020.0, 100.0).into()
         );
-        let rows = windows_monitor_rows(
-            &[
-                probe("a", "A", [0, 0, 2560, 1440], 192, true),
-                probe("b", "B", [2560, 200, 4480, 1280], 96, false),
-            ],
-            ids.clone(),
-        )
-        .unwrap();
+        let rows = mappings(
+            windows_monitor_rows(
+                &[
+                    probe("a", "A", [0, 0, 2560, 1440], 192, true),
+                    probe("b", "B", [2560, 200, 4480, 1280], 96, false),
+                ],
+                ids.clone(),
+            )
+            .unwrap(),
+        );
         let b_row = rows.iter().find(|row| row.id == b_id.0).unwrap();
         assert_eq!(
             b_row.geometry.device_to_logical((100.0, 100.0).into()),
             (1380.0, 200.0).into()
         );
-        let rows = windows_monitor_rows(
-            &[
-                probe("a", "A", [0, 0, 1920, 1080], 96, true),
-                probe("b", "B", [-1920, 0, 0, 1080], 96, false),
-            ],
-            ids,
-        )
-        .unwrap();
+        let rows = mappings(
+            windows_monitor_rows(
+                &[
+                    probe("a", "A", [0, 0, 1920, 1080], 96, true),
+                    probe("b", "B", [-1920, 0, 0, 1080], 96, false),
+                ],
+                ids,
+            )
+            .unwrap(),
+        );
         assert_eq!(
             rows.iter()
                 .find(|row| row.id == b_id.0)
@@ -2209,7 +2273,7 @@ mod windows_destination_tests {
     fn windows_destination_provider_refreshes_once_and_never_keeps_last_good() {
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
-        let mapping = windows_placement_mapping(Arc::new(move || {
+        let mapping = windows_placement_mapping(windows_placement_rows(Arc::new(move || {
             if count.fetch_add(1, Ordering::SeqCst) == 0 {
                 Ok((
                     vec![probe("a", "A", [0, 0, 1920, 1080], 96, true)],
@@ -2218,7 +2282,7 @@ mod windows_destination_tests {
             } else {
                 Err(PlatformError::NotFound)
             }
-        }));
+        })));
         assert_eq!(mapping().unwrap().len(), 1);
         assert!(mapping().is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
