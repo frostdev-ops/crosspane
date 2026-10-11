@@ -49,12 +49,22 @@ mod native {
         core::{BSTR, Interface},
     };
 
+    /// Logs a failed COM call's `HRESULT` at the given call site, for the setup log.
+    fn log_com_error(file: &str, line: u32, error: &windows::core::Error) {
+        crate::platform::windows::setup_log::setup_note!(
+            "com error 0x{:08X} at {file}:{line}",
+            error.code().0 as u32
+        );
+    }
     macro_rules! call {
         ($check:expr, $expr:expr) => {{
             ($check)()?;
             // SAFETY: the adapter owns this MTA's interfaces and valid bounded inputs/output slots.
             // The admission closure renews the original context, image pins and deadline first.
-            unsafe { $expr }.map_err(|_| NativeError::Unavailable)
+            unsafe { $expr }.map_err(|error| {
+                log_com_error(file!(), line!(), &error);
+                NativeError::Unavailable
+            })
         }};
     }
     /// Set only after a `Ready` outcome. Failures are never cached, so a later apartment retries.
@@ -147,8 +157,11 @@ mod native {
             Self::Native(error)
         }
     }
+    #[track_caller]
     fn repair_com<T>(result: windows::core::Result<T>) -> Result<T, RepairTaskFailure> {
+        let at = std::panic::Location::caller();
         result.map_err(|error| {
+            log_com_error(at.file(), at.line(), &error);
             if error.code().0 as u32 == 0x80070005 {
                 RepairTaskFailure::AccessDenied
             } else {

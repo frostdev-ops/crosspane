@@ -27,6 +27,8 @@ pub(crate) mod removal;
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) mod repair;
 pub mod service;
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) mod setup_log;
 pub mod transport;
 
 /// Fixed-argument binary entry only; it grants no root, process or operation authority.

@@ -247,6 +247,7 @@ pub(crate) fn open(
         .and_then(super::native_io::identity::LimitedIdentity::admit)
         .is_err()
     {
+        crate::platform::windows::setup_log::setup_note!("identity refused");
         anyhow::bail!(NOT_OWN_SESSION);
     }
     // An explicit --payload must be a folder. Without one, the payload folder beside the installer
@@ -263,6 +264,13 @@ pub(crate) fn open(
             .and_then(payload_beside)
             .filter(|folder| folder.is_dir()),
     };
+    let payload_text = payload
+        .as_ref()
+        .map_or_else(|| "none".to_owned(), |folder| folder.display().to_string());
+    crate::platform::windows::setup_log::setup_note!(
+        "installer start version={} payload={payload_text}",
+        env!("CARGO_PKG_VERSION")
+    );
     let root = std::env::var_os("SystemRoot")
         .ok_or_else(|| anyhow::anyhow!("Windows system font location unavailable"))?;
     let fonts =
@@ -853,6 +861,8 @@ pub(crate) fn run<D: Domains>(
                         NativeReport::Maintenance(report)
                     }
                 };
+                #[cfg(all(windows, not(test)))]
+                log_finished(&result);
                 if reports.send(result).is_err() {
                     break;
                 }
@@ -862,6 +872,90 @@ pub(crate) fn run<D: Domains>(
         }
     }
 }
+/// The longest detail copied into the setup log; longer text is cut.
+#[cfg(all(windows, not(test)))]
+const LOG_DETAIL_CHARS: usize = 300;
+
+/// Logs one finished job: its step, stage, outcome kind and detail, or a maintenance report's kind
+/// and text. Runs after the outcome is computed and before it is sent.
+#[cfg(all(windows, not(test)))]
+fn log_finished(report: &NativeReport) {
+    match report {
+        NativeReport::Step(step) => {
+            crate::platform::windows::setup_log::setup_note!(
+                "step={} stage={:?} outcome={} detail={}",
+                step.job.step.0,
+                step.job.stage,
+                outcome_kind(&step.outcome),
+                clipped(&step.detail)
+            );
+        }
+        NativeReport::Maintenance(report) => {
+            let (kind, detail) = maintenance_kind(report);
+            crate::platform::windows::setup_log::setup_note!(
+                "maintenance outcome={kind} detail={}",
+                clipped(&detail)
+            );
+        }
+    }
+}
+
+/// The kind of a native outcome, without its payload: no preview text and no observation time.
+#[cfg(all(windows, not(test)))]
+fn outcome_kind(outcome: &NativeOutcome) -> String {
+    match outcome {
+        NativeOutcome::Detected { needs_action } => {
+            format!("Detected(needs_action={needs_action})")
+        }
+        NativeOutcome::Planned { .. } => "Planned".to_owned(),
+        NativeOutcome::Applied(result) => format!("Applied({result:?})"),
+        NativeOutcome::NotSubmitted => "NotSubmitted".to_owned(),
+        NativeOutcome::Verified { source, .. } => format!("Verified({source:?})"),
+        NativeOutcome::Waiting(kind) => format!("Waiting({kind:?})"),
+        NativeOutcome::Failed => "Failed".to_owned(),
+        NativeOutcome::Unsupported => "Unsupported".to_owned(),
+        NativeOutcome::Progress => "Progress".to_owned(),
+    }
+}
+
+/// The kind and the readable text of a maintenance report. Previews and choice labels are left out.
+#[cfg(all(windows, not(test)))]
+fn maintenance_kind(report: &MaintenanceReport) -> (String, String) {
+    let text = |lines: &[String]| lines.join(" ");
+    match report {
+        MaintenanceReport::Inspected { .. } => ("Inspected".to_owned(), String::new()),
+        MaintenanceReport::Planned { .. } => ("Planned".to_owned(), String::new()),
+        MaintenanceReport::Progress { detail, .. } => ("Progress".to_owned(), detail.clone()),
+        MaintenanceReport::FollowUp { .. } => ("FollowUp".to_owned(), String::new()),
+        MaintenanceReport::Finished { outcome, lines, .. } => {
+            (format!("Finished({outcome:?})"), text(lines))
+        }
+        MaintenanceReport::Refused { reason, .. } => ("Refused".to_owned(), reason.clone()),
+        MaintenanceReport::RepairPlanned { .. } => ("RepairPlanned".to_owned(), String::new()),
+        MaintenanceReport::RepairDiscardable { .. } => {
+            ("RepairDiscardable".to_owned(), String::new())
+        }
+        MaintenanceReport::RepairDiscarded { lines, .. } => {
+            ("RepairDiscarded".to_owned(), text(lines))
+        }
+        MaintenanceReport::RepairResumable { lines, .. } => {
+            ("RepairResumable".to_owned(), text(lines))
+        }
+        MaintenanceReport::RepairWaiting { detail, .. } => {
+            ("RepairWaiting".to_owned(), detail.clone())
+        }
+        MaintenanceReport::RepairFinished { outcome, lines, .. } => {
+            (format!("RepairFinished({outcome:?})"), text(lines))
+        }
+    }
+}
+
+/// The first `LOG_DETAIL_CHARS` characters of `text`.
+#[cfg(all(windows, not(test)))]
+fn clipped(text: &str) -> String {
+    text.chars().take(LOG_DETAIL_CHARS).collect()
+}
+
 fn native_outcome(outcome: Outcome, now: u64) -> NativeOutcome {
     if outcome.refunds_consent() {
         return NativeOutcome::NotSubmitted;

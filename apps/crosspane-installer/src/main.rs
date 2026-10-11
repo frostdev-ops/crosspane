@@ -52,6 +52,17 @@ mod console {
     }
 }
 
+/// The library's setup log, included by path: this binary is a separate crate, and the library's
+/// copy is `pub(crate)`. The path is relative to this file's directory, so `setup_note!` resolves
+/// through `$crate::platform::windows::setup_log` exactly as it does in the library.
+#[cfg(windows)]
+mod platform {
+    pub(crate) mod windows {
+        #[path = "setup_log.rs"]
+        pub(crate) mod setup_log;
+    }
+}
+
 fn main() {
     #[cfg(windows)]
     {
@@ -138,6 +149,7 @@ fn main() {
         eprintln!("Crosspane Installer: {error:#}");
         #[cfg(windows)]
         if production {
+            platform::windows::setup_log::setup_note!("startup error: {error:#}");
             console::error_box(&format!("{error:#}"));
         }
         std::process::exit(1);

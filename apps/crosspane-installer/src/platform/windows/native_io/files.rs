@@ -328,9 +328,44 @@ pub(crate) mod native {
             _ => NativeError::Unavailable,
         }
     }
+    /// Logs a Windows error code with the location of the `last_error` or `nt_error` caller.
+    #[cfg(not(test))]
+    #[track_caller]
+    fn log_native_error(code: u32) {
+        let at = std::panic::Location::caller();
+        crate::platform::windows::setup_log::setup_note!(
+            "native error {code} (0x{code:08X}) at {}:{}",
+            at.file(),
+            at.line()
+        );
+    }
+    /// Logs an NTSTATUS with the location of the `nt_error` caller.
+    #[cfg(not(test))]
+    #[track_caller]
+    fn log_ntstatus(status: i32) {
+        let at = std::panic::Location::caller();
+        crate::platform::windows::setup_log::setup_note!(
+            "ntstatus 0x{status:08X} at {}:{}",
+            at.file(),
+            at.line()
+        );
+    }
+    #[track_caller]
     pub(crate) fn last_error() -> NativeError {
         // SAFETY: immediately captures the calling thread's last native error; no mutation.
-        error(unsafe { GetLastError() })
+        let code = unsafe { GetLastError() };
+        #[cfg(not(test))]
+        log_native_error(code);
+        error(code)
+    }
+    /// Maps an NTSTATUS to the `NativeError` of its DOS code, after logging the status.
+    #[track_caller]
+    fn nt_error(status: i32) -> NativeError {
+        // SAFETY: NTSTATUS conversion is a public stateless SDK call, not a retry.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        #[cfg(not(test))]
+        log_ntstatus(status);
+        error(code)
     }
     pub(crate) fn wide(value: &str) -> NativeResult<Vec<u16>> {
         let mut units: Vec<u16> = value.encode_utf16().collect();
@@ -693,8 +728,7 @@ pub(crate) mod native {
                 if status == STATUS_REPARSE_POINT_ENCOUNTERED {
                     return Err(NativeError::Foreign);
                 }
-                // SAFETY: NTSTATUS conversion is a public stateless SDK call, not a retry.
-                return Err(error(unsafe { RtlNtStatusToDosError(status) }));
+                return Err(nt_error(status));
             }
             if raw.is_null() || raw == INVALID_HANDLE_VALUE {
                 return Err(NativeError::OutcomeUnknown);
@@ -2405,8 +2439,7 @@ pub(crate) mod native {
             )
         };
         if status != STATUS_SUCCESS {
-            // SAFETY: NTSTATUS conversion is a public stateless SDK call, not a retry.
-            return Err(error(unsafe { RtlNtStatusToDosError(status) }));
+            return Err(nt_error(status));
         }
         Ok(())
     }
