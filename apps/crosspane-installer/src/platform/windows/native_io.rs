@@ -7290,6 +7290,7 @@ mod adapter {
                                     1,
                                     CREATE_SUSPENDED
                                         | CREATE_BREAKAWAY_FROM_JOB
+                                        | CREATE_NO_WINDOW
                                         | EXTENDED_STARTUPINFO_PRESENT,
                                     std::ptr::null(),
                                     directory.as_ptr(),

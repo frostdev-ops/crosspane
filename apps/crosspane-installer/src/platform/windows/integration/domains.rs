@@ -1,6 +1,10 @@
 //! Typed integration observations are never native ownership or executable approval.
 use crosspane_installer_core::ObservationSource;
-use crosspane_installer_core::elevated::step::ElevatedPlan;
+use crosspane_installer_core::elevated::status::StatusReport;
+use crosspane_installer_core::elevated::step::{
+    ElevatedPlan, INSTALL_WITHOUT_SETUP, PartResult, StepResult, report_lines, status_summary,
+};
+use crosspane_installer_core::elevated::{DriverState, FirewallState, VerbName};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Operation {
@@ -30,6 +34,8 @@ pub(crate) enum ElevatedPlanning {
 /// Read-only detection of the firewall rule and display driver.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ElevatedDetection {
+    /// ADMIN is satisfied: the firewall rule is present. The display driver is optional and is
+    /// reported only in `detail`.
     pub configured: bool,
     pub detail: String,
 }
@@ -87,6 +93,16 @@ impl Snapshot {
             && self.agent == State::Healthy
             && !self.unsettled
     }
+    /// The installed files and sign-in task are in place and settled, whatever the agent's health.
+    /// A first install has not yet run its agent when setup verifies it.
+    pub fn installed(&self) -> bool {
+        self.supported
+            && self.inventory
+            && self.cold == Cold::Existing
+            && self.payload == State::Healthy
+            && self.task == State::Healthy
+            && !self.unsettled
+    }
     pub fn verified(&self, operation: Operation) -> bool {
         if self.source != ObservationSource::Live {
             return false;
@@ -98,6 +114,7 @@ impl Snapshot {
                     && self.agent == State::Missing
                     && !self.unsettled
             }
+            Operation::Install => self.installed(),
             Operation::Elevated => self.healthy(),
             _ => self.healthy(),
         }
@@ -308,6 +325,45 @@ pub(crate) const DEFERRED: &[&str] = &[
     "Signing and distribution (W4.2)",
     "Attended Windows checks (W6.2/W6.4)",
 ];
+/// Said after an install or an administrator step when only the optional display driver is missing.
+pub(crate) const DRIVER_OPTIONAL_NOTE: &str =
+    "The display driver is optional: without it, Crosspane mirrors windows in place.";
+/// The payload refusal: the folder can't be read, or one of the three programs is missing.
+pub(crate) const PAYLOAD_UNREADABLE: &str = "The payload folder can't be read, or it is missing crosspane-agent.exe, crosspane-ui.exe or crosspanectl.exe. Nothing was changed.";
+/// Whether the install's administrator step added the firewall rule. The display driver is not part
+/// of this answer.
+pub(crate) fn firewall_part_verified(step: &StepResult) -> bool {
+    step.parts
+        .iter()
+        .any(|(name, part)| *name == VerbName::AddFirewall && *part == PartResult::Verified)
+}
+/// The ADMIN detection. `configured` means ADMIN is satisfied: the firewall rule is present. The
+/// display driver is optional, so it is reported only in `detail`, never as a reason to act.
+pub(crate) fn admin_detection(report: &StatusReport, pending: bool) -> ElevatedDetection {
+    let (_, mut detail) = status_summary(report, pending);
+    let configured = report.firewall.state == FirewallState::Present;
+    if configured && report.driver.state != DriverState::Installed {
+        detail.push(' ');
+        detail.push_str(DRIVER_OPTIONAL_NOTE);
+    }
+    ElevatedDetection { configured, detail }
+}
+/// The outcome lines of the first install's administrator step. `INSTALL_WITHOUT_SETUP` is said only
+/// when the install completed, no part waits for a restart and the firewall rule was not added. The
+/// optional-driver note is said only when the rule was added and the step is not fully verified.
+pub(crate) fn install_setup_lines(step: &StepResult, completed: bool) -> Vec<String> {
+    let mut lines = report_lines(step);
+    let restart = step
+        .parts
+        .iter()
+        .any(|(_, part)| *part == PartResult::RebootRequired);
+    if completed && !restart && !firewall_part_verified(step) {
+        lines.push(INSTALL_WITHOUT_SETUP.to_owned());
+    } else if completed && !restart && !step.all_verified() {
+        lines.push(DRIVER_OPTIONAL_NOTE.to_owned());
+    }
+    lines
+}
 
 #[cfg(all(windows, not(test)))]
 pub(crate) mod native {
@@ -325,8 +381,7 @@ pub(crate) mod native {
     };
     use super::*;
     use crosspane_installer_core::elevated::step::{
-        Gate, INSTALL_WITHOUT_SETUP, PartResult, REMOVAL_NOT_STARTED, StepResult, admin_gate,
-        removal_gate, report_lines,
+        Gate, REMOVAL_NOT_STARTED, StepResult, admin_gate, removal_gate, report_lines,
     };
     use std::{path::PathBuf, sync::Arc};
     // Frozen administrator-step planning reasons (WP-W4.1c2 lead ruling L7), shown verbatim.
@@ -394,7 +449,8 @@ pub(crate) mod native {
         fn inputs(&self) -> Result<[Box<dyn std::io::Read + Send>; 3], Failure> {
             use std::path::{Component, Prefix};
             let folder = self.folder.as_ref().ok_or(Failure::NotSubmitted)?;
-            // Explicit local input only; no PATH, sibling, UNC or backup fallback.
+            // The folder is the explicit --payload, or the kit's own payload folder that open()
+            // resolves. There is still no PATH, UNC or backup fallback: only a local absolute folder.
             if !folder.is_absolute()
                 || !matches!(folder.components().next(),
                 Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)))
@@ -419,6 +475,14 @@ pub(crate) mod native {
                 files.push(Box::new(file));
             }
             files.try_into().map_err(|_| Failure::NotSubmitted)
+        }
+        /// The payload inputs. A failure is refused with the payload reason, and nothing is submitted.
+        fn payload_inputs(&mut self) -> Result<[Box<dyn std::io::Read + Send>; 3], Failure> {
+            let inputs = self.inputs();
+            if inputs.is_err() {
+                self.first_refusal = Some(PAYLOAD_UNREADABLE);
+            }
+            inputs
         }
         fn handoff(&self, budget: &Deadline) -> Result<Handoff, Failure> {
             let Some(held) = &self.held else {
@@ -652,18 +716,16 @@ pub(crate) mod native {
             self.recovered = false;
             let Some(manifest) = elevated_kit::embedded() else {
                 let (outcome, _) = service::begin_first_install_elevated(
-                    self.inputs()?,
+                    self.payload_inputs()?,
                     None,
                     &deadline(120_000)?,
                 )
                 .map_err(|_| Failure::Unknown)?;
                 let dispatch = self.first_install_dispatch(outcome);
-                let mut lines = report_lines(&StepResult::not_run(plan.verb(), KIT_NOT_RUN));
                 // L16: "installed without them" is said only when the install itself completed.
-                if matches!(dispatch, Ok(Dispatch { complete: true, .. })) {
-                    lines.push(INSTALL_WITHOUT_SETUP.to_owned());
-                }
-                self.elevated_report = lines;
+                let completed = matches!(dispatch, Ok(Dispatch { complete: true, .. }));
+                let not_run = StepResult::not_run(plan.verb(), KIT_NOT_RUN);
+                self.elevated_report = install_setup_lines(&not_run, completed);
                 return dispatch;
             };
             // An unreadable source folder counts as no sources, and the placed kit is used instead.
@@ -677,7 +739,7 @@ pub(crate) mod native {
                 sources,
             };
             let (outcome, step) = service::begin_first_install_elevated(
-                self.inputs()?,
+                self.payload_inputs()?,
                 Some(elevated),
                 &deadline(120_000)?,
             )
@@ -685,18 +747,10 @@ pub(crate) mod native {
             let dispatch = self.first_install_dispatch(outcome);
             // The step's report is kept whatever the install's own outcome; the outcome is never changed by it.
             if let Some(step) = step {
-                let mut lines = report_lines(&step);
-                // L16: "installed without them" is said only when the install completed, no part
-                // waits for a restart, and the step is not fully verified.
+                // L16: "installed without them" is said only when the install completed and the
+                // firewall rule was not added; see install_setup_lines.
                 let completed = matches!(dispatch, Ok(Dispatch { complete: true, .. }));
-                let restart = step
-                    .parts
-                    .iter()
-                    .any(|(_, part)| *part == PartResult::RebootRequired);
-                if completed && !restart && !step.all_verified() {
-                    lines.push(INSTALL_WITHOUT_SETUP.to_owned());
-                }
-                self.elevated_report = lines;
+                self.elevated_report = install_setup_lines(&step, completed);
             }
             dispatch
         }
@@ -762,8 +816,9 @@ pub(crate) mod native {
             self.first_refusal = None;
             self.recovered = false;
             if op == Operation::Install {
-                let outcome = service::begin_first_install(self.inputs()?, &deadline(120_000)?)
-                    .map_err(|_| Failure::Unknown)?;
+                let outcome =
+                    service::begin_first_install(self.payload_inputs()?, &deadline(120_000)?)
+                        .map_err(|_| Failure::Unknown)?;
                 return self.first_install_dispatch(outcome);
             }
             let cold = read_observation()?.0.cold;
@@ -829,13 +884,15 @@ pub(crate) mod native {
             }
             let continuation = match op {
                 Operation::Upgrade => Continuation::Upgrade(
-                    service::begin_outer_upgrade(self.inputs()?).map_err(|_| Failure::Unknown)?,
+                    service::begin_outer_upgrade(self.payload_inputs()?)
+                        .map_err(|_| Failure::Unknown)?,
                 ),
                 Operation::Removal { erase_identity } => Continuation::Removal(Box::new(
                     service::begin_removal(erase_identity).map_err(|_| Failure::Unknown)?,
                 )),
                 Operation::PayloadRepair => Continuation::Repair(
-                    service::begin_payload_repair(self.inputs()?).map_err(|_| Failure::Unknown)?,
+                    service::begin_payload_repair(self.payload_inputs()?)
+                        .map_err(|_| Failure::Unknown)?,
                 ),
                 Operation::Install | Operation::MetadataRepair | Operation::Elevated => {
                     return Err(Failure::NotSubmitted);
@@ -886,9 +943,10 @@ pub(crate) mod native {
                     let step = self.run_elevated_step(plan);
                     self.elevated_report = report_lines(&step);
                     match admin_gate(&step) {
+                        // ADMIN is satisfied by the firewall rule alone; the driver is optional.
                         Gate::Proceed => Ok(Dispatch {
                             handoff: Handoff::NotCommitted,
-                            complete: step.all_verified(),
+                            complete: firewall_part_verified(&step),
                         }),
                         Gate::NotSubmitted => Err(Failure::NotSubmitted),
                         Gate::Unknown => Err(Failure::Unknown),
@@ -986,7 +1044,6 @@ pub(crate) mod native {
             use super::super::super::{
                 elevated_kit, elevated_launch::ElevatedHelper, elevated_step, elevated_store,
             };
-            use crosspane_installer_core::elevated::step::status_summary;
             let manifest = elevated_kit::embedded().ok_or(Failure::NotSubmitted)?;
             let budget = deadline(30_000)?;
             let probe = WindowsNativeIo::probe_repair(Arc::new(MonotonicClock::default()), &budget)
@@ -1006,8 +1063,7 @@ pub(crate) mod native {
                 let report = ElevatedHelper::locate(image)
                     .and_then(|helper| helper.status(None))
                     .map_err(|_| Failure::NotSubmitted)?;
-                let (configured, detail) = status_summary(&report, false);
-                return Ok(ElevatedDetection { configured, detail });
+                return Ok(admin_detection(&report, false));
             };
             let pending = !record.pending().is_empty();
             // L16: a placed kit that can't be verified is reported as not checked, not refused, so
@@ -1022,8 +1078,7 @@ pub(crate) mod native {
                     detail,
                 });
             };
-            let (configured, detail) = status_summary(&report, pending);
-            Ok(ElevatedDetection { configured, detail })
+            Ok(admin_detection(&report, pending))
         }
         fn verify(&mut self, op: Operation) -> Result<bool, Failure> {
             if op == Operation::Elevated {

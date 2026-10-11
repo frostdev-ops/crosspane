@@ -1,5 +1,5 @@
 //! Observation-only report projection; it has no Apply, lock, cleanup, task or launch port.
-use super::domains::{DEFERRED, Snapshot, State};
+use super::domains::{Snapshot, State};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Fact {
     pub check: &'static str,
@@ -17,7 +17,7 @@ fn name(state: State) -> &'static str {
     }
 }
 pub(crate) fn facts(snapshot: &Snapshot) -> Vec<Fact> {
-    let mut out = vec![
+    vec![
         Fact {
             check: "Limited user and fixed-root authority",
             value: if snapshot.supported {
@@ -69,13 +69,7 @@ pub(crate) fn facts(snapshot: &Snapshot) -> Vec<Fact> {
             },
             blocking: false,
         },
-    ];
-    out.extend(DEFERRED.iter().map(|check| Fact {
-        check,
-        value: "deferred",
-        blocking: false,
-    }));
-    out
+    ]
 }
 #[cfg(all(windows, not(test)))]
 pub(crate) fn run(payload: Option<&std::path::Path>, report: &mut crate::diagnose::Report) {

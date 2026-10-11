@@ -132,7 +132,6 @@ pub struct SupportReport {
     pub facts: SupportFacts,
     pub identity: Option<super::native_io::identity::TokenFacts>,
     pub native_issue: Option<NativeError>,
-    pub deferred: &'static [&'static str],
 }
 impl std::fmt::Debug for SupportReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -142,12 +141,6 @@ impl std::fmt::Debug for SupportReport {
             .finish_non_exhaustive()
     }
 }
-const DEFERRED: &[&str] = &[
-    "payload inventory",
-    "agent admission and health",
-    "autostart",
-    "wizard",
-];
 
 #[cfg(windows)]
 pub fn support_report(
@@ -165,14 +158,12 @@ pub fn support_report(
             },
             identity: Some(io.target().identity().clone()),
             native_issue: None,
-            deferred: DEFERRED,
         },
         Err(error) => SupportReport {
             eligibility: Eligibility::Unknown,
             facts: SupportFacts::unknown(),
             identity: None,
             native_issue: Some(error),
-            deferred: DEFERRED,
         },
     }
 }
@@ -195,7 +186,6 @@ pub fn current_report(
                 facts: SupportFacts::unknown(),
                 identity: None,
                 native_issue: Some(error),
-                deferred: DEFERRED,
             };
         }
     };
@@ -208,7 +198,6 @@ pub fn current_report(
             },
             identity: Some(observed),
             native_issue: Some(NativeError::Unsupported),
-            deferred: DEFERRED,
         };
     }
     match WindowsNativeIo::current(clock, deadline) {
@@ -225,7 +214,6 @@ pub fn current_report(
             },
             identity: Some(observed),
             native_issue: Some(error),
-            deferred: DEFERRED,
         },
     }
 }

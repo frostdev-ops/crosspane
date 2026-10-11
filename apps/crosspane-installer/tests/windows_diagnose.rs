@@ -25,7 +25,7 @@ fn read_only_report_has_no_mutation_capability() {
     let facts = diagnose::facts(&snapshot);
     assert_eq!(snapshot, before);
     assert!(facts.iter().any(|f| f.value == "user_disabled"));
-    assert!(facts.iter().any(|f| f.value == "deferred"));
+    assert!(!facts.iter().any(|f| f.value == "deferred"));
     assert!(facts.iter().filter(|f| f.blocking).count() >= 4);
     assert!(facts.iter().all(|f| !f.value.contains("1, 2, 3")));
 }

@@ -185,10 +185,14 @@ fn step_title(outcome: &str) -> &str {
         | "Crosspane is installed and starts when you sign in" => "Install Crosspane",
         "Crosspane starts when you sign in" => "Start Crosspane when you sign in",
         "A restart brings up a new, healthy instance" => "Restart Crosspane",
+        "Crosspane is running on this PC" => "Check that Crosspane is running",
         "Crosspane is running with its key in the system keyring"
         | "Crosspane is running with its key in the Keychain" => "Check that Crosspane is running",
         "This computer can reach the other one on your network" => {
             "Allow Crosspane on your network"
+        }
+        "Crosspane is allowed through Windows Defender Firewall" => {
+            "Allow Crosspane through the firewall"
         }
         "Crosspane has the Mac permissions it needs" => "Allow Mac permissions",
         "The Crosspane sound driver is installed" => "Install the sound driver",
@@ -2270,8 +2274,16 @@ mod copy_tests {
                 "Install Crosspane",
             ),
             (
+                "Crosspane is running on this PC",
+                "Check that Crosspane is running",
+            ),
+            (
                 "Crosspane is running with its key in the system keyring",
                 "Check that Crosspane is running",
+            ),
+            (
+                "Crosspane is allowed through Windows Defender Firewall",
+                "Allow Crosspane through the firewall",
             ),
             (
                 "Paired and connected to the other computer",
