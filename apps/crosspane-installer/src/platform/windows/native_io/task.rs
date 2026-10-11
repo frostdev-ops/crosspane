@@ -1,4 +1,31 @@
 //! Public Task Scheduler COM adapter. All interfaces live and die on one owned MTA thread.
+
+/// Classification of one `CoInitializeSecurity` call. Only `Ready` is ever cached.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SecurityOutcome {
+    /// Process COM security is in place, either set by this call or already set in this process.
+    Ready,
+    /// Not established by this call. A later apartment asks again rather than inheriting failure.
+    Retry,
+}
+
+/// Classifies the `HRESULT` of `CoInitializeSecurity`.
+///
+/// `RPC_E_TOO_LATE` means this process's COM security was already initialized before this
+/// installer's call. In the GUI process, the windowing and rendering stack has already used COM,
+/// so that is expected. The Task Scheduler object is created `CLSCTX_INPROC_SERVER`, so it needs
+/// no blanket of its own, and the in-process firewall query already works without this call.
+/// Every other failure is `Retry`, so a transient error cannot poison the whole GUI session.
+#[cfg(windows)]
+fn security_outcome(code: windows::core::HRESULT) -> SecurityOutcome {
+    if code.is_ok() || code == windows::Win32::Foundation::RPC_E_TOO_LATE {
+        SecurityOutcome::Ready
+    } else {
+        SecurityOutcome::Retry
+    }
+}
+
 #[cfg(all(windows, not(test)))]
 mod native {
     use super::super::super::service::task::{
@@ -8,10 +35,15 @@ mod native {
         NativeError, NativeResult,
         activation::{RegistrationStep, TaskSubmission},
     };
-    use std::{marker::PhantomData, rc::Rc, sync::OnceLock};
+    use super::{SecurityOutcome, security_outcome};
+    use std::{
+        marker::PhantomData,
+        rc::Rc,
+        sync::atomic::{AtomicBool, Ordering},
+    };
     use windows::{
         Win32::{
-            Foundation::{RPC_E_TOO_LATE, VARIANT_BOOL},
+            Foundation::VARIANT_BOOL,
             System::{Com::*, TaskScheduler::*, Variant::VARIANT},
         },
         core::{BSTR, Interface},
@@ -25,7 +57,8 @@ mod native {
             unsafe { $expr }.map_err(|_| NativeError::Unavailable)
         }};
     }
-    static SECURITY: OnceLock<NativeResult<()>> = OnceLock::new();
+    /// Set only after a `Ready` outcome. Failures are never cached, so a later apartment retries.
+    static SECURITY_READY: AtomicBool = AtomicBool::new(false);
     struct Apartment(PhantomData<Rc<()>>);
     impl Apartment {
         fn new(check: &dyn Fn() -> NativeResult<()>) -> NativeResult<Self> {
@@ -34,11 +67,14 @@ mod native {
             unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
                 .ok()
                 .map_err(|_| NativeError::Unsupported)?;
+            // Constructed right after the successful CoInitializeEx: any early return below drops
+            // it, so CoUninitialize still balances on this thread.
             let apartment = Self(PhantomData);
-            (*SECURITY.get_or_init(|| {
+            if !SECURITY_READY.load(Ordering::Acquire) {
                 check()?;
-                // SAFETY: process-once standard COM security, no custom descriptor or borrowed list.
-                unsafe {
+                // SAFETY: standard process COM security, no custom descriptor or borrowed list.
+                // RPC_E_TOO_LATE is accepted by `security_outcome`; any other failure is retried.
+                let outcome = match unsafe {
                     CoInitializeSecurity(
                         None,
                         -1,
@@ -50,15 +86,15 @@ mod native {
                         EOAC_NONE,
                         None,
                     )
+                } {
+                    Ok(()) => SecurityOutcome::Ready,
+                    Err(error) => security_outcome(error.code()),
+                };
+                match outcome {
+                    SecurityOutcome::Ready => SECURITY_READY.store(true, Ordering::Release),
+                    SecurityOutcome::Retry => return Err(NativeError::Unavailable),
                 }
-                .map_err(|error| {
-                    if error.code() == RPC_E_TOO_LATE {
-                        NativeError::Unsupported
-                    } else {
-                        NativeError::Unavailable
-                    }
-                })
-            }))?;
+            }
             Ok(apartment)
         }
     }
@@ -702,3 +738,28 @@ mod native {
 }
 #[cfg(all(windows, not(test)))]
 pub(crate) use native::{RepairTaskFailure, Scheduler};
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::{SecurityOutcome, security_outcome};
+    use windows::Win32::Foundation::{
+        E_ACCESSDENIED, E_OUTOFMEMORY, RPC_E_TOO_LATE, S_FALSE, S_OK,
+    };
+
+    #[test]
+    fn com_security_too_late_is_ready() {
+        assert_eq!(security_outcome(RPC_E_TOO_LATE), SecurityOutcome::Ready);
+    }
+
+    #[test]
+    fn com_security_success_is_ready() {
+        assert_eq!(security_outcome(S_OK), SecurityOutcome::Ready);
+        assert_eq!(security_outcome(S_FALSE), SecurityOutcome::Ready);
+    }
+
+    #[test]
+    fn com_security_other_failure_is_retried() {
+        assert_eq!(security_outcome(E_ACCESSDENIED), SecurityOutcome::Retry);
+        assert_eq!(security_outcome(E_OUTOFMEMORY), SecurityOutcome::Retry);
+    }
+}
