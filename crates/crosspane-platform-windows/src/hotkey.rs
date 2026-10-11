@@ -8,8 +8,9 @@
 //! SendInput. GetAsyncKeyState seeding also has no physical provenance and conflates up/failure.
 //! These limitations are accepted for a panic chord that can only end sharing, never start or
 //! extend it. Do not reuse this source for positive authorization. The frozen HotkeyEvent has no
-//! asynchronous health variant: loss is metadata-only and later calls fail synchronously;
-//! W1.5b must address that integration gap. No physical release is fabricated on observer loss.
+//! asynchronous health variant. Loss is reported only through [`HotkeyHealth`] (Live, Lost or
+//! Dropped), and the agent decides the reaction; later calls fail synchronously. No physical
+//! release is ever fabricated on observer loss.
 
 #![allow(unsafe_code)]
 
@@ -64,7 +65,9 @@ struct Shared {
     data: Mutex<Data>,
     emission: Mutex<()>,
     stopped: AtomicBool,
-    progress: Mutex<Instant>,
+    /// Set (Release) by `stop` before `lose`, so an Acquire read of `stopped` sees it.
+    dropped: AtomicBool,
+    progress: Mutex<MonoTime>,
 }
 
 impl Shared {
@@ -76,7 +79,8 @@ impl Shared {
             }),
             emission: Mutex::new(()),
             stopped: AtomicBool::new(false),
-            progress: Mutex::new(Instant::now()),
+            dropped: AtomicBool::new(false),
+            progress: Mutex::new(now()),
         }
     }
 
@@ -163,6 +167,8 @@ impl Shared {
     }
 
     fn stop(&self) {
+        // Ordered before `lose` so that any reader who sees `stopped` also sees `dropped`.
+        self.dropped.store(true, Ordering::Release);
         self.lose("backend dropped");
         // Wait out any already-entered nonblocking sink callback. Later sends check stopped.
         let _emission = self.emission.lock();
@@ -170,23 +176,64 @@ impl Shared {
 
     fn touch(&self) {
         if let Ok(mut progress) = self.progress.lock() {
-            *progress = Instant::now();
+            *progress = now();
         } else {
             self.lose("progress state poisoned");
         }
     }
 
+    /// True when no progress was recorded within `BOUND` on the unbiased clock. A poisoned
+    /// progress state counts as stalled.
+    fn stalled(&self) -> bool {
+        self.progress.lock().map_or(true, |progress| {
+            now().saturating_duration_since(*progress) > BOUND
+        })
+    }
+
     fn watch(&self) {
         while self.check().is_ok() {
-            if self
-                .progress
-                .lock()
-                .map_or(true, |progress| progress.elapsed() > BOUND)
-            {
+            if self.stalled() {
                 self.lose("observer stalled");
                 break;
             }
             thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// Observer health as the agent sees it. Loss is reported here, never as a made-up event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HotkeyHealthState {
+    /// The observer is running.
+    Live,
+    /// The observer stopped without the owner dropping it, for example a window thread exit, a
+    /// lost registration, a stall, or a sink failure. No physical release is synthesized.
+    Lost,
+    /// The owner dropped the backend. This is never reported as `Lost`.
+    Dropped,
+}
+
+/// Read-only health view of a [`WindowsHotkeys`] observer. It keeps no keyboard, device or
+/// chord state and stays valid after the backend is dropped.
+#[derive(Clone)]
+pub struct HotkeyHealth(Arc<Shared>);
+
+impl fmt::Debug for HotkeyHealth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HotkeyHealth").finish_non_exhaustive()
+    }
+}
+
+impl HotkeyHealth {
+    /// The observer's current state. It reads only the stop and drop flags, never keys,
+    /// devices or chord contents.
+    pub fn state(&self) -> HotkeyHealthState {
+        if !self.0.stopped.load(Ordering::Acquire) {
+            HotkeyHealthState::Live
+        } else if self.0.dropped.load(Ordering::Acquire) {
+            HotkeyHealthState::Dropped
+        } else {
+            HotkeyHealthState::Lost
         }
     }
 }
@@ -285,6 +332,11 @@ impl WindowsHotkeys {
         })??;
         backend.shared.check()?;
         Ok(backend)
+    }
+
+    /// A health view that the agent can poll to learn whether this observer is still live.
+    pub fn health(&self) -> HotkeyHealth {
+        HotkeyHealth(self.shared.clone())
     }
 
     fn request(&self, operation: Operation) -> Result<(), PlatformError> {
@@ -774,6 +826,11 @@ mod tests {
             MonoTime::ZERO,
         )
     }
+    /// A progress stamp older than `BOUND` on the unbiased clock.
+    fn stale_progress() -> MonoTime {
+        let stale = u64::try_from((BOUND + Duration::from_millis(1)).as_nanos()).unwrap();
+        MonoTime::from_nanos(now().as_nanos().saturating_sub(stale))
+    }
 
     #[test]
     fn hotkey_initial_event_precedes_exact_physical_pair() {
@@ -951,7 +1008,7 @@ mod tests {
     #[test]
     fn hotkey_stalled_worker_and_late_command_are_terminal() {
         let shared = Shared::new();
-        *shared.progress.lock().unwrap() = Instant::now() - BOUND - Duration::from_millis(1);
+        *shared.progress.lock().unwrap() = stale_progress();
         shared.watch();
         assert!(shared.configure(&chord(), &[], MonoTime::ZERO).is_err());
         assert!(
@@ -959,6 +1016,49 @@ mod tests {
                 .subscribe(Arc::new(|_| panic!("late callback")), &[], MonoTime::ZERO)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn hotkey_health_live_then_lost_on_observer_loss() {
+        let shared = Arc::new(Shared::new());
+        let health = HotkeyHealth(shared.clone());
+        assert_eq!(health.state(), HotkeyHealthState::Live);
+        assert_eq!(format!("{health:?}"), "HotkeyHealth { .. }");
+        shared.lose("fake window exit");
+        assert_eq!(health.state(), HotkeyHealthState::Lost);
+        assert_eq!(health.clone().state(), HotkeyHealthState::Lost);
+    }
+
+    #[test]
+    fn hotkey_health_dropped_on_stop_never_reads_lost() {
+        let shared = Arc::new(Shared::new());
+        let health = HotkeyHealth(shared.clone());
+        shared.stop();
+        assert_eq!(health.state(), HotkeyHealthState::Dropped);
+        shared.lose("late observer exit");
+        assert_eq!(health.state(), HotkeyHealthState::Dropped);
+
+        let lost_first = Arc::new(Shared::new());
+        let lost_health = HotkeyHealth(lost_first.clone());
+        lost_first.lose("fake window exit");
+        lost_first.stop();
+        assert_eq!(lost_health.state(), HotkeyHealthState::Dropped);
+    }
+
+    #[test]
+    fn hotkey_watchdog_uses_unbiased_clock() {
+        let stalled = Arc::new(Shared::new());
+        let stalled_health = HotkeyHealth(stalled.clone());
+        *stalled.progress.lock().unwrap() = stale_progress();
+        assert!(stalled.stalled());
+        stalled.watch();
+        assert_eq!(stalled_health.state(), HotkeyHealthState::Lost);
+
+        let fresh = Arc::new(Shared::new());
+        let fresh_health = HotkeyHealth(fresh.clone());
+        fresh.touch();
+        assert!(!fresh.stalled());
+        assert_eq!(fresh_health.state(), HotkeyHealthState::Live);
     }
 
     #[test]

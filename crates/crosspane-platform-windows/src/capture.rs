@@ -48,8 +48,9 @@ use windows_sys::Win32::{
     },
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-            KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, SendInput,
+            GetAsyncKeyState, GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+            KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, SendInput,
+            VK_CAPITAL, VK_NUMLOCK, VK_SCROLL,
         },
         Input::{
             GetRawInputData, GetRegisteredRawInputDevices, RAWINPUT, RAWINPUTDEVICE,
@@ -731,6 +732,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
 enum Command {
     Portals(
         Vec<(CapturePortal, PixelRect)>,
+        Vec<(DisplayId, [i32; 4])>,
         mpsc::SyncSender<Result<(), PlatformError>>,
     ),
     Begin {
@@ -761,7 +763,89 @@ enum Command {
 pub struct WindowsCapture {
     shared: Arc<Shared>,
     commands: mpsc::SyncSender<Command>,
+    /// The table last accepted by `set_portals` (the startup table until then). `end()` warps with
+    /// it and never refreshes: a refresh can block up to 2 s before input is given back.
     monitors: Vec<(DisplayId, [i32; 4])>,
+    /// Re-reads the monitor table at each `set_portals`; `None` keeps the startup table.
+    refresh: Option<crate::inject::MonitorRefresh>,
+}
+
+/// One native observation becomes the capture table: the non-twin displays in device-path order,
+/// with their stable IDs. Construction and every `set_portals` refresh share these rules.
+fn monitor_table(
+    probes: &[MonitorProbe],
+    ids: &mut DisplayIds,
+) -> Result<Vec<(DisplayId, [i32; 4])>, PlatformError> {
+    let layout = displays(probes, ids).map_err(|_| error("invalid capture display layout"))?;
+    let mut sorted: Vec<_> = probes.iter().filter(|p| !p.twin).collect();
+    sorted.sort_by(|a, b| a.device_path.cmp(&b.device_path));
+    let monitors: Vec<_> = layout
+        .displays
+        .iter()
+        .zip(sorted)
+        .map(|(d, p)| (d.id, p.rc_monitor))
+        .collect();
+    if monitors.iter().any(|(_, r)| {
+        r[2].checked_sub(r[0]).is_none_or(|w| w <= 0)
+            || r[3].checked_sub(r[1]).is_none_or(|h| h <= 0)
+    }) {
+        return Err(error("unrepresentable capture monitor"));
+    }
+    if monitors.is_empty() {
+        return Err(error("no capture display"));
+    }
+    Ok(monitors)
+}
+
+/// Only a non-empty set reads the displays. A CLEAR (no portals) keeps the last accepted table, so
+/// a dead or slow display read cannot stop old strips from being cleared.
+fn portals_need_refresh(portals: &[CapturePortal]) -> bool {
+    !portals.is_empty()
+}
+
+/// Maps each portal to its one-pixel strip on `monitors`. A portal on an unknown display, or a
+/// stretch outside that display, refuses the whole set.
+fn portal_strips(
+    portals: &[CapturePortal],
+    monitors: &[(DisplayId, [i32; 4])],
+) -> Result<Vec<(CapturePortal, PixelRect)>, PlatformError> {
+    let mut physical = Vec::new();
+    for &portal in portals {
+        let rect = monitors
+            .iter()
+            .find(|m| m.0 == portal.display)
+            .ok_or(PlatformError::NotFound)?
+            .1;
+        let length = if matches!(portal.edge, Edge::Left | Edge::Right) {
+            rect[3] - rect[1]
+        } else {
+            rect[2] - rect[0]
+        };
+        if !portal.from.is_finite()
+            || !portal.to.is_finite()
+            || portal.from < 0.0
+            || portal.to > f64::from(length)
+            || portal.from >= portal.to
+        {
+            return Err(error("invalid capture portal"));
+        }
+        let from = portal.from.ceil() as i32;
+        let to = portal.to.ceil() as i32;
+        let (x, y, w, h) = match portal.edge {
+            Edge::Left => (rect[0], rect[1] + from, 1, to - from),
+            Edge::Right => (rect[2] - 1, rect[1] + from, 1, to - from),
+            Edge::Top => (rect[0] + from, rect[1], to - from, 1),
+            Edge::Bottom => (rect[0] + from, rect[3] - 1, to - from, 1),
+        };
+        physical.push((
+            portal,
+            PixelRect::new(
+                crosspane_types::geom::euclid::point2(x, y),
+                crosspane_types::geom::euclid::point2(x + w, y + h),
+            ),
+        ));
+    }
+    Ok(physical)
 }
 
 impl std::fmt::Debug for WindowsCapture {
@@ -806,32 +890,13 @@ impl WindowsCapture {
         {
             return Err(error("capture owner already exists"));
         }
-        let layout = match displays(probes, ids) {
-            Ok(layout) => layout,
-            Err(_) => {
+        let monitors = match monitor_table(probes, ids) {
+            Ok(monitors) => monitors,
+            Err(e) => {
                 OWNER.store(false, Ordering::Release);
-                return Err(error("invalid capture display layout"));
+                return Err(e);
             }
         };
-        let mut sorted: Vec<_> = probes.iter().filter(|p| !p.twin).collect();
-        sorted.sort_by(|a, b| a.device_path.cmp(&b.device_path));
-        let monitors: Vec<_> = layout
-            .displays
-            .iter()
-            .zip(sorted)
-            .map(|(d, p)| (d.id, p.rc_monitor))
-            .collect();
-        if monitors.iter().any(|(_, r)| {
-            r[2].checked_sub(r[0]).is_none_or(|w| w <= 0)
-                || r[3].checked_sub(r[1]).is_none_or(|h| h <= 0)
-        }) {
-            OWNER.store(false, Ordering::Release);
-            return Err(error("unrepresentable capture monitor"));
-        }
-        if monitors.is_empty() {
-            OWNER.store(false, Ordering::Release);
-            return Err(error("no capture display"));
-        }
         let shared = Arc::new(Shared::new(gate));
         let (commands, receive) = mpsc::sync_channel(16);
         let (ready, wait) = mpsc::sync_channel(1);
@@ -871,7 +936,15 @@ impl WindowsCapture {
             shared,
             commands,
             monitors,
+            refresh: None,
         })
+    }
+
+    /// Each `set_portals` re-reads the monitor table from `refresh`; without it the startup table
+    /// is used (tests).
+    pub fn with_monitor_refresh(mut self, refresh: crate::inject::MonitorRefresh) -> Self {
+        self.refresh = Some(refresh);
+        self
     }
 
     fn request<T>(
@@ -903,44 +976,20 @@ impl WindowsCapture {
 
 impl InputCapture for WindowsCapture {
     fn set_portals(&mut self, portals: &[CapturePortal]) -> Result<(), PlatformError> {
-        let mut physical = Vec::new();
-        for &portal in portals {
-            let rect = self
-                .monitors
-                .iter()
-                .find(|m| m.0 == portal.display)
-                .ok_or(PlatformError::NotFound)?
-                .1;
-            let length = if matches!(portal.edge, Edge::Left | Edge::Right) {
-                rect[3] - rect[1]
-            } else {
-                rect[2] - rect[0]
-            };
-            if !portal.from.is_finite()
-                || !portal.to.is_finite()
-                || portal.from < 0.0
-                || portal.to > f64::from(length)
-                || portal.from >= portal.to
-            {
-                return Err(error("invalid capture portal"));
+        // Any refresh, table or portal failure refuses the whole set. The previous table stays in
+        // both places; Begin's live rectangle check refuses if a display no longer matches it.
+        // A CLEAR (empty set) skips the refresh and reuses the last accepted table.
+        let fresh = match &self.refresh {
+            Some(refresh) if portals_need_refresh(portals) => {
+                let (probes, mut ids) = refresh()?;
+                monitor_table(&probes, &mut ids)?
             }
-            let from = portal.from.ceil() as i32;
-            let to = portal.to.ceil() as i32;
-            let (x, y, w, h) = match portal.edge {
-                Edge::Left => (rect[0], rect[1] + from, 1, to - from),
-                Edge::Right => (rect[2] - 1, rect[1] + from, 1, to - from),
-                Edge::Top => (rect[0] + from, rect[1], to - from, 1),
-                Edge::Bottom => (rect[0] + from, rect[3] - 1, to - from, 1),
-            };
-            physical.push((
-                portal,
-                PixelRect::new(
-                    crosspane_types::geom::euclid::point2(x, y),
-                    crosspane_types::geom::euclid::point2(x + w, y + h),
-                ),
-            ));
-        }
-        self.request(|reply| Command::Portals(physical, reply))
+            _ => self.monitors.clone(),
+        };
+        let strips = portal_strips(portals, &fresh)?;
+        self.request(|reply| Command::Portals(strips, fresh.clone(), reply))?;
+        self.monitors = fresh;
+        Ok(())
     }
     fn subscribe(&mut self, sink: Arc<dyn EventSink<CaptureEvent>>) -> Result<(), PlatformError> {
         self.shared
@@ -1347,11 +1396,31 @@ impl Drop for Native {
     }
 }
 
-fn lock_keys() -> LockKeys {
-    // `[U]` This background capture queue has no proven current foreground toggle snapshot.
-    // GetKeyState is queue-relative, so unknown values must leave peer locks unchanged.
-    // <https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getkeystate>
-    LockKeys::default()
+/// `[P]` Lock bits come only from this owned pumping thread: a GetKeyState read after its own pump,
+/// and only once `fresh` (a resync posted by one pump is handled by the next). Resync through the
+/// pumping thread (posted key-state update events) is not documented by Microsoft. Lead probe
+/// 2026-10-11: a pumping-thread GetKeyState read tracked every toggle within one 250 ms sample. An
+/// unfresh read is unknown (all `None`). Values are never logged.
+/// <https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getkeystate>
+fn lock_keys(fresh: bool) -> LockKeys {
+    if !fresh {
+        return LockKeys::default();
+    }
+    // SAFETY: read-only GetKeyState on this owned pumping thread, after its pump. Only the toggle
+    // bits are used; the values are never logged.
+    let states =
+        unsafe { [VK_CAPITAL, VK_NUMLOCK, VK_SCROLL].map(|vk| GetKeyState(i32::from(vk))) };
+    locks_from_states(states)
+}
+
+/// Pure toggle-bit decode: bit 0 is the toggle state; the high "down" bit is ignored.
+fn locks_from_states(states: [i16; 3]) -> LockKeys {
+    let [caps, num, scroll] = states.map(|state| Some(state & 1 != 0));
+    LockKeys {
+        caps_lock: caps,
+        num_lock: num,
+        scroll_lock: scroll,
+    }
 }
 
 fn snapshot(shared: &Shared) -> (Vec<KeySnapshot>, [bool; 256]) {
@@ -1512,7 +1581,7 @@ fn owner_thread(
 ) {
     // Unwinding retains native ownership until this function's guard releases it.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_owner(&shared, &monitors, commands, &ready, drag)
+        run_owner(&shared, monitors, commands, &ready, drag)
     }));
     if result.is_err() {
         shared.fault.store(true, Ordering::Release);
@@ -1524,7 +1593,7 @@ fn owner_thread(
 
 fn run_owner(
     shared: &Arc<Shared>,
-    monitors: &[(DisplayId, [i32; 4])],
+    mut monitors: Vec<(DisplayId, [i32; 4])>,
     commands: mpsc::Receiver<Command>,
     ready: &mpsc::SyncSender<Result<(), PlatformError>>,
     drag: Option<crate::drag::DragConfig>,
@@ -1582,7 +1651,7 @@ fn run_owner(
     let mut hook = HookState::new();
     let mut pending: Option<Pending> = None;
     let mut monitor = false;
-    let mut locks = lock_keys();
+    let mut locks = lock_keys(false);
     let mut old_active = None;
     let mut portals = Vec::new();
     let mut clip_point: Option<POINT> = None;
@@ -1638,6 +1707,7 @@ fn run_owner(
     }
     let _ = ready.send(Ok(()));
     let mut raw_check = 0;
+    let mut iterations: u64 = 0;
     while !shared.shutdown.load(Ordering::Acquire)
         || shared.drag_order.load(Ordering::Acquire) != 0
         || shared
@@ -1662,6 +1732,9 @@ fn run_owner(
                 DispatchMessageW(&message);
             }
         }
+        iterations = iterations.saturating_add(1);
+        // A resync posted by one pump is handled by the next, so a read counts only after two.
+        let fresh = iterations >= 2;
         while let Some(record) = shared.ring.pop() {
             process_record(shared, &mut hook, record, monitor);
         }
@@ -1831,12 +1904,19 @@ fn run_owner(
                             MouseButton::PRIMARY,
                             &held,
                             &buttons,
-                            lock_keys(),
+                            lock_keys(fresh),
                             event_time(),
                         )
                     }
                 } else {
-                    hook.native_begin(p.id, p.portal, &held, &buttons, lock_keys(), event_time())
+                    hook.native_begin(
+                        p.id,
+                        p.portal,
+                        &held,
+                        &buttons,
+                        lock_keys(fresh),
+                        event_time(),
+                    )
                 };
                 match activation {
                     Ok((start, events)) => {
@@ -1923,7 +2003,7 @@ fn run_owner(
                 other => (None, other),
             };
             match command {
-                Command::Portals(next, reply) => {
+                Command::Portals(next, table, reply) => {
                     if let Some(drag) = &mut drag
                         && let Err(e) = drag.set_portals(&next, event_time())
                     {
@@ -1935,6 +2015,7 @@ fn run_owner(
                             shared.enqueue(None, event);
                         }
                         portals = next;
+                        monitors = table;
                     });
                     let _ = reply.send(result);
                 }
@@ -2161,7 +2242,7 @@ fn run_owner(
                 Command::BeginDrag { .. } => unreachable!("normalized owned command"),
             }
         }
-        let next_locks = lock_keys();
+        let next_locks = lock_keys(fresh);
         if locks != next_locks {
             locks = next_locks;
             shared.enqueue(None, CaptureEvent::LockKeys(locks));
@@ -2888,5 +2969,221 @@ mod tests {
         println!(
             "End verified clip/cursor restored and fresh-key decision passes; Drop verified hooks=0 mouse-raw=0; modifier/F24 status up (zero-query ambiguity remains)"
         );
+    }
+
+    /// Pure fixture: `rc_work` is the monitor minus a 40-pixel bottom strip.
+    fn refresh_probe(path: &str, rc: [i32; 4], primary: bool, twin: bool) -> MonitorProbe {
+        MonitorProbe {
+            device_path: path.into(),
+            name: path.into(),
+            rc_monitor: rc,
+            rc_work: [rc[0], rc[1], rc[2], rc[3] - 40],
+            primary,
+            dpi: 96,
+            refresh_millihz: 60_000,
+            edid: None,
+            twin,
+            quarter_turns: 0,
+        }
+    }
+
+    fn portal_on(display: DisplayId, edge: Edge, from: f64, to: f64) -> CapturePortal {
+        CapturePortal {
+            id: PortalId(1),
+            display,
+            edge,
+            from,
+            to,
+        }
+    }
+
+    fn refused_portal(portal: CapturePortal, monitors: &[(DisplayId, [i32; 4])]) -> bool {
+        matches!(
+            portal_strips(&[portal], monitors),
+            Err(PlatformError::Backend(m)) if m == "invalid capture portal"
+        )
+    }
+
+    #[test]
+    fn capture_refresh_table_matches_construction_rules() {
+        let left = refresh_probe("display-a", [0, 0, 1920, 1080], true, false);
+        let right = refresh_probe("display-b", [1920, 0, 3360, 1440], false, false);
+        // A twin mirrors a physical display and never enters the capture table.
+        let twin = refresh_probe("twin-a", [0, 0, 1920, 1080], false, true);
+        let mut ids = DisplayIds::default();
+        let table = monitor_table(&[right.clone(), twin, left.clone()], &mut ids).unwrap();
+        // Device-path order, with the allocator's stable ID for each path.
+        let mut expected = DisplayIds::default();
+        let a = expected.assign("display-a").unwrap();
+        let b = expected.assign("display-b").unwrap();
+        assert_eq!(table, vec![(a, left.rc_monitor), (b, right.rc_monitor)]);
+        // Refusals match construction: twins alone, invalid primaries, unrepresentable widths.
+        let twin_only = [refresh_probe("twin-a", [0, 0, 1920, 1080], true, true)];
+        assert!(matches!(
+            monitor_table(&twin_only, &mut DisplayIds::default()),
+            Err(PlatformError::Backend(m)) if m == "no capture display"
+        ));
+        let two_primaries = [
+            left.clone(),
+            refresh_probe("display-b", [1920, 0, 3360, 1440], true, false),
+        ];
+        assert!(matches!(
+            monitor_table(&two_primaries, &mut DisplayIds::default()),
+            Err(PlatformError::Backend(m)) if m == "invalid capture display layout"
+        ));
+        let no_primary = [refresh_probe("display-a", [0, 0, 1920, 1080], false, false)];
+        assert!(matches!(
+            monitor_table(&no_primary, &mut DisplayIds::default()),
+            Err(PlatformError::Backend(m)) if m == "invalid capture display layout"
+        ));
+        let wide = [refresh_probe(
+            "display-w",
+            [-2_000_000_000, 0, 2_000_000_000, 1080],
+            true,
+            false,
+        )];
+        assert!(matches!(
+            monitor_table(&wide, &mut DisplayIds::default()),
+            Err(PlatformError::Backend(m)) if m == "unrepresentable capture monitor"
+        ));
+    }
+
+    #[test]
+    fn capture_refresh_hotplugged_display_gets_strips() {
+        let primary = refresh_probe("display-a", [0, 0, 1920, 1080], true, false);
+        let mut ids = DisplayIds::default();
+        let before = monitor_table(std::slice::from_ref(&primary), &mut ids).unwrap();
+        // A display connected after startup joins the same allocator and keeps display-a's ID.
+        let added = refresh_probe("display-c", [1920, 0, 3840, 1440], false, false);
+        let table = monitor_table(&[primary, added.clone()], &mut ids).unwrap();
+        let new_id = ids.assign("display-c").unwrap();
+        assert_eq!(table[0].0, before[0].0);
+        assert!(table.contains(&(new_id, added.rc_monitor)));
+        let strips = portal_strips(&[portal_on(new_id, Edge::Right, 0.0, 100.0)], &table).unwrap();
+        assert_eq!(strips.len(), 1);
+        assert_eq!(strips[0].1.min.x, added.rc_monitor[2] - 1);
+        assert_eq!(strips[0].1.max.x, added.rc_monitor[2]);
+    }
+
+    #[test]
+    fn capture_refresh_removed_display_is_not_found() {
+        let primary = refresh_probe("display-a", [0, 0, 1920, 1080], true, false);
+        let secondary = refresh_probe("display-b", [1920, 0, 3360, 1440], false, false);
+        let mut ids = DisplayIds::default();
+        monitor_table(&[primary.clone(), secondary], &mut ids).unwrap();
+        let removed = ids.assign("display-b").unwrap();
+        // The refresh no longer reports display-b; the allocator keeps its ID for that path.
+        let table = monitor_table(std::slice::from_ref(&primary), &mut ids).unwrap();
+        assert!(table.iter().all(|(id, _)| *id != removed));
+        // A portal still naming the removed display is NotFound; the surviving display still maps.
+        let stale = portal_on(removed, Edge::Left, 0.0, 10.0);
+        assert!(matches!(
+            portal_strips(&[stale], &table),
+            Err(PlatformError::NotFound)
+        ));
+        let kept = portal_on(table[0].0, Edge::Left, 0.0, 10.0);
+        assert!(portal_strips(&[kept], &table).is_ok());
+    }
+
+    #[test]
+    fn capture_refresh_resolution_change_moves_strip() {
+        let probe = refresh_probe("display-a", [0, 0, 1920, 1080], true, false);
+        let mut ids = DisplayIds::default();
+        let before = monitor_table(std::slice::from_ref(&probe), &mut ids).unwrap();
+        let right = portal_on(before[0].0, Edge::Right, 0.0, 100.0);
+        let bottom = portal_on(before[0].0, Edge::Bottom, 0.0, 100.0);
+        let old_right = portal_strips(&[right], &before).unwrap();
+        assert_eq!(old_right[0].1.min.x, 1919);
+        // The same device path at a new mode keeps its ID; both edge strips follow the new size.
+        let grown = refresh_probe("display-a", [0, 0, 2560, 1440], true, false);
+        let after = monitor_table(&[grown], &mut ids).unwrap();
+        assert_eq!(after[0].0, before[0].0);
+        let new_right = portal_strips(&[right], &after).unwrap();
+        assert_eq!(new_right[0].1.min.x, 2559);
+        assert_eq!(new_right[0].1.max.x, 2560);
+        let new_bottom = portal_strips(&[bottom], &after).unwrap();
+        assert_eq!(new_bottom[0].1.min.y, 1439);
+        assert_eq!(new_bottom[0].1.max.y, 1440);
+    }
+
+    #[test]
+    fn capture_refresh_invalid_portal_refused() {
+        let probe = refresh_probe("display-a", [0, 0, 1920, 1080], true, false);
+        let mut ids = DisplayIds::default();
+        let table = monitor_table(std::slice::from_ref(&probe), &mut ids).unwrap();
+        let id = table[0].0;
+        // Empty, reversed, non-finite and negative stretches are refused.
+        assert!(refused_portal(
+            portal_on(id, Edge::Right, 10.0, 10.0),
+            &table
+        ));
+        assert!(refused_portal(
+            portal_on(id, Edge::Right, 20.0, 10.0),
+            &table
+        ));
+        assert!(refused_portal(
+            portal_on(id, Edge::Right, f64::NAN, 10.0),
+            &table
+        ));
+        assert!(refused_portal(
+            portal_on(id, Edge::Right, -1.0, 10.0),
+            &table
+        ));
+        // A stretch past the display's length (its height for Left and Right) is refused.
+        assert!(refused_portal(
+            portal_on(id, Edge::Right, 0.0, 1081.0),
+            &table
+        ));
+        // Resolution shrinks: a portal valid on the old table is refused on the new one.
+        let shrunk = refresh_probe("display-a", [0, 0, 1280, 720], true, false);
+        let shrunk_table = monitor_table(&[shrunk], &mut ids).unwrap();
+        let old_valid = portal_on(id, Edge::Right, 0.0, 1000.0);
+        assert!(portal_strips(&[old_valid], &table).is_ok());
+        assert!(refused_portal(old_valid, &shrunk_table));
+        // An unknown display is NotFound rather than an invalid portal.
+        let unknown = portal_on(DisplayId(id.0.wrapping_add(1)), Edge::Right, 0.0, 10.0);
+        assert!(matches!(
+            portal_strips(&[unknown], &table),
+            Err(PlatformError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn capture_refresh_skipped_for_empty_portals() {
+        let probe = refresh_probe("display-a", [0, 0, 1920, 1080], true, false);
+        let mut ids = DisplayIds::default();
+        let table = monitor_table(std::slice::from_ref(&probe), &mut ids).unwrap();
+        // A CLEAR reads no display: the empty set maps to no strips against the kept table.
+        assert!(!portals_need_refresh(&[]));
+        assert!(portal_strips(&[], &table).unwrap().is_empty());
+        // Any non-empty set still refreshes before its strips are mapped.
+        let armed = portal_on(table[0].0, Edge::Right, 0.0, 100.0);
+        assert!(portals_need_refresh(&[armed]));
+    }
+
+    #[test]
+    fn capture_locks_from_states_decodes_toggle_bit() {
+        let keys = |caps: bool, num: bool, scroll: bool| LockKeys {
+            caps_lock: Some(caps),
+            num_lock: Some(num),
+            scroll_lock: Some(scroll),
+        };
+        // Bit 0 is the toggle state, decoded per key.
+        assert_eq!(locks_from_states([1, 0, 0]), keys(true, false, false));
+        assert_eq!(locks_from_states([0, 1, 0]), keys(false, true, false));
+        assert_eq!(locks_from_states([0, 0, 1]), keys(false, false, true));
+        assert_eq!(locks_from_states([0, 0, 0]), keys(false, false, false));
+        // 0x8000 is the high "down" bit alone and never sets a lock; 0x8001 adds the toggle bit.
+        let down = 0x8000_u16 as i16;
+        assert_eq!(
+            locks_from_states([down, down, down]),
+            keys(false, false, false)
+        );
+        assert_eq!(
+            locks_from_states([down | 1, down, down]),
+            keys(true, false, false)
+        );
+        // Without a fresh pump read nothing is known; this path calls no native API.
+        assert_eq!(lock_keys(false), LockKeys::default());
     }
 }

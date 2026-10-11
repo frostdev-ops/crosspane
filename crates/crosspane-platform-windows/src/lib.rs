@@ -36,6 +36,7 @@ pub mod model;
 pub mod overlay;
 #[cfg(windows)]
 pub mod parking;
+pub mod permissions;
 #[cfg(windows)]
 pub mod session;
 #[cfg(windows)]

@@ -1,7 +1,14 @@
 //! Process facts and a bounded replacement-process restart.
 
+use std::ffi::OsStr;
+
 use anyhow::{Context, Result, bail, ensure};
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::System::Console::{
+    ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+};
 use windows_sys::Win32::System::SystemInformation::{
     ComputerNamePhysicalDnsHostname, GetComputerNameExW,
 };
@@ -90,6 +97,12 @@ pub(crate) fn wait_for_restart_parent() -> Result<()> {
     }
 }
 
+/// Start a replacement agent with the same arguments, then exit. The replacement inherits this
+/// process's job and its console state. The supervisor's kill-on-close job allows no breakaway, so
+/// never add `CREATE_BREAKAWAY_FROM_JOB`. A GUI build has no console; a console debug build reuses
+/// the same one. Do not add `CREATE_NO_WINDOW`. The supervisor follows only a clean exit 0 whose
+/// successor reaches Ready in the same job, so this exits 0 after a successful spawn and 1 only
+/// when the spawn fails.
 pub(crate) fn restart() -> ! {
     let result = (|| -> Result<()> {
         // SAFETY: the pseudo-handle is borrowed and valid for this process.
@@ -108,6 +121,30 @@ pub(crate) fn restart() -> ! {
             std::process::exit(1);
         }
     }
+}
+
+/// Attach to the parent's console for a one-shot command. The release build is a GUI application,
+/// so a command started from a shell would otherwise print nothing. This runs only when neither
+/// standard output nor standard error was inherited, and never for `run`, the default command.
+/// It reads only the handle table and passes no input to the console.
+pub(crate) fn attach_console_for_cli() {
+    let present = |id| {
+        // SAFETY: GetStdHandle reads this process's standard-handle table and takes no pointers.
+        let handle = unsafe { GetStdHandle(id) };
+        !handle.is_null() && handle != INVALID_HANDLE_VALUE
+    };
+    let inherited = present(STD_OUTPUT_HANDLE) && present(STD_ERROR_HANDLE);
+    if console_attach_wanted(std::env::args_os().nth(1).as_deref(), inherited) {
+        // SAFETY: AttachConsole takes a process id and no pointers. Failure is ignored: the process
+        // then has no console, as it did before this call.
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    }
+}
+
+/// Whether a one-shot command should attach to the parent's console. `first` is the first argument
+/// (`None` is the default `run`), and `present` is true when both standard handles are inherited.
+fn console_attach_wanted(first: Option<&OsStr>, present: bool) -> bool {
+    !present && first.is_some_and(|argument| argument != "run")
 }
 
 pub(crate) fn hostname() -> Option<String> {
@@ -136,4 +173,20 @@ pub(crate) fn exit_without_handlers(status: u32) -> ! {
     unsafe { TerminateProcess(GetCurrentProcess(), status) };
     // TerminateProcess does not return on success. If it fails, retain the fail-closed fallback.
     std::process::abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn console_attach_only_for_cli_without_handles() {
+        let run = OsStr::new("run");
+        let identity = OsStr::new("identity");
+        assert!(!console_attach_wanted(None, false));
+        assert!(!console_attach_wanted(Some(run), false));
+        assert!(console_attach_wanted(Some(identity), false));
+        assert!(!console_attach_wanted(Some(identity), true));
+        assert!(!console_attach_wanted(None, true));
+    }
 }

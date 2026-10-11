@@ -6,6 +6,7 @@
 //! `[P]` An owned WinEvent/message/repeat thread detects foreground ABA and gate epochs.
 //! `[U]` Event delivery can lag; fresh foreground/PID/start/token checks also precede submissions.
 //! `[U]` Native-call stalls and arbitrary application/IME delivery remain outside submission proof.
+//! `[P]` Lock bits come only from a fresh, settled owned-thread snapshot, else they stay unknown.
 
 #![allow(unsafe_code)]
 
@@ -173,6 +174,71 @@ fn foreground(generation: &AtomicU64) -> Result<Foreground, PlatformError> {
     }
 }
 
+const LOCK_MAX_AGE_MS: u64 = 50;
+const LOCK_SETTLE_MS: u64 = 100;
+const LOCK_CAPS: u64 = 1 << 0;
+const LOCK_NUM: u64 = 1 << 1;
+const LOCK_SCROLL: u64 = 1 << 2;
+const LOCK_VALID: u64 = 1 << 7;
+const LOCK_READ_SHIFT: u32 = 8;
+const LOCK_READ_MAX_MS: u64 = (1u64 << (64 - LOCK_READ_SHIFT)) - 1;
+
+/// `[P]` Lock bits published by the owned pumping thread. `word` packs bit0 caps, bit1 num, bit2
+/// scroll, bit7 valid, and bits 8 and up the read time in ms since `epoch`. Readers trust a bit
+/// only through `lock_keys_from`, which applies the freshness and settle rules.
+#[derive(Debug)]
+struct LockSnapshot {
+    epoch: Instant,
+    word: AtomicU64,
+}
+impl LockSnapshot {
+    fn new(epoch: Instant) -> Self {
+        Self {
+            epoch,
+            word: AtomicU64::new(0),
+        }
+    }
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }
+    /// A single Release store, so a reader sees all three bits and the read time together.
+    fn publish(&self, states: [i16; 3], read_ms: u64) {
+        let [caps, num, scroll] = states.map(|state| state & 1 != 0);
+        let bits = LOCK_VALID
+            | (read_ms.min(LOCK_READ_MAX_MS) << LOCK_READ_SHIFT)
+            | if caps { LOCK_CAPS } else { 0 }
+            | if num { LOCK_NUM } else { 0 }
+            | if scroll { LOCK_SCROLL } else { 0 };
+        self.word.store(bits, Ordering::Release);
+    }
+}
+
+/// `[P]` Pure lock rule. Unknown (all `None`) unless the valid bit is set, the read is at most
+/// `LOCK_MAX_AGE_MS` old, and, after our own lock submit at `t`, the read is at least `t` plus
+/// `LOCK_SETTLE_MS`. A read time after `now_ms` is also unknown (fail closed).
+fn lock_keys_from(word: u64, now_ms: u64, lock_submit_ms: Option<u64>) -> LockKeys {
+    let read_ms = word >> LOCK_READ_SHIFT;
+    let fresh = now_ms
+        .checked_sub(read_ms)
+        .is_some_and(|age| age <= LOCK_MAX_AGE_MS);
+    let settled =
+        lock_submit_ms.is_none_or(|submit| read_ms >= submit.saturating_add(LOCK_SETTLE_MS));
+    if word & LOCK_VALID == 0 || !fresh || !settled {
+        return LockKeys::default();
+    }
+    LockKeys {
+        caps_lock: Some(word & LOCK_CAPS != 0),
+        num_lock: Some(word & LOCK_NUM != 0),
+        scroll_lock: Some(word & LOCK_SCROLL != 0),
+    }
+}
+
+/// `[E]` Caps 0x3A, Num 0x45 and Scroll 0x46 scan codes. Conservative: any extended flag counts,
+/// and the `& 0xff` also marks other keys that share these codes; that only delays a lock read.
+fn is_lock_scan(scan: u16) -> bool {
+    matches!(scan & 0xff, 0x3A | 0x45 | 0x46)
+}
+
 struct NativePort {
     gate: Arc<IoGate>,
     generation: Arc<AtomicU64>,
@@ -185,6 +251,9 @@ struct NativePort {
     probes: Vec<MonitorProbe>,
     ids: DisplayIds,
     refresh: MonitorRefresh,
+    locks: Arc<LockSnapshot>,
+    /// Time of our most recent lock-scan submit, set before SendInput; `None` until one happens.
+    lock_submit_ms: Option<u64>,
     #[cfg(test)]
     owned_fixture: Option<usize>,
     #[cfg(test)]
@@ -282,6 +351,12 @@ impl InjectionPort for NativePort {
         {
             return Err(PlatformError::SecureInput);
         }
+        // `[P]` Marked before any SendInput, releases included, so lock reads wait for resync.
+        if let Packet::Key { scan, .. } = packet
+            && is_lock_scan(scan)
+        {
+            self.lock_submit_ms = Some(self.locks.now_ms());
+        }
         let input = encode(packet, self.tag);
         #[cfg(test)]
         {
@@ -317,10 +392,17 @@ impl InjectionPort for NativePort {
         }
     }
     fn locks(&mut self) -> Result<LockKeys, PlatformError> {
-        // `[U]` The calling thread has no proven foreground keyboard-queue relationship.
-        // GetKeyState is queue-relative; do not turn a potentially stale bit into a toggle.
+        // `[P]` Pumping-thread resync (posted key-state update events) is not documented by
+        // Microsoft; landing depends on the lead's probe. GetKeyState is queue-relative, so only a
+        // fresh, settled snapshot from the owned timer thread may report a bit. Anything else is
+        // unknown, and `set_locks` refuses with SecureInput (fail closed).
         // <https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getkeystate>
-        Ok(LockKeys::default())
+        let word = self.locks.word.load(Ordering::Acquire);
+        Ok(lock_keys_from(
+            word,
+            self.locks.now_ms(),
+            self.lock_submit_ms,
+        ))
     }
 }
 
@@ -438,6 +520,7 @@ fn timer(
     generation: Arc<AtomicU64>,
     started: Instant,
     ready: mpsc::SyncSender<bool>,
+    locks: Arc<LockSnapshot>,
 ) {
     EVENT_GENERATION.with(|g| *g.borrow_mut() = Some(generation));
     // SAFETY: out-of-context callbacks run on this owned message-pump thread, with TLS state.
@@ -456,10 +539,12 @@ fn timer(
     if hook.is_null() {
         return;
     }
+    let mut previous_ms: Option<u64> = None;
     while let Some(shared) = shared.upgrade() {
         if shared.stop.load(Ordering::Acquire) {
             break;
         }
+        let iteration_ms = locks.now_ms();
         // SAFETY: this thread's message queue only; no message contents are logged.
         unsafe {
             let mut msg = MSG::default();
@@ -471,6 +556,16 @@ fn timer(
                 DispatchMessageW(&msg);
             }
         }
+        // SAFETY: read-only GetKeyState on this owned pumping thread, after its pump. Only the
+        // toggle bits are published; the values are never logged.
+        let states =
+            unsafe { [VK_CAPITAL, VK_NUMLOCK, VK_SCROLL].map(|vk| GetKeyState(i32::from(vk))) };
+        // The resync seen now answers the previous iteration's requests, so publish the time of
+        // the previous iteration. The first iteration has no prior request and publishes nothing.
+        if let Some(read_ms) = previous_ms {
+            locks.publish(states, read_ms);
+        }
+        previous_ms = Some(iteration_ms);
         if let Ok(mut driver) = shared.driver.lock() {
             let cancel = shared.cancel.load(Ordering::Acquire);
             if cancel != driver.port().repeat_owner {
@@ -652,6 +747,8 @@ mod drag_tests {
             probes: Vec::new(),
             ids: DisplayIds::default(),
             refresh: Arc::new(|| Err(PlatformError::NotFound)),
+            locks: Arc::new(LockSnapshot::new(Instant::now())),
+            lock_submit_ms: None,
             owned_fixture: None,
             submitted: 0,
             observer: Some(Box::new(observer)),
@@ -883,6 +980,8 @@ pub fn injectors(
     let generation = Arc::new(AtomicU64::new(0));
     let cancel = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
+    let started = Instant::now();
+    let locks = Arc::new(LockSnapshot::new(started));
     let port = NativePort {
         gate: gate.clone(),
         generation: generation.clone(),
@@ -895,6 +994,8 @@ pub fn injectors(
         probes: probes.to_vec(),
         ids: ids.clone(),
         refresh,
+        locks: locks.clone(),
+        lock_submit_ms: None,
         #[cfg(test)]
         owned_fixture: None,
         #[cfg(test)]
@@ -913,12 +1014,11 @@ pub fn injectors(
         cancel,
         stop,
     });
-    let started = Instant::now();
     let (tx, rx) = mpsc::sync_channel(1);
     let weak = Arc::downgrade(&shared);
     let handle = thread::Builder::new()
         .name("crosspane-input-repeat".into())
-        .spawn(move || timer(weak, generation, started, tx))
+        .spawn(move || timer(weak, generation, started, tx, locks))
         .map_err(|_| unavailable())?;
     let runtime = Arc::new(Runtime {
         shared,
@@ -1080,6 +1180,161 @@ fn validate_monitors(probes: &[MonitorProbe]) -> Result<(), PlatformError> {
 }
 
 #[cfg(test)]
+mod lock_snapshot_tests {
+    use super::*;
+
+    fn known(caps: bool, num: bool, scroll: bool) -> LockKeys {
+        LockKeys {
+            caps_lock: Some(caps),
+            num_lock: Some(num),
+            scroll_lock: Some(scroll),
+        }
+    }
+
+    #[test]
+    fn lock_snapshot_unknown_until_fresh() {
+        let snapshot = LockSnapshot::new(Instant::now());
+        // Never published: the valid bit is clear, so the read is unknown at any clock.
+        assert_eq!(
+            lock_keys_from(snapshot.word.load(Ordering::Acquire), 10, None),
+            LockKeys::default()
+        );
+        // A fresh read time without the valid bit is still unknown.
+        assert_eq!(
+            lock_keys_from(10 << LOCK_READ_SHIFT, 10, None),
+            LockKeys::default()
+        );
+        snapshot.publish([1, 0, 0], 10);
+        assert_eq!(
+            lock_keys_from(snapshot.word.load(Ordering::Acquire), 10, None),
+            known(true, false, false)
+        );
+    }
+
+    #[test]
+    fn lock_snapshot_unknown_after_own_lock_submit_until_settled() {
+        let snapshot = LockSnapshot::new(Instant::now());
+        snapshot.publish([1, 1, 1], 1_000);
+        let word = snapshot.word.load(Ordering::Acquire);
+        // Our submit at 1_000 is not settled by a read at 1_000, nor by one at 1_000 for an
+        // earlier submit that ends 1 ms short of the settle window.
+        assert_eq!(
+            lock_keys_from(word, 1_000, Some(1_000)),
+            LockKeys::default()
+        );
+        assert_eq!(lock_keys_from(word, 1_000, Some(901)), LockKeys::default());
+        // A read at exactly submit + LOCK_SETTLE_MS is settled.
+        assert_eq!(
+            lock_keys_from(word, 1_000, Some(900)),
+            known(true, true, true)
+        );
+        // A later read settles an older submit, and a submit after the read blocks it again.
+        snapshot.publish([0, 0, 0], 1_100);
+        let word = snapshot.word.load(Ordering::Acquire);
+        assert_eq!(
+            lock_keys_from(word, 1_100, Some(1_000)),
+            known(false, false, false)
+        );
+        assert_eq!(
+            lock_keys_from(word, 1_100, Some(1_001)),
+            LockKeys::default()
+        );
+    }
+
+    #[test]
+    fn lock_snapshot_stale_age_is_unknown() {
+        let snapshot = LockSnapshot::new(Instant::now());
+        snapshot.publish([1, 0, 1], 1_000);
+        let word = snapshot.word.load(Ordering::Acquire);
+        // An age of exactly LOCK_MAX_AGE_MS is fresh; one millisecond more is unknown.
+        assert_eq!(
+            lock_keys_from(word, 1_000 + LOCK_MAX_AGE_MS, None),
+            known(true, false, true)
+        );
+        assert_eq!(
+            lock_keys_from(word, 1_000 + LOCK_MAX_AGE_MS + 1, None),
+            LockKeys::default()
+        );
+        // A read time after `now` is never fresh.
+        assert_eq!(lock_keys_from(word, 999, None), LockKeys::default());
+    }
+
+    #[test]
+    fn lock_snapshot_bits_decode() {
+        let snapshot = LockSnapshot::new(Instant::now());
+        // -32767 is 0x8001: only the low toggle bit is read, and the key-down bit is ignored.
+        snapshot.publish([0x0001, 0x0000, -32767], 0x0123_4567);
+        let word = snapshot.word.load(Ordering::Acquire);
+        assert_eq!(word & LOCK_VALID, LOCK_VALID);
+        assert_eq!(word >> LOCK_READ_SHIFT, 0x0123_4567);
+        assert_eq!(
+            word & (LOCK_CAPS | LOCK_NUM | LOCK_SCROLL),
+            LOCK_CAPS | LOCK_SCROLL
+        );
+        assert_eq!(
+            lock_keys_from(word, 0x0123_4567, None),
+            known(true, false, true)
+        );
+        // Clear toggle bits decode as off, including the MIN value of a key-down-only state.
+        snapshot.publish([i16::MIN, -2, 0x7ffe], 5);
+        let word = snapshot.word.load(Ordering::Acquire);
+        assert_eq!(word & (LOCK_CAPS | LOCK_NUM | LOCK_SCROLL), 0);
+        assert_eq!(lock_keys_from(word, 5, None), known(false, false, false));
+        // An oversized read time saturates at the field width and keeps the valid bit.
+        snapshot.publish([0; 3], u64::MAX);
+        let word = snapshot.word.load(Ordering::Acquire);
+        assert_eq!(word >> LOCK_READ_SHIFT, LOCK_READ_MAX_MS);
+        assert_eq!(word & LOCK_VALID, LOCK_VALID);
+    }
+
+    #[test]
+    fn lock_scan_detection_includes_caps_num_scroll() {
+        for scan in [0x3A, 0x45, 0x46, 0x13A, 0x145, 0x146] {
+            assert!(is_lock_scan(scan), "scan {scan:#x}");
+        }
+        for scan in [0x01, 0x1D, 0x1E, 0x38, 0x39, 0x47, 0x48, 0x53] {
+            assert!(!is_lock_scan(scan), "scan {scan:#x}");
+        }
+        // Releases skip the gate checks, so a lone release proves the submit-side marking.
+        let mut port = NativePort {
+            gate: IoGate::new(),
+            generation: Arc::new(AtomicU64::new(0)),
+            expected: None,
+            expected_gate_epoch: 0,
+            cancel: Arc::new(AtomicU64::new(0)),
+            repeat_fence: None,
+            repeat_owner: 0,
+            tag: 0,
+            probes: Vec::new(),
+            ids: DisplayIds::default(),
+            refresh: Arc::new(|| Err(PlatformError::NotFound)),
+            locks: Arc::new(LockSnapshot::new(Instant::now())),
+            lock_submit_ms: None,
+            owned_fixture: None,
+            submitted: 0,
+            observer: None,
+            sender: Some(Box::new(|_| 1)),
+            tainted: None,
+        };
+        port.submit(Packet::Key {
+            scan: 0x13A,
+            extended: true,
+            down: false,
+        })
+        .unwrap();
+        assert!(port.lock_submit_ms.is_some());
+        port.lock_submit_ms = None;
+        port.submit(Packet::Key {
+            scan: 0x1E,
+            extended: false,
+            down: false,
+        })
+        .unwrap();
+        assert_eq!(port.lock_submit_ms, None);
+    }
+}
+
+#[cfg(test)]
 mod probe_tests {
     use super::*;
     use std::sync::atomic::{AtomicI64, AtomicU32};
@@ -1166,6 +1421,8 @@ mod probe_tests {
                 probes: Vec::new(),
                 ids: DisplayIds::default(),
                 refresh: Arc::new(|| Err(PlatformError::NotFound)),
+                locks: Arc::new(LockSnapshot::new(Instant::now())),
+                lock_submit_ms: None,
                 owned_fixture: None,
                 submitted: 0,
                 observer: Some(Box::new(move || {
@@ -1243,6 +1500,8 @@ mod probe_tests {
                 probes: vec![probe],
                 ids,
                 refresh,
+                locks: Arc::new(LockSnapshot::new(Instant::now())),
+                lock_submit_ms: None,
                 owned_fixture: None,
                 submitted: 0,
                 observer: Some(Box::new(|| Err(PlatformError::SecureInput))),
@@ -1675,6 +1934,21 @@ mod probe_tests {
         unsafe { [VK_CAPITAL, VK_NUMLOCK, VK_SCROLL].map(|vk| GetKeyState(i32::from(vk)) & 1 != 0) }
     }
 
+    /// `[P]` Snapshot-versus-fixture comparison; all three bits must be known and equal.
+    fn same_locks(snapshot: LockKeys, fixture: [bool; 3]) -> bool {
+        [snapshot.caps_lock, snapshot.num_lock, snapshot.scroll_lock] == fixture.map(Some)
+    }
+
+    /// Bits are printed as 0/1 only; no key contents or text are involved.
+    fn lock_text(seen: Option<[bool; 3]>) -> String {
+        seen.map_or_else(
+            || "unknown".to_string(),
+            |[caps, num, scroll]| {
+                format!("{},{},{}", u8::from(caps), u8::from(num), u8::from(scroll))
+            },
+        )
+    }
+
     struct LockObserver {
         requests: Option<mpsc::Sender<mpsc::Sender<[bool; 3]>>>,
         thread: Option<JoinHandle<()>>,
@@ -1934,6 +2208,8 @@ mod probe_tests {
         };
         let mut background_current = 0u32;
         let mut background_stale = 0u32;
+        let mut snapshot_current = 0u32;
+        let mut snapshot_stale = 0u32;
         for index in 0..3 {
             let before = observer.read();
             if let Err(error) = restore.toggle(index) {
@@ -1948,6 +2224,7 @@ mod probe_tests {
                 );
                 panic!("owned lock trial refused: {error}");
             }
+            let toggled = Instant::now();
             fixture.pump(Duration::from_millis(70));
             let foreground = fixture_locks();
             assert!(
@@ -1964,6 +2241,68 @@ mod probe_tests {
                     "background state was inconsistent"
                 );
             }
+            // `[P]` Snapshot poll: up to 300 ms for the owned-thread snapshot to match the fixture.
+            let deadline = Instant::now() + Duration::from_millis(300);
+            let matched = loop {
+                if restore
+                    .keys
+                    .lock_keys()
+                    .is_ok_and(|seen| same_locks(seen, fixture_locks()))
+                {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                fixture.pump(Duration::from_millis(10));
+            };
+            if matched {
+                snapshot_current += 1;
+            } else {
+                snapshot_stale += 1;
+            }
+            // Restore only after the settle window, through the snapshot-driven setter.
+            fixture
+                .pump(Duration::from_millis(LOCK_SETTLE_MS + 50).saturating_sub(toggled.elapsed()));
+            let wanted = [
+                LockKeys {
+                    caps_lock: Some(originals[0]),
+                    ..Default::default()
+                },
+                LockKeys {
+                    num_lock: Some(originals[1]),
+                    ..Default::default()
+                },
+                LockKeys {
+                    scroll_lock: Some(originals[2]),
+                    ..Default::default()
+                },
+            ][index];
+            let before_restore = fixture_locks();
+            if let Err(error) = restore.keys.set_lock_keys(wanted) {
+                drop(restore);
+                println!(
+                    "OWNED_LOCK snapshot_refusal snapshot_current={} snapshot_stale={} restore_failures={}",
+                    snapshot_current,
+                    snapshot_stale,
+                    failures.load(Ordering::Acquire)
+                );
+                panic!("snapshot-driven lock restore refused: {error}");
+            }
+            fixture.pump(Duration::from_millis(70));
+            let restored = fixture_locks();
+            assert!(
+                restored == originals,
+                "snapshot-driven lock restore did not return to the original"
+            );
+            for other in 0..3 {
+                if other != index {
+                    assert_eq!(
+                        restored[other], before_restore[other],
+                        "snapshot-driven restore toggled another lock"
+                    );
+                }
+            }
             restore.restore();
             assert!(
                 fixture_locks() == originals,
@@ -1979,8 +2318,8 @@ mod probe_tests {
         assert_eq!(fixture.counts.downs.load(Ordering::Acquire), 6);
         assert_eq!(fixture.counts.ups.load(Ordering::Acquire), 6);
         println!(
-            "OWNED_LOCK balanced_lock_downs=6 ups=6 background_current={} background_stale={} restore_failures=0",
-            background_current, background_stale
+            "OWNED_LOCK balanced_lock_downs=6 ups=6 background_current={} background_stale={} snapshot_current={} snapshot_stale={} restore_failures=0",
+            background_current, background_stale, snapshot_current, snapshot_stale
         );
     }
 
@@ -2012,6 +2351,52 @@ mod probe_tests {
         }
         observe_owned_locks(&fixture, &mut keys);
         modifiers_clear();
+    }
+
+    #[test]
+    #[ignore = "Lead-run passive probe; no input submitted"]
+    fn passive_lock_snapshot_probe() {
+        assert_eq!(
+            std::env::var("CROSSPANE_W111_PROBE").as_deref(),
+            Ok("passive-locks")
+        );
+        assert!(limited());
+        let probe = MonitorProbe {
+            device_path: "passive-lock-probe".into(),
+            name: "passive-lock-probe".into(),
+            rc_monitor: [0, 0, 1920, 1080],
+            rc_work: [0, 0, 1920, 1080],
+            primary: true,
+            dpi: 96,
+            refresh_millihz: 60_000,
+            edid: None,
+            twin: false,
+            quarter_turns: 0,
+        };
+        let mut ids = DisplayIds::default();
+        ids.assign(&probe.device_path).unwrap();
+        let gate = IoGate::new();
+        gate.set_session_permits(true);
+        gate.set_engine_permits(true);
+        let refresh = owned_mapping(probe.clone(), ids.clone());
+        // Starting the owned timer thread only reads lock bits; no key or button is submitted.
+        let (keys, _pointer) =
+            injectors(gate, std::slice::from_ref(&probe), &mut ids, refresh).unwrap();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(20) {
+            let seen = keys
+                .lock_keys()
+                .ok()
+                .and_then(|seen| Some([seen.caps_lock?, seen.num_lock?, seen.scroll_lock?]));
+            // `unpumped` reads this thread's own state; it never pumps the owned thread's queue.
+            println!(
+                "PASSIVE_LOCK t_ms={} snapshot={} unpumped={}",
+                started.elapsed().as_millis(),
+                lock_text(seen),
+                lock_text(Some(fixture_locks()))
+            );
+            thread::sleep(Duration::from_millis(250));
+        }
     }
 
     #[test]

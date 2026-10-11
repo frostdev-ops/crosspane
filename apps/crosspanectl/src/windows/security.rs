@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::ffi::{OsStr, c_void};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
@@ -29,10 +29,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
     FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
-    FILE_READ_DATA, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, FileAttributeTagInfo,
-    FileDispositionInfo, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
-    OPEN_EXISTING, READ_CONTROL, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE,
-    SetFileInformationByHandle,
+    FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA,
+    FileAttributeTagInfo, FileDispositionInfo, GetFileInformationByHandleEx,
+    GetVolumeInformationByHandleW, OPEN_EXISTING, READ_CONTROL, SECURITY_IDENTIFICATION,
+    SECURITY_SQOS_PRESENT, SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, FILE_PERSISTENT_ACLS};
@@ -428,6 +428,60 @@ pub(super) fn read_metadata(path: &Path) -> Result<String> {
         "diagnostics metadata is too large"
     );
     Ok(output)
+}
+
+/// Read at most the last `max` bytes of a known log leaf through the same checked, pinned,
+/// no-follow admission as `read_metadata`. The data handle shares read, write and delete, but the
+/// admission pins stay held for the whole read, so renaming the leaf fails until it returns.
+pub(super) fn read_log_tail(path: &Path, max: u64) -> Result<Vec<u8>> {
+    let pins = pin_path(path)?;
+    let leaf = pins.last().context("log has no leaf")?;
+    ensure!(
+        file_attributes(leaf)? & FILE_ATTRIBUTE_DIRECTORY == 0,
+        "log is a directory"
+    );
+    persistent_acls(leaf.0)?;
+    check_owner(leaf)?;
+    let text = wide(path.as_os_str())?;
+    // SAFETY: every path component is pinned; the data handle opens only this no-follow leaf.
+    let raw = unsafe {
+        CreateFileW(
+            text.as_ptr(),
+            FILE_READ_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error()).context("read log");
+    }
+    // SAFETY: raw is a new, valid file handle exclusively transferred to std::fs::File.
+    let mut file = unsafe { std::fs::File::from_raw_handle(raw.cast()) };
+    let len = file.seek(SeekFrom::End(0)).context("measure log")?;
+    let start = len.saturating_sub(max);
+    file.seek(SeekFrom::Start(start))
+        .context("seek to log tail")?;
+    let mut bytes = Vec::new();
+    // take() bounds the read even if the agent appends after the length was measured.
+    file.take(max)
+        .read_to_end(&mut bytes)
+        .context("read log tail")?;
+    Ok(whole_lines(&bytes, start > 0).to_vec())
+}
+
+/// Drop a partial first line when the bounded read started after byte zero. A tail with no
+/// newline is one partial line, so nothing whole remains.
+fn whole_lines(bytes: &[u8], mid_file: bool) -> &[u8] {
+    if !mid_file {
+        return bytes;
+    }
+    match bytes.iter().position(|byte| *byte == b'\n') {
+        Some(index) => &bytes[index + 1..],
+        None => &[],
+    }
 }
 
 fn persistent_acls(handle: HANDLE) -> Result<()> {
@@ -1142,6 +1196,43 @@ mod tests {
         assert!(!archive_path.exists());
         assert!(!staging_path.exists());
         sibling.abort()?;
+        Ok(())
+    }
+
+    #[test]
+    fn log_tail_whole_lines_drops_partial_first_line() {
+        assert_eq!(whole_lines(b"", false), b"");
+        assert_eq!(whole_lines(b"first\nsecond\n", false), b"first\nsecond\n");
+        assert_eq!(whole_lines(b"cut\nwhole\nlast\n", true), b"whole\nlast\n");
+        assert_eq!(whole_lines(b"\nwhole\n", true), b"whole\n");
+        assert_eq!(whole_lines(b"no newline", true), b"");
+        assert_eq!(whole_lines(b"", true), b"");
+    }
+
+    #[test]
+    fn log_tail_reads_last_bytes_of_private_file() -> Result<()> {
+        let fixture = FixtureParent::new()?;
+        let path = fixture.path.join("agent.log");
+        let body: Vec<u8> = (0..5000)
+            .flat_map(|line: u32| format!("line {line:05}\n").into_bytes())
+            .collect();
+        let mut file = create_private_file(&path)?;
+        file.copy_from(&mut body.as_slice())?;
+        file.commit()?;
+        let tail = read_log_tail(&path, 1024);
+        let whole = read_log_tail(&path, u64::MAX);
+        // Remove the test-owned leaf through its own DELETE handle before the fixture directory
+        // is cleaned up. Only this exact object is verified and marked for deletion.
+        let removed = open_delete_leaf(&path).and_then(|handle| {
+            verify_private(handle.0, false, &fixture.identity)?;
+            mark_deleted(handle.0)
+        });
+        removed?;
+        assert_eq!(whole?, body);
+        let tail = tail?;
+        assert!(!tail.is_empty() && tail.len() <= 1024);
+        assert!(tail.starts_with(b"line "));
+        assert!(body.ends_with(&tail));
         Ok(())
     }
 }

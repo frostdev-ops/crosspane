@@ -153,6 +153,9 @@ pub fn diag(out: Option<PathBuf>) -> Result<()> {
     }
 }
 
+/// Largest tail of each agent log file that diagnostics copy; older lines are not collected.
+const LOG_TAIL_BYTES: u64 = 1024 * 1024;
+
 fn collect_diagnostics(
     staging: &security::PrivateDirectory,
     temp: &Path,
@@ -183,10 +186,28 @@ fn collect_diagnostics(
             Err(error) => return Err(error).context("read diagnostics metadata"),
         }
     }
-    staging.write(
-        "agent.log",
-        b"Unavailable: the Windows foreground agent logs to stderr.\n",
-    )?;
+    // Keep in sync with crosspane-agent `windows/log.rs`.
+    let logs = absolute_env("LOCALAPPDATA")?.join("Crosspane").join("logs");
+    let mut has_agent_log = false;
+    for file in ["agent.log", "agent.log.1", "agent.log.2"] {
+        match security::read_log_tail(&logs.join(file), LOG_TAIL_BYTES) {
+            Ok(bytes) => {
+                staging.write(file, &bytes)?;
+                has_agent_log |= file == "agent.log";
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) => {}
+            Err(error) => return Err(error).context("read agent log"),
+        }
+    }
+    if !has_agent_log {
+        staging.write(
+            "agent.log",
+            b"No agent log file yet (the agent has not written one on this machine).\n",
+        )?;
+    }
     staging.write(
         "system.txt",
         format!("OS: Windows\nArchitecture: {}\n", std::env::consts::ARCH).as_bytes(),

@@ -10,7 +10,7 @@ use anyhow::{Context, Result, ensure};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
-    SetConsoleCtrlHandler,
+    GetConsoleWindow, SetConsoleCtrlHandler,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -223,12 +223,22 @@ impl Watch {
         // SAFETY: function has the ABI required by SetConsoleCtrlHandler, and uses only static
         // atomics. Drop removes exactly this registration before relinquishing singleton state.
         let installed = unsafe { SetConsoleCtrlHandler(Some(console), 1) };
-        ensure!(
-            installed != 0,
-            "install console shutdown handler: {}",
-            std::io::Error::last_os_error()
-        );
-        watch.console = true;
+        if installed == 0 {
+            let error = std::io::Error::last_os_error();
+            // A release agent is a windows-subsystem process, so with no console there are no
+            // console stop events to observe. Session end still arrives on the hidden window.
+            // Only a failed install with a console attached is an error, since that console's stop
+            // events would go unobserved.
+            // SAFETY: GetConsoleWindow takes no arguments and only reads this process's console.
+            let attached = unsafe { GetConsoleWindow() };
+            ensure!(
+                attached.is_null(),
+                "install console shutdown handler: {error}"
+            );
+            tracing::debug!("no console; console stop events are not observed");
+        } else {
+            watch.console = true;
+        }
         watch.dispatch = Some(
             std::thread::Builder::new()
                 .name("stop-signals".into())

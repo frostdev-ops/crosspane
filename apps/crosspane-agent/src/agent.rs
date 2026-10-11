@@ -1588,16 +1588,20 @@ impl Agent {
     fn windows_proxy_place(
         &self,
         place: Option<ProxyPlacement>,
+        size: PixelSize,
     ) -> Option<crosspane_render::proxy::HostPlace> {
+        // `[P]` Chosen, not measured: enough for a default Windows 11 caption and frame. Check it
+        // against a live caption before relying on it (WP-W1.11 B2).
+        const WINDOWS_CAPTION_RESERVE: f64 = 32.0;
         let place = place?;
         let converted = (|| {
-            let rows = (self.platform.host_placement_mapping.as_ref()?)()?;
-            let mut matching = rows.iter().filter(|row| row.id == place.display.0);
+            let rows = (self.platform.windows_placement_rows.as_ref()?)()?;
+            let mut matching = rows.iter().filter(|row| row.mapping.id == place.display.0);
             let row = matching.next()?;
-            if matching.next().is_some() || !row.geometry.is_valid() {
+            if matching.next().is_some() || !row.mapping.geometry.is_valid() {
                 return None;
             }
-            let g = row.geometry;
+            let g = row.mapping.geometry;
             let cached = self
                 .local_displays
                 .iter()
@@ -1610,8 +1614,22 @@ impl Agent {
             {
                 return None;
             }
-            let point =
-                g.device_to_logical(PointDevice::new(f64::from(place.x), f64::from(place.y)));
+            // Keep the title bar below the work area's top edge: move that edge down by the
+            // reserve, in physical pixels. A work area not taller than the reserve is used as is.
+            let reserve = (WINDOWS_CAPTION_RESERVE * g.scale).ceil() as i32;
+            let mut work = row.rc_work;
+            if i64::from(work[3]) - i64::from(work[1]) > i64::from(reserve) {
+                work[1] += reserve;
+            }
+            // Oversized windows anchor at the work area's top-left (`work_area_clamp`).
+            let anchored = crosspane_platform_windows::model::geometry::work_area_clamp(
+                PointDevice::new(f64::from(place.x), f64::from(place.y)),
+                PixelSize::new(size.width.max(1), size.height.max(1)),
+                work,
+                row.rc_monitor,
+            )
+            .ok()?;
+            let point = g.device_to_logical(anchored);
             Some(crosspane_render::proxy::HostPlace {
                 content: (point.x, point.y).into(),
             })
@@ -2697,7 +2715,7 @@ impl Agent {
                     }
                 };
                 #[cfg(windows)]
-                let host_place = self.windows_proxy_place(place);
+                let host_place = self.windows_proxy_place(place, size);
                 if HYPRLAND_PLACEMENT && let Some(place) = place {
                     self.drag_places.insert(key, place);
                     self.placement.blocked.insert(key);
@@ -9485,6 +9503,8 @@ mod audio_tests {
             acceptance_source: false,
             #[cfg(windows)]
             host_placement_mapping: None,
+            #[cfg(windows)]
+            windows_placement_rows: None,
         };
         let e2 = E2Wiring {
             source_media: source_tx.into(),
@@ -9548,22 +9568,50 @@ mod audio_tests {
             hdr: false,
         };
         rig.agent.local_displays = vec![display.clone()];
-        let rows = vec![crosspane_render::proxy::HostMonitorMapping {
-            id: display.id.0,
-            native_id: "fixture".into(),
-            geometry: display.geometry,
-            physical_origin: (1920, 0).into(),
+        // The 2160-row monitor's work area stops 80 device rows above its bottom edge (taskbar).
+        let rows = vec![crate::platform::WindowsPlacementRow {
+            mapping: crosspane_render::proxy::HostMonitorMapping {
+                id: display.id.0,
+                native_id: "fixture".into(),
+                geometry: display.geometry,
+                physical_origin: (1920, 0).into(),
+            },
+            rc_monitor: [1920, 0, 3840, 2160],
+            rc_work: [1920, 0, 3840, 2080],
         }];
-        rig.agent.platform.host_placement_mapping = Some(Arc::new(move || Some(rows.clone())));
+        rig.agent.platform.windows_placement_rows = Some(Arc::new(move || Some(rows.clone())));
+        let size = PixelSize::new(400, 300);
         let place = ProxyPlacement {
             display: DisplayId(42),
             x: 200,
             y: 200,
             drag: false,
         };
-        let point = rig.agent.windows_proxy_place(Some(place)).unwrap().content;
-        assert_eq!((point.x, point.y), (2020.0, 100.0));
-        assert!(rig.agent.windows_proxy_place(None).is_none());
+        let content = |rig: &Rig, place: ProxyPlacement| {
+            let point = rig
+                .agent
+                .windows_proxy_place(Some(place), size)
+                .unwrap()
+                .content;
+            (point.x, point.y)
+        };
+        assert_eq!(content(&rig, place), (2020.0, 100.0));
+        // Low: the window stays above the taskbar (its bottom edge at 2080 device rows).
+        assert_eq!(
+            content(&rig, ProxyPlacement { y: 2000, ..place }),
+            (2020.0, 890.0)
+        );
+        // High: the title bar stays below the work area's top edge (the 32 logical px reserve).
+        assert_eq!(
+            content(&rig, ProxyPlacement { y: 0, ..place }),
+            (2020.0, 32.0)
+        );
+        // Right: the window stays inside the work area's right edge.
+        assert_eq!(
+            content(&rig, ProxyPlacement { x: 1900, ..place }),
+            (2680.0, 100.0)
+        );
+        assert!(rig.agent.windows_proxy_place(None, size).is_none());
         for invalid in [
             ProxyPlacement {
                 display: DisplayId(43),
@@ -9572,12 +9620,12 @@ mod audio_tests {
             ProxyPlacement { x: -1, ..place },
             ProxyPlacement { x: 1920, ..place },
         ] {
-            assert!(rig.agent.windows_proxy_place(Some(invalid)).is_none());
+            assert!(rig.agent.windows_proxy_place(Some(invalid), size).is_none());
         }
         rig.agent.local_displays[0].geometry.scale = 1.0;
-        assert!(rig.agent.windows_proxy_place(Some(place)).is_none());
-        rig.agent.platform.host_placement_mapping = Some(Arc::new(|| None));
-        assert!(rig.agent.windows_proxy_place(Some(place)).is_none());
+        assert!(rig.agent.windows_proxy_place(Some(place), size).is_none());
+        rig.agent.platform.windows_placement_rows = Some(Arc::new(|| None));
+        assert!(rig.agent.windows_proxy_place(Some(place), size).is_none());
     }
 
     #[test]
