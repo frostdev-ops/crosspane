@@ -234,7 +234,8 @@ pub(crate) mod native {
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
             FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
-            FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+            FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+            FileRenameInformation, NtCreateFile, NtSetInformationFile,
         },
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -1223,43 +1224,10 @@ pub(crate) mod native {
                 return Err(NativeError::Foreign);
             }
             let units: Vec<u16> = name.as_str().encode_utf16().collect();
-            let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-            let length = offset
-                .checked_add(units.len().checked_mul(2).ok_or(NativeError::Invalid)?)
-                .ok_or(NativeError::Invalid)?;
-            let mut buffer = vec![
-                0u64;
-                length
-                    .max(std::mem::size_of::<FILE_RENAME_INFO>())
-                    .div_ceil(8)
-            ];
-            let pointer = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-            // SAFETY: aligned allocation covers the SDK fixed header and complete variable name;
-            // relative single component is bound to our retained private directory handle.
-            unsafe {
-                (*pointer).Anonymous.ReplaceIfExists = true;
-                (*pointer).RootDirectory = self.file()?.as_raw_handle();
-                (*pointer).FileNameLength = (units.len() * 2) as u32;
-                std::ptr::copy_nonoverlapping(
-                    units.as_ptr(),
-                    buffer.as_mut_ptr().cast::<u8>().add(offset).cast::<u16>(),
-                    units.len(),
-                );
-            }
             deadline.check()?;
-            // SAFETY: retained own source has DELETE access; one same-volume rename with no copy
-            // fallback, target paths/streams excluded. Errors are inspected rather than retried.
-            if unsafe {
-                SetFileInformationByHandle(
-                    source.as_raw_handle(),
-                    FileRenameInfo,
-                    pointer.cast(),
-                    length as u32,
-                )
-            } == 0
-            {
-                return Err(last_error());
-            }
+            // Retained own source (DELETE access) moves under the private directory handle with
+            // ReplaceIfExists; see rename_relative for the same-volume, no-fallback reasoning.
+            rename_relative(source, self.file()?, &units, true)?;
             deadline.check()?;
             Ok(())
         }
@@ -2365,43 +2333,149 @@ pub(crate) mod native {
     ) -> NativeResult<()> {
         ComponentName::new(leaf)?;
         let units: Vec<u16> = leaf.encode_utf16().collect();
-        let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-        let length = offset
-            .checked_add(units.len() * 2)
-            .ok_or(NativeError::Invalid)?;
+        deadline.check()?;
+        // ReplaceIfExists=false preserves backup collisions and loaded-image sharing refusal.
+        // Retained source with DELETE, same-volume root, no following/copy/overwrite fallback.
+        rename_relative(source, destination.file()?, &units, false)?;
+        deadline.check()
+    }
+    /// Builds the `FILE_RENAME_INFORMATION` buffer for one relative component under `root`.
+    /// Pure: nothing is opened and `root` is stored, never dereferenced. Returns u64-backed
+    /// storage (the header is aligned) and the length to pass to the native call: the header up
+    /// to the name plus the name bytes, with no trailing NUL.
+    fn rename_information(
+        root: HANDLE,
+        units: &[u16],
+        replace: bool,
+    ) -> NativeResult<(Vec<u64>, u32)> {
+        if units.is_empty() {
+            return Err(NativeError::Invalid);
+        }
+        let offset = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+        let name_bytes = units.len().checked_mul(2).ok_or(NativeError::Invalid)?;
+        let length = offset.checked_add(name_bytes).ok_or(NativeError::Invalid)?;
+        let name_length = u32::try_from(name_bytes).map_err(|_| NativeError::Invalid)?;
+        let total = u32::try_from(length).map_err(|_| NativeError::Invalid)?;
         let mut buffer = vec![
             0u64;
             length
-                .max(std::mem::size_of::<FILE_RENAME_INFO>())
+                .max(std::mem::size_of::<FILE_RENAME_INFORMATION>())
                 .div_ceil(8)
         ];
-        let pointer = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-        // SAFETY: aligned complete variable buffer; single checked component under retained root.
-        // ReplaceIfExists=false preserves backup collisions and loaded-image sharing refusal.
+        let base = buffer.as_mut_ptr();
+        // SAFETY: aligned zeroed allocation covers the SDK fixed header and the complete variable
+        // name; the name is written at FileName, inside `length`. Root is stored only and stays
+        // owned by the caller. One base pointer is used for both the header and the name.
         unsafe {
-            (*pointer).Anonymous.ReplaceIfExists = false;
-            (*pointer).RootDirectory = destination.file()?.as_raw_handle();
-            (*pointer).FileNameLength = (units.len() * 2) as u32;
+            let header = base.cast::<FILE_RENAME_INFORMATION>();
+            (*header).Anonymous.ReplaceIfExists = replace;
+            (*header).RootDirectory = root;
+            (*header).FileNameLength = name_length;
             std::ptr::copy_nonoverlapping(
                 units.as_ptr(),
-                buffer.as_mut_ptr().cast::<u8>().add(offset).cast::<u16>(),
+                base.cast::<u8>().add(offset).cast::<u16>(),
                 units.len(),
             );
         }
-        deadline.check()?;
-        // SAFETY: retained source with DELETE, same-volume root, no following/copy/overwrite fallback.
-        if unsafe {
-            SetFileInformationByHandle(
+        Ok((buffer, total))
+    }
+    /// Renames `source` to one relative component under the retained `directory`.
+    /// `SetFileInformationByHandle(FileRenameInfo)` rejects a non-NULL RootDirectory with
+    /// ERROR_INVALID_PARAMETER on Windows 11, so the handle-relative rename uses
+    /// `NtSetInformationFile(FileRenameInformation)`, which keeps the same directory-handle
+    /// binding. One call: no retry, no copy, no overwrite or path fallback; errors are inspected.
+    fn rename_relative(
+        source: &File,
+        directory: &File,
+        units: &[u16],
+        replace: bool,
+    ) -> NativeResult<()> {
+        let (buffer, length) = rename_information(directory.as_raw_handle(), units, replace)?;
+        let mut status_block = IO_STATUS_BLOCK::default();
+        // SAFETY: retained source has DELETE access; `directory` is a live retained handle that
+        // outlives this synchronous call; `buffer` is a complete FILE_RENAME_INFORMATION of exactly
+        // `length` bytes; `status_block` is a valid out-parameter. Same-volume rename, no copy.
+        let status = unsafe {
+            NtSetInformationFile(
                 source.as_raw_handle(),
-                FileRenameInfo,
-                pointer.cast(),
-                length as u32,
+                &mut status_block,
+                buffer.as_ptr().cast(),
+                length,
+                FileRenameInformation,
             )
-        } == 0
-        {
-            return Err(last_error());
+        };
+        if status != STATUS_SUCCESS {
+            // SAFETY: NTSTATUS conversion is a public stateless SDK call, not a retry.
+            return Err(error(unsafe { RtlNtStatusToDosError(status) }));
         }
-        deadline.check()
+        Ok(())
+    }
+    #[cfg(test)]
+    mod rename_tests {
+        use super::*;
+
+        /// Fixed non-null sentinel: the builder stores the handle and never dereferences it.
+        fn sample_root() -> HANDLE {
+            std::ptr::without_provenance_mut(0x5a5a)
+        }
+
+        fn units(text: &str) -> Vec<u16> {
+            text.encode_utf16().collect()
+        }
+
+        /// The first `length` bytes of the buffer, as the native call reads them.
+        fn buffer_bytes(buffer: &[u64], length: u32) -> Vec<u8> {
+            buffer
+                .iter()
+                .flat_map(|word| word.to_ne_bytes())
+                .take(length as usize)
+                .collect()
+        }
+
+        #[test]
+        fn rename_information_copies_header_root_and_name_exactly() {
+            let name = units("record-temp-1.json");
+            let root = sample_root();
+            let Ok((buffer, length)) = rename_information(root, &name, true) else {
+                panic!("a valid relative name must build");
+            };
+            let offset = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+            // Total length is the header up to the name plus exactly the name bytes.
+            assert_eq!(length as usize, offset + name.len() * 2);
+            assert!(buffer.len() * 8 >= std::mem::size_of::<FILE_RENAME_INFORMATION>());
+            // SAFETY: the allocation holds at least size_of the header (asserted above) and is
+            // u64-aligned, so reading one header value from its start is in bounds and aligned.
+            let header = unsafe { buffer.as_ptr().cast::<FILE_RENAME_INFORMATION>().read() };
+            assert_eq!(header.RootDirectory, root);
+            assert_eq!(header.FileNameLength as usize, name.len() * 2);
+            let bytes = buffer_bytes(&buffer, length);
+            // ReplaceIfExists is the bool at the start of the union, so byte 0 is 1 here.
+            assert_eq!(bytes[0], 1);
+            let expected: Vec<u8> = name.iter().flat_map(|unit| unit.to_ne_bytes()).collect();
+            assert_eq!(&bytes[offset..], expected.as_slice());
+        }
+
+        #[test]
+        fn rename_information_clears_replace_when_collisions_must_fail() {
+            let name = units("backup.dll");
+            let Ok((buffer, length)) = rename_information(sample_root(), &name, false) else {
+                panic!("a valid relative name must build");
+            };
+            let offset = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+            let bytes = buffer_bytes(&buffer, length);
+            assert_eq!(bytes[0], 0);
+            assert_eq!(length as usize, offset + name.len() * 2);
+            let expected: Vec<u8> = name.iter().flat_map(|unit| unit.to_ne_bytes()).collect();
+            assert_eq!(&bytes[offset..], expected.as_slice());
+        }
+
+        #[test]
+        fn rename_information_refuses_an_empty_name() {
+            assert!(matches!(
+                rename_information(sample_root(), &[], true),
+                Err(NativeError::Invalid)
+            ));
+        }
     }
     fn entries(file: &File, deadline: &Deadline) -> NativeResult<Vec<String>> {
         let mut output = Vec::new();
