@@ -536,6 +536,296 @@ impl SpeakerMixer {
     }
 }
 
+/// A reopen attempt may start at most this many times per [`REOPEN_WINDOW`] for one stream.
+pub const REOPEN_MAX_ATTEMPTS: usize = 5;
+/// The sliding window over which [`REOPEN_MAX_ATTEMPTS`] is counted.
+pub const REOPEN_WINDOW: Duration = Duration::from_secs(60);
+const REOPEN_BACKOFF_BASE: Duration = Duration::from_millis(50);
+const REOPEN_BACKOFF_CAP: Duration = Duration::from_millis(1_600);
+
+/// What the owner of a render stream does about the next reopen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReopenStep {
+    /// Wait this long (it also coalesces a burst of notifications), then attempt the reopen.
+    Attempt { after: Duration },
+    /// The per-minute budget is spent: end the stream exactly as a device loss ended it before.
+    GiveUp,
+}
+
+/// Bounded reopen policy for one stream: at most [`REOPEN_MAX_ATTEMPTS`] attempts in any
+/// [`REOPEN_WINDOW`], with an exponential backoff (50 ms doubling, capped) between consecutive
+/// failed attempts. Every attempt, successful or not, counts against the budget, so a flapping
+/// device cannot make a stream reopen forever. Pure: callers pass the clock.
+#[derive(Debug)]
+#[allow(dead_code)] // Used by the Windows adapter; its policy tests also run on other hosts.
+pub struct ReopenLimiter {
+    starts: [Option<Instant>; REOPEN_MAX_ATTEMPTS],
+    next_slot: usize,
+    failures: u32,
+}
+impl Default for ReopenLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[allow(dead_code)]
+impl ReopenLimiter {
+    pub fn new() -> Self {
+        Self {
+            starts: [None; REOPEN_MAX_ATTEMPTS],
+            next_slot: 0,
+            failures: 0,
+        }
+    }
+    /// Delay before the attempt that follows `failures` consecutive failures.
+    pub fn backoff(failures: u32) -> Duration {
+        REOPEN_BACKOFF_BASE
+            .saturating_mul(1u32 << failures.min(10))
+            .min(REOPEN_BACKOFF_CAP)
+    }
+    /// Plans the next attempt at `now`. On [`ReopenStep::Attempt`] the attempt is recorded as
+    /// starting at `now + after`, the instant at which the budget is judged.
+    pub fn next(&mut self, now: Instant) -> ReopenStep {
+        let after = Self::backoff(self.failures);
+        let at = now + after;
+        let recent = self
+            .starts
+            .iter()
+            .flatten()
+            .filter(|start| at.saturating_duration_since(**start) < REOPEN_WINDOW)
+            .count();
+        if recent >= REOPEN_MAX_ATTEMPTS {
+            return ReopenStep::GiveUp;
+        }
+        self.starts[self.next_slot] = Some(at);
+        self.next_slot = (self.next_slot + 1) % REOPEN_MAX_ATTEMPTS;
+        ReopenStep::Attempt { after }
+    }
+    /// The last planned attempt opened a client: the next change starts again without backoff.
+    pub fn succeeded(&mut self) {
+        self.failures = 0;
+    }
+    /// The last planned attempt failed: lengthen the next backoff.
+    pub fn failed(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+    }
+}
+
+/// One MMDevice notification, reduced to the facts the relevance decision needs. Endpoint IDs are
+/// UTF-16 without their terminator; contents are compared, never parsed or logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum EndpointEvent<'a> {
+    /// `OnDefaultDeviceChanged`; `id` is `None` when no default endpoint remains.
+    DefaultChanged {
+        render: bool,
+        console: bool,
+        id: Option<&'a [u16]>,
+    },
+    /// `OnDeviceStateChanged`; `active` is whether the new state is `DEVICE_STATE_ACTIVE`.
+    State { id: &'a [u16], active: bool },
+    /// `OnDeviceRemoved`.
+    Removed { id: &'a [u16] },
+    /// `OnPropertyValueChanged`: conservatively invalidates the negotiated mix of that endpoint.
+    Property { id: &'a [u16] },
+}
+
+/// True when `event` means the stream's endpoint `current` (the console render default captured
+/// at open) is no longer the right one: another endpoint became the default, or `current` left the
+/// active state, was removed, or changed properties. Capture/communications changes are not ours.
+#[allow(dead_code)]
+pub fn endpoint_event_relevant(current: &[u16], event: EndpointEvent<'_>) -> bool {
+    match event {
+        EndpointEvent::DefaultChanged {
+            render,
+            console,
+            id,
+        } => render && console && id != Some(current),
+        EndpointEvent::State { id, active } => id == current && !active,
+        EndpointEvent::Removed { id } | EndpointEvent::Property { id } => id == current,
+    }
+}
+
+/// Latch from the notification thread to the stream owner. The callback only raises it (and
+/// signals the owner's event); the owner alone clears it and calls into WASAPI.
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+pub struct ChangeSignal(AtomicBool);
+#[allow(dead_code)]
+impl ChangeSignal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn raise(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+    /// Consumes a raised change; true at most once per `raise` burst.
+    pub fn take(&self) -> bool {
+        self.0.swap(false, Ordering::AcqRel)
+    }
+}
+
+#[cfg(test)]
+mod reopen_tests {
+    use super::*;
+
+    fn ids(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    #[test]
+    fn backoff_doubles_from_fifty_milliseconds_and_caps() {
+        let steps: Vec<_> = (0..8).map(ReopenLimiter::backoff).collect();
+        assert_eq!(
+            steps,
+            [50, 100, 200, 400, 800, 1_600, 1_600, 1_600].map(Duration::from_millis)
+        );
+        assert_eq!(ReopenLimiter::backoff(u32::MAX), REOPEN_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn attempts_are_capped_per_minute_and_recover_after_the_window() {
+        let base = Instant::now();
+        let mut limiter = ReopenLimiter::new();
+        for _ in 0..REOPEN_MAX_ATTEMPTS {
+            assert!(matches!(limiter.next(base), ReopenStep::Attempt { .. }));
+            limiter.succeeded();
+        }
+        assert_eq!(limiter.next(base), ReopenStep::GiveUp);
+        assert_eq!(
+            limiter.next(base + Duration::from_secs(59)),
+            ReopenStep::GiveUp
+        );
+        // Every recorded attempt has left the window, so the budget is available again.
+        assert!(matches!(
+            limiter.next(base + Duration::from_secs(61)),
+            ReopenStep::Attempt { .. }
+        ));
+    }
+
+    #[test]
+    fn failures_back_off_and_success_resets_them() {
+        let now = Instant::now();
+        let mut limiter = ReopenLimiter::new();
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            let ReopenStep::Attempt { after } = limiter.next(now) else {
+                panic!("budget unexpectedly spent");
+            };
+            waits.push(after);
+            limiter.failed();
+        }
+        assert_eq!(waits, [50, 100, 200].map(Duration::from_millis));
+        limiter.succeeded();
+        assert_eq!(
+            limiter.next(now),
+            ReopenStep::Attempt {
+                after: Duration::from_millis(50)
+            }
+        );
+    }
+
+    #[test]
+    fn five_consecutive_failures_exhaust_the_episode_then_give_up() {
+        let now = Instant::now();
+        let mut limiter = ReopenLimiter::new();
+        for _ in 0..REOPEN_MAX_ATTEMPTS {
+            assert!(matches!(limiter.next(now), ReopenStep::Attempt { .. }));
+            limiter.failed();
+        }
+        assert_eq!(limiter.next(now), ReopenStep::GiveUp);
+    }
+
+    #[test]
+    fn default_change_is_relevant_only_for_console_render_to_another_endpoint() {
+        let (speakers, headset) = (ids("{0.0.0.00000000}.speakers"), ids("{0.0.0.00000000}.hs"));
+        let default = |render, console, id| EndpointEvent::DefaultChanged {
+            render,
+            console,
+            id,
+        };
+        assert!(endpoint_event_relevant(
+            &speakers,
+            default(true, true, Some(&headset))
+        ));
+        // No default endpoint remains: the stream cannot stay where it is.
+        assert!(endpoint_event_relevant(
+            &speakers,
+            default(true, true, None)
+        ));
+        // The notification confirms the endpoint already in use, or is for another flow or role.
+        assert!(!endpoint_event_relevant(
+            &speakers,
+            default(true, true, Some(&speakers))
+        ));
+        assert!(!endpoint_event_relevant(
+            &speakers,
+            default(false, true, Some(&headset))
+        ));
+        assert!(!endpoint_event_relevant(
+            &speakers,
+            default(true, false, Some(&headset))
+        ));
+    }
+
+    #[test]
+    fn state_removal_and_property_changes_matter_only_for_the_active_endpoint() {
+        let (speakers, headset) = (ids("speakers"), ids("headset"));
+        for other in [
+            EndpointEvent::State {
+                id: &headset,
+                active: false,
+            },
+            EndpointEvent::Removed { id: &headset },
+            EndpointEvent::Property { id: &headset },
+        ] {
+            assert!(!endpoint_event_relevant(&speakers, other));
+        }
+        assert!(endpoint_event_relevant(
+            &speakers,
+            EndpointEvent::State {
+                id: &speakers,
+                active: false
+            }
+        ));
+        assert!(!endpoint_event_relevant(
+            &speakers,
+            EndpointEvent::State {
+                id: &speakers,
+                active: true
+            }
+        ));
+        assert!(endpoint_event_relevant(
+            &speakers,
+            EndpointEvent::Removed { id: &speakers }
+        ));
+        assert!(endpoint_event_relevant(
+            &speakers,
+            EndpointEvent::Property { id: &speakers }
+        ));
+        // A prefix or extension of our ID is a different endpoint.
+        let longer = ids("speakers2");
+        assert!(!endpoint_event_relevant(
+            &speakers,
+            EndpointEvent::Removed { id: &longer }
+        ));
+        assert!(!endpoint_event_relevant(
+            &speakers,
+            EndpointEvent::Removed { id: &speakers[..4] }
+        ));
+    }
+
+    #[test]
+    fn change_signal_coalesces_a_burst_into_one_take() {
+        let signal = ChangeSignal::new();
+        assert!(!signal.take());
+        signal.raise();
+        signal.raise();
+        assert!(signal.take());
+        assert!(!signal.take());
+    }
+}
+
 #[cfg(test)]
 mod borrowed_activation_tests {
     use super::BorrowedDescriptor;
