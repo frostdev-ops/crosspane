@@ -409,6 +409,16 @@ pub(crate) fn audio_enabled() -> bool {
     std::env::var("CROSSPANE_AUDIO").as_deref() != Ok("0")
 }
 
+/// Whether this node can capture a projected app's sound ("sound follows the window"):
+/// `audio_running` (audio is on and its backend opened, i.e. the audio worker exists) on an OS whose
+/// backend implements `AudioHost::set_peer_sources`. That is Windows (per-process loopback); the
+/// macOS and Linux backends accept the call and do nothing, so those nodes only ever receive
+/// projected sound. The engine sends no per-projection sources, and opens no projection audio
+/// stream, on a node that reports `false`.
+pub(crate) fn projection_audio_capture(audio_running: bool) -> bool {
+    cfg!(windows) && audio_running
+}
+
 /// This OS's audio backend for speaker v0 (AUDIO-v0 §4): PipeWire on Linux, CoreAudio on macOS.
 /// Constructing it connects to the audio server, so with `CROSSPANE_AUDIO=0` nothing is touched.
 /// `None` (and a log line) when it can't start: the node then doesn't advertise `audio`, and peers
@@ -3249,6 +3259,19 @@ mod acceptance_bind_tests {
             assert!(acceptance_bind_ip(&config, false).is_err());
             assert!(acceptance_bind_ip(&config, true).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod projection_audio_capture_tests {
+    use super::projection_audio_capture;
+
+    #[test]
+    fn capture_needs_a_running_worker_and_a_backend_that_can_capture_processes() {
+        // Without a worker (audio off, or no backend) no OS can capture.
+        assert!(!projection_audio_capture(false));
+        // With one, only Windows' per-process loopback can.
+        assert_eq!(projection_audio_capture(true), cfg!(windows));
     }
 }
 

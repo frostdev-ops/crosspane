@@ -24,6 +24,10 @@ message ControlMessage {
     ClipWithdraw clip_withdraw = 19;
     ClipFetch clip_fetch = 20;
     ClipFetchFailed clip_fetch_failed = 21;
+    // Source -> destination: stereo 48 kHz mix of the sender's windows projected to the receiver.
+    // Sent only when audio/1 is negotiated. Admitted under a live projection from the sender,
+    // never under AudioSpeaker. AudioOpened/AudioRefused/AudioClose/datagrams as AudioOpen.
+    AudioStream projection_audio_open = 22;
   }
 }
 

@@ -307,30 +307,51 @@ whose monitor list contains only `WAYLAND-*` outputs. See the
 `crosspanectl status` shows peers, layout, projections (with received frames), missing
 permissions and recent notices.
 
-## Audio (speakers, v0)
+## Audio (speakers and projected apps, v0)
 
-A machine can play its sound on a paired machine's speakers.
-Speakers only: microphones are not shared yet.
+A machine can play its sound on a paired machine's speakers, and a projected window brings its app's
+sound along. Speakers only: microphones are not shared yet.
 
 - **Use it:** each paired machine that has an audio backend shows a virtual output called
   "⟨peer⟩ speakers" (on Linux, a PipeWire sink; on the Mac, the Crosspane audio driver's "Crosspane
   speakers", once the owner has installed it). Pick it in the system's sound settings or in an app.
   Sound reaches the peer only while an app plays into it, and comes out of the peer's default
   output.
+- **Projected apps bring their sound.** When a machine accepts a projected window (it allowed the
+  source to present windows here: `crosspanectl allow <source> present`), that window's app plays
+  its sound on that machine. No `speaker` grant is needed for it, and there is no app list to set
+  up. A pulled window needs the same `present` grant and brings its sound the same way.
+- **`speaker` is for whole-machine audio:** what a Mac or Linux machine plays into its virtual
+  "⟨peer⟩ speakers" output (see Use it). Windows has no such output yet, so a Windows machine does
+  not send whole-machine sound.
 - **On Windows** there is no virtual output yet, so the peer's speakers don't appear in the sound
-  settings. A Windows machine plays a peer's sound on its default output (shared playback). As a
-  source, it sends the sound of the app behind a window projected to that peer, captured from that
-  app's process tree. Capturing doesn't mute the app: its sound still plays on this machine too.
-- **The speakers' owner decides.** Both sides are off by default: on the machine whose speakers
-  should play, run `crosspanectl allow <peer> speaker` (`--off` to withdraw). Withdrawing it,
-  locking the screen, `crosspanectl panic`, a lost connection or revoking the peer stops the sound
-  within a second. After an unlock, an app has to start playing again.
+  settings. A Windows machine plays a peer's sound on its default output (shared playback).
+- **Windows sources** send only projected apps' sound, taken from the window's process and the
+  processes it started, so browsers and Electron apps work. Projecting one window sends its whole
+  app's sound. The app stays audible on the source too: the sound is copied, not moved. These get
+  no projected sound: packaged (UWP) apps whose window belongs to `ApplicationFrameHost.exe`, apps
+  that play through a separate service or broker process, exclusive-mode audio, and Windows builds
+  older than 20348 (every Windows 10 build; all Windows 11 builds qualify).
+- **Versions.** Both machines must run an agent with projected-app sound (`audio/1` in its Hello).
+  With an older peer, a Windows source falls back to the old rule: its sound goes only if the
+  machine playing it has granted `speaker` to that Windows machine. Mac and Linux sources are
+  unchanged.
+- **The speakers' owner decides.** Whole-machine speaker audio is off by default on both sides: on
+  the machine whose speakers should play, run `crosspanectl allow <peer> speaker` (`--off` to
+  withdraw). Withdrawing it, locking the screen, `crosspanectl panic`, a lost connection or revoking
+  the peer stops that sound within a second. After an unlock, an app has to start playing again.
+- **Projected sound follows the projection.** It stops as soon as the window is returned or closed,
+  `present` is revoked, the screen locks, `crosspanectl panic` ends the projection, or the 20 s
+  reconnect grace runs out. A dropped connection stops it too, and it returns if the projection
+  resumes within the grace. Revoking `speaker` does not stop it; ending the projection does. After
+  an unlock, project the window again to hear it.
 - **`crosspanectl allow <peer> mic`** is accepted and stored, and answers that microphones are not
   supported yet: no microphone is ever opened. An app recording from "⟨peer⟩ microphone" hears
   silence, and the agent shows a refusal notice.
 - **See it:** `crosspanectl status` shows, per peer, what it may do here (`speaker`, `mic`, ...) and
-  whether it is playing on this machine's speakers; the tray / menu-bar menu lists the peers
-  playing now, and its icon shows the active state.
+  whether it is playing on this machine's speakers. The tray / menu-bar menu lists a peer whose
+  projected app is playing the same way as speaker audio ("⟨peer⟩ is playing sound on these
+  speakers"), and its icon shows the active state.
 - **Needs** an audio backend at agent start: PipeWire (Linux), CoreAudio (Mac) or the Windows audio
   stack (process-tree capture needs Windows build 20348 or later). The agent logs "audio sharing on"
   (or why not) and then advertises the `audio` feature. `CROSSPANE_AUDIO=0` in the agent's

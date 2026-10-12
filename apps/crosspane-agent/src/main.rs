@@ -392,6 +392,17 @@ fn append_drag_features(features: &mut Vec<String>, across: bool) {
     }
 }
 
+/// Advertise audio exactly when the audio worker runs: `audio` (whole-machine speakers) and
+/// `audio/1` ("sound follows the window"). Every OS advertises `audio/1` with `audio`, because the
+/// destination side (admitting and playing a peer's projected-app sound) is OS-free; only Windows
+/// also captures such sound, which the agent tells the engine separately.
+fn append_audio_features(features: &mut Vec<String>, audio_running: bool) {
+    if audio_running {
+        features.push("audio".to_owned());
+        features.push(crosspane_protocol::audio::PROJECTION_AUDIO_FEATURE.to_owned());
+    }
+}
+
 fn start_agent(
     paths: &Paths,
     lifecycle: &mut lifecycle::Lifecycle,
@@ -540,9 +551,7 @@ fn start_agent(
     // once the transport is bound; nothing is sent before a peer's link exists.
     let transport_slot = Arc::new(std::sync::OnceLock::new());
     let audio = start_audio(&platform, &transport_slot, &tx);
-    if audio.is_some() {
-        features.push("audio".to_owned());
-    }
+    append_audio_features(&mut features, audio.is_some());
     // `start_agent` runs on process MAIN before AppKit's loop; construct the facade here,
     // then transfer its Rust handle to the serialized worker. Advertise only after readiness.
     #[cfg(windows)]
@@ -2874,5 +2883,25 @@ mod drag_in_wiring_tests {
             }
             assert_eq!(features, expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod audio_features_tests {
+    #[test]
+    fn projection_audio_is_advertised_with_audio_and_only_with_audio() {
+        let mut off = vec!["e1".to_owned()];
+        super::append_audio_features(&mut off, false);
+        assert_eq!(off, ["e1"]);
+        let mut on = vec!["e1".to_owned()];
+        super::append_audio_features(&mut on, true);
+        assert_eq!(
+            on,
+            [
+                "e1",
+                "audio",
+                crosspane_protocol::audio::PROJECTION_AUDIO_FEATURE
+            ]
+        );
     }
 }

@@ -19,7 +19,7 @@ use crosspane_platform::{
     CaptureEvent, CaptureTarget, EventSink, FrameEvent, LinkClass, Permission, PermissionState,
     PlatformError, StreamId, WindowEvent, WindowInfo, WindowRole, WindowState,
 };
-use crosspane_protocol::audio::AudioPacket;
+use crosspane_protocol::audio::{AudioPacket, PROJECTION_AUDIO_FEATURE};
 use crosspane_protocol::clip::{CLIP_FEATURE, ClipDataHeader};
 use crosspane_protocol::link::{LinkEvent, PeerLink};
 use crosspane_protocol::msg::{
@@ -159,6 +159,9 @@ struct PeerInfo {
     rtt: Option<Duration>,
     /// What the engine was last told about audio with this peer (`Input::AudioPeer`).
     audio: bool,
+    /// What the engine was last told about projection audio ("sound follows the window") with
+    /// this peer (`Input::ProjectionAudioPeer`).
+    projection_audio: bool,
     drag: bool,
     /// Last bilateral drag/1 availability fed to the engine.
     drag_in: bool,
@@ -189,6 +192,15 @@ fn discovery_switched_off(value: Option<&str>) -> bool {
 fn audio_negotiated(local_features: &[String], peer_features: &[String]) -> bool {
     let has = |features: &[String]| features.iter().any(|f| f == "audio");
     has(local_features) && has(peer_features)
+}
+
+/// Whether projection audio ("sound follows the window") with a peer is available: audio is
+/// negotiated and both `Hello`s also advertise [`PROJECTION_AUDIO_FEATURE`]. The engine is only
+/// told of it for a peer that is already an audio peer, so an old peer (which never advertises
+/// `audio/1`) only ever gets the whole-machine `AudioOpen`.
+fn projection_audio_negotiated(local_features: &[String], peer_features: &[String]) -> bool {
+    let has = |features: &[String]| features.iter().any(|f| f == PROJECTION_AUDIO_FEATURE);
+    audio_negotiated(local_features, peer_features) && has(local_features) && has(peer_features)
 }
 
 /// The audio worker as the loop drives it. [`AudioWorker`] is the one implementation; the tests at
@@ -692,7 +704,6 @@ pub struct Agent {
     revocations: crate::revocations::Issued,
     /// The audio worker (WP-3.6d); `None` when audio sharing is off or has no backend.
     audio: Option<Box<dyn AudioPlane>>,
-    audio_sources: crate::audio::SourceCatalogue,
     clipboard: Option<crate::clipboard::Worker>,
     /// Accepted local promises only, to retire this connection's transport work on withdrawal.
     clip_promises: BTreeMap<u64, NodeId>,
@@ -1057,7 +1068,6 @@ impl Agent {
             port: e2.port,
             revocations: e2.revocations,
             audio,
-            audio_sources: crate::audio::SourceCatalogue::default(),
             clipboard: None,
             clip_promises: BTreeMap::new(),
             clip_readers: BTreeSet::new(),
@@ -1117,9 +1127,7 @@ impl Agent {
         self.home_startup();
         self.execute(startup);
         self.feed(Input::LocalDisplays(self.local_displays.clone()));
-        // Speaker v0 hosts no microphone: the worker refuses to open one, and the engine refuses
-        // microphone sessions without admitting them or showing an indicator (AUDIO-v0 §1).
-        self.feed(Input::AudioMicrophoneSupport { available: false });
+        self.feed_audio_support();
         self.send_grants();
         self.update_layout(false);
         // The first look at the backends: later differences advance `epochs.backends`.
@@ -1195,6 +1203,19 @@ impl Agent {
                 };
             }
         }
+    }
+
+    /// What this node's audio backend supports, told to the engine once at start (`run`).
+    fn feed_audio_support(&mut self) {
+        // Speaker v0 hosts no microphone: the worker refuses to open one, and the engine refuses
+        // microphone sessions without admitting them or showing an indicator (AUDIO-v0 §1).
+        self.feed(Input::AudioMicrophoneSupport { available: false });
+        // "Sound follows the window": whether this node can capture a projected app's sound. The
+        // engine decides, per projection and peer, which processes' sound goes where, and says so
+        // with `Output::AudioProjectionSources`; a node that cannot capture never gets one.
+        self.feed(Input::AudioProjectionCapture {
+            available: platform::projection_audio_capture(self.audio.is_some()),
+        });
     }
 
     /// The receive loop must wake for the watchdog even without engine deadlines or input.
@@ -1313,15 +1334,6 @@ impl Agent {
             _ => {}
         }
         self.revalidate_proxy_observation(&mut input);
-        // Already decoded and delivered through the transport's current-connection check.
-        self.audio_sources.observe(&input);
-        let source_window = match &input {
-            Input::Parked {
-                window,
-                result: Ok(_),
-            } => Some(*window),
-            _ => None,
-        };
         if tracing::enabled!(tracing::Level::DEBUG) {
             log_input(&input);
         }
@@ -1355,8 +1367,6 @@ impl Agent {
             self.engine.controlled_by(),
         );
         let outputs = self.engine.handle(input, now);
-        self.audio_sources
-            .outputs(self.node, source_window, &outputs);
         if let Some(peer) = offering {
             for output in &outputs {
                 if let Output::ClipPromise { offer, .. } = output {
@@ -1373,26 +1383,8 @@ impl Agent {
         #[cfg(test)]
         self.emitted.extend(outputs.iter().cloned());
         self.execute(outputs);
-        self.sync_projection_audio();
         self.tracker.executed();
         self.flush_placements();
-    }
-
-    fn sync_projection_audio(&mut self) {
-        let changes = self.audio_sources.changes(self.node, |window| {
-            if !self.projectable_windows.contains(&window) {
-                return None;
-            }
-            self.placement
-                .windows
-                .get(&window)
-                .and_then(|info| info.pid)
-        });
-        if let Some(audio) = &self.audio {
-            for (peer, pids) in changes {
-                audio.set_peer_sources(peer, &pids);
-            }
-        }
     }
 
     /// A worker may have queued geometry before our synchronous move. Read back conflicting
@@ -2193,6 +2185,7 @@ impl Agent {
                 }
                 let peer = *peer;
                 self.feed(Input::Link(event));
+                self.sync_projection_audio_peer(peer);
                 self.sync_drag_peer(peer);
                 self.sync_drag_in_peer(peer);
                 return;
@@ -2234,6 +2227,7 @@ impl Agent {
         self.feed(Input::PeerUp { peer });
         // After `PeerUp`: the engine ignores audio availability for a peer that isn't up.
         self.sync_audio_peer(peer);
+        self.sync_projection_audio_peer(peer);
         self.sync_drag_peer(peer);
         self.sync_drag_in_peer(peer);
         self.sync_clip_peer(peer);
@@ -2304,6 +2298,7 @@ impl Agent {
         });
         self.feed(Input::AudioConnectionReplaced { peer });
         self.sync_audio_peer(peer);
+        self.sync_projection_audio_peer(peer);
         self.sync_drag_peer(peer);
         self.sync_drag_in_peer(peer);
         self.sync_clip_peer(peer);
@@ -2336,6 +2331,22 @@ impl Agent {
             name,
             available,
         });
+    }
+
+    /// Tell the engine whether projection audio ("sound follows the window") with `peer` is
+    /// available (an audio peer whose `Hello` and ours both advertise `audio/1`), when that
+    /// differs from what it was last told. Always after [`Self::sync_audio_peer`], which the
+    /// engine's availability here builds on.
+    fn sync_projection_audio_peer(&mut self, peer: NodeId) {
+        let Some(info) = self.peers.get_mut(&peer) else {
+            return;
+        };
+        let available =
+            info.connected && projection_audio_negotiated(&self.features, &info.features);
+        if info.projection_audio != available {
+            info.projection_audio = available;
+            self.feed(Input::ProjectionAudioPeer { peer, available });
+        }
     }
 
     fn sync_drag_peer(&mut self, peer: NodeId) {
@@ -3129,6 +3140,16 @@ impl Agent {
             | Output::CloseAudioPlayback { .. }
             | Output::StartAudioStream { .. }
             | Output::StopAudioStream { .. } => self.audio_output(output),
+            // "Sound follows the window": the engine's latest set of processes whose sound goes to
+            // `peer` (empty stops it). The worker keeps only the latest set per peer and holds it
+            // until the peer's virtual devices exist; it never blocks this loop. Without a worker
+            // there is nothing to capture, and the engine only asks when `AudioProjectionCapture`
+            // said there is.
+            Output::AudioProjectionSources { peer, pids } => {
+                if let Some(audio) = &self.audio {
+                    audio.set_peer_sources(peer, &pids);
+                }
+            }
             Output::AudioIndicators {
                 microphones,
                 speakers,
@@ -3454,10 +3475,12 @@ impl Agent {
             if let Some(link) = self.links.get_mut(&node) {
                 link.close("forgotten");
             }
-            // Retire both negotiated drag capabilities before forgetting their cached state.
+            // Retire the negotiated drag and projection-audio capabilities before forgetting their
+            // cached state.
             if let Some(info) = self.peers.get_mut(&node) {
                 info.connected = false;
             }
+            self.sync_projection_audio_peer(node);
             self.sync_drag_peer(node);
             self.sync_drag_in_peer(node);
             self.peers.remove(&node);
@@ -9529,6 +9552,287 @@ mod audio_tests {
         }
     }
 
+    /// "Sound follows the window": what the agent tells the engine and what it does with the
+    /// engine's answer. Which process's sound goes to which peer is the engine's decision (and its
+    /// tests'); these pin only the wiring, so they hold whatever that policy is.
+    mod projection_audio_wiring_tests {
+        use super::*;
+
+        const BOTH: &[&str] = &["e1", "audio", PROJECTION_AUDIO_FEATURE];
+
+        fn availability(inputs: &[Input], wanted: bool) -> usize {
+            inputs
+                .iter()
+                .filter(|input| {
+                    matches!(input,
+                        Input::ProjectionAudioPeer { available, .. } if *available == wanted)
+                })
+                .count()
+        }
+
+        fn position(inputs: &[Input], what: impl Fn(&Input) -> bool) -> usize {
+            inputs.iter().position(what).expect("the input was fed")
+        }
+
+        /// Every `set_peer_sources` the worker got, in order.
+        fn source_calls(rig: &Rig) -> Vec<(NodeId, Vec<u32>)> {
+            rig.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|call| match call {
+                    Call::Sources(peer, pids) => Some((*peer, pids.clone())),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn projection_audio_needs_audio_and_its_own_feature_on_both_sides() {
+            let both = features(BOTH);
+            let plain = features(&["e1", "audio"]);
+            let orphan = features(&["e1", PROJECTION_AUDIO_FEATURE]);
+            assert!(projection_audio_negotiated(&both, &both));
+            assert!(!projection_audio_negotiated(&both, &plain));
+            assert!(!projection_audio_negotiated(&plain, &both));
+            // `audio/1` means nothing without `audio` (the transport refuses audio then).
+            assert!(!projection_audio_negotiated(&both, &orphan));
+            assert!(!projection_audio_negotiated(&orphan, &both));
+            assert!(!projection_audio_negotiated(&orphan, &orphan));
+            assert!(!projection_audio_negotiated(&[], &both));
+            assert!(!projection_audio_negotiated(&both, &[]));
+            // The name is exact.
+            let near = features(&[
+                "audio", "audio/0", "audio/2", "audio/10", "Audio/1", "audio/1 ",
+            ]);
+            assert!(!projection_audio_negotiated(&both, &near));
+        }
+
+        #[test]
+        fn the_engine_hears_of_projection_audio_after_the_audio_peer_and_only_when_both_have_it() {
+            for local_audio in [false, true] {
+                for local_feature in [false, true] {
+                    for remote in [
+                        vec!["e1"],
+                        vec!["e1", "audio"],
+                        vec!["e1", PROJECTION_AUDIO_FEATURE],
+                        BOTH.to_vec(),
+                    ] {
+                        let mut r = rig(local_audio);
+                        if local_feature {
+                            r.agent.features.push(PROJECTION_AUDIO_FEATURE.into());
+                        }
+                        let wanted = local_audio
+                            && local_feature
+                            && remote.contains(&"audio")
+                            && remote.contains(&PROJECTION_AUDIO_FEATURE);
+                        let what = format!("{local_audio} {local_feature} {remote:?}");
+                        r.agent.fed.clear();
+                        r.hello(&remote);
+                        assert_eq!(
+                            availability(&r.agent.fed, true),
+                            usize::from(wanted),
+                            "{what}"
+                        );
+                        assert_eq!(availability(&r.agent.fed, false), 0, "{what}");
+                        if wanted {
+                            let up = position(&r.agent.fed, |i| matches!(i, Input::PeerUp { .. }));
+                            let audio = position(&r.agent.fed, |i| {
+                                matches!(
+                                    i,
+                                    Input::AudioPeer {
+                                        available: true,
+                                        ..
+                                    }
+                                )
+                            });
+                            let projection = position(&r.agent.fed, |i| {
+                                matches!(
+                                    i,
+                                    Input::ProjectionAudioPeer {
+                                        available: true,
+                                        ..
+                                    }
+                                )
+                            });
+                            assert!(up < audio && audio < projection, "{what}");
+                        }
+                        // Nothing more is said while the state doesn't change.
+                        r.agent.fed.clear();
+                        r.refresh(&remote);
+                        assert_eq!(availability(&r.agent.fed, true), 0, "{what}");
+                        assert_eq!(availability(&r.agent.fed, false), 0, "{what}");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn a_refresh_that_loses_the_feature_withdraws_it_and_one_that_returns_it_restores_it() {
+            let mut r = rig(true);
+            r.agent.features.push(PROJECTION_AUDIO_FEATURE.into());
+            r.hello(BOTH);
+            r.agent.fed.clear();
+            // A replacement connection whose peer no longer has `audio/1`.
+            r.refresh(&["e1", "audio"]);
+            assert_eq!(availability(&r.agent.fed, false), 1);
+            assert_eq!(availability(&r.agent.fed, true), 0);
+            // Audio itself is still available: only the new feature went.
+            assert!(
+                !r.agent
+                    .fed
+                    .iter()
+                    .any(|i| matches!(i, Input::AudioPeer { .. }))
+            );
+            r.agent.fed.clear();
+            r.refresh(BOTH);
+            assert_eq!(availability(&r.agent.fed, true), 1);
+            // The audio peer is told first on a refresh that changes both.
+            r.refresh(&["e1"]);
+            r.agent.fed.clear();
+            r.refresh(BOTH);
+            let audio = position(&r.agent.fed, |i| {
+                matches!(
+                    i,
+                    Input::AudioPeer {
+                        available: true,
+                        ..
+                    }
+                )
+            });
+            let projection = position(&r.agent.fed, |i| {
+                matches!(
+                    i,
+                    Input::ProjectionAudioPeer {
+                        available: true,
+                        ..
+                    }
+                )
+            });
+            assert!(audio < projection);
+        }
+
+        #[test]
+        fn a_closed_link_withdraws_it_after_the_close_and_a_new_link_restores_it() {
+            let mut r = rig(true);
+            r.agent.features.push(PROJECTION_AUDIO_FEATURE.into());
+            r.hello(BOTH);
+            r.agent.fed.clear();
+            r.close();
+            assert_eq!(availability(&r.agent.fed, false), 1);
+            let closed = position(&r.agent.fed, |i| {
+                matches!(i, Input::Link(LinkEvent::Closed { .. }))
+            });
+            let withdrawn = position(&r.agent.fed, |i| {
+                matches!(
+                    i,
+                    Input::ProjectionAudioPeer {
+                        available: false,
+                        ..
+                    }
+                )
+            });
+            assert!(closed < withdrawn);
+            // A second close says nothing more.
+            r.agent.fed.clear();
+            r.close();
+            assert_eq!(availability(&r.agent.fed, false), 0);
+            // A new link negotiates it again, from scratch.
+            r.agent.fed.clear();
+            r.hello(BOTH);
+            assert_eq!(availability(&r.agent.fed, true), 1);
+        }
+
+        #[test]
+        fn forgetting_or_revoking_a_peer_withdraws_it_before_the_cache_goes() {
+            for revoke in [false, true] {
+                let mut r = rig(true);
+                r.agent.features.push(PROJECTION_AUDIO_FEATURE.into());
+                r.hello(BOTH);
+                assert_eq!(availability(&r.agent.fed, true), 1);
+                r.agent.fed.clear();
+                let peer = "peer-name".into();
+                let response = r.agent.on_ctl(if revoke {
+                    Request::Revoke { peer }
+                } else {
+                    Request::Forget { peer }
+                });
+                assert!(response.ok, "{response:?}");
+                assert!(!r.agent.peers.contains_key(&r.peer));
+                assert_eq!(availability(&r.agent.fed, false), 1);
+                // The native link's later close doesn't publish it again.
+                r.close();
+                assert_eq!(availability(&r.agent.fed, false), 1);
+            }
+        }
+
+        #[test]
+        fn the_engines_source_sets_reach_the_worker_in_order_and_an_empty_set_stops_the_peer() {
+            let mut r = rig(true);
+            let (peer, other) = (r.peer, NodeId([9; 32]));
+            r.agent.execute(vec![
+                Output::AudioProjectionSources {
+                    peer,
+                    pids: vec![42, 7],
+                },
+                Output::AudioProjectionSources {
+                    peer: other,
+                    pids: vec![5],
+                },
+                Output::AudioProjectionSources { peer, pids: vec![] },
+            ]);
+            assert_eq!(
+                source_calls(&r),
+                [(peer, vec![42, 7]), (other, vec![5]), (peer, vec![])]
+            );
+            // They are not audio commands for the worker's data thread.
+            assert!(
+                r.calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|call| matches!(call, Call::Sources(..)))
+            );
+        }
+
+        #[test]
+        fn a_node_without_a_worker_has_nothing_to_capture_and_drops_the_sets() {
+            let mut r = rig(false);
+            let peer = r.peer;
+            r.agent.execute(vec![Output::AudioProjectionSources {
+                peer,
+                pids: vec![1],
+            }]);
+            assert!(r.calls.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn capture_support_is_told_to_the_engine_once_at_start_and_needs_the_worker_on_windows() {
+            for audio in [false, true] {
+                let mut r = rig(audio);
+                r.agent.fed.clear();
+                r.agent.feed_audio_support();
+                let told: Vec<bool> = r
+                    .agent
+                    .fed
+                    .iter()
+                    .filter_map(|input| match input {
+                        Input::AudioProjectionCapture { available } => Some(*available),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(told, [audio && cfg!(windows)]);
+                // Next to the microphone support the start already told the engine.
+                assert!(
+                    r.agent
+                        .fed
+                        .iter()
+                        .any(|i| matches!(i, Input::AudioMicrophoneSupport { available: false }))
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_hello_replaces_what_the_cache_knew_and_reports_changed_displays() {
         let mut info = PeerInfo::default();
@@ -9553,6 +9857,8 @@ mod audio_tests {
         Submit(Output),
         Packet(NodeId, AudioStreamId),
         Cancel(NodeId),
+        /// `set_peer_sources`: the latest projected-process set for a peer.
+        Sources(NodeId, Vec<u32>),
         Shutdown,
     }
 
@@ -9578,6 +9884,7 @@ mod audio_tests {
                 Call::Submit(_) => "other",
                 Call::Packet(..) => "packet",
                 Call::Cancel(_) => "cancel",
+                Call::Sources(..) => "sources",
                 Call::Shutdown => "shutdown",
             }
         }
@@ -9593,7 +9900,10 @@ mod audio_tests {
     }
 
     impl AudioPlane for Recorder {
-        fn set_peer_sources(&self, _peer: NodeId, _pids: &[u32]) {}
+        fn set_peer_sources(&self, peer: NodeId, pids: &[u32]) {
+            self.push(Call::Sources(peer, pids.to_vec()));
+        }
+
         fn submit(&self, output: Output) {
             self.push(Call::Submit(output));
         }
@@ -13319,6 +13629,7 @@ mod home_tests {
         h
     }
 
+    /// Records `set_peer_sources` and ignores everything else a worker is asked.
     type SourceCalls = Arc<Mutex<Vec<(NodeId, Vec<u32>)>>>;
     struct SourceRecorder(SourceCalls);
     impl AudioPlane for SourceRecorder {
@@ -13333,116 +13644,42 @@ mod home_tests {
         }
         fn shutdown(self: Box<Self>) {}
     }
-    fn source_audio_fixture() -> (Home, SourceRecorder) {
+
+    /// The one end-to-end check of "sound follows the window" in the agent: with the engine told
+    /// what the agent tells it (capture available, an `audio/1` audio peer), the process of a
+    /// window projected to that peer reaches the worker, and returning the window stops it. It
+    /// assumes only the engine's frozen rule that a capture-capable node sends an `audio/1` peer
+    /// the pids of the windows projected to it; the policy's details are the engine's tests'.
+    #[test]
+    fn a_projected_windows_process_reaches_the_worker_and_its_return_stops_it() {
         let mut h = bare_scenario();
-        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls: SourceCalls = Arc::new(Mutex::new(Vec::new()));
         h.rig.agent.audio = Some(Box::new(SourceRecorder(calls.clone())));
         let peer = h.rig.peer;
+        step(&mut h, Input::AudioProjectionCapture { available: true });
         step(
             &mut h,
-            control_input(peer, ControlMessage::Grants(vec![Capability::AudioSpeaker])),
-        );
-        project(&mut h, 1);
-        (h, SourceRecorder(calls))
-    }
-    fn source_calls(h: &Home, recorder: &SourceRecorder) -> Vec<Vec<u32>> {
-        recorder
-            .0
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(peer, _)| *peer == h.rig.peer)
-            .map(|(_, pids)| pids.clone())
-            .collect()
-    }
-    #[test]
-    fn source_projection_hook_start_and_final_end_use_original_window_pid() {
-        let (mut h, calls) = source_audio_fixture();
-        assert_eq!(source_calls(&h, &calls), [vec![42]]);
-        give_back(&mut h, 1);
-        assert_eq!(source_calls(&h, &calls), [vec![42], vec![]]);
-    }
-    #[test]
-    fn source_projection_hook_second_window_same_pid_does_not_resubmit() {
-        let (mut h, calls) = source_audio_fixture();
-        step(
-            &mut h,
-            Input::Windows(WindowEvent::Added(window(
-                20,
-                "fixture",
-                42,
-                Some(1),
-                (0.0, 0.0, 320.0, 240.0),
-                WindowState::Normal,
-            ))),
-        );
-        let peer = h.rig.peer;
-        step(
-            &mut h,
-            Input::Command(Command::Project {
-                window: WindowId(20),
-                to: peer,
-                place: None,
-            }),
-        );
-        step(
-            &mut h,
-            projection_input(
+            Input::AudioPeer {
                 peer,
-                ProjectionMessage::Accepted {
-                    projection: ProjectionId(2),
-                    size: PixelSize::new(400, 300),
-                    scale: 1.0,
-                },
-            ),
+                name: "peer-name".into(),
+                available: true,
+            },
         );
-        assert_eq!(source_calls(&h, &calls), [vec![42]]);
+        step(
+            &mut h,
+            Input::ProjectionAudioPeer {
+                peer,
+                available: true,
+            },
+        );
+        assert!(calls.lock().unwrap().is_empty(), "nothing is projected yet");
+        project(&mut h, 1);
+        // The window `bare_scenario` added belongs to process 42.
+        assert_eq!(*calls.lock().unwrap(), [(peer, vec![42])]);
         give_back(&mut h, 1);
-        assert_eq!(source_calls(&h, &calls), [vec![42]]);
-        give_back(&mut h, 2);
-        assert_eq!(source_calls(&h, &calls), [vec![42], vec![]]);
+        assert_eq!(*calls.lock().unwrap(), [(peer, vec![42]), (peer, vec![])]);
     }
-    #[test]
-    fn source_projection_hook_received_revoke_and_connection_loss_clear() {
-        for replacement in [false, true] {
-            let (mut h, calls) = source_audio_fixture();
-            let peer = h.rig.peer;
-            if replacement {
-                step(&mut h, Input::AudioConnectionReplaced { peer });
-            } else {
-                step(
-                    &mut h,
-                    control_input(peer, ControlMessage::Grants(Vec::new())),
-                );
-            }
-            assert_eq!(source_calls(&h, &calls), [vec![42], vec![]]);
-            step(&mut h, Input::Tick);
-            assert_eq!(source_calls(&h, &calls), [vec![42], vec![]]);
-        }
-        let (mut h, calls) = source_audio_fixture();
-        h.rig.agent.on_link(LinkEvent::Closed {
-            peer: h.rig.peer,
-            error: crosspane_protocol::link::LinkError::Closed,
-        });
-        assert_eq!(source_calls(&h, &calls), [vec![42], vec![]]);
-    }
-    #[test]
-    fn source_projection_hook_current_window_pid_refresh_and_missing_pid_clear() {
-        let (mut h, calls) = source_audio_fixture();
-        let mut info = window(
-            10,
-            "fixture",
-            52,
-            Some(1),
-            (0.0, 0.0, 320.0, 240.0),
-            WindowState::Normal,
-        );
-        step(&mut h, Input::Windows(WindowEvent::Changed(info.clone())));
-        assert_eq!(source_calls(&h, &calls), [vec![42], vec![52]]);
-        info.pid = None;
-        step(&mut h, Input::Windows(WindowEvent::Changed(info)));
-        assert_eq!(source_calls(&h, &calls), [vec![42], vec![52], vec![]]);
-    }
+
     fn cross_scenario(h: &mut Home) {
         let portal = h
             .rig

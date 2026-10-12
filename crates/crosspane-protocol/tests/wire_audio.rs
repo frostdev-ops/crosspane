@@ -1,5 +1,5 @@
 use crosspane_protocol::audio::{
-    AudioKind, AudioPacket, AudioStreamId, decode_audio, encode_audio,
+    AudioKind, AudioPacket, AudioStreamId, PROJECTION_AUDIO_FEATURE, decode_audio, encode_audio,
 };
 use crosspane_protocol::msg::{Capability, ControlMessage, Refusal};
 use crosspane_protocol::wire::{Frame, HEADER_LEN, KIND_CONTROL, decode_control, encode_control};
@@ -42,12 +42,19 @@ fn audio_control_round_trips_and_validates_formats() {
                 stream,
                 reason: Refusal::Permission,
             },
+            ControlMessage::ProjectionAudioOpen { stream },
         ] {
             assert_eq!(control(&message), Ok(message));
         }
     }
     assert!(
         control(&ControlMessage::AudioClose {
+            stream: AudioStreamId(0)
+        })
+        .is_err()
+    );
+    assert!(
+        control(&ControlMessage::ProjectionAudioOpen {
             stream: AudioStreamId(0)
         })
         .is_err()
@@ -70,6 +77,44 @@ fn audio_control_round_trips_and_validates_formats() {
             })
             .is_err()
         );
+    }
+}
+
+#[test]
+fn projection_audio_is_tag_22_and_shares_the_audio_stream_checks() {
+    assert_eq!(PROJECTION_AUDIO_FEATURE, "audio/1");
+    // Field 22, wire type 2 (0xb2 0x01), then the AudioStream body: field 1 as a varint.
+    let mut out = Vec::new();
+    encode_control(
+        &ControlMessage::ProjectionAudioOpen {
+            stream: AudioStreamId(7),
+        },
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(&out[HEADER_LEN..], &[0xb2, 0x01, 0x02, 0x08, 0x07]);
+    // Valid body, then zero and a value past u16 (the same width AudioOpen enforces).
+    for (body, valid) in [
+        (vec![8, 7], true),
+        (vec![8, 0], false),
+        (vec![8, 128, 128, 4], false),
+    ] {
+        let mut payload = vec![0xb2, 0x01, body.len() as u8];
+        payload.extend_from_slice(&body);
+        let decoded = decode_control(&Frame {
+            kind: KIND_CONTROL,
+            payload,
+        });
+        if valid {
+            assert_eq!(
+                decoded,
+                Ok(ControlMessage::ProjectionAudioOpen {
+                    stream: AudioStreamId(7)
+                })
+            );
+        } else {
+            assert!(decoded.is_err());
+        }
     }
 }
 

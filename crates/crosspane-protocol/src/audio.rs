@@ -5,6 +5,9 @@ use std::fmt;
 use crate::wire::{HEADER_LEN, KIND_AUDIO, WIRE_VERSION, WireError};
 pub use crosspane_types::audio::{AudioKind, AudioStreamId, MAX_OPUS_PACKET};
 
+/// Both Hellos: projection audio ("sound follows the window"). Only meaningful with "audio".
+pub const PROJECTION_AUDIO_FEATURE: &str = "audio/1";
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct AudioPacket {
     pub stream: AudioStreamId,

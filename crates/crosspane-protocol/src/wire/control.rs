@@ -352,6 +352,11 @@ fn to_pb(msg: &ControlMessage) -> Result<pb::ControlMessage, WireError> {
         ControlMessage::AudioClose { stream } => Body::AudioClose(pb::AudioStream {
             stream: check_audio_stream(u32::from(stream.0))?.0.into(),
         }),
+        ControlMessage::ProjectionAudioOpen { stream } => {
+            Body::ProjectionAudioOpen(pb::AudioStream {
+                stream: check_audio_stream(u32::from(stream.0))?.0.into(),
+            })
+        }
         ControlMessage::Projection(message) => Body::Projection(projection_to_pb(message)?),
         ControlMessage::ClipOffer(offer) => {
             check_clip_kinds(&offer.kinds)?;
@@ -529,6 +534,9 @@ fn from_pb(body: pb::control_message::Body) -> Result<ControlMessage, WireError>
         },
         Body::AudioClose(close) => ControlMessage::AudioClose {
             stream: check_audio_stream(close.stream)?,
+        },
+        Body::ProjectionAudioOpen(open) => ControlMessage::ProjectionAudioOpen {
+            stream: check_audio_stream(open.stream)?,
         },
         Body::Projection(projection) => ControlMessage::Projection(projection_from_pb(projection)?),
         Body::ClipOffer(offer) => {
@@ -1464,7 +1472,7 @@ mod pb {
     pub struct ControlMessage {
         #[prost(
             oneof = "control_message::Body",
-            tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
+            tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22"
         )]
         pub body: Option<control_message::Body>,
     }
@@ -1514,6 +1522,8 @@ mod pb {
             ClipFetch(super::ClipFetch),
             #[prost(message, tag = "21")]
             ClipFetchFailed(super::ClipFetchFailed),
+            #[prost(message, tag = "22")]
+            ProjectionAudioOpen(super::AudioStream),
         }
     }
 

@@ -1,6 +1,6 @@
 //! Lifecycle, focus guard and content-to-display input mapping on the window owner.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crosspane_input::Held;
@@ -1462,9 +1462,41 @@ impl E2 {
             source.stop_capture(out);
         }
     }
+
+    /// AUD-PROJ: the process ids whose audio follows this node's projections, per destination
+    /// peer. A projection counts only while its destination has accepted it on the current
+    /// connection and the window is parked: `Capturing`, `Live` or `Restarting` (the stages of
+    /// `Notice::ProjectionStarted` and its resumption). `Offered` and `Parking` (not accepted or
+    /// not parked yet), `Suspended` (link lost) and `Resuming` (re-offered, not yet accepted
+    /// again) contribute nothing, and a projection that has ended is no longer in `sources`.
+    /// The pid is the projected window's own process as the platform reported it; a window
+    /// without one, or with pid 0, contributes nothing. A peer without any pid has no entry.
+    pub(super) fn audio_sources(&self) -> BTreeMap<NodeId, BTreeSet<u32>> {
+        let mut sources: BTreeMap<NodeId, BTreeSet<u32>> = BTreeMap::new();
+        for source in self.sources.values().filter(|s| s.accepted_here()) {
+            if let Some(pid) = self
+                .windows
+                .get(&source.window)
+                .and_then(|info| info.pid)
+                .filter(|&pid| pid != 0)
+            {
+                sources.entry(source.peer).or_default().insert(pid);
+            }
+        }
+        sources
+    }
 }
 
 impl Source {
+    /// The destination accepted this projection on the current connection and the window is
+    /// parked (or being parked again after a resume): the stages from which it is shown.
+    fn accepted_here(&self) -> bool {
+        matches!(
+            self.stage,
+            Stage::Capturing(_) | Stage::Live | Stage::Restarting(_)
+        )
+    }
+
     fn reconcile_stand_in(
         &mut self,
         windows: &BTreeMap<WindowId, WindowInfo>,
