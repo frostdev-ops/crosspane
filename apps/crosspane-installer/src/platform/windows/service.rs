@@ -553,8 +553,18 @@ mod first_native {
         let (io, inventory, installer, inputs, reopened, reinstalling) = match prepared {
             Ok(Ok(values)) => values,
             Ok(Err(reason)) => return Ok((FirstInstallOutcome::NotSubmitted(reason), None)),
-            Err(NativeError::OutcomeUnknown) => return Ok((FirstInstallOutcome::Unknown, None)),
-            Err(_) => {
+            Err(NativeError::OutcomeUnknown) => {
+                #[cfg(not(test))]
+                crate::platform::windows::setup_log::setup_note!(
+                    "first install admission: outcome unknown"
+                );
+                return Ok((FirstInstallOutcome::Unknown, None));
+            }
+            Err(_error) => {
+                #[cfg(not(test))]
+                crate::platform::windows::setup_log::setup_note!(
+                    "first install admission failed: {_error:?}"
+                );
                 return Ok((
                     FirstInstallOutcome::NotSubmitted("first-install admission unavailable"),
                     None,
@@ -688,6 +698,13 @@ mod first_native {
             })();
             // Taken before the port can be stashed, so Complete and Unknown both return it.
             elevated_result = port.elevated_result.take();
+            #[cfg(not(test))]
+            if let Err(error) = &result {
+                crate::platform::windows::setup_log::setup_note!(
+                    "first install driver stopped at phase {:?}: {error:?}",
+                    record.phase()
+                );
+            }
             if result.is_err() {
                 if port.launched {
                     port.permit.take();
@@ -699,6 +716,12 @@ mod first_native {
             }
             Ok(())
         })();
+        #[cfg(not(test))]
+        if let Err(error) = &effect {
+            crate::platform::windows::setup_log::setup_note!(
+                "first install effect failed: {error:?}"
+            );
+        }
         Ok((
             if effect.is_ok() {
                 FirstInstallOutcome::Complete
@@ -5596,6 +5619,15 @@ mod first_recovery_native {
     /// `Pre` covers every refusal before the first record persist or driver call: probing, the
     /// admitted reads, the Supersede observations, lock and reservation acquisition, and selection
     /// (including the R5 vacancy `Busy`). `Post` covers the driver call and everything after it.
+    /// Maps a refusal before any recovery effect, noting its step in the setup log.
+    fn pre(step: &'static str) -> impl FnOnce(NativeError) -> RecoveryError {
+        move |error| {
+            crate::platform::windows::setup_log::setup_note!(
+                "first-install recovery pre-step {step}: {error:?}"
+            );
+            RecoveryError::Pre(error)
+        }
+    }
     pub(super) fn begin(
         mut mode: FirstRecoveryMode,
         deadline: &Deadline,
@@ -5607,20 +5639,20 @@ mod first_recovery_native {
             return Err(RecoveryError::Post(NativeError::OutcomeUnknown));
         }
         let probe = WindowsNativeIo::probe_repair(Arc::new(MonotonicClock::default()), deadline)
-            .map_err(RecoveryError::Pre)?;
+            .map_err(pre("probe"))?;
         let io = probe
             .io()
             .cloned()
             .ok_or(RecoveryError::Pre(NativeError::Unsupported))?;
-        let p = io.admit_support(deadline).map_err(RecoveryError::Pre)?;
+        let p = io.admit_support(deadline).map_err(pre("admit"))?;
         let source = match io
             .read_first_install(&p, deadline)
-            .map_err(RecoveryError::Pre)?
+            .map_err(pre("read record"))?
         {
             Some(source) => source,
             None => {
                 io.read_first_recovery(&p, deadline)
-                    .map_err(RecoveryError::Pre)?
+                    .map_err(pre("read recovery"))?
                     .ok_or(RecoveryError::Pre(NativeError::Missing))?
                     .document
             }
@@ -5628,25 +5660,27 @@ mod first_recovery_native {
         if mode == FirstRecoveryMode::Supersede {
             if let Ok(agent) = io.observe_agent(&p, deadline) {
                 super::upgrade::first_ready_status(&io, &agent, deadline)
-                    .map_err(RecoveryError::Pre)?;
-                let proof = io.admit_support(deadline).map_err(RecoveryError::Pre)?;
+                    .map_err(pre("supersede status"))?;
+                let proof = io.admit_support(deadline).map_err(pre("supersede admit"))?;
                 let agent = io
                     .clone_agent(&agent, &proof, deadline)
-                    .map_err(RecoveryError::Pre)?;
+                    .map_err(pre("supersede agent"))?;
                 let live = super::super::native_io::supervisor_owner::observe_first_supersession(
                     io.clone(),
                     &source,
                     Arc::new(agent),
                     deadline,
                 )
-                .map_err(RecoveryError::Pre)?;
-                let p = io.admit_support(deadline).map_err(RecoveryError::Pre)?;
+                .map_err(pre("supersede observe"))?;
+                let p = io
+                    .admit_support(deadline)
+                    .map_err(pre("supersede admit lock"))?;
                 let lock = io
                     .acquire_installer_lock(&p, deadline)
-                    .map_err(RecoveryError::Pre)?;
+                    .map_err(pre("supersede lock"))?;
                 let mut record = io
                     .select_live_first_recovery(&p, &lock, &source, deadline)
-                    .map_err(RecoveryError::Pre)?;
+                    .map_err(pre("supersede select"))?;
                 let mut port = LivePort {
                     io,
                     lock,
@@ -5665,16 +5699,16 @@ mod first_recovery_native {
         }
         // A possibly consumed Run is observation/retirement only, never task/file rollback.
         super::super::first_install::recovery_mode_allowed(&source, mode)
-            .map_err(RecoveryError::Pre)?;
+            .map_err(pre("mode allowed"))?;
         let lock = io
             .acquire_installer_lock(&p, deadline)
-            .map_err(RecoveryError::Pre)?;
+            .map_err(pre("installer lock"))?;
         let reservation = io
             .reserve_first_recovery(&p, &lock, &source, mode, deadline)
-            .map_err(RecoveryError::Pre)?;
+            .map_err(pre("reserve"))?;
         let mut r = io
             .select_first_recovery(&p, &lock, &reservation, mode, deadline)
-            .map_err(RecoveryError::Pre)?;
+            .map_err(pre("select"))?;
         let mut port = Port {
             io,
             lock,

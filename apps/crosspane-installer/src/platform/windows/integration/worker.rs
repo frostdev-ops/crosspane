@@ -21,6 +21,13 @@ impl Fence {
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
+    /// The selected operation and whether the fence is cancelled, for the setup log.
+    pub fn state(&self) -> (u64, bool) {
+        (
+            self.current.load(Ordering::Acquire),
+            self.cancelled.load(Ordering::Acquire),
+        )
+    }
     pub fn admits(&self, operation: u64) -> bool {
         operation != 0
             && !self.cancelled.load(Ordering::Acquire)
@@ -126,26 +133,31 @@ impl<D: Domains> Coordinator<D> {
         fence: &Fence,
     ) -> Applied {
         if !fence.admits(ticket) || revision == 0 {
-            return Applied::failure(Outcome::NotSubmitted);
+            return refused("operation fence or revision", Outcome::NotSubmitted);
         }
         let Some(plan) = self.plans.get(&slot).cloned() else {
-            return Applied::failure(Outcome::NotSubmitted);
+            return refused("no plan for the step", Outcome::NotSubmitted);
         };
         if plan.ticket != plan_ticket {
-            return Applied::failure(Outcome::NotSubmitted);
+            return refused("plan ticket changed", Outcome::NotSubmitted);
         }
         if self.uncertain || self.dispatched.contains_key(&slot) {
-            return Applied::failure(Outcome::Unknown);
+            return refused("an earlier submission is unsettled", Outcome::Unknown);
         }
         let current = match self.domains.observe() {
             Ok(value) => value,
-            Err(_) => return Applied::failure(Outcome::NotSubmitted),
+            Err(_) => return refused("observation failed", Outcome::NotSubmitted),
         };
-        if current != plan.snapshot || !current.allowed(plan.operation) {
-            return Applied::failure(Outcome::NotSubmitted);
+        if current != plan.snapshot {
+            log_changed(&plan.snapshot, &current);
+            return refused("state changed since the plan", Outcome::NotSubmitted);
+        }
+        if !current.allowed(plan.operation) {
+            log_disallowed(&current, plan.operation);
+            return refused("operation not allowed in this state", Outcome::NotSubmitted);
         }
         if !fence.admits(ticket) {
-            return Applied::failure(Outcome::NotSubmitted);
+            return refused("operation fence", Outcome::NotSubmitted);
         }
         // Reserve before either settlement or new mutation. No ambiguous return removes it.
         self.dispatched.insert(slot, ticket);
@@ -172,11 +184,16 @@ impl<D: Domains> Coordinator<D> {
         let result = self.domains.apply_elevated(plan.operation, planned);
         match result {
             Ok(Dispatch { handoff, complete }) => {
-                // A first-install recovery removal completes in place: there is no keeper to hand off.
-                let recovery_removal = matches!(plan.operation, Operation::Removal { .. })
-                    && matches!(plan.snapshot.cold, Cold::Partial | Cold::Stale)
+                // A first-install recovery (rollback or removal of a partial or stale first install)
+                // completes in place: there is no keeper to hand off and nothing installed to verify.
+                let recovery = matches!(
+                    plan.operation,
+                    Operation::Removal { .. } | Operation::MetadataRepair
+                ) && matches!(plan.snapshot.cold, Cold::Partial | Cold::Stale)
                     && complete
                     && handoff == Handoff::NotCommitted;
+                let recovery_removal =
+                    recovery && matches!(plan.operation, Operation::Removal { .. });
                 if matches!(
                     plan.operation,
                     Operation::Upgrade | Operation::PayloadRepair | Operation::Removal { .. }
@@ -185,9 +202,28 @@ impl<D: Domains> Coordinator<D> {
                 {
                     return Applied::failure(Outcome::Unknown);
                 }
-                let complete = complete && self.verify(plan.operation) == Outcome::Verified;
+                // A recovery is settled when a fresh observation no longer shows the partial or
+                // stale first install; an install verification would never pass after it.
+                let complete = complete
+                    && if recovery {
+                        matches!(self.domains.observe(), Ok(s) if s.source == crosspane_installer_core::ObservationSource::Live
+                            && !matches!(s.cold, Cold::Partial | Cold::Stale | Cold::Unknown))
+                    } else {
+                        self.verify(plan.operation) == Outcome::Verified
+                    };
                 if complete {
                     self.uncertain = false;
+                    // A settled recovery frees its step: the install it cleared the way for is a
+                    // new submission in the same step.
+                    if recovery {
+                        self.dispatched.remove(&slot);
+                    }
+                }
+                #[cfg(not(test))]
+                if recovery && !complete {
+                    crate::platform::windows::setup_log::setup_note!(
+                        "first-install recovery submitted but not settled"
+                    );
                 }
                 Applied {
                     outcome: Outcome::Submitted,
@@ -224,4 +260,85 @@ impl<D: Domains> Coordinator<D> {
             Err(Failure::Unknown) => Outcome::Unknown,
         }
     }
+}
+
+/// A refused apply, with its reason in the setup log.
+fn refused(why: &str, outcome: Outcome) -> Applied {
+    #[cfg(not(test))]
+    crate::platform::windows::setup_log::setup_note!("apply refused: {why}");
+    #[cfg(test)]
+    let _ = why;
+    Applied::failure(outcome)
+}
+
+/// Logs which snapshot fields differ between the plan and the apply (names and states only).
+fn log_changed(planned: &Snapshot, current: &Snapshot) {
+    let mut changed = Vec::new();
+    if planned.supported != current.supported {
+        changed.push(format!(
+            "supported {}->{}",
+            planned.supported, current.supported
+        ));
+    }
+    if planned.inventory != current.inventory {
+        changed.push(format!(
+            "inventory {}->{}",
+            planned.inventory, current.inventory
+        ));
+    }
+    if planned.sources != current.sources {
+        changed.push(format!("sources {}->{}", planned.sources, current.sources));
+    }
+    if planned.payload != current.payload {
+        changed.push(format!(
+            "payload {:?}->{:?}",
+            planned.payload, current.payload
+        ));
+    }
+    if planned.task != current.task {
+        changed.push(format!("task {:?}->{:?}", planned.task, current.task));
+    }
+    if planned.agent != current.agent {
+        changed.push(format!("agent {:?}->{:?}", planned.agent, current.agent));
+    }
+    if planned.cold != current.cold {
+        changed.push(format!("cold {:?}->{:?}", planned.cold, current.cold));
+    }
+    if planned.terminal_history != current.terminal_history {
+        changed.push("terminal_history".to_owned());
+    }
+    if planned.unsettled != current.unsettled {
+        changed.push(format!(
+            "unsettled {}->{}",
+            planned.unsettled, current.unsettled
+        ));
+    }
+    if planned.correlation != current.correlation {
+        changed.push("correlation".to_owned());
+    }
+    if planned.source != current.source {
+        changed.push("source".to_owned());
+    }
+    #[cfg(not(test))]
+    crate::platform::windows::setup_log::setup_note!("snapshot changed: {}", changed.join(", "));
+    #[cfg(test)]
+    let _ = changed;
+}
+
+/// Logs the snapshot facts that `allowed` reads when it refuses an operation.
+fn log_disallowed(current: &Snapshot, operation: Operation) {
+    #[cfg(not(test))]
+    crate::platform::windows::setup_log::setup_note!(
+        "not allowed: op={operation:?} supported={} inventory={} sources={} unsettled={} cold={:?} payload={:?} task={:?} agent={:?}",
+        current.supported,
+        current.inventory,
+        current.sources,
+        current.unsettled,
+        current.cold,
+        current.payload,
+        current.task,
+        current.agent
+    );
+    #[cfg(test)]
+    let _ = (current, operation);
 }

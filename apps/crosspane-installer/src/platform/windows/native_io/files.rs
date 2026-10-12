@@ -777,10 +777,17 @@ pub(crate) mod native {
             ObjectKind::File => GENERIC_READ | GENERIC_WRITE | super::DELETE,
             ObjectKind::Opaque => return Err(NativeError::Invalid),
         };
+        // A retained directory handle must share write like `child` does: a rename into the
+        // directory opens it for FILE_ADD_FILE, which a read-only share refuses with
+        // STATUS_SHARING_VIOLATION. Delete is never shared, so the directory stays pinned.
+        let sharing = match kind {
+            ObjectKind::Directory => FILE_SHARE_READ | FILE_SHARE_WRITE,
+            _ => FILE_SHARE_READ,
+        };
         relative_component(
             &NativeComponentIo {
                 access,
-                sharing: FILE_SHARE_READ,
+                sharing,
                 descriptor: Some(descriptor),
             },
             parent,
@@ -1013,9 +1020,14 @@ pub(crate) mod native {
                 .last()
                 .map(|pin| pin.facts.requested.as_str())
                 .ok_or(NativeError::Foreign)?;
-            if observe(self.file()?, requested, security)?.acl.owner != Principal::User {
-                return Err(NativeError::Foreign);
-            }
+            // The parent is re-admitted as an ancestor now: a foreign owner, or foreign write or
+            // delete-child access, refuses. Trusted machine administrators may own it: on some
+            // machines an elevated program created %LOCALAPPDATA%\Programs, owned by
+            // Administrators with the user's full control. The child itself is private.
+            admit_component(
+                &observe(self.file()?, requested, security)?,
+                Admission::Ancestor,
+            )?;
             let descriptor = Descriptor::private(&security.user)?;
             deadline.check()?;
             let file = create_component(

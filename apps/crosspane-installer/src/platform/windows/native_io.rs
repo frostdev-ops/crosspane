@@ -335,9 +335,20 @@ mod adapter {
         fn reached(&self) {
             self.0.store(true, Ordering::Release);
         }
+        #[track_caller]
         fn finish<T>(&self, result: NativeResult<T>) -> NativeResult<T> {
+            let at = std::panic::Location::caller();
             result.map_err(|error| {
                 if self.0.load(Ordering::Acquire) {
+                    // The cause is replaced by OutcomeUnknown; keep it in the setup log.
+                    #[cfg(not(test))]
+                    crate::platform::windows::setup_log::setup_note!(
+                        "change after effect failed: {error:?} at {}:{}",
+                        at.file(),
+                        at.line()
+                    );
+                    #[cfg(test)]
+                    let _ = at;
                     NativeError::OutcomeUnknown
                 } else {
                     error
@@ -19060,6 +19071,10 @@ mod adapter {
                     ) {
                         continue;
                     }
+                    // An unpublished record temporary is no state: a failed publish leaves one.
+                    if crate::platform::windows::first_install::is_record_temporary(&name) {
+                        continue;
+                    }
                     if stale
                         && matches!(
                             name.as_str(),
@@ -19116,6 +19131,12 @@ mod adapter {
                 }
                 Ok(())
             }
+            /// Notes which first-recovery reservation check refused, for the setup log.
+            fn reserve_note(step: &str, error: &NativeError) {
+                crate::platform::windows::setup_log::setup_note!(
+                    "first-recovery reserve {step}: {error:?}"
+                );
+            }
             pub(crate) fn reserve_first_recovery(
                 self: &Arc<Self>,
                 proof: &SupportProof,
@@ -19124,9 +19145,13 @@ mod adapter {
                 mode: FirstRecoveryMode,
                 deadline: &Deadline,
             ) -> NativeResult<FirstRecoveryReservation> {
-                self.verify_stop_lock(proof, lock, deadline)?;
-                source.validate()?;
-                self.exclude_other_first_recovery(proof, source, mode, deadline)?;
+                self.verify_stop_lock(proof, lock, deadline)
+                    .inspect_err(|e| Self::reserve_note("stop lock", e))?;
+                source
+                    .validate()
+                    .inspect_err(|e| Self::reserve_note("validate", e))?;
+                self.exclude_other_first_recovery(proof, source, mode, deadline)
+                    .inspect_err(|e| Self::reserve_note("exclude other", e))?;
                 let (identity, bytes) = match self.read_record(
                     proof,
                     records::RecordName::FirstInstall,
@@ -19152,8 +19177,11 @@ mod adapter {
                 if FirstInstallRecord::decode(&bytes)? != *source {
                     return Err(NativeError::Foreign);
                 }
-                renew_prior_context(self, proof, source, deadline)?;
-                let reservation = self.acquire_first_reservation(proof, lock, false, deadline)?;
+                renew_prior_context(self, proof, source, deadline)
+                    .inspect_err(|e| Self::reserve_note("prior context", e))?;
+                let reservation = self
+                    .acquire_first_reservation(proof, lock, false, deadline)
+                    .inspect_err(|e| Self::reserve_note("reservation", e))?;
                 let value = FirstRecoveryReservation {
                     io: self.clone(),
                     reservation,
@@ -19172,7 +19200,9 @@ mod adapter {
                         }
                     },
                 };
-                value.reverify(self, proof, lock, deadline)?;
+                value
+                    .reverify(self, proof, lock, deadline)
+                    .inspect_err(|e| Self::reserve_note("reverify", e))?;
                 Ok(value)
             }
             fn previous_first_recovery_settled(

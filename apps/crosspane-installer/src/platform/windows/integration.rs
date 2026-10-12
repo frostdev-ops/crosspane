@@ -392,6 +392,16 @@ pub(crate) fn run<D: Domains>(
                             elevated_reports.remove(&slot);
                         }
                         let outcome = if !fence.admits(job.operation.0) {
+                            #[cfg(all(windows, not(test)))]
+                            {
+                                let (current, cancelled) = fence.state();
+                                crate::platform::windows::setup_log::setup_note!(
+                                    "step={} stage={:?} fenced: job={} selected={current} cancelled={cancelled}",
+                                    job.step.0,
+                                    job.stage,
+                                    job.operation.0
+                                );
+                            }
                             NativeOutcome::NotSubmitted
                         } else if job.step == SUPPORT || job.step == AGENT {
                             match coordinator.detect() {
@@ -587,7 +597,14 @@ pub(crate) fn run<D: Domains>(
                                             }
                                             native_outcome(v.outcome, (clock)())
                                         }
-                                        None => NativeOutcome::NotSubmitted,
+                                        None => {
+                                            #[cfg(all(windows, not(test)))]
+                                            crate::platform::windows::setup_log::setup_note!(
+                                                "step={} apply without a matching consent",
+                                                job.step.0
+                                            );
+                                            NativeOutcome::NotSubmitted
+                                        }
                                     }
                                 }
                                 JobStage::Verify => {

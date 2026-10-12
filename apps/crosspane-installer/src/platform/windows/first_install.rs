@@ -74,16 +74,27 @@ pub(crate) struct DecodedHistory<'a> {
     pub claimed_activation: bool,
     pub names: &'a [String],
 }
+/// Whether `name` is exactly a record temporary, `record-temp-<32 lowercase hex>.json`, the only
+/// name `records::publish` creates before its rename.
+pub(crate) fn is_record_temporary(name: &str) -> bool {
+    name.strip_prefix("record-temp-")
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .is_some_and(|hex| {
+            hex.len() == 32 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
 pub(crate) fn classify_history(history: DecodedHistory<'_>) -> FirstInstallDisposition {
     use super::removal::RemovalCursor as R;
     use FirstInstallDisposition as D;
     use crosspane_installer_core::elevated::journal;
     // The elevated-setup record is never deleted, so it must never change the branch taken.
+    // An unpublished record temporary is never read as a record: a publish that failed before
+    // its rename leaves one behind, and it is no evidence of any later effect.
     let names: Vec<&str> = history
         .names
         .iter()
         .map(String::as_str)
-        .filter(|name| *name != journal::RECORD_LEAF)
+        .filter(|name| *name != journal::RECORD_LEAF && !is_record_temporary(name))
         .collect();
     if let Some(removal) = history.removal {
         return if matches!(

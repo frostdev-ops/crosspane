@@ -681,6 +681,52 @@ pub(crate) mod native {
         };
         Ok((snapshot, actual.clone()))
     }
+    /// Logs which parts of the repair observation changed between two reads (names and
+    /// diagnostics only; never task XML or record bytes).
+    fn log_observation_change(previous: &RepairObservation, actual: &RepairObservation) {
+        let mut changed = Vec::new();
+        if previous.payload() != actual.payload() {
+            changed.push(format!(
+                "payload {:?}->{:?}",
+                previous.payload(),
+                actual.payload()
+            ));
+        }
+        if previous.task().diagnostic() != actual.task().diagnostic() {
+            changed.push(format!(
+                "task {:?}->{:?}",
+                previous.task().diagnostic(),
+                actual.task().diagnostic()
+            ));
+        } else if previous.task() != actual.task() {
+            changed.push("task details".to_owned());
+        }
+        if previous.agent() != actual.agent() {
+            changed.push(format!(
+                "agent {:?}->{:?}",
+                previous.agent(),
+                actual.agent()
+            ));
+        }
+        if previous.journals() != actual.journals() {
+            changed.push(format!(
+                "journals {}->{}",
+                previous.journals().len(),
+                actual.journals().len()
+            ));
+        }
+        if previous.publication() != actual.publication() {
+            changed.push(format!(
+                "publication {:?}->{:?}",
+                previous.publication(),
+                actual.publication()
+            ));
+        }
+        crate::platform::windows::setup_log::setup_note!(
+            "observation changed: {}",
+            changed.join(", ")
+        );
+    }
     impl NativeDomains {
         /// The first-install outcome mapping, shared by the plain and the administrator-step Install.
         fn first_install_dispatch(
@@ -693,6 +739,9 @@ pub(crate) mod native {
                     complete: true,
                 }),
                 service::FirstInstallOutcome::NotSubmitted(reason) => {
+                    crate::platform::windows::setup_log::setup_note!(
+                        "first install not submitted: {reason}"
+                    );
                     self.first_refusal = Some(reason);
                     Err(Failure::NotSubmitted)
                 }
@@ -788,6 +837,9 @@ pub(crate) mod native {
         fn observe(&mut self) -> Result<Snapshot, Failure> {
             let (mut snapshot, actual) = read_observation()?;
             if self.previous.as_ref() != Some(&actual) {
+                if let Some(previous) = &self.previous {
+                    log_observation_change(previous, &actual);
+                }
                 self.version = self.version.saturating_add(1);
                 self.previous = Some(actual);
             }
@@ -855,9 +907,19 @@ pub(crate) mod native {
                 let outcome = match service::recover_first_install(mode, &budget) {
                     Ok(outcome) => outcome,
                     // Pre: refused before any recovery effect, so nothing was submitted.
-                    Err(service::RecoveryError::Pre(_)) => return Err(Failure::NotSubmitted),
+                    Err(service::RecoveryError::Pre(error)) => {
+                        crate::platform::windows::setup_log::setup_note!(
+                            "first-install recovery {mode:?} refused before any effect: {error:?}"
+                        );
+                        return Err(Failure::NotSubmitted);
+                    }
                     // Post: an effect may have run, so the outcome is unresolved.
-                    Err(service::RecoveryError::Post(_)) => return Err(Failure::Unknown),
+                    Err(service::RecoveryError::Post(error)) => {
+                        crate::platform::windows::setup_log::setup_note!(
+                            "first-install recovery {mode:?} outcome unknown: {error:?}"
+                        );
+                        return Err(Failure::Unknown);
+                    }
                 };
                 if matches!(outcome, O::Retained { .. }) {
                     return Err(Failure::Unknown);
