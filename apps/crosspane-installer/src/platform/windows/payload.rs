@@ -661,8 +661,12 @@ mod native {
         if !io.file_recovery_requires_lock(&proof, deadline)? {
             return Ok(super::PriorLogonFileCheck { recovered: false });
         }
-        let proof = io.admit_support(deadline)?;
-        let lock = io.acquire_installer_lock(&proof, deadline)?;
+        // An installer that just ran the task may still hold the lock; wait it out in budget.
+        let lock = crate::platform::windows::first_install::retry_busy(
+            deadline,
+            || io.acquire_installer_lock(&io.admit_support(deadline)?, deadline),
+            |ms| std::thread::sleep(std::time::Duration::from_millis(ms)),
+        )?;
         let proof = io.admit_support(deadline)?;
         let check = recover_prior_logon_files(io, &proof, &lock, deadline)?;
         drop(lock);

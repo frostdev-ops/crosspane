@@ -50,7 +50,7 @@ pub(crate) const AGENT_STARTING: &str =
 pub(crate) const INSTALL_UNVERIFIED: &str =
     "Setup couldn't confirm Crosspane's files and sign-in task yet. Check again.";
 /// The support refusal: the account, the Windows build or the folders can't run Crosspane.
-pub(crate) const NOT_SUPPORTED: &str = "Setup couldn't confirm that this Windows account can run Crosspane. It needs your own signed-in session without administrator rights, with your folders on this PC's local drive. Nothing was changed.";
+pub(crate) const NOT_SUPPORTED: &str = "Crosspane needs Windows 11 24H2 or later on an x64 PC, in your own signed-in session without administrator rights, with your folders on this PC's local drive. Setup couldn't confirm these requirements. Nothing was changed.";
 /// The refusal of a build that carries no approved inventory.
 pub(crate) const NO_INVENTORY: &str = "This installer build has no approved inventory, so nothing will be copied, started or removed.";
 /// The refusal while an earlier change is unsettled.
@@ -68,6 +68,7 @@ const TEARDOWN_CHOICE: u16 = 2;
 pub(crate) const TEARDOWN_LABEL: &str = "Also remove the Windows Defender Firewall rule and the Crosspane display driver (Windows asks for administrator approval)";
 pub(crate) const ELEVATED_WAITING: &str =
     "Windows asks for administrator approval during this step";
+const FIRST_RECOVERY_WAITING: &str = "An earlier first install needs recovery. Choose Remove or repair Crosspane, review the recovery, then check setup again.";
 /// The same text `Coordinator::plan_elevated` uses when the domain can't plan the teardown.
 static PARENT_EXIT: AtomicBool = AtomicBool::new(false);
 pub(crate) fn take_parent_exit() -> bool {
@@ -426,6 +427,16 @@ pub(crate) fn run<D: Domains>(
                                         JobStage::Apply => NativeOutcome::NotSubmitted,
                                     }
                                 }
+                                Ok(snapshot)
+                                    if job.step == SUPPORT
+                                        && matches!(
+                                            snapshot.cold,
+                                            domains::Cold::Partial | domains::Cold::Stale
+                                        ) =>
+                                {
+                                    detail = FIRST_RECOVERY_WAITING.into();
+                                    NativeOutcome::Waiting(WaitKind::User)
+                                }
                                 Ok(snapshot) => {
                                     // The support refusal names the reason; the agent is still starting.
                                     detail = if job.step == SUPPORT {
@@ -457,6 +468,15 @@ pub(crate) fn run<D: Domains>(
                                     }
                                 }
                                 JobStage::Detect => match coordinator.detect() {
+                                    Ok(v)
+                                        if matches!(
+                                            v.cold,
+                                            domains::Cold::Partial | domains::Cold::Stale
+                                        ) =>
+                                    {
+                                        detail = FIRST_RECOVERY_WAITING.into();
+                                        NativeOutcome::Waiting(WaitKind::User)
+                                    }
                                     Ok(v) => NativeOutcome::Detected {
                                         needs_action: !v.installed(),
                                     },
@@ -516,6 +536,16 @@ pub(crate) fn run<D: Domains>(
                                     Err(_) => {
                                         detail = PLAN_UNAVAILABLE.to_owned();
                                         NativeOutcome::Failed
+                                    }
+                                    Ok(snapshot)
+                                        if matches!(
+                                            snapshot.cold,
+                                            domains::Cold::Partial | domains::Cold::Stale
+                                        ) =>
+                                    {
+                                        // Recovery uses maintenance slot 102; INSTALL stays unused.
+                                        detail = FIRST_RECOVERY_WAITING.into();
+                                        NativeOutcome::Waiting(WaitKind::User)
                                     }
                                     Ok(snapshot) => {
                                         let operation = snapshot.install_operation();
@@ -643,7 +673,8 @@ pub(crate) fn run<D: Domains>(
                         let report = match req {
                             MaintenanceRequest::Inspect { .. } => {
                                 let snapshot = coordinator.detect();
-                                if matches!(&snapshot, Ok(s) if s.unsettled || s.terminal_history)
+                                if matches!(&snapshot, Ok(s) if (s.unsettled || s.terminal_history)
+                                    && !matches!(s.cold, domains::Cold::Partial | domains::Cold::Stale))
                                     && reports.send(NativeReport::Maintenance(MaintenanceReport::RepairResumable {
                                         id, lines: vec!["An earlier operation has retained evidence. Resume only settles provably completed artifacts and observes again; uncertain Stop or Run is never replayed".into()],
                                     })).is_err() { break; }
@@ -735,11 +766,12 @@ pub(crate) fn run<D: Domains>(
                                 if applied.handoff.permits_exit() {
                                     close.handed_off.store(true, Ordering::Release);
                                 }
-                                let mut lines = vec![format!(
-                                    "Removal submission: {:?}; completion is independently verified",
+                                #[cfg(all(windows, not(test)))]
+                                crate::platform::windows::setup_log::setup_note!(
+                                    "removal submission={:?}",
                                     applied.outcome
-                                )];
-                                lines.extend(coordinator.domains.take_elevated_report());
+                                );
+                                let lines = coordinator.domains.take_elevated_report();
                                 MaintenanceReport::Finished {
                                     id,
                                     outcome: if matches!(
@@ -747,6 +779,8 @@ pub(crate) fn run<D: Domains>(
                                         Outcome::NotSubmitted | Outcome::Refused
                                     ) {
                                         MaintenanceOutcome::Refused
+                                    } else if applied.complete {
+                                        MaintenanceOutcome::Removed
                                     } else {
                                         MaintenanceOutcome::Partial
                                     },
@@ -759,6 +793,11 @@ pub(crate) fn run<D: Domains>(
                                 if applied.handoff.permits_exit() {
                                     close.handed_off.store(true, Ordering::Release);
                                 }
+                                #[cfg(all(windows, not(test)))]
+                                crate::platform::windows::setup_log::setup_note!(
+                                    "repair submission={:?}",
+                                    applied.outcome
+                                );
                                 if matches!(
                                     applied.outcome,
                                     Outcome::NotSubmitted | Outcome::Refused
@@ -788,10 +827,7 @@ pub(crate) fn run<D: Domains>(
                                         lines: if first_recovery && applied.complete {
                                             vec!["First-install recovery completed. Review the current facts; a new install requires a new Apply.".into()]
                                         } else {
-                                            vec![format!(
-                                                "Repair submission: {:?}",
-                                                applied.outcome
-                                            )]
+                                            Vec::new()
                                         },
                                         resumable: !applied.complete,
                                     }

@@ -77,6 +77,7 @@ pub fn plan(desired: &Definition, current: Option<&Snapshot>) -> NativeResult<Pl
         return Err(NativeError::Oversize);
     }
     if current.xml.is_empty() || !same_role(desired, &current.definition) {
+        note_role_differences(desired, &current.definition);
         return Err(NativeError::Foreign);
     }
     if !current.definition.enabled {
@@ -110,6 +111,38 @@ fn validate_desired(desired: &Definition) -> NativeResult<()> {
         return Err(NativeError::Invalid);
     }
     Ok(())
+}
+/// Notes, for the setup log, which fields of a found task differ from the desired one (names only).
+fn note_role_differences(expected: &Definition, actual: &Definition) {
+    let fields = [
+        ("name", expected.name == actual.name),
+        ("principal", expected.principal == actual.principal),
+        ("trigger user", expected.trigger_user == actual.trigger_user),
+        ("logon", expected.logon == actual.logon),
+        ("run level", expected.run_level == actual.run_level),
+        ("action", expected.action == actual.action),
+        ("arguments", expected.arguments == actual.arguments),
+        (
+            "working directory",
+            expected.working_directory == actual.working_directory,
+        ),
+        (
+            "logon trigger",
+            expected.logon_trigger_only == actual.logon_trigger_only,
+        ),
+    ];
+    let differing: Vec<&str> = fields
+        .iter()
+        .filter(|(_, same)| !same)
+        .map(|(name, _)| *name)
+        .collect();
+    #[cfg(all(windows, not(test)))]
+    crate::platform::windows::setup_log::setup_note!(
+        "task definition differs: {}",
+        differing.join(", ")
+    );
+    #[cfg(not(all(windows, not(test))))]
+    let _ = differing;
 }
 fn same_role(expected: &Definition, actual: &Definition) -> bool {
     // Native paths were already admitted from fixed roots. These comparisons grant no authority.
@@ -705,36 +738,60 @@ mod native {
             Ok(())
         }
         fn run_once(&mut self) -> NativeResult<TaskSubmission> {
+            let note = |step: &'static str| {
+                move |error: &NativeError| {
+                    crate::platform::windows::setup_log::setup_note!("task run {step}: {error:?}");
+                }
+            };
             if self.lock.is_some() || self.retired {
+                note("lock held or retired")(&NativeError::Foreign);
                 return Err(NativeError::Foreign);
             }
-            let current = self.binding.record()?.ok_or(NativeError::Foreign)?;
-            current.bind(
-                self.operation,
-                &self.binding.user(),
-                self.binding.images.installer.identity(),
-            )?;
+            let current = self
+                .binding
+                .record()
+                .inspect_err(note("record"))?
+                .ok_or(NativeError::Foreign)
+                .inspect_err(note("record missing"))?;
+            current
+                .bind(
+                    self.operation,
+                    &self.binding.user(),
+                    self.binding.images.installer.identity(),
+                )
+                .inspect_err(note("bind"))?;
             if current.phase() != Phase::RunIntent || current.claim().is_some() {
+                note("phase or claim")(&NativeError::Foreign);
                 return Err(NativeError::Foreign);
             }
             let desired = desired(&self.binding);
-            let actual = self.scheduler.inspect(&|| self.binding.check())?;
+            let actual = self
+                .scheduler
+                .inspect(&|| self.binding.check())
+                .inspect_err(note("inspect"))?;
             if let Some(repair) = &self.binding.repair {
-                repair.matches_task(actual.as_ref())?;
+                repair
+                    .matches_task(actual.as_ref())
+                    .inspect_err(note("repair match"))?;
             }
-            if plan(&desired, actual.as_ref())? != Plan::Keep {
+            if plan(&desired, actual.as_ref()).inspect_err(note("plan"))? != Plan::Keep {
+                note("plan is not keep")(&NativeError::Foreign);
                 return Err(NativeError::Foreign);
             }
-            self.scheduler.run(&|| self.binding.check())
+            self.scheduler
+                .run(&|| self.binding.check())
+                .inspect_err(note("run"))
         }
         fn record_run_result(&mut self, submission: &TaskSubmission) -> NativeResult<()> {
             self.binding.check()?;
-            let proof = self.binding.io().admit_support(&self.binding.deadline)?;
-            self.lock = Some(
-                self.binding
-                    .io()
-                    .acquire_installer_lock(&proof, &self.binding.deadline)?,
-            );
+            // The started supervisor may be claiming under this lock right now; wait for it.
+            let io = self.binding.io();
+            let deadline = &self.binding.deadline;
+            self.lock = Some(crate::platform::windows::first_install::retry_busy(
+                deadline,
+                || io.acquire_installer_lock(&io.admit_support(deadline)?, deadline),
+                |ms| std::thread::sleep(std::time::Duration::from_millis(ms)),
+            )?);
             // The child may have claimed the RunIntent while Run was completing. Re-read and
             // preserve that exact claim instead of overwriting it with a stale parent snapshot.
             let mut record = self.binding.record()?.ok_or(NativeError::Foreign)?;
@@ -1062,8 +1119,18 @@ mod native {
         }
         let proof = images.io.admit_support(deadline)?;
         let owner = images.io.own_process_identity(&proof, deadline)?;
-        let proof = images.io.admit_support(deadline)?;
-        let lock = images.io.acquire_installer_lock(&proof, deadline)?;
+        // The installer that ran this task takes the same lock to record the run, and either
+        // order is valid (the claim accepts RunIntent or RunObserved; the run record keeps a
+        // claim). The handoff waits for the lock within the deadline instead of failing on it.
+        let lock = crate::platform::windows::first_install::retry_busy(
+            deadline,
+            || {
+                images
+                    .io
+                    .acquire_installer_lock(&images.io.admit_support(deadline)?, deadline)
+            },
+            |ms| std::thread::sleep(std::time::Duration::from_millis(ms)),
+        )?;
         let proof = images.io.admit_support(deadline)?;
         let mut record = TaskActivationRecord::read(&images.io, &proof, deadline)?
             .ok_or(NativeError::Foreign)?;

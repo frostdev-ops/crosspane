@@ -1,5 +1,5 @@
 #![allow(dead_code, unused_imports, clippy::unwrap_used, clippy::expect_used)]
-//! In-memory task fixtures only; no COM or scheduled-task operation is executed.
+//! In-memory task fixtures and inert COM definitions; no registered task is read or mutated.
 use crosspane_installer::agent_contract;
 #[path = "../src/platform/windows/detect.rs"]
 mod detect;
@@ -16,6 +16,335 @@ mod transport;
 use native_io::{NativeError, NativeResult};
 use service::task::*;
 use std::collections::VecDeque;
+
+#[cfg(windows)]
+mod native_template {
+    use super::*;
+    use windows::{
+        Win32::System::{Com::*, TaskScheduler::*, Variant::VARIANT},
+        core::{BSTR, Interface},
+    };
+
+    struct Apartment;
+    impl Apartment {
+        fn new() -> Self {
+            // SAFETY: the test owns this thread's MTA until every interface is released.
+            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+                .ok()
+                .unwrap();
+            Self
+        }
+    }
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            // SAFETY: balances successful initialization on this test thread.
+            unsafe { CoUninitialize() };
+        }
+    }
+    fn service() -> ITaskService {
+        // SAFETY: owned test MTA, public in-process SDK object; no registered task is selected.
+        let service: ITaskService =
+            unsafe { CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER) }.unwrap();
+        // SAFETY: local current-token connection only, with no credentials or task operation.
+        unsafe {
+            service.Connect(
+                &VARIANT::default(),
+                &VARIANT::default(),
+                &VARIANT::default(),
+                &VARIANT::default(),
+            )
+        }
+        .unwrap();
+        service
+    }
+    fn xml(definition: &ITaskDefinition) -> String {
+        let mut xml = BSTR::new();
+        // SAFETY: owned inert definition, initialized output; no namespace access.
+        unsafe { definition.XmlText(&mut xml) }.unwrap();
+        xml.to_string()
+    }
+    fn parse(service: &ITaskService, xml: &str) -> ITaskDefinition {
+        // SAFETY: creates an unregistered memory-only definition on this MTA.
+        let definition = unsafe { service.NewTask(0) }.unwrap();
+        // SAFETY: bounded authored fixture text; this definition is never registered or run.
+        unsafe { definition.SetXmlText(&BSTR::from(xml)) }.unwrap();
+        definition
+    }
+    fn fixture() -> (Definition, String) {
+        let mut desired = desired();
+        desired.principal = "S-1-5-21-101-202-303-1001".into();
+        desired.trigger_user = desired.principal.clone();
+        (desired, "FIXTURE\\fixture".into())
+    }
+    fn independent_xml(desired: &Definition, trigger_user: &str) -> String {
+        let trigger_user = trigger_user.replace('&', "&amp;").replace('<', "&lt;");
+        format!(
+            r#"<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+<RegistrationInfo><URI>\Crosspane\Agent</URI></RegistrationInfo>
+<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{trigger_user}</UserId></LogonTrigger></Triggers>
+<Principals><Principal id="Author"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>false</AllowHardTerminate><IdleSettings><Duration>PT10M</Duration><WaitTimeout>PT1H</WaitTimeout><StopOnIdleEnd>true</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><RunOnlyIfIdle>false</RunOnlyIfIdle><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>
+<Actions Context="Author"><Exec><Command>{}</Command><Arguments>--windows-supervisor</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions>
+</Task>"#,
+            desired.principal, desired.action, desired.working_directory,
+        )
+    }
+
+    #[test]
+    fn removal_expected_task_uses_trusted_canonical_programs_and_refuses_alias_drift() {
+        let _apartment = Apartment::new();
+        let service = service();
+        let (_, name) = fixture();
+        let user = native_io::identity::Sid::from_bytes(vec![
+            1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 101, 0, 0, 0, 202, 0, 0, 0, 47, 1, 0, 0, 233, 3,
+            0, 0,
+        ])
+        .unwrap();
+        let desired =
+            native_io::removal_task_definition(&user, r"\\?\C:\fixture\Programs").unwrap();
+        assert_eq!(
+            desired.working_directory,
+            r"\\?\C:\fixture\Programs\Crosspane"
+        );
+        let expected =
+            xml(
+                &native_io::task::template::definition(&service, &desired, &name, &|| Ok(()))
+                    .unwrap(),
+            );
+        let registered = parse(&service, &independent_xml(&desired, &name));
+        assert_eq!(xml(&registered), expected);
+        for drift in 0..3 {
+            let changed = parse(&service, &independent_xml(&desired, &name));
+            // SAFETY: getters/setters affect only this unregistered fixture definition.
+            unsafe {
+                let action = changed
+                    .Actions()
+                    .unwrap()
+                    .get_Item(1)
+                    .unwrap()
+                    .cast::<IExecAction>()
+                    .unwrap();
+                match drift {
+                    0 => {
+                        action
+                            .SetPath(&BSTR::from(
+                                r"C:\fixture\Programs\Crosspane\crosspane-installer.exe",
+                            ))
+                            .unwrap();
+                        action
+                            .SetWorkingDirectory(&BSTR::from(r"C:\fixture\Programs\Crosspane"))
+                            .unwrap();
+                    }
+                    1 => action
+                        .SetPath(&BSTR::from(r"\\?\C:\foreign\crosspane-installer.exe"))
+                        .unwrap(),
+                    _ => action.SetArguments(&BSTR::from("--foreign")).unwrap(),
+                }
+            }
+            assert!(
+                xml(&changed) != expected,
+                "removal drift {drift} stays foreign"
+            );
+        }
+        assert!(matches!(
+            native_io::removal_task_definition(&user, r"C:\fixture\Programs"),
+            Err(NativeError::Foreign)
+        ));
+    }
+
+    #[test]
+    fn generated_definition_matches_independent_registered_representation() {
+        let _apartment = Apartment::new();
+        let service = service();
+        let (desired, name) = fixture();
+        let actual =
+            native_io::task::template::definition(&service, &desired, &name, &|| Ok(())).unwrap();
+        let expected = parse(&service, &independent_xml(&desired, &name));
+        assert_eq!(xml(&actual), xml(&expected));
+        // SAFETY: getters on owned inert definitions, with initialized scalar/string outputs.
+        unsafe {
+            let mut id = BSTR::new();
+            actual.Principal().unwrap().Id(&mut id).unwrap();
+            assert_eq!(id.to_string(), "Author");
+            let mut context = BSTR::new();
+            actual.Actions().unwrap().Context(&mut context).unwrap();
+            assert_eq!(context.to_string(), "Author");
+        }
+    }
+
+    #[test]
+    fn whole_template_comparison_refuses_foreign_identity_and_unrelated_drift() {
+        let _apartment = Apartment::new();
+        let service = service();
+        let (desired, name) = fixture();
+        let expected =
+            xml(
+                &native_io::task::template::definition(&service, &desired, &name, &|| Ok(()))
+                    .unwrap(),
+            );
+        for drift in 0..8 {
+            let changed = parse(&service, &independent_xml(&desired, &name));
+            // SAFETY: changes only this test-owned unregistered definition; no task namespace API.
+            unsafe {
+                match drift {
+                    0 => changed
+                        .Principal()
+                        .unwrap()
+                        .SetUserId(&BSTR::from("S-1-5-21-7-8-9-1002"))
+                        .unwrap(),
+                    1 => changed
+                        .Triggers()
+                        .unwrap()
+                        .get_Item(1)
+                        .unwrap()
+                        .cast::<ILogonTrigger>()
+                        .unwrap()
+                        .SetUserId(&BSTR::from("S-1-5-21-7-8-9-1002"))
+                        .unwrap(),
+                    2 => changed.Settings().unwrap().SetPriority(5).unwrap(),
+                    3 => changed
+                        .RegistrationInfo()
+                        .unwrap()
+                        .SetAuthor(&BSTR::from("fixture foreign author"))
+                        .unwrap(),
+                    4 => {
+                        changed
+                            .Principal()
+                            .unwrap()
+                            .SetId(&BSTR::from("Other"))
+                            .unwrap();
+                        changed
+                            .Actions()
+                            .unwrap()
+                            .SetContext(&BSTR::from("Other"))
+                            .unwrap();
+                    }
+                    5 => changed
+                        .Actions()
+                        .unwrap()
+                        .get_Item(1)
+                        .unwrap()
+                        .cast::<IExecAction>()
+                        .unwrap()
+                        .SetArguments(&BSTR::from("--foreign"))
+                        .unwrap(),
+                    6 => changed
+                        .Actions()
+                        .unwrap()
+                        .get_Item(1)
+                        .unwrap()
+                        .cast::<IExecAction>()
+                        .unwrap()
+                        .SetPath(&BSTR::from("C:\\fixture\\other.exe"))
+                        .unwrap(),
+                    _ => changed
+                        .RegistrationInfo()
+                        .unwrap()
+                        .SetDate(&BSTR::from("2026-10-12T12:00:00"))
+                        .unwrap(),
+                }
+            }
+            assert!(
+                xml(&changed) != expected,
+                "drift {drift} must remain foreign"
+            );
+        }
+    }
+
+    #[test]
+    fn template_checks_refuse_before_inert_definition_creation() {
+        let _apartment = Apartment::new();
+        let service = service();
+        let (desired, name) = fixture();
+        assert!(matches!(
+            native_io::task::template::definition(&service, &desired, &name, &|| Err(
+                NativeError::Foreign
+            )),
+            Err(NativeError::Foreign)
+        ));
+    }
+}
+
+#[test]
+fn current_xml_principal_sid_allows_its_observed_bare_account_name() {
+    assert_eq!(
+        native_io::task::normalize_account_ids(
+            "alex",
+            "LOCAL\\alex",
+            "S-1-5-21-101",
+            Some("LOCAL\\alex"),
+            true,
+        ),
+        Ok(("S-1-5-21-101".into(), "S-1-5-21-101".into()))
+    );
+    assert_eq!(
+        native_io::task::normalize_account_ids(
+            "S-1-5-21-101",
+            "S-1-5-21-101",
+            "S-1-5-21-101",
+            None,
+            true,
+        ),
+        Ok(("S-1-5-21-101".into(), "S-1-5-21-101".into()))
+    );
+}
+
+#[test]
+fn foreign_xml_principal_sid_rejects_the_same_bare_name_before_task_mutation() {
+    let observed = native_io::task::normalize_account_ids(
+        "alex",
+        "LOCAL\\alex",
+        "S-1-5-21-101",
+        Some("LOCAL\\alex"),
+        false,
+    );
+    assert_eq!(observed, Err(NativeError::Foreign));
+    let mut fake = Fake::new(Vec::new());
+    fake.views
+        .push_back(observed.map(|(principal, trigger_user)| {
+            let mut current = desired();
+            current.principal = principal;
+            current.trigger_user = trigger_user;
+            Some(snapshot(current))
+        }));
+    assert_eq!(reconcile(&mut fake, &desired()), Err(NativeError::Foreign));
+    assert_eq!(fake.events, ["inspect"]);
+}
+
+#[test]
+fn foreign_qualified_principal_or_trigger_is_not_mapped_to_the_current_sid() {
+    for (principal, trigger_user) in [("DOMAIN\\alex", "LOCAL\\alex"), ("alex", "DOMAIN\\alex")] {
+        assert_eq!(
+            native_io::task::normalize_account_ids(
+                principal,
+                trigger_user,
+                "S-1-5-21-101",
+                Some("LOCAL\\alex"),
+                true,
+            ),
+            Err(NativeError::Foreign)
+        );
+    }
+}
+
+#[test]
+fn bare_trigger_name_or_unresolved_principal_name_never_grants_account_identity() {
+    for (principal, trigger_user, own_name) in [
+        ("alex", "alex", Some("LOCAL\\alex")),
+        ("alex", "S-1-5-21-101", None),
+    ] {
+        assert_eq!(
+            native_io::task::normalize_account_ids(
+                principal,
+                trigger_user,
+                "S-1-5-21-101",
+                own_name,
+                true,
+            ),
+            Err(NativeError::Foreign)
+        );
+    }
+}
 
 fn desired() -> Definition {
     Definition {

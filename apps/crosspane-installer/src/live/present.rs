@@ -828,7 +828,7 @@ impl LiveController {
             let head = match end.outcome {
                 RepairOutcome::Retired => "The earlier repair record was discarded.",
                 RepairOutcome::Verified => {
-                    "Crosspane was repaired. The new instance reported healthy."
+                    "Crosspane was repaired. Its current installation is verified and healthy."
                 }
                 RepairOutcome::HealthVerifiedCleanupIncomplete => {
                     "Repaired: health verified, cleanup incomplete."
@@ -1001,6 +1001,17 @@ impl LiveController {
                     "Start setup",
                     true,
                     ButtonKind::Primary,
+                ));
+            }
+            ScreenId::Compatibility | ScreenId::InstallPlan
+                if self.desc.platform == crate::agent_contract::AgentPlatform::Windows =>
+            {
+                buttons.push(button(
+                    ids::REMOVE_OR_REPAIR,
+                    ButtonRole::Ordinary,
+                    "Remove or repair Crosspane…",
+                    !busy,
+                    ButtonKind::Link,
                 ));
             }
             ScreenId::Connect => self.connect_controls(&mut buttons, &mut fields),

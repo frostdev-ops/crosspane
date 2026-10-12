@@ -32,7 +32,15 @@ fn pe(marker: u8) -> Vec<u8> {
     b
 }
 fn facts(role: PayloadRole) -> PeFacts {
-    let b = pe(role as u8);
+    facts_for_machine(role, 0x8664)
+}
+fn pe_for_machine(role: PayloadRole, machine: u16) -> Vec<u8> {
+    let mut b = pe(role as u8);
+    b[68..70].copy_from_slice(&machine.to_le_bytes());
+    b
+}
+fn facts_for_machine(role: PayloadRole, machine: u16) -> PeFacts {
+    let b = pe_for_machine(role, machine);
     let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &b);
     let mut sha256 = [0; 32];
     sha256.copy_from_slice(hash.as_ref());
@@ -52,10 +60,17 @@ fn pins() -> Vec<ApprovedPe> {
         .collect()
 }
 fn manifest() -> serde_json::Value {
-    let payloads = [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl].map(|role| {
-        let pin = facts(role);
-        serde_json::json!({"role":role,"leaf":role.leaf(),"size":pin.size,"sha256":native_io::records::hex(&pin.sha256),"machine":pin.machine,"subsystem":pin.subsystem,"version":pin.version})
-    });
+    manifest_for_machines([0x8664; 3])
+}
+fn manifest_for_machines(machines: [u16; 3]) -> serde_json::Value {
+    let payloads: Vec<_> = [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl]
+        .into_iter()
+        .zip(machines)
+        .map(|(role, machine)| {
+            let pin = facts_for_machine(role, machine);
+            serde_json::json!({"role":role,"leaf":role.leaf(),"size":pin.size,"sha256":native_io::records::hex(&pin.sha256),"machine":pin.machine,"subsystem":pin.subsystem,"version":pin.version})
+        })
+        .collect();
     serde_json::json!({"schema_version":1,"payloads":payloads})
 }
 fn parse(v: serde_json::Value) -> NativeResult<ApprovedInventory> {
@@ -138,6 +153,144 @@ fn inventory_limits_hash_pe_and_version_are_strict() {
     let i = ApprovedInventory::fixture(pins()).unwrap();
     i.check_staging_budget(i.role(PayloadRole::Installer).unwrap(), true)
         .unwrap();
+}
+#[test]
+fn arm64_metadata_remains_inspectable_but_embedded_approvals_require_x64() {
+    let generic = facts_for_machine(PayloadRole::Agent, 0xaa64);
+    assert!(generic.valid());
+    let encoded = serde_json::to_vec(&generic).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<PeFacts>(&encoded).unwrap(),
+        generic
+    );
+    assert_eq!(
+        pe_header(&pe_for_machine(PayloadRole::Agent, 0xaa64), 512),
+        Ok((0xaa64, 3))
+    );
+    assert!(parse(manifest_for_machines([0x8664; 3])).is_ok());
+    for machines in [
+        [0xaa64, 0x8664, 0x8664],
+        [0x8664, 0xaa64, 0x8664],
+        [0x8664, 0x8664, 0xaa64],
+        [0xaa64; 3],
+    ] {
+        assert_eq!(
+            parse(manifest_for_machines(machines)).err(),
+            Some(NativeError::Unsupported)
+        );
+    }
+}
+#[test]
+fn staging_preflight_binds_every_payload_to_the_supported_installer_machine() {
+    for (installer_machine, machines) in [
+        (0x8664, [0x8664; 3]),
+        (0x8664, [0xaa64, 0x8664, 0x8664]),
+        (0x8664, [0x8664, 0xaa64, 0x8664]),
+        (0x8664, [0x8664, 0x8664, 0xaa64]),
+        (0x8664, [0xaa64; 3]),
+        (0xaa64, [0x8664; 3]),
+        (0xaa64, [0xaa64; 3]),
+    ] {
+        let installer = ApprovedPe::fixture(
+            PayloadRole::Installer,
+            facts_for_machine(PayloadRole::Installer, installer_machine),
+        );
+        let mut pins = vec![installer.clone()];
+        pins.extend(
+            [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl]
+                .into_iter()
+                .zip(machines)
+                .map(|(role, machine)| ApprovedPe::fixture(role, facts_for_machine(role, machine))),
+        );
+        let inventory = ApprovedInventory::fixture(pins).unwrap();
+        for helper in [false, true] {
+            assert_eq!(
+                inventory.check_staging_budget(&installer, helper),
+                if installer_machine == 0x8664 && machines == [0x8664; 3] {
+                    Ok(())
+                } else {
+                    Err(NativeError::Unsupported)
+                }
+            );
+        }
+    }
+}
+#[test]
+fn incompatible_source_machines_refuse_before_reads_and_receiver_approval() {
+    use std::{
+        io::{Cursor, Read},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    struct CountingRead {
+        bytes: Cursor<Vec<u8>>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Read for CountingRead {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.bytes.read(out)
+        }
+    }
+    for (installer_machine, machines) in [
+        (0x8664, [0x8664; 3]),
+        (0x8664, [0xaa64, 0x8664, 0x8664]),
+        (0x8664, [0x8664, 0xaa64, 0x8664]),
+        (0x8664, [0x8664, 0x8664, 0xaa64]),
+        (0x8664, [0xaa64; 3]),
+        (0xaa64, [0x8664; 3]),
+        (0xaa64, [0xaa64; 3]),
+    ] {
+        let installer = ApprovedPe::fixture(
+            PayloadRole::Installer,
+            facts_for_machine(PayloadRole::Installer, installer_machine),
+        );
+        let roles = [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl];
+        let mut pins = vec![installer.clone()];
+        pins.extend(
+            roles
+                .into_iter()
+                .zip(machines)
+                .map(|(role, machine)| ApprovedPe::fixture(role, facts_for_machine(role, machine))),
+        );
+        let inventory = ApprovedInventory::fixture(pins).unwrap();
+        // Every supplied PE matches its pin's complete hash/header/size, including ARM64.
+        // A refusal therefore proves target admission, rather than corrupt-source rejection.
+        let bytes: [Vec<u8>; 3] =
+            std::array::from_fn(|index| pe_for_machine(roles[index], machines[index]));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let inputs = roles
+            .into_iter()
+            .zip(bytes.clone())
+            .map(|(role, bytes)| payload::PayloadInput {
+                role,
+                content: Box::new(CountingRead {
+                    bytes: Cursor::new(bytes),
+                    calls: calls.clone(),
+                }),
+            })
+            .collect();
+        let deadline = native_io::Deadline::new(
+            5000,
+            Arc::new(native_io::MonotonicClock::default()),
+            native_io::Cancellation::default(),
+        )
+        .unwrap();
+        let buffered = payload::buffer_outer_sources(inputs, &inventory, &installer, &deadline);
+        let received =
+            payload::ApprovedOuterSources::receive(bytes, &inventory, &installer, &deadline);
+        if installer_machine == 0x8664 && machines == [0x8664; 3] {
+            assert!(buffered.is_ok());
+            assert!(received.is_ok());
+            assert!(calls.load(Ordering::Relaxed) > 0);
+        } else {
+            assert_eq!(buffered.err(), Some(NativeError::Unsupported));
+            assert_eq!(received.err(), Some(NativeError::Unsupported));
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+        }
+    }
 }
 #[test]
 fn pe_header_refuses_truncated_non_pe32plus_and_unsupported_machine() {

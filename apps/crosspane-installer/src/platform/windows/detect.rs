@@ -1,5 +1,9 @@
 use super::native_io::{NativeError, NativeResult};
 
+#[cfg(windows)]
+#[path = "detect/native.rs"]
+pub(crate) mod native;
+
 #[derive(Clone)]
 pub struct FolderFacts {
     pub local: String,
@@ -74,13 +78,34 @@ impl FixedPaths {
         &self.programs
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fact<T> {
     Known(T),
     Unknown,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowsVersion {
+    pub major: u32,
+    pub build: u32,
+    pub workstation: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostFacts {
+    pub version: Fact<WindowsVersion>,
+    /// IMAGE_FILE_MACHINE_* for the actual host, never the emulated process architecture.
+    pub native_machine: Fact<u16>,
+}
+impl HostFacts {
+    pub fn unknown() -> Self {
+        Self {
+            version: Fact::Unknown,
+            native_machine: Fact::Unknown,
+        }
+    }
+}
 #[derive(Debug)]
 pub struct SupportFacts {
+    pub host: HostFacts,
     pub limited: Fact<bool>,
     pub folders: Fact<bool>,
     pub ntfs: Fact<bool>,
@@ -89,6 +114,7 @@ pub struct SupportFacts {
 impl SupportFacts {
     pub fn unknown() -> Self {
         Self {
+            host: HostFacts::unknown(),
             limited: Fact::Unknown,
             folders: Fact::Unknown,
             ntfs: Fact::Unknown,
@@ -102,13 +128,35 @@ pub enum Eligibility {
     Unsupported,
     Unknown,
 }
+pub fn classify_host(facts: &HostFacts) -> Eligibility {
+    let version = match facts.version {
+        Fact::Known(version) => {
+            Fact::Known(version.workstation && version.major >= 10 && version.build >= 26100)
+        }
+        Fact::Unknown => Fact::Unknown,
+    };
+    let architecture = match facts.native_machine {
+        Fact::Known(machine) => Fact::Known(machine == 0x8664), // IMAGE_FILE_MACHINE_AMD64
+        Fact::Unknown => Fact::Unknown,
+    };
+    classify_values(&[&version, &architecture])
+}
 pub fn classify(facts: &SupportFacts) -> Eligibility {
+    let host = match classify_host(&facts.host) {
+        Eligibility::Supported => Fact::Known(true),
+        Eligibility::Unsupported => Fact::Known(false),
+        Eligibility::Unknown => Fact::Unknown,
+    };
     let values = [
+        &host,
         &facts.limited,
         &facts.folders,
         &facts.ntfs,
         &facts.authority,
     ];
+    classify_values(&values)
+}
+fn classify_values(values: &[&Fact<bool>]) -> Eligibility {
     if values.iter().any(|v| matches!(v, Fact::Known(false))) {
         Eligibility::Unsupported
     } else if values.iter().all(|v| matches!(v, Fact::Known(true))) {
@@ -137,6 +185,7 @@ impl std::fmt::Debug for SupportReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SupportReport")
             .field("eligibility", &self.eligibility)
+            .field("host", &self.facts.host)
             .field("native_issue", &self.native_issue)
             .finish_non_exhaustive()
     }
@@ -151,6 +200,7 @@ pub fn support_report(
         Ok(_) => SupportReport {
             eligibility: Eligibility::Supported,
             facts: SupportFacts {
+                host: *io.target().host(),
                 limited: Fact::Known(true),
                 folders: Fact::Known(true),
                 ntfs: Fact::Known(true),
@@ -160,7 +210,11 @@ pub fn support_report(
             native_issue: None,
         },
         Err(error) => SupportReport {
-            eligibility: Eligibility::Unknown,
+            eligibility: if matches!(error, NativeError::Foreign | NativeError::Unsupported) {
+                Eligibility::Unsupported
+            } else {
+                Eligibility::Unknown
+            },
             facts: SupportFacts::unknown(),
             identity: None,
             native_issue: Some(error),
@@ -178,8 +232,8 @@ pub fn current_report(
         process::{CallOwner, Dispatch},
     };
     let owner = std::sync::Arc::new(CallOwner::default());
-    let observed = match owner.run(Dispatch::Observation, deadline, identity::native::observe) {
-        Ok(identity) => identity,
+    let host = match owner.run(Dispatch::Observation, deadline, || Ok(native::observe())) {
+        Ok(host) => host,
         Err(error) => {
             return SupportReport {
                 eligibility: Eligibility::Unknown,
@@ -189,10 +243,41 @@ pub fn current_report(
             };
         }
     };
+    let eligibility = classify_host(&host);
+    if eligibility != Eligibility::Supported {
+        return SupportReport {
+            native_issue: Some(if eligibility == Eligibility::Unsupported {
+                NativeError::Unsupported
+            } else {
+                NativeError::Unavailable
+            }),
+            eligibility,
+            facts: SupportFacts {
+                host,
+                ..SupportFacts::unknown()
+            },
+            identity: None,
+        };
+    }
+    let observed = match owner.run(Dispatch::Observation, deadline, identity::native::observe) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return SupportReport {
+                eligibility: Eligibility::Unknown,
+                facts: SupportFacts {
+                    host,
+                    ..SupportFacts::unknown()
+                },
+                identity: None,
+                native_issue: Some(error),
+            };
+        }
+    };
     if identity::LimitedIdentity::admit(observed.clone()).is_err() {
         return SupportReport {
             eligibility: Eligibility::Unsupported,
             facts: SupportFacts {
+                host,
                 limited: Fact::Known(false),
                 ..SupportFacts::unknown()
             },
@@ -209,6 +294,7 @@ pub fn current_report(
                 Eligibility::Unknown
             },
             facts: SupportFacts {
+                host,
                 limited: Fact::Known(true),
                 ..SupportFacts::unknown()
             },

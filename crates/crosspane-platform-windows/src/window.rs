@@ -1032,6 +1032,17 @@ fn emit(events: Vec<WindowEvent>, sink: &Option<Arc<dyn EventSink<WindowEvent>>>
     }
 }
 
+/// Crosspane's own windows are never sources (model/winevent.rs excludes them). Their fields
+/// are not read either: GetWindowTextW on a same-process window sends WM_GETTEXT to its owner
+/// thread, and that thread may be the one waiting for this source to start.
+fn own_process(window: HWND) -> bool {
+    let mut pid = 0;
+    // SAFETY: PID metadata only; this never sends a message to the window.
+    unsafe { GetWindowThreadProcessId(window, &mut pid) };
+    // SAFETY: identifier of this process only.
+    pid == unsafe { GetCurrentProcessId() }
+}
+
 fn observe(
     id: u64,
     context: &Context,
@@ -1042,6 +1053,7 @@ fn observe(
 ) -> Result<(), PlatformError> {
     if !context.allows(id)
         || id == number(native.window)
+        || own_process(hwnd(id))
         || !context.state.fields_open.load(Ordering::Acquire)
     {
         return Ok(());

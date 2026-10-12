@@ -1,10 +1,52 @@
 use super::{NativeError, NativeResult};
 
 pub const DELETE: u32 = 0x10000;
+pub(crate) fn history_leaf_allowed(leaf: &str) -> bool {
+    matches!(
+        leaf,
+        "supervisor.json"
+            | "supervisor-logon.json"
+            | "task-activation.json"
+            | "supervisor-epoch-0.json"
+            | "supervisor-epoch-1.json"
+            | "supervisor-epoch-2.json"
+            | "supervisor-archive-intent.json"
+            | "removal.json"
+            | "first-install.json"
+            | "first-install-recovery.json"
+            | "stage-catalog.json"
+            | "outer-upgrade.json"
+            | "file-recovery.json"
+            | "repair.json"
+            | "repair-publication-intent.json"
+            | "repair-pending.json"
+            | "repair-evidence-index.json"
+            | "repair-payload.json"
+            | "repair-payload-catalog.json"
+            | "repair-payload-publication-intent.json"
+            | "repair-payload-pending.json"
+    ) || leaf
+        .strip_prefix("operation-")
+        .and_then(|s| s.strip_suffix(".json"))
+        .is_some_and(|id| {
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileIdentity {
     pub volume: u64,
     pub file: [u8; 16],
+}
+/// Correlation for one immutable metadata leaf, not a path or deletion capability.
+pub(crate) struct HistoryMetadata<'a> {
+    pub name: &'a str,
+    pub identity: FileIdentity,
+    pub length: u32,
+    pub digest: [u8; 32],
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Principal {
@@ -12,6 +54,7 @@ pub enum Principal {
     System,
     Administrators,
     TrustedInstaller,
+    Capability,
     Foreign,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,12 +98,13 @@ pub fn admit_component(facts: &ComponentFacts, admission: Admission) -> NativeRe
         || facts.identity.file == [0; 16]
         || (!directory && facts.links != 1)
         || (private && (facts.acl.owner != Principal::User || !facts.acl.protected))
-        || facts.acl.owner == Principal::Foreign
+        || matches!(facts.acl.owner, Principal::Foreign | Principal::Capability)
     {
         return Err(NativeError::Foreign);
     }
     // Trusted machine administrators remain part of Windows' security boundary. An existing
     // ancestor may allow foreign creation of a sibling, but never changes/deletion of our child.
+    // AppContainer capability grants also require the ordinary user/group access check.
     const ANCESTOR_MUTATION: u32 =
         DELETE | 0x40 | 0x100 | 0x40000 | 0x80000 | 0x10000000 | 0x40000000;
     for ace in &facts.acl.entries {
@@ -450,6 +494,9 @@ pub(crate) mod native {
         }
         if security.trusted_installer.as_ref() == Some(&sid) {
             return Ok(Principal::TrustedInstaller);
+        }
+        if sid.is_specific_capability() {
+            return Ok(Principal::Capability);
         }
         match sid.sddl().as_str() {
             "S-1-5-18" => Ok(Principal::System),
@@ -1561,6 +1608,26 @@ pub(crate) mod native {
             }
             Ok(image)
         }
+        #[cfg_attr(test, allow(dead_code))] // Native keeper consumers are absent in library unit tests.
+        pub(crate) fn stage_readonly_image(
+            &self,
+            leaf: &str,
+            input: Box<dyn std::io::Read + Send>,
+            expected: &super::super::super::payload::inventory::ApprovedPe,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<ImageData> {
+            let staged = self.stage_image(leaf, input, expected, security, deadline)?;
+            let identity = staged.identity;
+            let facts = staged.facts.clone();
+            // Strict read-only pins cannot coexist with this copy's writable/delete staging handle.
+            drop(staged);
+            let image = self.open_image(leaf, true, expected.version(), security, deadline)?;
+            if image.identity != identity || image.facts != facts {
+                return Err(NativeError::Foreign);
+            }
+            Ok(image)
+        }
         pub(crate) fn move_opaque(
             &self,
             mut source: OpaqueData,
@@ -2347,11 +2414,146 @@ pub(crate) mod native {
             deadline.check()
         }
     }
+    impl Anchor {
+        /// Retire only a recorded regular leaf in one of the three fixed history slots.
+        #[cfg_attr(test, allow(dead_code))] // Native consumers are absent in library unit-test roots.
+        pub(crate) fn delete_first_history_metadata(
+            &self,
+            slot: u8,
+            directory: FileIdentity,
+            leaf: &HistoryMetadata<'_>,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            if !history_leaf_allowed(leaf.name)
+                || leaf.length == 0
+                || leaf.length as usize > MAX_RECORD_BYTES
+            {
+                return Err(NativeError::Foreign);
+            }
+            self.revalidate(security, true, deadline)?;
+            let archive = self
+                .child("first-install-history", security, deadline)?
+                .map(|parent| {
+                    parent.child(
+                        match slot {
+                            0 => "slot-0",
+                            1 => "slot-1",
+                            2 => "slot-2",
+                            _ => return Err(NativeError::Invalid),
+                        },
+                        security,
+                        deadline,
+                    )
+                })
+                .transpose()?
+                .flatten()
+                .ok_or(NativeError::Foreign)?;
+            if archive.identity()? != directory {
+                return Err(NativeError::Foreign);
+            }
+            let mut source = open_component(
+                archive.file()?,
+                &ComponentName::new(leaf.name)?,
+                ObjectKind::File,
+                GENERIC_READ | super::DELETE,
+                0,
+                deadline,
+            )?
+            .ok_or(NativeError::OutcomeUnknown)?;
+            let facts = observe(&source, leaf.name, security)?;
+            admit_component(&facts, Admission::PrivateFile)?;
+            let bytes = read_repair_bytes(&mut source, deadline)?;
+            if facts.identity != leaf.identity
+                || bytes.len() != leaf.length as usize
+                || aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &bytes).as_ref()
+                    != leaf.digest
+            {
+                return Err(NativeError::Foreign);
+            }
+            let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            deadline.check()?;
+            // SAFETY: exact rechecked private no-follow FileId and byte digest, exclusive DELETE handle.
+            if unsafe {
+                SetFileInformationByHandle(
+                    source.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            drop(source);
+            if archive
+                .opaque(leaf.name, false, security, deadline)?
+                .is_some()
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            deadline.check()
+        }
+        /// Delete the exact empty slot only, after every journal-owned metadata leaf is absent.
+        #[cfg_attr(test, allow(dead_code))] // Native consumers are absent in library unit-test roots.
+        pub(crate) fn delete_empty_first_history_slot(
+            &self,
+            slot: u8,
+            expected: FileIdentity,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let leaf = match slot {
+                0 => "slot-0",
+                1 => "slot-1",
+                2 => "slot-2",
+                _ => return Err(NativeError::Invalid),
+            };
+            self.revalidate(security, true, deadline)?;
+            let parent = self
+                .child("first-install-history", security, deadline)?
+                .ok_or(NativeError::Foreign)?;
+            // No retained slot pin survives into this DELETE open. Parent pins remain read/no-delete.
+            let source = open_component(
+                parent.file()?,
+                &ComponentName::new(leaf)?,
+                ObjectKind::Directory,
+                super::DELETE | FILE_LIST_DIRECTORY | FILE_TRAVERSE,
+                0,
+                deadline,
+            )?
+            .ok_or(NativeError::OutcomeUnknown)?;
+            let facts = observe(&source, leaf, security)?;
+            admit_component(&facts, Admission::PrivateDirectory)?;
+            if facts.identity != expected || !entries(&source, deadline)?.is_empty() {
+                return Err(NativeError::Foreign);
+            }
+            let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            deadline.check()?;
+            // SAFETY: exact private empty directory with expected FileId and exclusive DELETE handle.
+            if unsafe {
+                SetFileInformationByHandle(
+                    source.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            drop(source);
+            if parent.child(leaf, security, deadline)?.is_some() {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            deadline.check()
+        }
+    }
     #[cfg(not(test))]
     fn name_of_repair_file(file: &File) -> NativeResult<String> {
         name(file)
     }
-    #[cfg(not(test))]
+    #[cfg_attr(test, allow(dead_code))]
     fn read_repair_bytes(file: &mut File, deadline: &Deadline) -> NativeResult<Vec<u8>> {
         use std::io::{Read, Seek};
         let standard: FILE_STANDARD_INFO = info(file, FileStandardInfo)?;

@@ -1,5 +1,29 @@
 //! Public Task Scheduler COM adapter. All interfaces live and die on one owned MTA thread.
 
+#[cfg_attr(test, allow(dead_code))] // Native consumer is excluded from library unit-test roots.
+pub(crate) fn normalize_account_ids(
+    principal: &str,
+    trigger_user: &str,
+    own_sid: &str,
+    own_name: Option<&str>,
+    xml_principal_matches: bool,
+) -> super::NativeResult<(String, String)> {
+    let qualified_matches = |value: &str| {
+        own_name.is_some_and(|name| name.contains('\\') && value.eq_ignore_ascii_case(name))
+    };
+    let bare_matches = own_name.is_some_and(|name| {
+        name.rsplit_once('\\')
+            .is_some_and(|(_, bare)| principal.eq_ignore_ascii_case(bare))
+    });
+    if !xml_principal_matches
+        || !(principal == own_sid || qualified_matches(principal) || bare_matches)
+        || !(trigger_user == own_sid || qualified_matches(trigger_user))
+    {
+        return Err(super::NativeError::Foreign);
+    }
+    Ok((own_sid.to_owned(), own_sid.to_owned()))
+}
+
 /// Classification of one `CoInitializeSecurity` call. Only `Ready` is ever cached.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,10 +50,93 @@ fn security_outcome(code: windows::core::HRESULT) -> SecurityOutcome {
     }
 }
 
+#[cfg(windows)]
+macro_rules! call {
+    ($check:expr, $expr:expr) => {{
+        ($check)()?;
+        // SAFETY: the adapter owns this MTA's interfaces and valid bounded inputs/output slots.
+        // The admission closure renews the original context, image pins and deadline first.
+        unsafe { $expr }.map_err(|error| {
+            #[cfg(not(test))]
+            super::native::log_com_error(file!(), line!(), &error);
+            #[cfg(test)]
+            let _ = error;
+            NativeError::Unavailable
+        })
+    }};
+}
+
+#[cfg(windows)]
+pub(crate) mod template {
+    use super::super::super::service::task::{Definition, SUPERVISOR_ARGUMENT, TASK_NAME};
+    use super::super::{NativeError, NativeResult};
+    use windows::{
+        Win32::{Foundation::VARIANT_BOOL, System::TaskScheduler::*},
+        core::{BSTR, Interface},
+    };
+
+    /// Independent in-memory definition; this helper has no registration, task lookup or Run call.
+    #[cfg_attr(test, allow(dead_code))] // Native consumer is excluded from library unit-test roots.
+    pub(crate) fn definition(
+        service: &ITaskService,
+        desired: &Definition,
+        admitted_trigger_user: &str,
+        check: &dyn Fn() -> NativeResult<()>,
+    ) -> NativeResult<ITaskDefinition> {
+        let definition = call!(check, service.NewTask(0))?;
+        let principal = call!(check, definition.Principal())?;
+        call!(check, principal.SetId(&BSTR::from("Author")))?;
+        call!(
+            check,
+            principal.SetUserId(&BSTR::from(desired.principal.as_str()))
+        )?;
+        call!(check, principal.SetLogonType(TASK_LOGON_INTERACTIVE_TOKEN))?;
+        call!(check, principal.SetRunLevel(TASK_RUNLEVEL_LUA))?;
+        let triggers = call!(check, definition.Triggers())?;
+        let trigger = call!(check, triggers.Create(TASK_TRIGGER_LOGON))?;
+        let trigger: ILogonTrigger = trigger.cast().map_err(|_| NativeError::Unavailable)?;
+        call!(check, trigger.SetUserId(&BSTR::from(admitted_trigger_user)))?;
+        let actions = call!(check, definition.Actions())?;
+        call!(check, actions.SetContext(&BSTR::from("Author")))?;
+        let action = call!(check, actions.Create(TASK_ACTION_EXEC))?;
+        let action: IExecAction = action.cast().map_err(|_| NativeError::Unavailable)?;
+        call!(check, action.SetPath(&BSTR::from(desired.action.as_str())))?;
+        call!(check, action.SetArguments(&BSTR::from(SUPERVISOR_ARGUMENT)))?;
+        call!(
+            check,
+            action.SetWorkingDirectory(&BSTR::from(desired.working_directory.as_str()))
+        )?;
+        let settings = call!(check, definition.Settings())?;
+        call!(
+            check,
+            settings.SetMultipleInstances(TASK_INSTANCES_IGNORE_NEW)
+        )?;
+        call!(check, settings.SetRestartCount(0))?;
+        call!(check, settings.SetAllowDemandStart(VARIANT_BOOL(-1)))?;
+        call!(check, settings.SetExecutionTimeLimit(&BSTR::from("PT0S")))?;
+        call!(check, settings.SetStopIfGoingOnBatteries(VARIANT_BOOL(0)))?;
+        call!(
+            check,
+            settings.SetDisallowStartIfOnBatteries(VARIANT_BOOL(0))
+        )?;
+        call!(check, settings.SetAllowHardTerminate(VARIANT_BOOL(0)))?;
+        call!(check, settings.SetRunOnlyIfIdle(VARIANT_BOOL(0)))?;
+        call!(
+            check,
+            settings.SetRunOnlyIfNetworkAvailable(VARIANT_BOOL(0))
+        )?;
+        call!(check, settings.SetWakeToRun(VARIANT_BOOL(0)))?;
+        call!(check, settings.SetEnabled(VARIANT_BOOL(-1)))?;
+        let information = call!(check, definition.RegistrationInfo())?;
+        call!(check, information.SetURI(&BSTR::from(TASK_NAME)))?;
+        Ok(definition)
+    }
+}
+
 #[cfg(all(windows, not(test)))]
 mod native {
     use super::super::super::service::task::{
-        Definition, Logon, MAX_XML_BYTES, RunLevel, SUPERVISOR_ARGUMENT, Snapshot, TASK_NAME,
+        Definition, Logon, MAX_XML_BYTES, RunLevel, Snapshot, TASK_NAME,
     };
     use super::super::{
         NativeError, NativeResult,
@@ -50,22 +157,11 @@ mod native {
     };
 
     /// Logs a failed COM call's `HRESULT` at the given call site, for the setup log.
-    fn log_com_error(file: &str, line: u32, error: &windows::core::Error) {
+    pub(super) fn log_com_error(file: &str, line: u32, error: &windows::core::Error) {
         crate::platform::windows::setup_log::setup_note!(
             "com error 0x{:08X} at {file}:{line}",
             error.code().0 as u32
         );
-    }
-    macro_rules! call {
-        ($check:expr, $expr:expr) => {{
-            ($check)()?;
-            // SAFETY: the adapter owns this MTA's interfaces and valid bounded inputs/output slots.
-            // The admission closure renews the original context, image pins and deadline first.
-            unsafe { $expr }.map_err(|error| {
-                log_com_error(file!(), line!(), &error);
-                NativeError::Unavailable
-            })
-        }};
     }
     /// Set only after a `Ready` outcome. Failures are never cached, so a later apartment retries.
     static SECURITY_READY: AtomicBool = AtomicBool::new(false);
@@ -475,12 +571,27 @@ mod native {
             {
                 return Err(NativeError::Foreign);
             }
+            let own_user = super::super::identity::native::observe()?.user;
+            let own_sid = own_user.sddl();
+            let own_name = super::super::identity::native::account_name(&own_user).ok();
+            let (principal, trigger_user) = super::normalize_account_ids(
+                &bounded_bstr(&user, 256)?,
+                &bounded_bstr(&trigger_user, 256)?,
+                &own_sid,
+                own_name.as_deref(),
+                self.xml_principal_matches(&xml, &own_sid, check)?,
+            )?;
+            let enabled = call!(check, task.Enabled())?.0 != 0;
+            // Bind the separately read COM fields and principal proof to the same XML observation.
+            if bounded_bstr(&call!(check, task.Xml())?, MAX_XML_BYTES)? != xml {
+                return Err(NativeError::Foreign);
+            }
             Ok(Some(Snapshot {
                 xml,
                 definition: Definition {
                     name: path,
-                    principal: bounded_bstr(&user, 256)?,
-                    trigger_user: bounded_bstr(&trigger_user, 256)?,
+                    principal,
+                    trigger_user,
                     logon: Logon::InteractiveToken,
                     run_level: RunLevel::Limited,
                     action: bounded_bstr(&action_path, 32768)?,
@@ -489,9 +600,28 @@ mod native {
                     logon_trigger_only: true,
                     ignore_new_instance: policy == TASK_INSTANCES_IGNORE_NEW,
                     manager_restart_count: restart as u32,
-                    enabled: call!(check, task.Enabled())?.0 != 0,
+                    enabled,
                 },
             }))
+        }
+        fn xml_principal_matches(
+            &self,
+            xml: &str,
+            own_sid: &str,
+            check: &dyn Fn() -> NativeResult<()>,
+        ) -> NativeResult<bool> {
+            let definition = call!(check, self.service.NewTask(0))?;
+            call!(check, definition.SetXmlText(&BSTR::from(xml)))?;
+            let mut before = BSTR::new();
+            call!(check, definition.XmlText(&mut before))?;
+            let before = bounded_bstr(&before, MAX_XML_BYTES)?;
+            let principal = call!(check, definition.Principal())?;
+            // Getter names can be ambiguous; assigning the expected SID must leave this inert
+            // definition's whole canonical XML unchanged. No registered task is modified.
+            call!(check, principal.SetUserId(&BSTR::from(own_sid)))?;
+            let mut after = BSTR::new();
+            call!(check, definition.XmlText(&mut after))?;
+            Ok(before == bounded_bstr(&after, MAX_XML_BYTES)?)
         }
         /// Caller durably published exact original XML before this first external namespace mutation.
         pub(crate) fn register(
@@ -501,6 +631,7 @@ mod native {
             check: &dyn Fn() -> NativeResult<()>,
             journal: &mut dyn FnMut(RegistrationStep) -> NativeResult<()>,
         ) -> NativeResult<()> {
+            let definition = self.expected_definition(desired, check)?;
             if self.folder.is_none() {
                 journal(RegistrationStep::FolderIntent)?;
                 let folder = call!(
@@ -511,51 +642,6 @@ mod native {
                 self.folder = Some(folder);
                 journal(RegistrationStep::FolderCreated)?;
             }
-            let definition = call!(check, self.service.NewTask(0))?;
-            let principal = call!(check, definition.Principal())?;
-            call!(
-                check,
-                principal.SetUserId(&BSTR::from(desired.principal.as_str()))
-            )?;
-            call!(check, principal.SetLogonType(TASK_LOGON_INTERACTIVE_TOKEN))?;
-            call!(check, principal.SetRunLevel(TASK_RUNLEVEL_LUA))?;
-            let triggers = call!(check, definition.Triggers())?;
-            let trigger = call!(check, triggers.Create(TASK_TRIGGER_LOGON))?;
-            let trigger: ILogonTrigger = trigger.cast().map_err(|_| NativeError::Unavailable)?;
-            call!(
-                check,
-                trigger.SetUserId(&BSTR::from(desired.trigger_user.as_str()))
-            )?;
-            let actions = call!(check, definition.Actions())?;
-            let action = call!(check, actions.Create(TASK_ACTION_EXEC))?;
-            let action: IExecAction = action.cast().map_err(|_| NativeError::Unavailable)?;
-            call!(check, action.SetPath(&BSTR::from(desired.action.as_str())))?;
-            call!(check, action.SetArguments(&BSTR::from(SUPERVISOR_ARGUMENT)))?;
-            call!(
-                check,
-                action.SetWorkingDirectory(&BSTR::from(desired.working_directory.as_str()))
-            )?;
-            let settings = call!(check, definition.Settings())?;
-            call!(
-                check,
-                settings.SetMultipleInstances(TASK_INSTANCES_IGNORE_NEW)
-            )?;
-            call!(check, settings.SetRestartCount(0))?;
-            call!(check, settings.SetAllowDemandStart(VARIANT_BOOL(-1)))?;
-            call!(check, settings.SetExecutionTimeLimit(&BSTR::from("PT0S")))?;
-            call!(check, settings.SetStopIfGoingOnBatteries(VARIANT_BOOL(0)))?;
-            call!(
-                check,
-                settings.SetDisallowStartIfOnBatteries(VARIANT_BOOL(0))
-            )?;
-            call!(check, settings.SetAllowHardTerminate(VARIANT_BOOL(0)))?;
-            call!(check, settings.SetRunOnlyIfIdle(VARIANT_BOOL(0)))?;
-            call!(
-                check,
-                settings.SetRunOnlyIfNetworkAvailable(VARIANT_BOOL(0))
-            )?;
-            call!(check, settings.SetWakeToRun(VARIANT_BOOL(0)))?;
-            call!(check, settings.SetEnabled(VARIANT_BOOL(-1)))?;
             let flags = (if existing {
                 TASK_UPDATE.0
             } else {
@@ -578,61 +664,29 @@ mod native {
             journal(RegistrationStep::DefinitionRegistered)?;
             Ok(())
         }
-        /// Generated expectation only. SDK roundtripping does not promise that registration's
-        /// automatic author/date fields match this template. Any discrepancy is retained, never
-        /// copied from the observed task or normalized away. Native equivalence remains unproven.
+        fn expected_definition(
+            &self,
+            desired: &Definition,
+            check: &dyn Fn() -> NativeResult<()>,
+        ) -> NativeResult<ITaskDefinition> {
+            check()?;
+            let identity = super::super::identity::native::current()?;
+            let user = &identity.facts().user;
+            let own_sid = user.sddl();
+            if desired.principal != own_sid || desired.trigger_user != own_sid {
+                return Err(NativeError::Foreign);
+            }
+            let trigger_user = super::super::identity::native::account_name(user)?;
+            super::template::definition(&self.service, desired, &trigger_user, check)
+        }
+        /// Independent expected registration representation. Author/date or any other observed
+        /// drift remains foreign; no field is copied from an observed task or normalized away.
         pub(crate) fn removal_template(
             &self,
             desired: &Definition,
             check: &dyn Fn() -> NativeResult<()>,
         ) -> NativeResult<String> {
-            let definition = call!(check, self.service.NewTask(0))?;
-            let principal = call!(check, definition.Principal())?;
-            call!(
-                check,
-                principal.SetUserId(&BSTR::from(desired.principal.as_str()))
-            )?;
-            call!(check, principal.SetLogonType(TASK_LOGON_INTERACTIVE_TOKEN))?;
-            call!(check, principal.SetRunLevel(TASK_RUNLEVEL_LUA))?;
-            let triggers = call!(check, definition.Triggers())?;
-            let trigger = call!(check, triggers.Create(TASK_TRIGGER_LOGON))?;
-            let trigger: ILogonTrigger = trigger.cast().map_err(|_| NativeError::Unavailable)?;
-            call!(
-                check,
-                trigger.SetUserId(&BSTR::from(desired.trigger_user.as_str()))
-            )?;
-            let actions = call!(check, definition.Actions())?;
-            let action = call!(check, actions.Create(TASK_ACTION_EXEC))?;
-            let action: IExecAction = action.cast().map_err(|_| NativeError::Unavailable)?;
-            call!(check, action.SetPath(&BSTR::from(desired.action.as_str())))?;
-            call!(check, action.SetArguments(&BSTR::from(SUPERVISOR_ARGUMENT)))?;
-            call!(
-                check,
-                action.SetWorkingDirectory(&BSTR::from(desired.working_directory.as_str()))
-            )?;
-            let settings = call!(check, definition.Settings())?;
-            call!(
-                check,
-                settings.SetMultipleInstances(TASK_INSTANCES_IGNORE_NEW)
-            )?;
-            call!(check, settings.SetRestartCount(0))?;
-            call!(check, settings.SetAllowDemandStart(VARIANT_BOOL(-1)))?;
-            call!(check, settings.SetExecutionTimeLimit(&BSTR::from("PT0S")))?;
-            call!(check, settings.SetStopIfGoingOnBatteries(VARIANT_BOOL(0)))?;
-            call!(
-                check,
-                settings.SetDisallowStartIfOnBatteries(VARIANT_BOOL(0))
-            )?;
-            call!(check, settings.SetAllowHardTerminate(VARIANT_BOOL(0)))?;
-            call!(check, settings.SetRunOnlyIfIdle(VARIANT_BOOL(0)))?;
-            call!(
-                check,
-                settings.SetRunOnlyIfNetworkAvailable(VARIANT_BOOL(0))
-            )?;
-            call!(check, settings.SetWakeToRun(VARIANT_BOOL(0)))?;
-            call!(check, settings.SetEnabled(VARIANT_BOOL(-1)))?;
-            let information = call!(check, definition.RegistrationInfo())?;
-            call!(check, information.SetURI(&BSTR::from(TASK_NAME)))?;
+            let definition = self.expected_definition(desired, check)?;
             let mut xml = BSTR::new();
             call!(check, definition.XmlText(&mut xml))?;
             bounded_bstr(&xml, MAX_XML_BYTES)

@@ -267,38 +267,7 @@ pub(crate) fn history_digest(bytes: &[u8]) -> [u8; 32] {
     out
 }
 pub(crate) fn history_leaf_allowed(leaf: &str) -> bool {
-    matches!(
-        leaf,
-        "supervisor.json"
-            | "supervisor-logon.json"
-            | "task-activation.json"
-            | "supervisor-epoch-0.json"
-            | "supervisor-epoch-1.json"
-            | "supervisor-epoch-2.json"
-            | "supervisor-archive-intent.json"
-            | "removal.json"
-            | "first-install.json"
-            | "first-install-recovery.json"
-            | "stage-catalog.json"
-            | "outer-upgrade.json"
-            | "file-recovery.json"
-            | "repair.json"
-            | "repair-publication-intent.json"
-            | "repair-pending.json"
-            | "repair-evidence-index.json"
-            | "repair-payload.json"
-            | "repair-payload-catalog.json"
-            | "repair-payload-publication-intent.json"
-            | "repair-payload-pending.json"
-    ) || leaf
-        .strip_prefix("operation-")
-        .and_then(|s| s.strip_suffix(".json"))
-        .is_some_and(|id| {
-            id.len() == 32
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        })
+    super::super::native_io::files::history_leaf_allowed(leaf)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -375,6 +344,33 @@ impl FirstHistorySlot {
         }
         Ok(())
     }
+    /// Conservative reference scan of a separately validated current record. These values
+    /// protect history only; they never grant deletion, launch, or process authority.
+    pub(crate) fn referenced_by(&self, value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Array(values) => {
+                let matches = |expected: &[u8; 16]| {
+                    values.len() == 16
+                        && values
+                            .iter()
+                            .zip(expected)
+                            .all(|(value, byte)| value.as_u64() == Some(u64::from(*byte)))
+                };
+                matches(&self.operation)
+                    || matches(&self.next_operation)
+                    || self.leaves.iter().any(|leaf| matches(&leaf.identity.file))
+                    || values.iter().any(|value| self.referenced_by(value))
+            }
+            serde_json::Value::Object(values) => {
+                values.values().any(|value| self.referenced_by(value))
+            }
+            serde_json::Value::String(value) => {
+                value.contains(&records::hex(&self.operation))
+                    || value.contains(&records::hex(&self.next_operation))
+            }
+            _ => false,
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -415,18 +411,96 @@ impl FirstHistoryIntent {
 pub(crate) struct FirstHistoryIndex {
     pub schema_version: u32,
     pub slots: [Option<FirstHistorySlot>; 3],
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<u8>,
+    #[serde(default, skip_serializing_if = "no_history_settlements")]
+    pub settlements: [Option<FirstHistorySettlement>; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement: Option<FirstHistoryRetirement>,
+}
+fn no_history_settlements(values: &[Option<FirstHistorySettlement>; 3]) -> bool {
+    values.iter().all(Option::is_none)
+}
+/// A copied, already-published terminal recovery document, bound to the archived source.
+/// It is historical correlation, never a process, image, or filesystem capability.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FirstHistorySettlement {
+    pub observed: HistoryLeaf,
+    pub document: FirstRecoveryRecord,
+    pub bytes: Vec<u8>,
+}
+impl FirstHistorySettlement {
+    pub(crate) fn validate(&self, slot: &FirstHistorySlot) -> NativeResult<()> {
+        self.document.validate()?;
+        self.observed.validate()?;
+        // Three exact witness copies share the existing 1 MiB index bound. Oversized legacy
+        // whitespace is retained, never truncated or rewritten to manufacture a witness.
+        if self.bytes.len() > 64 * 1024 {
+            return Err(NativeError::Oversize);
+        }
+        if self.observed.leaf != "first-install-recovery.json"
+            || !self.observed.matches(self.observed.identity, &self.bytes)
+            || FirstRecoveryRecord::decode(&self.bytes)? != self.document
+            || self.document.cursor != FirstRecoveryCursor::Retired
+            || self.document.pending_scaffold
+            || self.document.pending.iter().any(|pending| *pending)
+            || self.document.document.operation() != slot.operation
+            || !slot.leaves.contains(&self.document.source)
+            || !matches!(
+                (slot.source, self.document.mode),
+                (
+                    FirstHistorySource::Partial,
+                    FirstRecoveryMode::Rollback | FirstRecoveryMode::Remove
+                ) | (FirstHistorySource::Stale, FirstRecoveryMode::RetireStale)
+            )
+        {
+            return Err(NativeError::Foreign);
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FirstHistoryRetirementCursor {
+    DeleteLeaf(usize),
+    DeleteSlot,
+}
+/// Durable intent for one exact victim only. No fourth archive or arbitrary descendant exists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FirstHistoryRetirement {
+    pub slot: u8,
+    pub selected: FirstHistorySlot,
+    pub directory: FileStamp,
+    pub cursor: FirstHistoryRetirementCursor,
+}
+impl FirstHistoryRetirement {
+    pub(crate) fn validate(&self) -> NativeResult<()> {
+        self.selected.validate()?;
+        if self.slot > 2
+            || !self.directory.valid()
+            || matches!(self.cursor, FirstHistoryRetirementCursor::DeleteLeaf(index) if index >= self.selected.leaves.len())
+        {
+            return Err(NativeError::Invalid);
+        }
+        Ok(())
+    }
 }
 impl Default for FirstHistoryIndex {
     fn default() -> Self {
         Self {
             schema_version: 1,
             slots: [None, None, None],
+            order: Vec::new(),
+            settlements: [None, None, None],
+            retirement: None,
         }
     }
 }
 impl FirstHistoryIndex {
     pub(crate) fn validate(&self) -> NativeResult<()> {
-        if self.schema_version != 1 {
+        if !matches!(self.schema_version, 1 | 2) {
             return Err(NativeError::Invalid);
         }
         for (index, value) in self.slots.iter().enumerate() {
@@ -439,10 +513,150 @@ impl FirstHistoryIndex {
                 }
             }
         }
+        if self.schema_version == 1 {
+            if !self.order.is_empty()
+                || !no_history_settlements(&self.settlements)
+                || self.retirement.is_some()
+            {
+                return Err(NativeError::Invalid);
+            }
+        } else {
+            if self.order.len() != self.slots.iter().flatten().count()
+                || self.order.iter().enumerate().any(|(position, slot)| {
+                    *slot > 2
+                        || self.slots[usize::from(*slot)].is_none()
+                        || self.order[..position].contains(slot)
+                })
+            {
+                return Err(NativeError::Invalid);
+            }
+            for (slot, settlement) in self.slots.iter().zip(&self.settlements) {
+                if let Some(settlement) = settlement {
+                    settlement.validate(slot.as_ref().ok_or(NativeError::Foreign)?)?;
+                }
+            }
+            if let Some(retirement) = &self.retirement {
+                retirement.validate()?;
+                if self.slots[usize::from(retirement.slot)].as_ref() != Some(&retirement.selected) {
+                    return Err(NativeError::Foreign);
+                }
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn upgrade(&mut self) -> NativeResult<()> {
+        self.validate()?;
+        if self.schema_version == 1 {
+            // Version 1 never evicted and always used the lowest vacant slot.
+            self.order = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, value)| value.as_ref().map(|_| slot as u8))
+                .collect();
+            self.schema_version = 2;
+        }
+        self.validate()
+    }
+    /// The caller separately supplies terminal and reference admission from actual observations.
+    pub(crate) fn retirement_candidate(
+        &self,
+        eligible: [bool; 3],
+        protected: [bool; 3],
+    ) -> NativeResult<Option<u8>> {
+        let mut current = self.clone();
+        current.upgrade()?;
+        if current.retirement.is_some() {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        Ok(current
+            .order
+            .iter()
+            .copied()
+            .find(|slot| eligible[usize::from(*slot)] && !protected[usize::from(*slot)]))
+    }
+    pub(crate) fn begin_retirement(&mut self, slot: u8, directory: FileStamp) -> NativeResult<()> {
+        self.upgrade()?;
+        if self.retirement.is_some() || slot > 2 {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        self.retirement = Some(FirstHistoryRetirement {
+            slot,
+            selected: self.slots[usize::from(slot)]
+                .clone()
+                .ok_or(NativeError::Foreign)?,
+            directory,
+            cursor: FirstHistoryRetirementCursor::DeleteLeaf(0),
+        });
+        self.validate()
+    }
+    pub(crate) fn finish_retirement(&mut self) -> NativeResult<()> {
+        self.validate()?;
+        let retirement = self.retirement.as_ref().ok_or(NativeError::Foreign)?;
+        if retirement.cursor != FirstHistoryRetirementCursor::DeleteSlot {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        let slot = retirement.slot;
+        self.slots[usize::from(slot)] = None;
+        self.settlements[usize::from(slot)] = None;
+        self.order.retain(|value| *value != slot);
+        self.retirement = None;
+        self.validate()
+    }
+    pub(crate) fn retirement_follows(&self, previous: &Self) -> NativeResult<()> {
+        self.validate()?;
+        previous.validate()?;
+        if self == previous {
+            return Ok(());
+        }
+        let mut expected = previous.clone();
+        match (&previous.retirement, &self.retirement) {
+            (None, Some(next)) => {
+                expected.upgrade()?;
+                let slot = usize::from(next.slot);
+                if expected.settlements[slot].is_some()
+                    && expected.settlements[slot] != self.settlements[slot]
+                {
+                    return Err(NativeError::Foreign);
+                }
+                expected.settlements[slot] = self.settlements[slot].clone();
+                expected.begin_retirement(next.slot, next.directory)?;
+            }
+            (Some(old), Some(next))
+                if old.slot == next.slot
+                    && old.selected == next.selected
+                    && old.directory == next.directory =>
+            {
+                let cursor = match old.cursor {
+                    FirstHistoryRetirementCursor::DeleteLeaf(position)
+                        if position + 1 < old.selected.leaves.len() =>
+                    {
+                        FirstHistoryRetirementCursor::DeleteLeaf(position + 1)
+                    }
+                    FirstHistoryRetirementCursor::DeleteLeaf(_) => {
+                        FirstHistoryRetirementCursor::DeleteSlot
+                    }
+                    FirstHistoryRetirementCursor::DeleteSlot => return Err(NativeError::Foreign),
+                };
+                expected
+                    .retirement
+                    .as_mut()
+                    .ok_or(NativeError::Foreign)?
+                    .cursor = cursor;
+            }
+            (Some(_), None) => expected.finish_retirement()?,
+            _ => return Err(NativeError::Foreign),
+        }
+        if &expected != self {
+            return Err(NativeError::Foreign);
+        }
         Ok(())
     }
     pub(crate) fn vacant(&self) -> NativeResult<u8> {
         self.validate()?;
+        if self.retirement.is_some() {
+            return Err(NativeError::OutcomeUnknown);
+        }
         self.slots
             .iter()
             .position(Option::is_none)
@@ -462,13 +676,19 @@ impl FirstHistoryIndex {
         Ok(value)
     }
     pub(crate) fn commit(&mut self, intent: &FirstHistoryIntent) -> NativeResult<()> {
-        self.validate()?;
+        self.upgrade()?;
         intent.validate()?;
+        if self.retirement.is_some() {
+            return Err(NativeError::OutcomeUnknown);
+        }
         if intent.moved != intent.selected.leaves.len() {
             return Err(NativeError::OutcomeUnknown);
         }
         match &self.slots[usize::from(intent.slot)] {
-            None => self.slots[usize::from(intent.slot)] = Some(intent.selected.clone()),
+            None => {
+                self.slots[usize::from(intent.slot)] = Some(intent.selected.clone());
+                self.order.push(intent.slot);
+            }
             Some(old) if old == &intent.selected => {}
             _ => return Err(NativeError::Foreign),
         }

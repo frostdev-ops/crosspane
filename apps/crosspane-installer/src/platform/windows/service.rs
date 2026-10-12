@@ -379,25 +379,36 @@ mod first_native {
                 .as_ref()
                 .cloned()
                 .ok_or(NativeError::Foreign)?;
+            let note = |step: &'static str| {
+                move |error: &NativeError| {
+                    crate::platform::windows::setup_log::setup_note!(
+                        "first install activate {step}: {error:?}"
+                    );
+                }
+            };
             let selection = if let Some(history) = self.history.take() {
-                task::prepare_first_reinstall(self.io.clone(), payload, history, &self.deadline)?
+                task::prepare_first_reinstall(self.io.clone(), payload, history, &self.deadline)
+                    .inspect_err(note("prepare reinstall"))?
             } else {
                 task::prepare_first_install(
                     self.io.clone(),
                     payload,
                     self.reservation()?.clone(),
                     &self.deadline,
-                )?
+                )
+                .inspect_err(note("prepare"))?
             };
             if !self.io.native_idle() {
+                note("native idle")(&NativeError::OutcomeUnknown);
                 return Err(NativeError::OutcomeUnknown);
             }
             self.permit.take();
             drop(self.lock.take().ok_or(NativeError::Foreign)?);
             // All original mutation/lock aliases settled; the unchanged constructor uses its own lock.
-            let trusted = TrustedImages::current()?;
+            let trusted = TrustedImages::current().inspect_err(note("trusted images"))?;
             self.launched = true; // A failed call is never replayed, even if it failed before Run.
-            let evidence = task::start_first_install(&trusted, selection, &self.deadline)?;
+            let evidence = task::start_first_install(&trusted, selection, &self.deadline)
+                .inspect_err(note("start"))?;
             if evidence.operation() != record.operation() {
                 return Err(NativeError::Foreign);
             }
@@ -500,7 +511,7 @@ mod first_native {
                 disposition == first_install::FirstInstallDisposition::CompletedRemoval;
             if reinstalling && !io.first_history_capacity_available(&proof, deadline)? {
                 return Ok(Err(
-                    "first-install history archive is full; retained history was not evicted",
+                    "first-install history has no proven terminal, unreferenced slot to retire",
                 ));
             }
             first_install::before_foundation(
@@ -783,8 +794,16 @@ impl TrustedImages {
         let proof = io.admit_support(&deadline)?;
         let module = io.self_image(&proof, &deadline)?;
         let installer_pin = ApprovedPe::own_image(&module)?;
-        let proof = io.admit_support(&deadline)?;
-        let lock = io.acquire_installer_lock(&proof, &deadline)?;
+        // The installer that ran the task may still hold the lock while it records the run, so a
+        // busy lock is waited out within this deadline instead of failing the supervisor start.
+        let lock = super::first_install::retry_busy(
+            &deadline,
+            || {
+                let proof = io.admit_support(&deadline)?;
+                io.acquire_installer_lock(&proof, &deadline)
+            },
+            |ms| std::thread::sleep(std::time::Duration::from_millis(ms)),
+        )?;
         let proof = io.admit_support(&deadline)?;
         let root = io.payload_root(&proof, &lock, &deadline)?;
         let proof = io.admit_support(&deadline)?;

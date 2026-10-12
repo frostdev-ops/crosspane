@@ -452,8 +452,24 @@ mod native {
     fn proof(io: &WindowsNativeIo, deadline: &Deadline) -> NativeResult<SupportProof> {
         io.admit_support(deadline)
     }
+    /// The installer lock, waiting out another holder within `deadline` (the installer that ran
+    /// this task may still be recording the run); every attempt takes a fresh support proof.
+    fn wait_lock(io: &WindowsNativeIo, deadline: &Deadline) -> NativeResult<InstallerLock> {
+        crate::platform::windows::first_install::retry_busy(
+            deadline,
+            || io.acquire_installer_lock(&proof(io, deadline)?, deadline),
+            |ms| std::thread::sleep(Duration::from_millis(ms)),
+        )
+    }
     fn pause() {
         std::thread::sleep(Duration::from_millis(50));
+    }
+    /// Notes which supervisor startup step failed, for the setup log; the result passes through.
+    fn step<T>(name: &str, result: NativeResult<T>) -> NativeResult<T> {
+        if let Err(error) = &result {
+            crate::platform::windows::setup_log::setup_note!("supervisor {name}: {error:?}");
+        }
+        result
     }
 
     /// Status is read-only and bound by A2 to the selected live original endpoint. A scheduler's
@@ -486,7 +502,7 @@ mod native {
             };
             if replies.next().is_some() || reply.id != 1 || reply.source != ObservationSource::Live
             {
-                return Err(NativeError::Foreign);
+                return step("status reply", Err(NativeError::Foreign));
             }
             match reply.result {
                 Ok(DecodedReply::Status(StatusAdmission::Supported(health))) => {
@@ -496,12 +512,24 @@ mod native {
                         || instance.pid != bootstrap.pid
                         || instance.uid.is_some()
                     {
-                        return Err(NativeError::Foreign);
+                        return step("status instance", Err(NativeError::Foreign));
                     }
-                    original.revalidate(io, &proof(io, deadline)?, deadline)?;
+                    step(
+                        "status revalidate",
+                        original.revalidate(io, &proof(io, deadline)?, deadline),
+                    )?;
                     return Ok(());
                 }
-                _ => return Err(NativeError::Unavailable),
+                other => {
+                    crate::platform::windows::setup_log::setup_note!(
+                        "supervisor status unsupported: {}",
+                        match other {
+                            Ok(_) => "other reply",
+                            Err(_) => "error reply",
+                        }
+                    );
+                    return Err(NativeError::Unavailable);
+                }
             }
         }
     }
@@ -537,11 +565,14 @@ mod native {
                         original.bootstrap().phase,
                     ) {
                         ready_status(owner.io(), &original, owner.clock(), deadline)?;
-                        let generation = owner.admit_ready(
-                            child,
-                            &original,
-                            &proof(owner.io(), deadline)?,
-                            deadline,
+                        let generation = step(
+                            "admit ready",
+                            owner.admit_ready(
+                                child,
+                                &original,
+                                &proof(owner.io(), deadline)?,
+                                deadline,
+                            ),
                         )?;
                         return Ok((original, generation));
                     }
@@ -720,11 +751,7 @@ mod native {
         type Child = CreatedChild;
         type Ready = InitialReady;
         fn prepare_epoch(&mut self) -> NativeResult<()> {
-            let support = proof(self.owner.io(), self.deadline)?;
-            let lock = self
-                .owner
-                .io()
-                .acquire_installer_lock(&support, self.deadline)?;
+            let lock = wait_lock(self.owner.io(), self.deadline)?;
             let support = proof(self.owner.io(), self.deadline)?;
             // Both variants retain the real archive admission and Preparing provenance until
             // Ready/publication. The logon path cannot turn its proof into an installer task claim.
@@ -739,10 +766,13 @@ mod native {
                     )?)
                 }
                 EntryPermit::Installer(permit)
-                    if self.owner.io().is_first_reinstall_epoch(
-                        &support,
-                        permit.operation(),
-                        self.deadline,
+                    if step(
+                        "first reinstall check",
+                        self.owner.io().is_first_reinstall_epoch(
+                            &support,
+                            permit.operation(),
+                            self.deadline,
+                        ),
                     )? =>
                 {
                     InitialArchive::FirstReinstall(self.owner.io().prepare_first_reinstall_epoch(
@@ -753,15 +783,16 @@ mod native {
                         self.deadline,
                     )?)
                 }
-                EntryPermit::Installer(permit) => {
-                    InitialArchive::Installer(self.owner.io().prepare_supervisor_epoch(
+                EntryPermit::Installer(permit) => InitialArchive::Installer(step(
+                    "prepare epoch",
+                    self.owner.io().prepare_supervisor_epoch(
                         &support,
                         &lock,
                         permit,
                         &self.owner,
                         self.deadline,
-                    )?)
-                }
+                    ),
+                )?),
                 EntryPermit::Logon(permit) => {
                     InitialArchive::Logon(self.owner.io().prepare_logon_epoch(
                         &support,
@@ -777,11 +808,7 @@ mod native {
         fn create(&mut self) -> NativeResult<Self::Child> {
             // A retained genuine epoch gate precedes every Create/Assign/Resume in jobs::launch.
             {
-                let support = proof(self.owner.io(), self.deadline)?;
-                let lock = self
-                    .owner
-                    .io()
-                    .acquire_installer_lock(&support, self.deadline)?;
+                let lock = wait_lock(self.owner.io(), self.deadline)?;
                 self.reverify_archive(
                     &proof(self.owner.io(), self.deadline)?,
                     &lock,
@@ -789,17 +816,25 @@ mod native {
                 )?;
             }
             let support = proof(self.owner.io(), self.deadline)?;
-            let start = self
-                .permit
-                .initial_start(self.owner.clone(), &support, self.deadline)?;
-            self.owner.launch(
-                start,
-                &proof(self.owner.io(), self.deadline)?,
-                self.deadline,
+            let start = step(
+                "start permit",
+                self.permit
+                    .initial_start(self.owner.clone(), &support, self.deadline),
+            )?;
+            step(
+                "launch",
+                self.owner.launch(
+                    start,
+                    &proof(self.owner.io(), self.deadline)?,
+                    self.deadline,
+                ),
             )
         }
         fn await_ready(&mut self, child: &Self::Child) -> NativeResult<Self::Ready> {
-            let (original, generation) = await_ready(&self.owner, child, self.deadline)?;
+            let (original, generation) = step(
+                "await ready",
+                await_ready(&self.owner, child, self.deadline),
+            )?;
             let mut model = Supervisor::new(generation, self.owner.clock().now_ms(), Vec::new())?;
             model.running();
             let record = Journal {
@@ -824,23 +859,28 @@ mod native {
         }
         fn publish_running(&mut self, ready: &Self::Ready) -> NativeResult<()> {
             let deadline = budget(self.owner.clock(), 30_000)?;
+            let lock = wait_lock(self.owner.io(), &deadline)?;
             let support = proof(self.owner.io(), &deadline)?;
-            let lock = self
-                .owner
-                .io()
-                .acquire_installer_lock(&support, &deadline)?;
-            let support = proof(self.owner.io(), &deadline)?;
-            self.reverify_archive(&support, &lock, &deadline)?;
-            ready.record.publish_owned_transition(
-                self.owner.io(),
-                &support,
-                &lock,
-                None,
-                &deadline,
+            step(
+                "running archive check",
+                self.reverify_archive(&support, &lock, &deadline),
+            )?;
+            step(
+                "publish running",
+                ready.record.publish_owned_transition(
+                    self.owner.io(),
+                    &support,
+                    &lock,
+                    None,
+                    &deadline,
+                ),
             )?;
             // Bound is published only after the real Running journal exists. If either write is
             // uncertain, Preparing/current mismatches refuse later admission; no fake completion.
-            self.publish_bound(&proof(self.owner.io(), &deadline)?, &lock, &deadline)
+            step(
+                "publish bound",
+                self.publish_bound(&proof(self.owner.io(), &deadline)?, &lock, &deadline),
+            )
         }
     }
     fn fresh_server_agent(
@@ -882,8 +922,7 @@ mod native {
         generation: Generation,
     ) -> NativeResult<()> {
         let deadline = budget(owner.clock(), 30_000)?;
-        let support = proof(owner.io(), &deadline)?;
-        let lock = owner.io().acquire_installer_lock(&support, &deadline)?;
+        let lock = wait_lock(owner.io(), &deadline)?;
         let support = proof(owner.io(), &deadline)?;
         let mut next = record.clone();
         next.phase = phase;
@@ -946,39 +985,44 @@ mod native {
         let initial = budget(Arc::new(MonotonicClock::default()), 30_000)?;
         // Selection is read-only and precedes either admission's effects. Once selected, an
         // installer claim failure returns; it can NEVER fall through into a fresh logon permit.
-        let candidate = match entry_selection(trusted, &initial)? {
-            EntrySelection::Installer => {
-                EntryCandidate::Installer(Arc::new(task::claim_supervisor(trusted, &initial)?))
-            }
-            EntrySelection::Logon => {
-                EntryCandidate::Logon(Box::new(prepare_logon(trusted, &initial)?))
-            }
+        let candidate = match step("entry selection", entry_selection(trusted, &initial))? {
+            EntrySelection::Installer => EntryCandidate::Installer(Arc::new(step(
+                "installer claim",
+                task::claim_supervisor(trusted, &initial),
+            )?)),
+            EntrySelection::Logon => EntryCandidate::Logon(Box::new(step(
+                "logon prepare",
+                prepare_logon(trusted, &initial),
+            )?)),
         };
         let images = &trusted._native;
         let support = proof(&images.io, &initial)?;
-        let owner =
+        let owner = step(
+            "prepare owner",
             images
                 .io
-                .prepare_supervisor(&support, &images.agent, &images._root, &initial)?;
-        let server = OwnerServer::reserve(
-            images.io.clone(),
-            owner.clone(),
-            &proof(&images.io, &initial)?,
-            &initial,
+                .prepare_supervisor(&support, &images.agent, &images._root, &initial),
+        )?;
+        let server = step(
+            "owner server",
+            OwnerServer::reserve(
+                images.io.clone(),
+                owner.clone(),
+                &proof(&images.io, &initial)?,
+                &initial,
+            ),
         )?;
         // A4d companion shares this original owner's current-agent/terminal/export state.
         // It reserves no new job or source namespace; warm updates use that SAME state Arc.
-        let mut outer = Some(OuterOwnerServer::reserve(
-            &server,
-            &proof(owner.io(), &initial)?,
-            &initial,
+        let mut outer = Some(step(
+            "outer owner server",
+            OuterOwnerServer::reserve(&server, &proof(owner.io(), &initial)?, &initial),
         )?);
         let permit = match candidate {
             EntryCandidate::Installer(permit) => EntryPermit::Installer(permit),
             EntryCandidate::Logon(candidate) => {
                 let (reservation, disposition) = {
-                    let support = proof(owner.io(), &initial)?;
-                    let lock = owner.io().acquire_installer_lock(&support, &initial)?;
+                    let lock = wait_lock(owner.io(), &initial)?;
                     owner.io().prepare_logon_reservation(
                         &proof(owner.io(), &initial)?,
                         &lock,
@@ -986,11 +1030,9 @@ mod native {
                         &initial,
                     )?
                 };
-                EntryPermit::Logon(Arc::new(admit_logon(
-                    *candidate,
-                    reservation,
-                    disposition,
-                    &initial,
+                EntryPermit::Logon(Arc::new(step(
+                    "logon admit",
+                    admit_logon(*candidate, reservation, disposition, &initial),
                 )?))
             }
         };
@@ -1007,8 +1049,14 @@ mod native {
             mut record,
         } = initialize_epoch(&mut initial_epoch)?;
         let bound = budget(owner.clock(), 30_000)?;
-        let server_agent = fresh_server_agent(&owner, generation, &bound)?;
-        server.update_generation(server_agent, &proof(owner.io(), &bound)?, &bound)?;
+        let server_agent = step(
+            "server agent",
+            fresh_server_agent(&owner, generation, &bound),
+        )?;
+        step(
+            "server generation",
+            server.update_generation(server_agent, &proof(owner.io(), &bound)?, &bound),
+        )?;
         let mut successor_wait: Option<Deadline> = None;
         loop {
             let deadline = budget(owner.clock(), 30_000)?;

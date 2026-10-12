@@ -428,9 +428,12 @@ fn windows_setup_walks_from_welcome_to_ready_then_removal_through_the_real_worke
         w.enabled(ids::REMOVE_CONFIRM)
     });
     h.click(ids::REMOVE_CONFIRM);
-    h.settle("the removal submission", |w| {
-        w.view().message.contains("Removal submission: Submitted")
+    h.settle("the submitted removal remains unconfirmed", |w| {
+        w.view()
+            .message
+            .contains("Some parts of Crosspane are still here.")
     });
+    assert!(!h.view().message.contains("submission:"));
 
     // Each effect ran exactly once, in order.
     let entries = log.lock().unwrap_or_else(PoisonError::into_inner).clone();

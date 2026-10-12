@@ -74,6 +74,7 @@ fn main() {
                     crosspane_installer::platform::windows::service::upgrade_keeper_entry()
                 {
                     eprintln!("Crosspane Installer upgrade keeper: {error}");
+                    platform::windows::setup_log::setup_note!("upgrade keeper failed: {error:?}");
                     std::process::exit(1);
                 }
                 return;
@@ -89,6 +90,7 @@ fn main() {
             Ok(true) => {
                 if let Err(error) = crosspane_installer::platform::windows::replace_helper_entry() {
                     eprintln!("Crosspane Installer replace helper: {error}");
+                    platform::windows::setup_log::setup_note!("replace helper failed: {error:?}");
                     std::process::exit(1);
                 }
                 return;
@@ -101,11 +103,16 @@ fn main() {
         }
         match crosspane_installer::platform::windows::service::supervisor_mode(&arguments) {
             Ok(true) => {
-                if let Err(error) =
-                    crosspane_installer::platform::windows::service::supervisor_entry()
-                {
-                    eprintln!("Crosspane Installer supervisor: {error}");
-                    std::process::exit(1);
+                platform::windows::setup_log::setup_note!("supervisor start");
+                match crosspane_installer::platform::windows::service::supervisor_entry() {
+                    Ok(exit) => {
+                        platform::windows::setup_log::setup_note!("supervisor exit: {exit:?}");
+                    }
+                    Err(error) => {
+                        eprintln!("Crosspane Installer supervisor: {error}");
+                        platform::windows::setup_log::setup_note!("supervisor failed: {error:?}");
+                        std::process::exit(1);
+                    }
                 }
                 return;
             }

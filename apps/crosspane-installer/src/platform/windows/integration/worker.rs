@@ -202,22 +202,9 @@ impl<D: Domains> Coordinator<D> {
                 {
                     return Applied::failure(Outcome::Unknown);
                 }
-                // A recovery is settled when a fresh observation no longer shows the partial or
-                // stale first install; an install verification would never pass after it.
-                let complete = complete
-                    && if recovery {
-                        matches!(self.domains.observe(), Ok(s) if s.source == crosspane_installer_core::ObservationSource::Live
-                            && !matches!(s.cold, Cold::Partial | Cold::Stale | Cold::Unknown))
-                    } else {
-                        self.verify(plan.operation) == Outcome::Verified
-                    };
+                let complete = complete && self.verify(plan.operation) == Outcome::Verified;
                 if complete {
                     self.uncertain = false;
-                    // A settled recovery frees its step: the install it cleared the way for is a
-                    // new submission in the same step.
-                    if recovery {
-                        self.dispatched.remove(&slot);
-                    }
                 }
                 #[cfg(not(test))]
                 if recovery && !complete {

@@ -290,6 +290,104 @@ pub(crate) fn archive_history<P: FirstHistoryPort>(
     port.renew(intent)
 }
 
+/// Separate metadata retirement port; it cannot register, launch, stop, or mint owner proofs.
+pub(crate) trait FirstHistoryRetirementPort {
+    fn renew_retirement(&mut self, index: &super::record::FirstHistoryIndex) -> NativeResult<()>;
+    fn persist_retirement(&mut self, index: &super::record::FirstHistoryIndex) -> NativeResult<()>;
+    fn retirement_directory(
+        &mut self,
+        intent: &super::record::FirstHistoryRetirement,
+    ) -> NativeResult<Option<(FileStamp, Vec<String>)>>;
+    fn retirement_leaf(
+        &mut self,
+        intent: &super::record::FirstHistoryRetirement,
+        leaf: &super::record::HistoryLeaf,
+    ) -> NativeResult<Option<HistoryObservation>>;
+    fn delete_history_leaf(
+        &mut self,
+        intent: &super::record::FirstHistoryRetirement,
+        leaf: &super::record::HistoryLeaf,
+    ) -> NativeResult<()>;
+    fn delete_history_slot(
+        &mut self,
+        intent: &super::record::FirstHistoryRetirement,
+    ) -> NativeResult<()>;
+}
+/// Only an intent-owned deletion may already be absent. Changed or unplanned material refuses.
+pub(crate) fn retire_history<P: FirstHistoryRetirementPort>(
+    port: &mut P,
+    index: &mut super::record::FirstHistoryIndex,
+) -> NativeResult<()> {
+    use super::record::FirstHistoryRetirementCursor as C;
+    index.validate()?;
+    port.renew_retirement(index)?;
+    port.persist_retirement(index)?;
+    loop {
+        port.renew_retirement(index)?;
+        let intent = index
+            .retirement
+            .as_ref()
+            .ok_or(NativeError::Foreign)?
+            .clone();
+        let position = match intent.cursor {
+            C::DeleteLeaf(position) => position,
+            C::DeleteSlot => intent.selected.leaves.len(),
+        };
+        let directory = port.retirement_directory(&intent)?;
+        if let Some((identity, names)) = directory {
+            if identity != intent.directory
+                || names
+                    .iter()
+                    .any(|name| !intent.selected.leaves.iter().any(|leaf| &leaf.leaf == name))
+            {
+                return Err(NativeError::Foreign);
+            }
+            // Check the complete remaining inventory before each effect, including future leaves.
+            for (offset, leaf) in intent.selected.leaves.iter().enumerate() {
+                match port.retirement_leaf(&intent, leaf)? {
+                    None if offset <= position => {}
+                    Some((identity, bytes))
+                        if offset >= position && leaf.matches(identity, &bytes) => {}
+                    _ => return Err(NativeError::OutcomeUnknown),
+                }
+            }
+            if let C::DeleteLeaf(position) = intent.cursor {
+                let leaf = &intent.selected.leaves[position];
+                if port.retirement_leaf(&intent, leaf)?.is_some() {
+                    port.delete_history_leaf(&intent, leaf)?;
+                }
+                if port.retirement_leaf(&intent, leaf)?.is_some() {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                let mut next = index.clone();
+                next.retirement.as_mut().ok_or(NativeError::Foreign)?.cursor =
+                    if position + 1 == intent.selected.leaves.len() {
+                        C::DeleteSlot
+                    } else {
+                        C::DeleteLeaf(position + 1)
+                    };
+                port.persist_retirement(&next)?;
+                *index = next;
+                continue;
+            }
+            if !names.is_empty() {
+                return Err(NativeError::Foreign);
+            }
+            port.delete_history_slot(&intent)?;
+            if port.retirement_directory(&intent)?.is_some() {
+                return Err(NativeError::OutcomeUnknown);
+            }
+        } else if intent.cursor != C::DeleteSlot {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        let mut complete = index.clone();
+        complete.finish_retirement()?;
+        port.persist_retirement(&complete)?;
+        *index = complete;
+        return port.renew_retirement(index);
+    }
+}
+
 pub(crate) trait FirstRecoveryPort {
     fn renew_recovery(&mut self, recovery: &super::record::FirstRecoveryRecord)
     -> NativeResult<()>;

@@ -83,7 +83,7 @@ while IFS=$'\t' read -r crate manifest; do
     done
 done <<< "$os_packages"
 
-for target in x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+for target in x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
     metadata=$(cargo metadata --offline --format-version 1 --filter-platform "$target")
     violations=$(jq -r --argjson os_free "$os_free_json" \
         --arg bindings "$PLATFORM_BINDINGS" --arg target "$target" '
@@ -120,4 +120,4 @@ done
 if (( failed )); then
     exit 1
 fi
-printf 'layering OK: %s OS-free crates checked (linux, macos)\n' "${#OS_FREE[@]}"
+printf 'layering OK: %s OS-free crates checked (linux, macos, windows)\n' "${#OS_FREE[@]}"

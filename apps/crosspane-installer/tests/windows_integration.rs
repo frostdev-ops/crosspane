@@ -9,10 +9,11 @@ use crosspane_installer_core::elevated::step::{
 };
 use crosspane_installer_core::elevated::{AgentProgram, InstallId, RuleScope, Verb};
 use domains::*;
+use gui::InstallerController;
 use integration::{domains, ports, worker};
 use std::sync::{
     Arc, Mutex, MutexGuard,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
 use worker::*;
@@ -30,6 +31,308 @@ fn snapshot() -> Snapshot {
         unsettled: false,
         correlation: vec![1],
         source: ObservationSource::Live,
+    }
+}
+
+struct RespondingAgent {
+    clock: live::Clock,
+    replies: Vec<agent_contract::AgentReply>,
+}
+impl agent_contract::AgentPort for RespondingAgent {
+    fn submit(
+        &mut self,
+        call: agent_contract::AgentCall,
+    ) -> Result<(), agent_contract::CallFailure> {
+        self.replies.push(agent_contract::AgentReply {
+            id: call.id,
+            observed_at_ms: (self.clock)(),
+            source: ObservationSource::Live,
+            result: Err(agent_contract::CallFailure::Unavailable),
+        });
+        Ok(())
+    }
+    fn poll(&mut self) -> Vec<agent_contract::AgentReply> {
+        std::mem::take(&mut self.replies)
+    }
+}
+struct ControllerRig {
+    controller: live::LiveController,
+    now: Arc<AtomicU64>,
+}
+impl ControllerRig {
+    #[allow(clippy::unwrap_used)] // Test-only controller setup must accept its graph.
+    fn new<D: Domains + 'static>(domains: D) -> Self {
+        let now = Arc::new(AtomicU64::new(1));
+        let observed_time = now.clone();
+        let clock: live::Clock = Arc::new(move || observed_time.load(Ordering::Acquire));
+        let platform = integration::platform_fixture(
+            domains,
+            clock.clone(),
+            Box::new(RespondingAgent {
+                clock: clock.clone(),
+                replies: Vec::new(),
+            }),
+        );
+        let controller = live::LiveController::new(platform, clock).unwrap();
+        Self { controller, now }
+    }
+    fn until(&mut self, ready: impl Fn(&view::WizardView) -> bool) {
+        for _ in 0..300 {
+            if ready(self.controller.view()) {
+                return;
+            }
+            self.now.fetch_add(100, Ordering::Release);
+            self.controller.tick();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!(
+            "controller did not reach the expected state: {:?}",
+            self.controller.view()
+        );
+    }
+    fn click(&mut self, id: u16) {
+        assert!(
+            button_enabled(self.controller.view(), id),
+            "button {id} unavailable: {:?}",
+            self.controller.view()
+        );
+        self.controller.accept(view::WizardAction {
+            revision: self.controller.view().revision,
+            intent: view::WizardIntent::Button(id),
+        });
+    }
+}
+impl Drop for ControllerRig {
+    fn drop(&mut self) {
+        self.controller.close();
+    }
+}
+fn button_enabled(view: &view::WizardView, id: u16) -> bool {
+    view.buttons
+        .iter()
+        .any(|button| button.id == id && button.enabled)
+}
+
+#[test]
+fn start_reaches_install_and_admin_without_claiming_shared_readiness() {
+    let mut fake = Fake::new();
+    fake.elevated_detection = Ok(ElevatedDetection {
+        configured: true,
+        detail: "Configured".into(),
+    });
+    let applied = fake.elevated.clone();
+    let mut rig = ControllerRig::new(fake);
+    rig.click(live::ids::NEXT);
+    rig.until(|v| v.screen == view::ScreenId::Connect);
+    assert_eq!(
+        rig.controller.view().summary,
+        view::SummaryView::InstalledWaiting
+    );
+    for step in [20, 30, 55] {
+        assert!(
+            rig.controller
+                .rows()
+                .iter()
+                .any(|row| row.id == step && row.state == view::RowState::Verified)
+        );
+    }
+    assert!(locked(&applied).applied.is_empty());
+}
+
+#[test]
+fn installer_waits_for_current_consent_when_its_preview_asks_for_administrator() {
+    let mut fake = fresh(Cold::Eligible);
+    fake.elevated_plans.push((
+        ElevatedRequest::Setup,
+        Ok(ElevatedPlanning::Planned(setup_plan())),
+    ));
+    let applied = fake.elevated.clone();
+    let mut rig = ControllerRig::new(fake);
+    let consent = live::ids::consent(crosspane_installer_core::StepId(20));
+    rig.click(live::ids::NEXT);
+    rig.until(|v| button_enabled(v, consent));
+    assert!(locked(&applied).applied.is_empty());
+    rig.controller.accept(view::WizardAction {
+        revision: rig.controller.view().revision.saturating_sub(1),
+        intent: view::WizardIntent::Button(consent),
+    });
+    assert!(locked(&applied).applied.is_empty());
+    rig.click(consent);
+    rig.until(|v| v.summary == view::SummaryView::InstalledWaiting);
+    assert_eq!(
+        locked(&applied).applied,
+        vec![(Operation::Install, Some(setup_plan()))]
+    );
+}
+
+#[test]
+fn first_install_recovery_is_reviewed_then_install_uses_its_unused_slot() {
+    let mut observed = partial_snapshot();
+    observed.inventory = true;
+    observed.sources = true;
+    let domains = RecoveryDomains::new(observed, false);
+    let applied = domains.applied.clone();
+    let mut rig = ControllerRig::new(domains);
+    rig.click(live::ids::NEXT);
+    rig.until(|v| {
+        v.screen == view::ScreenId::InstallPlan
+            && v.rows
+                .iter()
+                .any(|row| row.id == 20 && row.state == view::RowState::Waiting)
+    });
+    assert!(applied.lock().unwrap().is_empty());
+    rig.click(live::ids::REMOVE_OR_REPAIR);
+    rig.until(|v| button_enabled(v, live::ids::REPAIR));
+    assert!(!button_enabled(
+        rig.controller.view(),
+        live::ids::REPAIR_RESUME
+    ));
+    rig.click(live::ids::REPAIR);
+    rig.until(|v| button_enabled(v, live::ids::REPAIR_CONFIRM));
+    assert!(applied.lock().unwrap().is_empty());
+    rig.click(live::ids::REPAIR_CONFIRM);
+    rig.until(|v| button_enabled(v, live::ids::BACK));
+    assert_eq!(*applied.lock().unwrap(), vec![Operation::MetadataRepair]);
+    rig.click(live::ids::BACK);
+    let retry = if button_enabled(rig.controller.view(), live::ids::RETRY_ALL) {
+        live::ids::RETRY_ALL
+    } else {
+        live::ids::retry(crosspane_installer_core::StepId(20))
+    };
+    rig.click(retry);
+    rig.until(|v| v.summary == view::SummaryView::InstalledWaiting);
+    assert_eq!(
+        *applied.lock().unwrap(),
+        vec![Operation::MetadataRepair, Operation::Install]
+    );
+}
+
+#[test]
+fn partial_and_stale_install_jobs_wait_for_maintenance_without_reserving_install() {
+    use crosspane_installer_core::{JobStage, WaitKind};
+    for cold in [Cold::Partial, Cold::Stale] {
+        let mut observed = partial_snapshot();
+        observed.cold = cold;
+        let domains = RecoveryDomains::new(observed, false);
+        let applied = domains.applied.clone();
+        let reports = run_jobs(
+            domains,
+            vec![
+                (1, step_job(10, 1, JobStage::Detect, None)),
+                (2, step_job(20, 2, JobStage::Detect, None)),
+                (3, step_job(20, 3, JobStage::Plan, None)),
+                (4, step_job(20, 4, JobStage::Apply, Some(consent_for(3, 4)))),
+            ],
+        );
+        for report in &reports[..3] {
+            assert_eq!(
+                step_of(report).outcome,
+                live::NativeOutcome::Waiting(WaitKind::User)
+            );
+            assert!(
+                step_of(report)
+                    .detail
+                    .contains("Remove or repair Crosspane")
+            );
+        }
+        assert_eq!(
+            step_of(&reports[3]).outcome,
+            live::NativeOutcome::NotSubmitted
+        );
+        assert!(applied.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn unknown_first_recovery_never_replays_or_admits_install() {
+    use crosspane_installer_core::{JobStage, WaitKind};
+    let domains = RecoveryDomains::new(partial_snapshot(), true);
+    let applied = domains.applied.clone();
+    let confirm = live::NativeJob::Maintenance(live::MaintenanceRequest::ConfirmRepair {
+        id: live::MaintenanceId(1),
+        plan: 1,
+        revision: 1,
+        status: None,
+    });
+    let reports = run_jobs(
+        domains,
+        vec![
+            (
+                1,
+                live::NativeJob::Maintenance(live::MaintenanceRequest::PlanRepair {
+                    id: live::MaintenanceId(1),
+                    status: None,
+                }),
+            ),
+            (1, confirm.clone()),
+            (1, confirm),
+            (2, step_job(20, 2, JobStage::Plan, None)),
+            (3, step_job(20, 3, JobStage::Apply, Some(consent_for(2, 3)))),
+        ],
+    );
+    for report in &reports[1..3] {
+        assert!(matches!(
+            maintenance_of(report),
+            live::MaintenanceReport::RepairFinished {
+                outcome: live::RepairOutcome::OutcomeUnknown,
+                resumable: true,
+                ..
+            }
+        ));
+    }
+    assert_eq!(
+        step_of(&reports[3]).outcome,
+        live::NativeOutcome::Waiting(WaitKind::User)
+    );
+    assert_eq!(
+        step_of(&reports[4]).outcome,
+        live::NativeOutcome::NotSubmitted
+    );
+    assert_eq!(*applied.lock().unwrap(), vec![Operation::MetadataRepair]);
+}
+
+#[test]
+fn independently_verified_removal_reports_removed_and_other_outcomes_stay_conservative() {
+    let reports = run_jobs(
+        RecoveryDomains::new(partial_snapshot(), false),
+        vec![(1, uninstall_plan(1, vec![])), (2, confirm_uninstall(2))],
+    );
+    assert!(matches!(
+        maintenance_of(&reports[1]),
+        live::MaintenanceReport::Finished {
+            outcome: live::MaintenanceOutcome::Removed,
+            ..
+        }
+    ));
+    for (failure, unverified_complete, expected) in [
+        (None, false, live::MaintenanceOutcome::Partial),
+        (None, true, live::MaintenanceOutcome::Partial),
+        (
+            Some(Failure::Unknown),
+            false,
+            live::MaintenanceOutcome::Partial,
+        ),
+        (
+            Some(Failure::NotSubmitted),
+            false,
+            live::MaintenanceOutcome::Refused,
+        ),
+    ] {
+        let mut fake = Fake::new();
+        fake.failure = failure;
+        if unverified_complete {
+            fake.elevated_apply = Some(Ok(Dispatch {
+                handoff: Handoff::Complete,
+                complete: true,
+            }));
+        }
+        let reports = run_jobs(
+            fake,
+            vec![(1, uninstall_plan(1, vec![])), (2, confirm_uninstall(2))],
+        );
+        assert!(
+            matches!(maintenance_of(&reports[1]), live::MaintenanceReport::Finished { outcome, .. } if *outcome == expected)
+        );
     }
 }
 /// The elevated calls the worker made. `run` takes the fake by value, so tests keep a clone of
@@ -1000,6 +1303,14 @@ fn payload_beside_the_installer_is_the_default_payload_folder() {
         integration::payload_beside(&installer),
         Some(std::path::Path::new("kit").join("payload"))
     );
+    for folder in ["Crosspane kit", "Crosspane & (kit) %PATH% !name! ^ $`"] {
+        let kit = std::env::temp_dir().join(folder);
+        assert!(kit.is_absolute());
+        assert_eq!(
+            integration::payload_beside(&kit.join("crosspane-installer.exe")),
+            Some(kit.join("payload"))
+        );
+    }
 }
 #[test]
 fn first_install_apply_uses_worker_consent_fresh_verify_and_keeps_parent_open() {
@@ -1250,6 +1561,8 @@ struct RecoveryDomains {
     mutations: usize,
     failure: bool,
     recovered: bool,
+    applied: Arc<Mutex<Vec<Operation>>>,
+    recovery_observation: Option<Snapshot>,
 }
 impl RecoveryDomains {
     fn new(observed: Snapshot, failure: bool) -> Self {
@@ -1259,6 +1572,8 @@ impl RecoveryDomains {
             mutations: 0,
             failure,
             recovered: false,
+            applied: Arc::default(),
+            recovery_observation: None,
         }
     }
 }
@@ -1269,9 +1584,11 @@ impl Domains for RecoveryDomains {
     fn settle(&mut self, _: Operation) -> Result<bool, Failure> {
         Ok(false)
     }
+    #[allow(clippy::unwrap_used)] // A poisoned test operation log must fail the fixture.
     fn apply(&mut self, op: Operation) -> Result<Dispatch, Failure> {
         assert!(self.observed.allowed(op));
         self.applications += 1;
+        self.applied.lock().unwrap().push(op);
         self.recovered = false;
         let recovering = matches!(self.observed.cold, Cold::Partial | Cold::Stale);
         if recovering {
@@ -1295,6 +1612,9 @@ impl Domains for RecoveryDomains {
             }
         } else if op == Operation::Install {
             self.observed = snapshot();
+        }
+        if recovering && let Some(observed) = self.recovery_observation.take() {
+            self.observed = observed;
         }
         Ok(Dispatch {
             handoff: Handoff::NotCommitted,
@@ -1381,6 +1701,11 @@ fn a8b_recovery_complete_clears_uncertainty_and_allows_a_new_install() {
     let repair = apply(&mut c, Operation::MetadataRepair);
     assert_eq!(repair.outcome, Outcome::Submitted);
     assert!(repair.complete);
+    c.plan(1, 3, Operation::Install).unwrap();
+    let same_slot = Fence::default();
+    same_slot.select(4);
+    assert_eq!(c.apply(1, 4, 3, 4, &same_slot).outcome, Outcome::Unknown);
+    assert_eq!(c.domains.applications, 1);
     // A dispatch reservation is per slot, so the new install is planned on its own slot.
     c.plan(2, 3, Operation::Install).unwrap();
     let fence = Fence::default();
@@ -1389,6 +1714,57 @@ fn a8b_recovery_complete_clears_uncertainty_and_allows_a_new_install() {
     assert_eq!(install.outcome, Outcome::Submitted);
     assert!(install.complete);
     assert_eq!(c.domains.applications, 2);
+}
+
+#[test]
+fn recovery_requires_supported_live_settled_facts_and_keeps_dispatch_reserved() {
+    let mut invalid = Vec::new();
+    for cold in [
+        Cold::Unknown,
+        Cold::AccessDenied,
+        Cold::Observe,
+        Cold::Partial,
+        Cold::Stale,
+    ] {
+        let mut observed = snapshot();
+        observed.cold = cold;
+        invalid.push(observed);
+    }
+    for (supported, unsettled, source) in [
+        (false, false, ObservationSource::Live),
+        (true, true, ObservationSource::Live),
+        (true, false, ObservationSource::Demo),
+    ] {
+        let mut observed = snapshot();
+        observed.cold = Cold::Eligible;
+        observed.supported = supported;
+        observed.unsettled = unsettled;
+        observed.source = source;
+        invalid.push(observed);
+    }
+    for observed in invalid {
+        assert!(!observed.first_recovery_settled());
+        let mut domains = RecoveryDomains::new(partial_snapshot(), false);
+        domains.recovery_observation = Some(observed);
+        let mut c = Coordinator::new(domains);
+        c.plan(102, 1, Operation::MetadataRepair).unwrap();
+        let fence = Fence::default();
+        fence.select(2);
+        let applied = c.apply(102, 2, 1, 1, &fence);
+        assert_eq!(applied.outcome, Outcome::Submitted);
+        assert!(!applied.complete && !applied.outcome.refunds_consent());
+        for (slot, op) in [(102, Operation::MetadataRepair), (20, Operation::Install)] {
+            c.plan(slot, 3, op).unwrap();
+            fence.select(4);
+            assert_eq!(c.apply(slot, 4, 3, 2, &fence).outcome, Outcome::Unknown);
+        }
+        assert_eq!(c.domains.applications, 1);
+    }
+    for cold in [Cold::Eligible, Cold::CompletedRemoval, Cold::Existing] {
+        let mut observed = snapshot();
+        observed.cold = cold;
+        assert!(observed.first_recovery_settled());
+    }
 }
 #[test]
 fn a8b_partial_removal_through_coordinator_is_submitted_not_unknown() {
@@ -1408,7 +1784,6 @@ fn a8b_partial_removal_through_coordinator_is_submitted_not_unknown() {
 /// Plans through the production report path and returns the preview the operator sees.
 #[allow(clippy::unwrap_used)] // Test-only fixture; a failed send or join should fail the test.
 fn plan_preview(fake: Fake) -> String {
-    use crosspane_installer_core::{JobIntent, JobStage, OperationId, StepId};
     let (tx, commands) = mpsc::sync_channel(32);
     let (reports, rx) = mpsc::sync_channel(32);
     let (agents, _agent_rx) = mpsc::sync_channel(32);
@@ -1429,15 +1804,10 @@ fn plan_preview(fake: Fake) -> String {
     fence.select(1);
     tx.send(ports::Command::Job {
         fence,
-        job: live::NativeJob::Step {
-            job: JobIntent {
-                step: StepId(20),
-                operation: OperationId(1),
-                stage: JobStage::Plan,
-            },
-            consent: None,
+        job: live::NativeJob::Maintenance(live::MaintenanceRequest::PlanRepair {
+            id: live::MaintenanceId(1),
             status: None,
-        },
+        }),
     })
     .unwrap();
     let report = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
@@ -1445,11 +1815,10 @@ fn plan_preview(fake: Fake) -> String {
     drop(tx);
     thread.join().unwrap();
     match report {
-        live::NativeReport::Step(report) => match report.outcome {
-            live::NativeOutcome::Planned { preview } => preview,
-            _ => panic!("planned outcome expected"),
-        },
-        _ => panic!("step report expected"),
+        live::NativeReport::Maintenance(live::MaintenanceReport::RepairPlanned {
+            preview, ..
+        }) => preview,
+        _ => panic!("recovery preview expected"),
     }
 }
 #[test]
@@ -1531,7 +1900,10 @@ fn fresh(cold: Cold) -> Fake {
 /// Runs `jobs` through the production worker, in order. Each job gets its own fence, selected to
 /// the job's ticket, so one job's selection cannot change another job's admission.
 #[allow(clippy::unwrap_used)] // Test-only harness; a failed send or join should fail the test.
-fn run_jobs(fake: Fake, jobs: Vec<(u64, live::NativeJob)>) -> Vec<live::NativeReport> {
+fn run_jobs<D: Domains + 'static>(
+    fake: D,
+    jobs: Vec<(u64, live::NativeJob)>,
+) -> Vec<live::NativeReport> {
     let (tx, commands) = mpsc::sync_channel(32);
     let (reports, rx) = mpsc::sync_channel(32);
     let (agents, _agent_rx) = mpsc::sync_channel(32);
@@ -1778,7 +2150,7 @@ fn elevated_is_never_requested_for_upgrade_or_a_non_eligible_install() {
         assert!(seen.requests.is_empty());
         assert!(seen.applied.is_empty());
     }
-    // Recovery is planned without the administrator step; an unknown or denied admission is refused.
+    // Recovery waits for maintenance; an unknown or denied admission is refused.
     for cold in [
         Cold::Partial,
         Cold::Stale,
@@ -1791,12 +2163,9 @@ fn elevated_is_never_requested_for_upgrade_or_a_non_eligible_install() {
         let reports = run_jobs(fake, vec![(1, step_job(20, 1, JobStage::Plan, None))]);
         assert_eq!(reports.len(), 1);
         let expected = match cold {
-            Cold::Partial => live::NativeOutcome::Planned {
-                preview: "Roll back / remove the partial first install".to_owned(),
-            },
-            Cold::Stale => live::NativeOutcome::Planned {
-                preview: "Settle the stale first-install record".to_owned(),
-            },
+            Cold::Partial | Cold::Stale => {
+                live::NativeOutcome::Waiting(crosspane_installer_core::WaitKind::User)
+            }
             _ => live::NativeOutcome::Failed,
         };
         assert_eq!(step_of(&reports[0]).outcome, expected);
@@ -2058,11 +2427,7 @@ fn teardown_not_submitted_refunds_keeps_the_report_lines_and_a_fresh_removal_sti
             assert_eq!(*outcome, live::MaintenanceOutcome::Refused);
             assert_eq!(
                 lines,
-                &vec![
-                    "Removal submission: NotSubmitted; completion is independently verified"
-                        .to_owned(),
-                    "Windows did not start the firewall teardown.".to_owned(),
-                ]
+                &vec!["Windows did not start the firewall teardown.".to_owned(),]
             );
         }
         _ => panic!("finished report expected"),
@@ -2075,13 +2440,7 @@ fn teardown_not_submitted_refunds_keeps_the_report_lines_and_a_fresh_removal_sti
     match maintenance_of(&reports[3]) {
         live::MaintenanceReport::Finished { outcome, lines, .. } => {
             assert_eq!(*outcome, live::MaintenanceOutcome::Partial);
-            assert_eq!(
-                lines,
-                &vec![
-                    "Removal submission: Submitted; completion is independently verified"
-                        .to_owned()
-                ]
-            );
+            assert!(lines.is_empty());
         }
         _ => panic!("finished report expected"),
     }
@@ -2226,11 +2585,7 @@ fn refused_teardown_refunds_even_when_settle_archived_metadata() {
             assert_eq!(*outcome, live::MaintenanceOutcome::Refused);
             assert_eq!(
                 lines,
-                &vec![
-                    "Removal submission: NotSubmitted; completion is independently verified"
-                        .to_owned(),
-                    "Windows did not start the firewall teardown.".to_owned(),
-                ]
+                &vec!["Windows did not start the firewall teardown.".to_owned(),]
             );
         }
         _ => panic!("finished report expected"),
@@ -2243,13 +2598,7 @@ fn refused_teardown_refunds_even_when_settle_archived_metadata() {
     match maintenance_of(&reports[3]) {
         live::MaintenanceReport::Finished { outcome, lines, .. } => {
             assert_eq!(*outcome, live::MaintenanceOutcome::Partial);
-            assert_eq!(
-                lines,
-                &vec![
-                    "Removal submission: Submitted; completion is independently verified"
-                        .to_owned()
-                ]
-            );
+            assert!(lines.is_empty());
         }
         _ => panic!("finished report expected"),
     }

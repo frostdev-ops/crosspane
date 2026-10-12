@@ -901,6 +901,672 @@ fn a8b_archive_claim_bytes_stay_immutable_and_gate_new_epoch() {
     assert_eq!(FirstHistoryIntent::decode(&bytes).unwrap(), intent);
 }
 
+// The retirement fake models only an already-admitted metadata victim. Its eligibility inputs
+// stand in for independent native terminal/reference checks; they grant no executable authority.
+#[derive(Clone)]
+struct HistoryRetirementFake {
+    published: FirstHistoryIndex,
+    observed: FirstHistoryIndex,
+    directory: Option<FileStamp>,
+    leaves: Vec<Option<HistoryObservation>>,
+    extra_names: Vec<String>,
+    eligible: [bool; 3],
+    protected: [bool; 3],
+    unknown_references: bool,
+    leaf_deletes: Vec<usize>,
+    directory_deletes: usize,
+    publications: usize,
+    boundaries: usize,
+    cut: Option<usize>,
+    change_predecessor: bool,
+}
+impl HistoryRetirementFake {
+    fn new(published: FirstHistoryIndex, victim: u8) -> Self {
+        let selected = published.slots[usize::from(victim)].as_ref().unwrap();
+        let (_, leaves) = rolling_history_slot(selected.operation[0]);
+        assert_eq!(
+            selected.leaves,
+            leaves
+                .iter()
+                .map(|(identity, bytes, name)| {
+                    HistoryLeaf::observe(name.clone(), *identity, bytes).unwrap()
+                })
+                .collect::<Vec<_>>()
+        );
+        let count = leaves.len();
+        Self {
+            observed: published.clone(),
+            published,
+            directory: Some(history_directory(victim)),
+            leaves: leaves
+                .into_iter()
+                .map(|(identity, bytes, _)| Some((identity, bytes)))
+                .collect(),
+            extra_names: Vec::new(),
+            eligible: [true; 3],
+            protected: [false; 3],
+            unknown_references: false,
+            leaf_deletes: vec![0; count],
+            directory_deletes: 0,
+            publications: 0,
+            boundaries: 0,
+            cut: None,
+            change_predecessor: false,
+        }
+    }
+    fn boundary(&mut self) -> NativeResult<()> {
+        self.boundaries += 1;
+        if self.cut == Some(self.boundaries) {
+            Err(NativeError::OutcomeUnknown)
+        } else {
+            Ok(())
+        }
+    }
+    fn position(intent: &FirstHistoryRetirement, leaf: &HistoryLeaf) -> usize {
+        intent
+            .selected
+            .leaves
+            .iter()
+            .position(|selected| selected == leaf)
+            .unwrap()
+    }
+    fn reopen(&mut self) {
+        self.observed = self.published.clone();
+        self.cut = None;
+    }
+}
+impl FirstHistoryRetirementPort for HistoryRetirementFake {
+    fn renew_retirement(&mut self, index: &FirstHistoryIndex) -> NativeResult<()> {
+        index.retirement_follows(&self.published)?;
+        if self.unknown_references {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        if let Some(intent) = index
+            .retirement
+            .as_ref()
+            .or(self.published.retirement.as_ref())
+        {
+            let slot = usize::from(intent.slot);
+            if !self.eligible[slot] || self.protected[slot] {
+                return Err(NativeError::OutcomeUnknown);
+            }
+        }
+        self.observed = self.published.clone();
+        Ok(())
+    }
+    fn persist_retirement(&mut self, index: &FirstHistoryIndex) -> NativeResult<()> {
+        self.boundary()?;
+        if self.change_predecessor {
+            self.published.order.swap(1, 2);
+            self.change_predecessor = false;
+        }
+        if self.published != self.observed {
+            return Err(NativeError::Foreign);
+        }
+        index.retirement_follows(&self.published)?;
+        self.published = index.clone();
+        self.publications += 1;
+        self.boundary()?;
+        self.observed = self.published.clone();
+        Ok(())
+    }
+    fn retirement_directory(
+        &mut self,
+        intent: &FirstHistoryRetirement,
+    ) -> NativeResult<Option<(FileStamp, Vec<String>)>> {
+        Ok(self.directory.map(|identity| {
+            let mut names = self.extra_names.clone();
+            names.extend(
+                self.leaves
+                    .iter()
+                    .zip(&intent.selected.leaves)
+                    .filter_map(|(observed, leaf)| observed.as_ref().map(|_| leaf.leaf.clone())),
+            );
+            (identity, names)
+        }))
+    }
+    fn retirement_leaf(
+        &mut self,
+        intent: &FirstHistoryRetirement,
+        leaf: &HistoryLeaf,
+    ) -> NativeResult<Option<HistoryObservation>> {
+        Ok(if self.directory.is_some() {
+            self.leaves[Self::position(intent, leaf)].clone()
+        } else {
+            None
+        })
+    }
+    fn delete_history_leaf(
+        &mut self,
+        intent: &FirstHistoryRetirement,
+        leaf: &HistoryLeaf,
+    ) -> NativeResult<()> {
+        assert_eq!(self.published.retirement.as_ref(), Some(intent));
+        assert_eq!(self.directory, Some(intent.directory));
+        let position = Self::position(intent, leaf);
+        let (identity, bytes) = self.leaves[position].as_ref().unwrap();
+        assert!(leaf.matches(*identity, bytes));
+        self.boundary()?;
+        self.leaves[position] = None;
+        self.leaf_deletes[position] += 1;
+        self.boundary()
+    }
+    fn delete_history_slot(&mut self, intent: &FirstHistoryRetirement) -> NativeResult<()> {
+        assert_eq!(self.published.retirement.as_ref(), Some(intent));
+        assert_eq!(intent.cursor, FirstHistoryRetirementCursor::DeleteSlot);
+        assert_eq!(self.directory, Some(intent.directory));
+        assert!(self.leaves.iter().all(Option::is_none));
+        assert!(self.extra_names.is_empty());
+        self.boundary()?;
+        self.directory = None;
+        self.directory_deletes += 1;
+        self.boundary()
+    }
+}
+fn history_directory(slot: u8) -> FileStamp {
+    FileStamp {
+        volume: 1,
+        file: [150 + slot; 16],
+    }
+}
+type RollingHistoryLeaf = (FileStamp, Vec<u8>, String);
+fn rolling_history_slot(operation: u8) -> (FirstHistorySlot, Vec<RollingHistoryLeaf>) {
+    let leaves: Vec<_> = ["supervisor.json", "removal.json"]
+        .into_iter()
+        .enumerate()
+        .map(|(offset, name)| {
+            (
+                FileStamp {
+                    volume: 1,
+                    file: [operation * 4 + offset as u8; 16],
+                },
+                format!("admitted history {operation}: {name}").into_bytes(),
+                name.to_owned(),
+            )
+        })
+        .collect();
+    (
+        FirstHistorySlot {
+            source: FirstHistorySource::Removal,
+            operation: [operation; 16],
+            next_operation: [100 + operation; 16],
+            context: vec![operation],
+            leaves: leaves
+                .iter()
+                .map(|(identity, bytes, name)| {
+                    HistoryLeaf::observe(name.clone(), *identity, bytes).unwrap()
+                })
+                .collect(),
+        },
+        leaves,
+    )
+}
+fn append_rolling_history(index: &mut FirstHistoryIndex, operation: u8) {
+    let mut intent = index.select(rolling_history_slot(operation).0).unwrap();
+    let claim = intent.selected.clone();
+    intent.moved = intent.selected.leaves.len();
+    intent.complete = true;
+    index.commit(&intent).unwrap();
+    assert_eq!(intent.selected, claim);
+}
+fn full_rolling_history() -> FirstHistoryIndex {
+    let mut index = FirstHistoryIndex::default();
+    for operation in 1..=3 {
+        append_rolling_history(&mut index, operation);
+    }
+    index
+}
+fn pending_rolling_retirement() -> (HistoryRetirementFake, FirstHistoryIndex) {
+    let previous = full_rolling_history();
+    let port = HistoryRetirementFake::new(previous.clone(), 0);
+    let mut index = previous;
+    index.begin_retirement(0, history_directory(0)).unwrap();
+    (port, index)
+}
+
+#[test]
+fn rolling_history_reuses_only_admitted_fifo_victims_and_preserves_latest_claims() {
+    let mut index = FirstHistoryIndex::default();
+    let mut retained = Vec::new();
+    for operation in 1..=9 {
+        if index.vacant() == Err(NativeError::Busy) {
+            let latest = *index.order.last().unwrap();
+            let mut protected = [false; 3];
+            protected[usize::from(latest)] = true;
+            let victim = index
+                .retirement_candidate([true; 3], protected)
+                .unwrap()
+                .unwrap();
+            assert_eq!(victim, index.order[0]);
+            let claims = index.slots.clone();
+            let mut port = HistoryRetirementFake::new(index.clone(), victim);
+            port.protected = protected;
+            index
+                .begin_retirement(victim, history_directory(victim))
+                .unwrap();
+            assert_eq!(
+                index.retirement.as_ref().unwrap().selected,
+                *claims[usize::from(victim)].as_ref().unwrap()
+            );
+            retire_history(&mut port, &mut index).unwrap();
+            assert_eq!(index, port.published);
+            assert_eq!(port.leaf_deletes, [1, 1]);
+            assert_eq!(port.directory_deletes, 1);
+            assert!(port.directory.is_none());
+            for (slot, claim) in claims.iter().enumerate() {
+                if slot != usize::from(victim) {
+                    assert_eq!(&index.slots[slot], claim);
+                }
+            }
+            retained.remove(0);
+        }
+        append_rolling_history(&mut index, operation);
+        retained.push(operation);
+        assert!(index.slots.iter().flatten().count() <= 3);
+        assert_eq!(
+            index
+                .order
+                .iter()
+                .map(|slot| index.slots[usize::from(*slot)].as_ref().unwrap().operation[0])
+                .collect::<Vec<_>>(),
+            retained
+        );
+        assert_eq!(
+            FirstHistoryIndex::decode(&index.encode().unwrap()).unwrap(),
+            index
+        );
+    }
+    assert_eq!(retained, [7, 8, 9]);
+}
+
+#[test]
+fn rolling_history_legacy_decode_keeps_claims_and_rejects_unknown_or_invalid_order() {
+    let mut legacy = full_rolling_history();
+    legacy.schema_version = 1;
+    legacy.order.clear();
+    let bytes = legacy.encode().unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(envelope["data"].get("order").is_none());
+    assert!(envelope["data"].get("settlements").is_none());
+    assert!(envelope["data"].get("retirement").is_none());
+    let claims = legacy.slots.clone();
+    let mut decoded = FirstHistoryIndex::decode(&bytes).unwrap();
+    decoded.upgrade().unwrap();
+    assert_eq!(decoded.schema_version, 2);
+    assert_eq!(decoded.order, [0, 1, 2]);
+    assert_eq!(decoded.slots, claims);
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyIndex {
+        schema_version: u32,
+        slots: [Option<FirstHistorySlot>; 3],
+    }
+    assert!(
+        serde_json::from_value::<LegacyIndex>(serde_json::to_value(&decoded).unwrap()).is_err()
+    );
+    for order in [vec![0, 0, 2], vec![0, 1], vec![0, 1, 3], vec![0, 1, 2, 0]] {
+        let mut invalid = decoded.clone();
+        invalid.order = order;
+        assert_eq!(invalid.validate(), Err(NativeError::Invalid));
+    }
+    for schema in [0, 3, u32::MAX] {
+        let mut unknown = envelope.clone();
+        unknown["data"]["schema_version"] = schema.into();
+        assert_eq!(
+            FirstHistoryIndex::decode(&serde_json::to_vec(&unknown).unwrap()),
+            Err(NativeError::Invalid)
+        );
+    }
+    let mut invalid_legacy = legacy;
+    invalid_legacy.order = vec![0, 1, 2];
+    assert_eq!(invalid_legacy.validate(), Err(NativeError::Invalid));
+}
+
+#[test]
+fn rolling_history_unadmitted_partial_stale_and_protected_or_unknown_refs_have_no_delete() {
+    for source in [FirstHistorySource::Partial, FirstHistorySource::Stale] {
+        let mut index = full_rolling_history();
+        for slot in index.slots.iter_mut().flatten() {
+            slot.source = source;
+        }
+        assert!(index.settlements.iter().all(Option::is_none));
+        assert_eq!(index.retirement_candidate([false; 3], [false; 3]), Ok(None));
+        let mut port = HistoryRetirementFake::new(index.clone(), 0);
+        port.eligible = [false; 3];
+        index.begin_retirement(0, history_directory(0)).unwrap();
+        assert_eq!(
+            retire_history(&mut port, &mut index),
+            Err(NativeError::OutcomeUnknown)
+        );
+        assert_eq!(port.publications, 0);
+        assert_eq!(port.leaf_deletes, [0, 0]);
+    }
+    for unknown in [false, true] {
+        let (mut port, mut index) = pending_rolling_retirement();
+        port.unknown_references = unknown;
+        port.protected = [!unknown; 3];
+        assert_eq!(
+            port.published.retirement_candidate([true; 3], [true; 3]),
+            Ok(None)
+        );
+        assert_eq!(
+            retire_history(&mut port, &mut index),
+            Err(NativeError::OutcomeUnknown)
+        );
+        assert_eq!(port.publications, 0);
+        assert_eq!(port.leaf_deletes, [0, 0]);
+        assert_eq!(port.directory_deletes, 0);
+    }
+}
+
+#[test]
+fn rolling_history_reference_scan_protects_nested_operations_and_exact_file_stamps() {
+    let slot = rolling_history_slot(1).0;
+    let references = [
+        serde_json::json!({"data": {"source_operation": slot.operation}}),
+        serde_json::json!({"data": {"operation": slot.next_operation}}),
+        serde_json::json!({"data": {"associated": [{"stamp": slot.leaves[0].identity}]}}),
+        serde_json::json!({"data": {"source": format!("operation-{}.json", native_io::records::hex(&slot.operation))}}),
+    ];
+    for reference in references {
+        assert!(slot.referenced_by(&reference));
+    }
+    let unrelated_operation = [99; 16];
+    let unrelated_file = [98; 16];
+    assert!(!slot.referenced_by(&serde_json::json!({"data": {"operation": unrelated_operation, "stamp": {"volume": 1, "file": unrelated_file}}})));
+}
+
+#[test]
+fn rolling_history_every_publication_and_delete_cut_reopens_without_repeating_effects() {
+    let (mut reference, mut complete) = pending_rolling_retirement();
+    retire_history(&mut reference, &mut complete).unwrap();
+    for cut in 1..=reference.boundaries {
+        let (mut port, mut index) = pending_rolling_retirement();
+        let claims = port.published.slots.clone();
+        port.cut = Some(cut);
+        assert_eq!(
+            retire_history(&mut port, &mut index),
+            Err(NativeError::OutcomeUnknown),
+            "cut {cut}"
+        );
+        port.reopen();
+        let mut reopened = port.published.clone();
+        if reopened.slots[0].is_some() {
+            if reopened.retirement.is_none() {
+                reopened.begin_retirement(0, history_directory(0)).unwrap();
+            }
+            retire_history(&mut port, &mut reopened).unwrap();
+        }
+        assert_eq!(reopened, complete, "cut {cut}");
+        assert_eq!(port.published, complete, "cut {cut}");
+        assert_eq!(port.leaf_deletes, [1, 1], "cut {cut}");
+        assert_eq!(port.directory_deletes, 1, "cut {cut}");
+        assert!(port.directory.is_none());
+        assert!(port.leaves.iter().all(Option::is_none));
+        assert_eq!(reopened.slots[1], claims[1]);
+        assert_eq!(reopened.slots[2], claims[2]);
+        assert_eq!(reopened.vacant(), Ok(0));
+    }
+}
+
+#[test]
+fn rolling_history_changed_or_unplanned_inventory_refuses_before_any_delete() {
+    for drift in 0..5 {
+        let (mut port, mut index) = pending_rolling_retirement();
+        match drift {
+            0 => port.directory.as_mut().unwrap().file = [90; 16],
+            1 => port.leaves[1].as_mut().unwrap().0.file = [91; 16],
+            2 => port.leaves[1].as_mut().unwrap().1.push(0),
+            3 => port.extra_names.push("unplanned.json".into()),
+            4 => port.leaves[1] = None,
+            _ => unreachable!(),
+        }
+        assert!(
+            retire_history(&mut port, &mut index).is_err(),
+            "drift {drift}"
+        );
+        assert_eq!(port.leaf_deletes, [0, 0]);
+        assert_eq!(port.directory_deletes, 0);
+        assert!(port.published.slots[0].is_some());
+    }
+    let (mut port, mut index) = pending_rolling_retirement();
+    port.directory = None;
+    assert_eq!(
+        retire_history(&mut port, &mut index),
+        Err(NativeError::OutcomeUnknown)
+    );
+    assert!(port.published.slots[0].is_some());
+}
+
+#[test]
+fn rolling_history_reappeared_deleted_leaf_refuses_remaining_effects() {
+    let (mut port, mut index) = pending_rolling_retirement();
+    let original = port.leaves[0].clone();
+    // Initial publication, first deletion, then durable next-leaf publication all took effect.
+    port.cut = Some(6);
+    assert_eq!(
+        retire_history(&mut port, &mut index),
+        Err(NativeError::OutcomeUnknown)
+    );
+    assert_eq!(
+        port.published.retirement.as_ref().unwrap().cursor,
+        FirstHistoryRetirementCursor::DeleteLeaf(1)
+    );
+    assert_eq!(port.leaf_deletes, [1, 0]);
+    port.leaves[0] = original;
+    port.reopen();
+    let mut reopened = port.published.clone();
+    assert_eq!(
+        retire_history(&mut port, &mut reopened),
+        Err(NativeError::OutcomeUnknown)
+    );
+    assert_eq!(port.leaf_deletes, [1, 0]);
+    assert_eq!(port.directory_deletes, 0);
+}
+
+#[test]
+fn rolling_history_complete_predecessor_and_progress_must_match_before_publication() {
+    let (port, index) = pending_rolling_retirement();
+    index.retirement_follows(&port.published).unwrap();
+    for drift in 0..3 {
+        let mut predecessor = port.published.clone();
+        match drift {
+            0 => predecessor.slots[1].as_mut().unwrap().context.push(9),
+            1 => predecessor.order.swap(1, 2),
+            2 => predecessor.slots[0].as_mut().unwrap().context.push(9),
+            _ => unreachable!(),
+        }
+        predecessor.validate().unwrap();
+        assert_eq!(
+            index.retirement_follows(&predecessor),
+            Err(NativeError::Foreign)
+        );
+    }
+    let mut skipped = index.clone();
+    skipped.retirement.as_mut().unwrap().cursor = FirstHistoryRetirementCursor::DeleteSlot;
+    assert_eq!(
+        skipped.retirement_follows(&index),
+        Err(NativeError::Foreign)
+    );
+    let mut next = index.clone();
+    next.retirement.as_mut().unwrap().cursor = FirstHistoryRetirementCursor::DeleteLeaf(1);
+    next.retirement_follows(&index).unwrap();
+    assert_eq!(index.retirement_follows(&next), Err(NativeError::Foreign));
+    let (partial, witness) = terminal_history_witness(FirstRecoveryMode::Rollback);
+    let mut witnessed = port.published.clone();
+    witnessed.slots[1] = Some(partial);
+    // Give this independent witness a distinct source operation within the otherwise full index.
+    witnessed.slots[0].as_mut().unwrap().operation = [41; 16];
+    witnessed.settlements[1] = Some(witness);
+    witnessed.validate().unwrap();
+    let mut witnessed_next = witnessed.clone();
+    witnessed_next
+        .begin_retirement(0, history_directory(0))
+        .unwrap();
+    let mut changed_witness = witnessed;
+    changed_witness.settlements[1] = None;
+    changed_witness.validate().unwrap();
+    assert_eq!(
+        witnessed_next.retirement_follows(&changed_witness),
+        Err(NativeError::Foreign)
+    );
+    let (mut port, mut proposed) = pending_rolling_retirement();
+    port.change_predecessor = true;
+    assert_eq!(
+        retire_history(&mut port, &mut proposed),
+        Err(NativeError::Foreign)
+    );
+    assert_eq!(port.published.order, [0, 2, 1]);
+    assert!(port.published.retirement.is_none());
+    assert_eq!(port.publications, 0);
+    assert_eq!(port.leaf_deletes, [0, 0]);
+}
+
+fn terminal_history_witness(mode: FirstRecoveryMode) -> (FirstHistorySlot, FirstHistorySettlement) {
+    let document = match mode {
+        FirstRecoveryMode::Rollback => {
+            let (mut port, mut record) = RecoveryFake::new(mode);
+            assert_eq!(
+                recover_first(&mut port, &mut record).unwrap(),
+                FirstRecoveryOutcome::RolledBack
+            );
+            record
+        }
+        FirstRecoveryMode::Remove => {
+            let (mut port, mut record) = RecoveryFake::new(mode);
+            assert_eq!(
+                removal::executor::remove_partial_first(&mut port, &mut record).unwrap(),
+                FirstRecoveryOutcome::Removed
+            );
+            record
+        }
+        FirstRecoveryMode::RetireStale => {
+            let (mut port, mut record) = stale_fixture(mode);
+            assert_eq!(
+                settle_stale_first(&mut port, &mut record).unwrap(),
+                FirstRecoveryOutcome::Retired
+            );
+            record
+        }
+        FirstRecoveryMode::Supersede => unreachable!(),
+    };
+    assert_eq!(document.cursor, FirstRecoveryCursor::Retired);
+    let canonical = document.encode().unwrap();
+    let mut legacy: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+    legacy["data"]
+        .as_object_mut()
+        .unwrap()
+        .remove("stray_stage");
+    let mut bytes = b" \n".to_vec();
+    bytes.extend(serde_json::to_vec_pretty(&legacy).unwrap());
+    bytes.extend(b"\n  ");
+    assert_ne!(bytes, canonical);
+    assert_eq!(FirstRecoveryRecord::decode(&bytes).unwrap(), document);
+    let slot = FirstHistorySlot {
+        source: if mode == FirstRecoveryMode::RetireStale {
+            FirstHistorySource::Stale
+        } else {
+            FirstHistorySource::Partial
+        },
+        operation: document.document.operation(),
+        next_operation: [102; 16],
+        context: vec![1],
+        leaves: vec![document.source.clone()],
+    };
+    let observed = HistoryLeaf::observe(
+        "first-install-recovery.json".into(),
+        FileStamp {
+            volume: 1,
+            file: [88; 16],
+        },
+        &bytes,
+    )
+    .unwrap();
+    (
+        slot,
+        FirstHistorySettlement {
+            observed,
+            document,
+            bytes,
+        },
+    )
+}
+
+#[test]
+fn rolling_history_exact_terminal_legacy_witness_survives_index_migration_without_rewriting_claim()
+{
+    for mode in [
+        FirstRecoveryMode::Rollback,
+        FirstRecoveryMode::Remove,
+        FirstRecoveryMode::RetireStale,
+    ] {
+        let (slot, settlement) = terminal_history_witness(mode);
+        settlement.validate(&slot).unwrap();
+        assert!(settlement.document.stray_stage.is_none());
+        let original_claim = slot.clone();
+        let original_bytes = settlement.bytes.clone();
+        let mut index = FirstHistoryIndex::default();
+        index.slots[0] = Some(slot);
+        index.upgrade().unwrap();
+        index.settlements[0] = Some(settlement.clone());
+        let reopened = FirstHistoryIndex::decode(&index.encode().unwrap()).unwrap();
+        assert_eq!(reopened.slots[0], Some(original_claim));
+        assert_eq!(
+            reopened.settlements[0].as_ref().unwrap().bytes,
+            original_bytes
+        );
+        assert_eq!(reopened.settlements[0], Some(settlement));
+    }
+}
+
+#[test]
+fn rolling_history_terminal_witness_rejects_byte_source_document_phase_and_mode_drift() {
+    let (slot, settlement) = terminal_history_witness(FirstRecoveryMode::Rollback);
+    for drift in 0..6 {
+        let mut changed = settlement.clone();
+        let mut selected = slot.clone();
+        match drift {
+            0 => changed.bytes.push(b' '),
+            1 => changed.observed.digest[0] ^= 1,
+            2 => changed.document.source.identity.file = [89; 16],
+            3 => changed.document.mode = FirstRecoveryMode::Remove,
+            4 => {
+                changed.document.cursor = FirstRecoveryCursor::RetireIntent;
+                changed.bytes = changed.document.encode().unwrap();
+                changed.observed = HistoryLeaf::observe(
+                    changed.observed.leaf.clone(),
+                    changed.observed.identity,
+                    &changed.bytes,
+                )
+                .unwrap();
+            }
+            5 => selected.source = FirstHistorySource::Stale,
+            _ => unreachable!(),
+        }
+        assert!(changed.validate(&selected).is_err(), "drift {drift}");
+    }
+}
+
+#[test]
+fn rolling_history_oversized_raw_terminal_witness_is_retained_and_refused() {
+    let (slot, mut settlement) = terminal_history_witness(FirstRecoveryMode::Rollback);
+    let original_claim = slot.clone();
+    settlement.bytes.resize(64 * 1024 + 1, b' ');
+    assert_eq!(
+        FirstRecoveryRecord::decode(&settlement.bytes).unwrap(),
+        settlement.document
+    );
+    settlement.observed = HistoryLeaf::observe(
+        settlement.observed.leaf.clone(),
+        settlement.observed.identity,
+        &settlement.bytes,
+    )
+    .unwrap();
+    assert_eq!(settlement.validate(&slot), Err(NativeError::Oversize));
+    assert_eq!(settlement.bytes.len(), 64 * 1024 + 1);
+    assert_eq!(slot, original_claim);
+}
+
 #[derive(Clone)]
 struct RecoveryFake {
     saved: Option<FirstRecoveryRecord>,

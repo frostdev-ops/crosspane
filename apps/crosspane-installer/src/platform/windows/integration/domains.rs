@@ -122,7 +122,11 @@ impl Snapshot {
     /// A completed first-install recovery leaves no partial or stale cold state behind.
     pub fn first_recovery_settled(&self) -> bool {
         self.source == ObservationSource::Live
-            && !matches!(self.cold, Cold::Partial | Cold::Stale)
+            && self.supported
+            && matches!(
+                self.cold,
+                Cold::Eligible | Cold::CompletedRemoval | Cold::Existing
+            )
             && !self.unsettled
     }
     pub fn install_operation(&self) -> Operation {

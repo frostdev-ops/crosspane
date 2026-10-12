@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 pub(crate) const MAX_INVENTORY_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MAX_STAGING_BYTES: u64 = MAX_IMAGE_BYTES;
+// Runtime host admission supports native x64 only. Broader PE metadata stays inspectable,
+// but executable approvals must agree with that target before any source or effect is eligible.
+const SUPPORTED_TARGET_MACHINE: u16 = 0x8664;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum PayloadRole {
@@ -96,7 +99,7 @@ impl ApprovedPe {
     #[cfg(windows)]
     pub(crate) fn own_image(image: &super::super::native_io::SelfImagePin) -> NativeResult<Self> {
         let facts = image.facts().clone();
-        if !facts.valid() {
+        if !facts.valid() || facts.machine != SUPPORTED_TARGET_MACHINE {
             return Err(NativeError::Unsupported);
         }
         Ok(Self {
@@ -165,7 +168,7 @@ impl ApprovedInventory {
                 subsystem: pin.subsystem,
                 version: pin.version,
             };
-            if !facts.valid() {
+            if !facts.valid() || facts.machine != SUPPORTED_TARGET_MACHINE {
                 return Err(NativeError::Unsupported);
             }
             payloads.push(ApprovedPe {
@@ -186,7 +189,8 @@ impl ApprovedInventory {
         }
         Ok(inventory)
     }
-    /// Aggregate staged bytes include four fixed roles and the optional installer helper copy.
+    /// Bind payload machines to the admitted installer before sources or effects, and bound
+    /// aggregate staged bytes across four fixed roles plus the optional installer helper copy.
     pub(crate) fn check_staging_budget(
         &self,
         installer: &ApprovedPe,
@@ -195,13 +199,20 @@ impl ApprovedInventory {
         if installer.role() != PayloadRole::Installer {
             return Err(NativeError::Foreign);
         }
+        if installer.machine() != SUPPORTED_TARGET_MACHINE {
+            return Err(NativeError::Unsupported);
+        }
         let mut total = installer
             .size()
             .checked_mul(if helper { 2 } else { 1 })
             .ok_or(NativeError::Oversize)?;
         for role in [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl] {
+            let payload = self.role(role)?;
+            if payload.machine() != installer.machine() {
+                return Err(NativeError::Unsupported);
+            }
             total = total
-                .checked_add(self.role(role)?.size())
+                .checked_add(payload.size())
                 .ok_or(NativeError::Oversize)?;
         }
         if total > MAX_STAGING_BYTES {

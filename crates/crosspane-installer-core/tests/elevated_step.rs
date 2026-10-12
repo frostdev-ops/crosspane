@@ -652,7 +652,7 @@ fn constructed_results_gate_as_their_constructors_say() {
 }
 
 #[test]
-fn report_lines_use_the_frozen_wording_for_every_state_and_subject() {
+fn report_lines_use_the_expected_wording_for_every_state_and_subject() {
     // The wording of every state that reads the same for both subjects. NotRun uses `REASON`.
     let states: [(PartResult, &str); 6] = [
         (RebootRequired, "Windows needs a restart to finish"),
@@ -666,7 +666,7 @@ fn report_lines_use_the_frozen_wording_for_every_state_and_subject() {
         ),
         (
             Failed,
-            "could not be changed; anything this step created was undone",
+            "did not finish; some changes may remain. Check the current status before trying again",
         ),
         (
             Unknown,
@@ -712,6 +712,32 @@ fn report_lines_use_the_frozen_wording_for_every_state_and_subject() {
                 "{name:?} {part:?}"
             );
         }
+    }
+}
+
+#[test]
+fn failed_changes_never_claim_cleanup_when_observation_shows_remaining_objects() {
+    let mut driver = report(DriverState::PackageOnly, FirewallState::NotRequested);
+    driver.driver.packages.push("oem42.inf".into());
+    let mut firewall = report(DriverState::Absent, FirewallState::Present);
+    firewall.firewall.family_count = 1;
+    for (verb, after) in [
+        (Verb::InstallDriver, driver),
+        (Verb::AddFirewall(scope()), firewall),
+    ] {
+        after.validate().unwrap();
+        let result = StepResult::launched(
+            &verb,
+            &[(verb.clone(), Some(Outcome::Failed))],
+            Some(&after),
+        );
+        assert_eq!(result.parts, [(verb.name(), Failed)]);
+        assert!(!result.all_verified());
+        assert_eq!(removal_gate(&result), Gate::Unknown);
+        let lines = report_lines(&result);
+        assert!(lines[0].contains("some changes may remain"));
+        assert!(!lines[0].contains("undone"));
+        assert!(!lines[0].contains("unchanged"));
     }
 }
 

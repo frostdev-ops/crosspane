@@ -264,7 +264,8 @@ fn state(name: VerbName, part: PartResult, not_run: Option<&'static str>) -> Str
             "unchanged; Windows or an existing conflicting object refused the change".to_owned()
         }
         PartResult::Failed => {
-            "could not be changed; anything this step created was undone".to_owned()
+            "did not finish; some changes may remain. Check the current status before trying again"
+                .to_owned()
         }
         PartResult::Unknown => {
             "result unknown; it is checked again before the next administrator step".to_owned()

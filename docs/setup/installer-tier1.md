@@ -113,6 +113,46 @@ The package test regenerates and compares the inventory, checks its exact bytes 
 binary (absent from the bootstrap), checks all hashes/modes and verifies the nested code signature.
 
 
+## Windows
+
+The installer supports native x64 Windows 11 24H2 or later (workstation build 26100 or later),
+with local NTFS profile folders. It runs in your own signed-in, non-elevated session. Windows
+Server, ARM64, and unknown or unsupported host observations are refused before installation.
+
+From the Windows checkout, use the native build prerequisites in `docs/running.md` and load
+the session-only CMake and prebuilt NASM settings. Choose a fresh absolute output under an
+existing directory and the existing signed x64 driver directory:
+
+```powershell
+. .\scripts\windows\dev-env.ps1
+$env:CARGO_BUILD_JOBS = '2'
+$env:CARGO_INCREMENTAL = '0'
+$env:CARGO_PROFILE_RELEASE_DEBUG = '0'
+New-Item -ItemType Directory -Path .\target -Force | Out-Null
+$windowsOut = Join-Path $PWD 'target\windows-tier1'
+& .\scripts\installer\stage-windows.ps1 -Out $windowsOut -Driver 'C:\path\to\signed-driver' -AgentFeatures video
+& .\scripts\installer\test-stage-windows.ps1
+```
+
+Leave `CARGO_BUILD_TARGET` unset: the stager uses native `target/release` output. The driver
+directory must contain `CrosspaneIdd.inf`, `CrosspaneIdd.cat`, and `CrosspaneIdd.dll`. The Windows
+stager builds the agent with video support, UI, control tool, elevated helper, and installer;
+it does not build or sign the driver, sign the executables, install, or launch them. It checks
+x64 PE images, bounded sizes, embedded inventories, and the hashes of the staged copies before
+publishing the kit. A nonempty output directory is refused. The packaging test uses inert
+fixtures and a mocked build command; it executes no artifact.
+
+Keep the published kit together, including `crosspane-installer.exe`, its sibling `payload`
+directory, and the inventory JSONs. Double-click the installer normally. It selects that
+sibling payload; an explicit `--payload` must name the kit's `payload` directory. The JSONs
+are inspection copies: runtime approval comes from the inventories embedded in the installer.
+An ordinary unpinned Cargo build has no install authority.
+
+Only the separate firewall/optional display-driver helper requests administrator approval
+when setup needs it. The main installer and agent remain non-elevated. Windows Tier 1 still
+uses local developer artifacts; executable release signing and download trust are separate
+work. Installer recovery preserves unknown evidence rather than replaying an unproved action.
+
 ## Read-only installer diagnostics
 
 On the machine you want to inspect, run an already built installer against an existing staged
