@@ -1043,6 +1043,8 @@ mod inject_drag_follow_tests {
 
     type Seen = Arc<StdMutex<Result<Foreground, PlatformError>>>;
     type Sent = Arc<StdMutex<Vec<u32>>>;
+    /// Every submitted packet as (INPUT type, dwFlags, scancode); the scancode is 0 for the mouse.
+    type Events = Arc<StdMutex<Vec<(u32, u32, u16)>>>;
 
     fn foreground_of(window: u64, integrity: u32) -> Foreground {
         Foreground {
@@ -1059,12 +1061,57 @@ mod inject_drag_follow_tests {
     /// in `submit`), with a scripted foreground and a recording `SendInput` stand-in. Nothing
     /// reaches the OS.
     fn driver(first: Foreground) -> (Driver<NativePort>, Seen, Sent) {
+        let sent: Sent = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = sent.clone();
+        let (driver, current) = build(
+            first,
+            Box::new(move |input| {
+                // SAFETY: only mouse packets are submitted here; `encode` initialized `mi`.
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(unsafe { input.Anonymous.mi.dwFlags });
+                1
+            }),
+        );
+        (driver, current, sent)
+    }
+
+    /// Like `driver`, but it records keyboard packets as well as mouse ones.
+    fn keyed_driver(first: Foreground) -> (Driver<NativePort>, Seen, Events) {
+        let events: Events = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = events.clone();
+        let (driver, current) = build(
+            first,
+            Box::new(move |input| {
+                // SAFETY: `encode` initialized the union member that `type` names.
+                let event = unsafe {
+                    if input.r#type == INPUT_KEYBOARD {
+                        (
+                            INPUT_KEYBOARD,
+                            input.Anonymous.ki.dwFlags,
+                            input.Anonymous.ki.wScan,
+                        )
+                    } else {
+                        (input.r#type, input.Anonymous.mi.dwFlags, 0)
+                    }
+                };
+                recorded.lock().unwrap().push(event);
+                1
+            }),
+        );
+        (driver, current, events)
+    }
+
+    fn build(
+        first: Foreground,
+        sender: Box<dyn FnMut(INPUT) -> u32 + Send>,
+    ) -> (Driver<NativePort>, Seen) {
         let gate = IoGate::new();
         gate.set_session_permits(true);
         gate.set_engine_permits(true);
         let current: Seen = Arc::new(StdMutex::new(Ok(first)));
-        let sent: Sent = Arc::new(StdMutex::new(Vec::new()));
-        let (observed, recorded) = (current.clone(), sent.clone());
+        let observed = current.clone();
         let port = NativePort {
             gate: gate.clone(),
             generation: Arc::new(AtomicU64::new(5)),
@@ -1087,21 +1134,20 @@ mod inject_drag_follow_tests {
                 Ok(f) => Ok(*f),
                 Err(_) => Err(PlatformError::SecureInput),
             })),
-            sender: Some(Box::new(move |input| {
-                // SAFETY: only mouse packets are submitted here; `encode` initialized `mi`.
-                recorded
-                    .lock()
-                    .unwrap()
-                    .push(unsafe { input.Anonymous.mi.dwFlags });
-                1
-            })),
+            sender: Some(sender),
             tainted: None,
         };
         let driver = Driver::new(port, gate, 0x2000, RepeatSettings::new(0, 0).unwrap());
-        (driver, current, sent)
+        (driver, current)
     }
 
     const MOVE: u32 = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    const KEY_DOWN: u32 = KEYEVENTF_SCANCODE;
+    const KEY_UP: u32 = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+    /// Scancodes of the Left Shift, Left Ctrl and `A` keys.
+    const SHIFT: u16 = 0x2A;
+    const CTRL: u16 = 0x1D;
+    const A: u16 = 0x1E;
 
     #[test]
     fn inject_native_drag_continues_into_the_window_the_click_activated() {
@@ -1149,6 +1195,120 @@ mod inject_drag_follow_tests {
             // Nothing is owed any more, so a later release request sends nothing.
             driver.release_buttons().unwrap();
             assert_eq!(sent.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn inject_native_shift_drag_continues_into_the_window_the_click_activated() {
+        let (mut driver, current, events) = keyed_driver(foreground_of(1, 0x2000));
+        driver.key(HidUsage::keyboard(0xe1), true, 0).unwrap();
+        driver.button(MouseButton::PRIMARY, true).unwrap();
+        *current.lock().unwrap() = Ok(foreground_of(9, 0x2000));
+        driver
+            .submit_guarded(Packet::Move { x: 10, y: 10 })
+            .unwrap();
+        driver
+            .submit_guarded(Packet::Move { x: 20, y: 20 })
+            .unwrap();
+        // A modifier never arms a typematic repeat, so nothing but the drag reaches window 9.
+        assert!(!driver.repeating());
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                (INPUT_KEYBOARD, KEY_DOWN, SHIFT),
+                (INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, 0),
+                (INPUT_MOUSE, MOVE, 0),
+                (INPUT_MOUSE, MOVE, 0),
+            ]
+        );
+        driver.button(MouseButton::PRIMARY, false).unwrap();
+        driver.key(HidUsage::keyboard(0xe1), false, 1).unwrap();
+        assert_eq!(
+            events.lock().unwrap()[4..],
+            [
+                (INPUT_MOUSE, MOUSEEVENTF_LEFTUP, 0),
+                (INPUT_KEYBOARD, KEY_UP, SHIFT),
+            ]
+        );
+        assert!(driver.held_keys().is_empty() && driver.held_buttons().is_empty());
+        driver.release_everything().unwrap();
+        assert_eq!(events.lock().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn inject_native_ctrl_alone_follows_the_foreground_without_a_button() {
+        let (mut driver, current, events) = keyed_driver(foreground_of(1, 0x2000));
+        driver.key(HidUsage::keyboard(0xe0), true, 0).unwrap();
+        *current.lock().unwrap() = Ok(foreground_of(9, 0x1000));
+        driver
+            .submit_guarded(Packet::Move { x: 10, y: 10 })
+            .unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            [(INPUT_KEYBOARD, KEY_DOWN, CTRL), (INPUT_MOUSE, MOVE, 0)]
+        );
+        driver.key(HidUsage::keyboard(0xe0), false, 1).unwrap();
+        assert_eq!(
+            events.lock().unwrap()[2..],
+            [(INPUT_KEYBOARD, KEY_UP, CTRL)]
+        );
+        assert!(driver.held_keys().is_empty());
+    }
+
+    #[test]
+    fn inject_native_modifier_with_a_typing_key_held_releases_exactly_once() {
+        let (mut driver, current, events) = keyed_driver(foreground_of(1, 0x2000));
+        driver.key(HidUsage::keyboard(0xe1), true, 0).unwrap();
+        driver.key(HidUsage::keyboard(4), true, 1).unwrap();
+        assert!(driver.repeating());
+        *current.lock().unwrap() = Ok(foreground_of(9, 0x2000));
+        assert!(matches!(
+            driver.submit_guarded(Packet::Move { x: 10, y: 10 }),
+            Err(PlatformError::SecureInput)
+        ));
+        // The typematic repeat is gone, and each key went up exactly once (the typing key first,
+        // by usage order). The move never went out.
+        assert!(!driver.repeating());
+        driver.repeat(1_000_000).unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                (INPUT_KEYBOARD, KEY_DOWN, SHIFT),
+                (INPUT_KEYBOARD, KEY_DOWN, A),
+                (INPUT_KEYBOARD, KEY_UP, A),
+                (INPUT_KEYBOARD, KEY_UP, SHIFT),
+            ]
+        );
+        driver.release_everything().unwrap();
+        assert_eq!(events.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn inject_native_modifier_drag_into_a_higher_or_unknown_foreground_releases_exactly_once() {
+        for next in [
+            Ok(foreground_of(9, 0x3000)),
+            Err(PlatformError::SecureInput),
+        ] {
+            let (mut driver, current, events) = keyed_driver(foreground_of(1, 0x2000));
+            driver.key(HidUsage::keyboard(0xe1), true, 0).unwrap();
+            driver.button(MouseButton::PRIMARY, true).unwrap();
+            *current.lock().unwrap() = next;
+            assert!(matches!(
+                driver.submit_guarded(Packet::Move { x: 10, y: 10 }),
+                Err(PlatformError::SecureInput)
+            ));
+            assert_eq!(
+                *events.lock().unwrap(),
+                [
+                    (INPUT_KEYBOARD, KEY_DOWN, SHIFT),
+                    (INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, 0),
+                    (INPUT_KEYBOARD, KEY_UP, SHIFT),
+                    (INPUT_MOUSE, MOUSEEVENTF_LEFTUP, 0),
+                ]
+            );
+            assert!(driver.held_keys().is_empty() && driver.held_buttons().is_empty());
+            driver.release_everything().unwrap();
+            assert_eq!(events.lock().unwrap().len(), 4);
         }
     }
 }

@@ -6,16 +6,24 @@
 //! | --- | --- |
 //! | Closed/changed gate | Cancel repeat, attempt all owed ups, return `Locked` |
 //! | Unknown/null/incomplete/higher-integrity foreground | Cancel repeat, attempt owed ups, return `SecureInput` |
-//! | Changed foreground, a key or lock toggle owed | Drain both ledgers, refuse this submission |
-//! | Changed foreground, only buttons held, new one complete and integrity <= ours | Adopt it as the owner; the drag continues, nothing is released |
+//! | Changed foreground, a non-modifier key or a lock toggle owed | Drain both ledgers, refuse this submission |
+//! | Changed foreground, only buttons and/or modifier keys held, new one complete and integrity <= ours | Adopt it as the owner; the drag or modifier chord continues, nothing is released |
 //! | Changed foreground, nothing held | Normal admission |
 //! | Fresh matching foreground and open gate | Record possible down before submission |
 //! | Any release/recovery | Cancel repeat first; submit ups regardless of the guard |
 //! | Failed up | Retain it as owed; never claim delivery |
 //!
+//! A *modifier* is one of the eight Left/Right Shift, Ctrl, Alt and Win keys (`HidUsage::is_modifier`).
+//! A *non-modifier key* is every other usage held, including Caps/Num/Scroll Lock; an owed
+//! lock-toggle up counts the same.
+//!
 //! The adoption row exists because a click normally activates the clicked window: the button down
-//! is admitted against the old foreground, so the very next move of the drag sees a new one.
-//! `judge_foreground` is the whole decision; `Driver::guard` only applies it.
+//! is admitted against the old foreground, so the very next move of the drag sees a new one. The
+//! same holds for a Shift-, Ctrl- or Alt-click-drag, where the modifier was admitted against the
+//! old foreground too. Modifiers are safe to carry over because the injector never repeats them
+//! (only the down of a non-modifier, non-lock key arms the typematic repeat, and any key up
+//! cancels it), so a repeat can only exist while a non-modifier key is held, and that always
+//! releases. `judge_foreground` is the whole decision; `Driver::guard` only applies it.
 
 use super::geometry::{DisplayIds, MonitorProbe, displays};
 use super::hook::DragSettlementResult;
@@ -44,8 +52,28 @@ pub struct Foreground {
 pub struct HeldInput {
     /// At least one injected (or owed) pointer button.
     pub buttons: bool,
-    /// At least one injected (or owed) key, or an owed lock-toggle up.
+    /// At least one injected (or owed) modifier key (`HidUsage::is_modifier`: Left/Right Shift,
+    /// Ctrl, Alt or Win). Modifiers are never repeated and produce no character on their own.
+    pub modifiers: bool,
+    /// At least one injected (or owed) key that is not a modifier (a typing key, which can arm the
+    /// typematic repeat, or a Caps/Num/Scroll Lock usage), or an owed lock-toggle up.
     pub keys: bool,
+}
+impl HeldInput {
+    /// Classifies the driver's three ledgers. Anything on the keyboard that is not one of the
+    /// eight modifier usages counts as `keys`, including usages on other pages, so an unknown
+    /// usage can only make the verdict stricter.
+    pub fn classify(
+        keys: &BTreeSet<HidUsage>,
+        toggle_ups: &BTreeSet<HidUsage>,
+        buttons: &BTreeSet<MouseButton>,
+    ) -> Self {
+        Self {
+            buttons: !buttons.is_empty(),
+            modifiers: keys.iter().any(|usage| usage.is_modifier()),
+            keys: !toggle_ups.is_empty() || keys.iter().any(|usage| !usage.is_modifier()),
+        }
+    }
 }
 
 /// The outcome of judging one foreground observation against the foreground that owns the held
@@ -54,8 +82,8 @@ pub struct HeldInput {
 pub enum ForegroundVerdict {
     /// Same owner, or nothing held: admit the submission against the observed foreground.
     Admit,
-    /// A pointer drag outlives the click that activated another window: the observed foreground
-    /// becomes the owner and the submission is admitted.
+    /// A pointer drag, or a held modifier, outlives the click that activated another window: the
+    /// observed foreground becomes the owner and the submission is admitted.
     Adopt,
     /// Fail safe: release everything owed once and refuse the submission.
     Release,
@@ -69,10 +97,13 @@ pub enum ForegroundVerdict {
 /// thread and an integrity no higher than `own_integrity`; anything else is released, whatever is
 /// held, so this never injects into a more privileged or unknown target.
 ///
-/// A changed foreground follows the click only for a pure pointer drag (buttons held, no key and no
-/// lock-toggle up owed) and only when the new identity is complete (a process creation time, so
-/// PID reuse is still told apart). Held keys keep the original rule: their typematic repeat and
-/// their ups are tied to one focus owner.
+/// A changed foreground follows the click only while every owed up is a pointer button or a
+/// modifier key (a Shift/Ctrl-click-drag, or a held Ctrl with the wheel), with no other key and no
+/// lock-toggle up owed, and only when the new identity is complete (a process creation time, so
+/// PID reuse is still told apart). A held non-modifier key keeps the original rule: its typematic
+/// repeat and its up are tied to one focus owner. Modifiers have no repeat to leak into the new
+/// window, and Adopt moves only the ownership: the ledger, and so the single owed up of every
+/// held button and modifier, is untouched.
 pub fn judge_foreground(
     observed: Option<Foreground>,
     owned: Option<Foreground>,
@@ -87,8 +118,8 @@ pub fn judge_foreground(
     match owned {
         None => ForegroundVerdict::Admit,
         Some(owner) if owner == now => ForegroundVerdict::Admit,
-        Some(_) if !held.buttons && !held.keys => ForegroundVerdict::Admit,
-        Some(_) if held.buttons && !held.keys && now.born != 0 => ForegroundVerdict::Adopt,
+        Some(_) if held == HeldInput::default() => ForegroundVerdict::Admit,
+        Some(_) if !held.keys && now.born != 0 => ForegroundVerdict::Adopt,
         Some(_) => ForegroundVerdict::Release,
     }
 }
@@ -464,16 +495,16 @@ impl<P: InjectionPort> Driver<P> {
             observed,
             self.focus.map(|(owned, _)| owned),
             self.own_integrity,
-            HeldInput {
-                buttons: !self.buttons.is_empty(),
-                keys: !self.keys.is_empty() || !self.toggle_ups.is_empty(),
-            },
+            HeldInput::classify(&self.keys, &self.toggle_ups, &self.buttons),
         );
         let foreground = match (verdict, observed) {
             (ForegroundVerdict::Admit, Some(f)) => f,
             (ForegroundVerdict::Adopt, Some(f)) => {
-                // The drag follows the click into the window it activated. Only ownership moves;
-                // every held button keeps its single owed up.
+                // The drag (or Shift/Ctrl chord) follows the click into the window it activated.
+                // Only ownership moves; every held button and modifier keeps its single owed up.
+                // Adopt never sees a typematic repeat (it needs a held non-modifier key, which
+                // releases), but a repeat must never outlive its owner, so clear it regardless.
+                self.cancel_repeat();
                 self.focus = Some((f, epoch));
                 f
             }
@@ -583,6 +614,10 @@ impl<P: InjectionPort> Driver<P> {
         };
         // Check on every timer turn, even before due: closed/changed gates cancel immediately.
         self.guard()?;
+        if self.repeat.is_none() {
+            // The guard cancelled it without refusing (an adopted foreground never keeps one).
+            return Ok(());
+        }
         if now_ms >= due {
             let result = self.port.submit(key_packet(usage, true)?);
             if result.is_err() {
@@ -806,22 +841,37 @@ mod judge_tests {
     use super::*;
 
     const OWN: u32 = 0x2000;
-    const NOTHING: HeldInput = HeldInput {
-        buttons: false,
-        keys: false,
-    };
-    const BUTTONS: HeldInput = HeldInput {
-        buttons: true,
-        keys: false,
-    };
-    const KEYS: HeldInput = HeldInput {
-        buttons: false,
-        keys: true,
-    };
-    const BOTH: HeldInput = HeldInput {
-        buttons: true,
-        keys: true,
-    };
+    const fn held(buttons: bool, modifiers: bool, keys: bool) -> HeldInput {
+        HeldInput {
+            buttons,
+            modifiers,
+            keys,
+        }
+    }
+    const NOTHING: HeldInput = held(false, false, false);
+    const BUTTONS: HeldInput = held(true, false, false);
+    const MODIFIERS: HeldInput = held(false, true, false);
+    const BUTTONS_AND_MODIFIERS: HeldInput = held(true, true, false);
+    /// Every held set that carries a non-modifier key or an owed lock-toggle up.
+    const WITH_KEYS: [HeldInput; 4] = [
+        held(false, false, true),
+        held(true, false, true),
+        held(false, true, true),
+        held(true, true, true),
+    ];
+    /// Held sets whose owed ups are only pointer buttons and/or modifier keys.
+    const FOLLOWS: [HeldInput; 3] = [BUTTONS, MODIFIERS, BUTTONS_AND_MODIFIERS];
+    /// Every combination of the three flags.
+    const ALL: [HeldInput; 8] = [
+        NOTHING,
+        BUTTONS,
+        MODIFIERS,
+        BUTTONS_AND_MODIFIERS,
+        WITH_KEYS[0],
+        WITH_KEYS[1],
+        WITH_KEYS[2],
+        WITH_KEYS[3],
+    ];
 
     fn fg(window: u64, integrity: u32) -> Foreground {
         Foreground {
@@ -843,7 +893,7 @@ mod judge_tests {
 
     #[test]
     fn inject_same_foreground_or_no_owner_is_normal_admission() {
-        for held in [NOTHING, BUTTONS, KEYS, BOTH] {
+        for held in ALL {
             assert_eq!(judge(Some(fg(1, OWN)), Some(fg(1, OWN)), held), Admit);
             assert_eq!(judge(Some(fg(1, 0x1000)), Some(fg(1, 0x1000)), held), Admit);
             assert_eq!(judge(Some(fg(1, OWN)), None, held), Admit);
@@ -866,13 +916,16 @@ mod judge_tests {
     }
 
     #[test]
-    fn inject_changed_foreground_with_buttons_held_continues_at_equal_or_lower_integrity() {
-        for integrity in [OWN, 0x1000, 0x0000] {
-            assert_eq!(
-                judge(Some(fg(2, integrity)), Some(fg(1, OWN)), BUTTONS),
-                Adopt,
-                "integrity {integrity:#x}"
-            );
+    fn inject_changed_foreground_with_buttons_or_modifiers_held_continues_at_equal_or_lower_integrity()
+     {
+        for held in FOLLOWS {
+            for integrity in [OWN, 0x1000, 0x0000] {
+                assert_eq!(
+                    judge(Some(fg(2, integrity)), Some(fg(1, OWN)), held),
+                    Adopt,
+                    "integrity {integrity:#x} while {held:?}"
+                );
+            }
         }
         // The owner may also have been a lower-integrity window, and a bumped generation, a
         // reused pid or a new thread of the same window all count as a changed foreground.
@@ -893,7 +946,9 @@ mod judge_tests {
                 ..owner
             },
         ] {
-            assert_eq!(judge(Some(observed), Some(owner), BUTTONS), Adopt);
+            for held in FOLLOWS {
+                assert_eq!(judge(Some(observed), Some(owner), held), Adopt, "{held:?}");
+            }
         }
     }
 
@@ -921,8 +976,15 @@ mod judge_tests {
             }),
         ];
         for observed in unusable {
-            assert_eq!(judge(observed, owner, BUTTONS), Release, "{observed:?}");
-            assert_eq!(judge(observed, owner, BOTH), Release, "{observed:?}");
+            // With nothing held there is nothing to follow, so an incomplete identity is still
+            // admitted as before (the unchanged rule); everything held releases.
+            for held in ALL.into_iter().filter(|held| *held != NOTHING) {
+                assert_eq!(
+                    judge(observed, owner, held),
+                    Release,
+                    "{observed:?} while {held:?}"
+                );
+            }
         }
     }
 
@@ -944,7 +1006,7 @@ mod judge_tests {
             }),
         ];
         for observed in unusable {
-            for held in [NOTHING, BUTTONS, KEYS, BOTH] {
+            for held in ALL {
                 assert_eq!(judge(observed, None, held), Release, "{observed:?}");
                 assert_eq!(
                     judge(observed, Some(fg(1, OWN)), held),
@@ -967,12 +1029,15 @@ mod judge_tests {
     }
 
     #[test]
-    fn inject_changed_foreground_with_a_key_or_lock_toggle_held_keeps_the_fail_safe() {
-        for held in [KEYS, BOTH] {
+    fn inject_changed_foreground_with_a_non_modifier_key_or_lock_toggle_held_keeps_the_fail_safe() {
+        // A held typing key (typematic repeat) or an owed lock-toggle up releases, whatever else is
+        // held with it, and whatever the integrity of the new foreground.
+        for held in WITH_KEYS {
             for integrity in [OWN, 0x1000] {
                 assert_eq!(
                     judge(Some(fg(2, integrity)), Some(fg(1, OWN)), held),
-                    Release
+                    Release,
+                    "{held:?}"
                 );
             }
         }
@@ -981,7 +1046,8 @@ mod judge_tests {
     #[test]
     fn inject_verdict_matches_the_decision_table_over_a_lattice() {
         // Exhaustive over a small lattice: Adopt happens exactly when the owner differs, the new
-        // foreground is usable and complete, buttons are held and no key is.
+        // foreground is usable and complete, something is held, and what is held is only buttons
+        // and/or modifiers (no non-modifier key, no lock-toggle up).
         let owners = [None, Some(fg(1, OWN)), Some(fg(1, 0x1000))];
         let observations = [
             None,
@@ -998,14 +1064,14 @@ mod judge_tests {
         ];
         for owned in owners {
             for observed in observations {
-                for held in [NOTHING, BUTTONS, KEYS, BOTH] {
+                for held in ALL {
                     let usable = observed.is_some_and(|f| f.window != 0 && f.integrity <= OWN);
                     let changed = owned.is_some() && owned != observed;
                     let expected = if !usable {
                         Release
                     } else if !changed || held == NOTHING {
                         Admit
-                    } else if held == BUTTONS && observed.is_some_and(|f| f.born != 0) {
+                    } else if !WITH_KEYS.contains(&held) && observed.is_some_and(|f| f.born != 0) {
                         Adopt
                     } else {
                         Release
@@ -1018,6 +1084,77 @@ mod judge_tests {
                 }
             }
         }
+    }
+
+    fn classify(keys: &[u16], toggle_ups: &[u16], buttons: &[MouseButton]) -> HeldInput {
+        let usages = |ids: &[u16]| -> BTreeSet<HidUsage> {
+            ids.iter().map(|&id| HidUsage::keyboard(id)).collect()
+        };
+        HeldInput::classify(
+            &usages(keys),
+            &usages(toggle_ups),
+            &buttons.iter().copied().collect(),
+        )
+    }
+
+    #[test]
+    fn inject_held_input_counts_exactly_the_eight_modifier_usages_as_modifiers() {
+        assert_eq!(classify(&[], &[], &[]), NOTHING);
+        // Left/Right Ctrl, Shift, Alt and Win (GUI), one at a time and all at once.
+        for id in 0xE0..=0xE7 {
+            assert_eq!(classify(&[id], &[], &[]), MODIFIERS, "{id:#x}");
+        }
+        let all: Vec<u16> = (0xE0..=0xE7).collect();
+        assert_eq!(classify(&all, &[], &[]), MODIFIERS);
+        // Buttons are independent of the keyboard.
+        assert_eq!(classify(&[], &[], &[MouseButton::PRIMARY]), BUTTONS);
+        assert_eq!(
+            classify(
+                &[0xE1],
+                &[],
+                &[MouseButton::PRIMARY, MouseButton::SECONDARY]
+            ),
+            BUTTONS_AND_MODIFIERS
+        );
+    }
+
+    #[test]
+    fn inject_held_input_counts_every_other_key_and_an_owed_toggle_up_as_a_key() {
+        // Letters, Enter, Space, the three lock toggles (HID Caps 0x39, Scroll 0x47, Num 0x53),
+        // F-keys, and the usages just outside the modifier range.
+        for id in [
+            0x04, 0x28, 0x2C, 0x39, 0x47, 0x53, 0x3A, 0x65, 0xDF, 0xE8, 0xFF,
+        ] {
+            assert_eq!(
+                classify(&[id], &[], &[]),
+                held(false, false, true),
+                "{id:#x}"
+            );
+        }
+        // An owed lock-toggle up counts even though the key is no longer in the key ledger.
+        for id in [0x39, 0x47, 0x53] {
+            assert_eq!(
+                classify(&[], &[id], &[]),
+                held(false, false, true),
+                "{id:#x}"
+            );
+            assert_eq!(
+                classify(&[0xE1], &[id], &[MouseButton::PRIMARY]),
+                held(true, true, true),
+                "{id:#x}"
+            );
+        }
+        // One typing key among modifiers makes both flags true; the judge then releases.
+        assert_eq!(classify(&[0xE1, 0x04], &[], &[]), held(false, true, true));
+        // A usage on another page is never a modifier, even with a modifier's id.
+        let consumer = BTreeSet::from([HidUsage {
+            page: 0x0C,
+            id: 0xE1,
+        }]);
+        assert_eq!(
+            HeldInput::classify(&consumer, &BTreeSet::new(), &BTreeSet::new()),
+            held(false, false, true)
+        );
     }
 }
 
