@@ -109,7 +109,11 @@ impl Completion {
             #[cfg(windows)]
             notice: None,
             outcome: match command {
-                Command::Restore { window, .. } => Outcome::Restored { window, ok: false },
+                Command::Restore { window, .. } => Outcome::Restored {
+                    window,
+                    ok: false,
+                    failure: Some(Failure::Other),
+                },
                 Command::Activate { window } => Outcome::Activated {
                     window,
                     result: Err(Failure::Other),
@@ -139,6 +143,11 @@ pub(crate) enum Outcome {
     Restored {
         window: WindowId,
         ok: bool,
+        /// Why a return failed (`None` when it succeeded). `Locked` and `SecureInput` mean the
+        /// session was closed or the OS could not prove it open: the agent retries those when the
+        /// session opens again (no window is lost), and leaves every other failure to the
+        /// journal's startup recovery.
+        failure: Option<Failure>,
     },
     /// The focus request ran (or was refused) on the worker; the focus change itself arrives as a
     /// window event.
@@ -593,6 +602,7 @@ fn operation(
             Outcome::Restored {
                 window,
                 ok: result.is_ok(),
+                failure: result.as_ref().err().map(failure_of),
             }
         }
     };

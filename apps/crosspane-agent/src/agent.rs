@@ -602,6 +602,11 @@ pub struct Agent {
     parking_next: Option<u64>,
     /// Only this request may answer the engine's current Park/Resize for each window.
     parking_latest: BTreeMap<WindowId, u64>,
+    /// Returns of parked windows the engine asked for, by window: the one in flight, and the ones
+    /// refused while the session was closed, which are submitted again when it opens. A window
+    /// stays here until its return succeeds or its retries are used up, so a session that
+    /// flickers closed never leaves it parked for good (04 §5, no window is lost).
+    restore_retry: BTreeMap<WindowId, RestoreRetry>,
     net: Net,
     trust: SharedTrust,
     links: HashMap<NodeId, Box<dyn PeerLink>>,
@@ -887,6 +892,79 @@ struct Waiter {
     pull: bool,
     deadline: Instant,
 }
+
+/// How long the return of a parked window waits before each retry, once the session is open and
+/// the return was refused anyway: three retries over about five seconds. After that the journal's
+/// startup recovery has the window (a warning says so).
+const RESTORE_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_millis(1500),
+    Duration::from_secs(3),
+];
+
+/// The return of one parked window that the engine asked for (`Output::Restore`), kept until it
+/// succeeds. The engine does not hear how a return went: the projection has ended and the engine
+/// has forgotten it, so a return refused while the session was closed would leave the window
+/// parked, out of sight, until the next start. The agent retries it when the session opens.
+#[derive(Debug)]
+struct RestoreRetry {
+    place: Option<(DisplayId, PointDevice)>,
+    /// The operation queued or running; `None` while the return waits to be submitted again.
+    in_flight: Option<u64>,
+    /// Refusals met with the session open. Each spends a step of [`RESTORE_BACKOFF`].
+    spent: usize,
+    /// A waiting return is not submitted before this.
+    not_before: Instant,
+}
+
+/// What a refused return does to its retry.
+#[derive(Debug, PartialEq, Eq)]
+enum RetryStep {
+    /// An older submission answered, not the one in flight: nothing changes.
+    Stale,
+    /// Submitted again once the session is open and `not_before` has passed.
+    Waiting,
+    /// The retries are used up.
+    GaveUp,
+}
+
+impl RestoreRetry {
+    fn new(place: Option<(DisplayId, PointDevice)>, id: u64, now: Instant) -> Self {
+        Self {
+            place,
+            in_flight: Some(id),
+            spent: 0,
+            not_before: now,
+        }
+    }
+
+    /// Whether a retry may be submitted now, if the session is open.
+    fn due(&self, now: Instant) -> bool {
+        self.in_flight.is_none() && self.not_before <= now
+    }
+
+    /// Operation `id` was refused for a session reason (`Locked`, `SecureInput`). A refusal met
+    /// with the session closed was the session's doing: it costs nothing and the retry waits only
+    /// for the session to open. A refusal met with the session open spends a backoff step.
+    fn refused(&mut self, id: u64, session_open: bool, now: Instant) -> RetryStep {
+        if self.in_flight != Some(id) {
+            return RetryStep::Stale;
+        }
+        self.in_flight = None;
+        if !session_open {
+            self.not_before = now;
+            return RetryStep::Waiting;
+        }
+        match RESTORE_BACKOFF.get(self.spent) {
+            Some(delay) => {
+                self.spent += 1;
+                self.not_before = now + *delay;
+                RetryStep::Waiting
+            }
+            None => RetryStep::GaveUp,
+        }
+    }
+}
 /// A grant change restarts the agent only after it has run this long, so a flapping permission
 /// state can't make it restart in a tight loop.
 const MIN_RUN_BEFORE_RESTART: Duration = Duration::from_secs(10);
@@ -916,6 +994,7 @@ impl Agent {
             parking_available: false,
             parking_next: Some(1),
             parking_latest: BTreeMap::new(),
+            restore_retry: BTreeMap::new(),
             net,
             trust,
             links: HashMap::new(),
@@ -1153,6 +1232,24 @@ impl Agent {
             .fold(timeout, |wait, (_, next, _)| {
                 wait.min(next.saturating_duration_since(clock_now))
             });
+        // A return that waits out a backoff with the session open wakes the loop when it is due.
+        // (With the session closed it waits for the event that opens it, and the loop's usual
+        // housekeeping tick.)
+        let timeout = if self.platform.gate.is_open() {
+            self.restore_retry
+                .values()
+                .filter(|retry| retry.in_flight.is_none())
+                .fold(timeout, |wait, retry| {
+                    wait.min(
+                        retry
+                            .not_before
+                            .saturating_duration_since(clock_now)
+                            .max(Duration::from_millis(10)),
+                    )
+                })
+        } else {
+            timeout
+        };
         if self.home_watchdog_needed() {
             let deadline = self
                 .home
@@ -1693,7 +1790,14 @@ impl Agent {
         }
     }
 
-    fn parking_submit(&mut self, command: crate::parking_worker::Command) {
+    /// Returns the operation's ID.
+    fn parking_submit(&mut self, command: crate::parking_worker::Command) -> u64 {
+        self.parking_submit_as(command, true)
+    }
+
+    /// `asked`: the engine asked for this operation. A retry of a refused return is not a new
+    /// return, so the installer tracker does not count it.
+    fn parking_submit_as(&mut self, command: crate::parking_worker::Command, asked: bool) -> u64 {
         self.parking_start();
         let id = self.parking_next.unwrap_or(0);
         self.parking_next = self.parking_next.and_then(|id| id.checked_add(1));
@@ -1701,8 +1805,15 @@ impl Agent {
             crate::parking_worker::Command::Park { window, .. }
             | crate::parking_worker::Command::Resize { window, .. } => {
                 self.parking_latest.insert(window, id);
+                // The window is being projected again: a return that waits for the session to
+                // open must not undo that.
+                self.restore_retry.remove(&window);
             }
-            crate::parking_worker::Command::Restore { .. } => self.tracker.restore_started(id),
+            crate::parking_worker::Command::Restore { .. } => {
+                if asked {
+                    self.tracker.restore_started(id);
+                }
+            }
             // A focus request leaves no state to settle: a failure is logged when it completes.
             crate::parking_worker::Command::Activate { .. } => {}
         }
@@ -1717,6 +1828,60 @@ impl Agent {
             let _ = self.events.send(Event::Parking(
                 crate::parking_worker::Completion::unavailable(id, command),
             ));
+        }
+        id
+    }
+
+    /// The returns of windows that were refused while the session was closed, or that the session
+    /// could not be proven open for: submitted again once the gate is open and the backoff has
+    /// passed. Run after every event, so the one that reopens the gate retries at once.
+    fn retry_restores(&mut self) {
+        if self.restore_retry.is_empty() || !self.platform.gate.is_open() {
+            return;
+        }
+        let now = Instant::now();
+        let due: Vec<_> = self
+            .restore_retry
+            .iter()
+            .filter(|(_, retry)| retry.due(now))
+            .map(|(window, retry)| (*window, retry.place))
+            .collect();
+        for (window, place) in due {
+            tracing::info!(
+                window = window.0,
+                "the session is open: retrying the return of a parked window"
+            );
+            let id = self.parking_submit_as(
+                crate::parking_worker::Command::Restore { window, place },
+                false,
+            );
+            if let Some(retry) = self.restore_retry.get_mut(&window) {
+                retry.in_flight = Some(id);
+            }
+        }
+    }
+
+    /// A return failed for a session reason: keep it pending, or give up on it.
+    fn restore_refused(&mut self, window: WindowId, id: u64) {
+        let session_open = self.platform.gate.is_open();
+        let step = self
+            .restore_retry
+            .get_mut(&window)
+            .map(|retry| retry.refused(id, session_open, Instant::now()));
+        match step {
+            Some(RetryStep::Waiting) => tracing::info!(
+                window = window.0,
+                session_open,
+                "the return of a parked window was refused by a closed session: retrying when it opens"
+            ),
+            Some(RetryStep::GaveUp) => {
+                self.restore_retry.remove(&window);
+                tracing::warn!(
+                    window = window.0,
+                    "a parked window could not be returned while the session was open; its journal entry stays and the next start restores it"
+                );
+            }
+            Some(RetryStep::Stale) | None => {}
         }
     }
 
@@ -1769,7 +1934,11 @@ impl Agent {
                     );
                 }
             }
-            crate::parking_worker::Outcome::Restored { window, ok } => {
+            crate::parking_worker::Outcome::Restored {
+                window,
+                ok,
+                failure,
+            } => {
                 if !ok && let Some(cached) = self.placement.windows.get(window) {
                     tracing::warn!(
                         operation = completion.id,
@@ -1782,6 +1951,20 @@ impl Agent {
                 self.tracker.restored(*window, completion.id, *ok);
                 if *ok {
                     self.home.twins.remove(window);
+                    self.restore_retry.remove(window);
+                } else if matches!(failure, Some(Failure::Locked | Failure::SecureInput)) {
+                    // The session was closed, or the OS could not prove it open, when the return
+                    // ran. The window is still parked and still journaled: it stays tracked
+                    // (`tracker.parked`, `home.twins`, `restore_retry`) until a return succeeds.
+                    self.restore_refused(*window, completion.id);
+                } else if self
+                    .restore_retry
+                    .get(window)
+                    .is_some_and(|retry| retry.in_flight == Some(completion.id))
+                {
+                    // Another failure is not the session's: the journal's startup recovery has
+                    // it. (A newer return of the window in flight keeps its entry.)
+                    self.restore_retry.remove(window);
                 }
             }
             crate::parking_worker::Outcome::Activated { window, result } => {
@@ -1805,6 +1988,9 @@ impl Agent {
     }
 
     fn parking_shutdown(&mut self, wait: Duration) -> crate::lifecycle::Parking {
+        // The final recovery below returns every parked window from the journal: nothing is left
+        // to retry once it has run.
+        self.restore_retry.clear();
         self.parking_start();
         let Some(worker) = &mut self.parking else {
             return if self.parking_available {
@@ -2543,7 +2729,12 @@ impl Agent {
             Output::Restore { window, place } => {
                 let place =
                     place.map(|p| (p.display, PointDevice::new(f64::from(p.x), f64::from(p.y))));
-                self.parking_submit(crate::parking_worker::Command::Restore { window, place });
+                // A new return replaces what an earlier one left pending for this window.
+                self.restore_retry.remove(&window);
+                let id =
+                    self.parking_submit(crate::parking_worker::Command::Restore { window, place });
+                self.restore_retry
+                    .insert(window, RestoreRetry::new(place, id, Instant::now()));
             }
             Output::ActivateWindow { window } => {
                 // A backend whose focus call can wait (Windows: up to two seconds when the OS
@@ -4469,6 +4660,7 @@ impl Agent {
         {
             self.twin_video_retry(stream);
         }
+        self.retry_restores();
         self.home_housekeeping();
         self.discovery_housekeeping();
         // Known limit (WP-4.5): a backend that flips and flips back within one tick is missed.
@@ -12264,7 +12456,7 @@ mod home_tests {
                     assert!(!restored, "the activation completed before the return ran");
                     activated = true;
                 }
-                crate::parking_worker::Outcome::Restored { window, ok } => {
+                crate::parking_worker::Outcome::Restored { window, ok, .. } => {
                     assert_eq!((*window, *ok), (WindowId(5), true));
                     restored = true;
                 }
@@ -12437,6 +12629,303 @@ mod home_tests {
                 .unwrap()
                 .shutdown(crate::parking_worker::SHUTDOWN_WAIT);
         }
+    }
+
+    // ---- a return refused by a closed session is retried when the session opens (04 §5) ----
+
+    /// How the fixture backend answers a return.
+    const RETURN_OK: u8 = 0;
+    const RETURN_SECURE_INPUT: u8 = 1;
+    const RETURN_LOCKED: u8 = 2;
+    const RETURN_OTHER: u8 = 3;
+
+    /// A parking backend that refuses the return of a window the way the live backend did when the
+    /// session state flickered to Unknown: the OS could not prove the input desktop was the default
+    /// one. It records every return it was asked for.
+    struct SessionParking {
+        mode: Arc<std::sync::atomic::AtomicU8>,
+        returns: Arc<Mutex<Vec<WindowId>>>,
+    }
+
+    impl crosspane_platform::WindowParking for SessionParking {
+        fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+            Err(PlatformError::Unsupported("fixture"))
+        }
+        fn park(
+            &mut self,
+            window: WindowId,
+            size: PixelSize,
+            scale: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            crosspane_platform::WindowParking::park(&mut FakeParking, window, size, scale)
+        }
+        fn resize(
+            &mut self,
+            window: WindowId,
+            size: PixelSize,
+            scale: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            self.park(window, size, scale)
+        }
+        fn geometry(&self, window: WindowId) -> Result<crosspane_platform::Parked, PlatformError> {
+            crosspane_platform::WindowParking::geometry(&FakeParking, window)
+        }
+        fn restore(&mut self, window: WindowId) -> Result<(), PlatformError> {
+            self.returns.lock().unwrap().push(window);
+            match self.mode.load(std::sync::atomic::Ordering::SeqCst) {
+                RETURN_OK => Ok(()),
+                RETURN_SECURE_INPUT => Err(PlatformError::SecureInput),
+                RETURN_LOCKED => Err(PlatformError::Locked),
+                _ => Err(PlatformError::NotFound),
+            }
+        }
+        fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+            Ok(Vec::new())
+        }
+    }
+
+    type Returns = Arc<Mutex<Vec<WindowId>>>;
+
+    /// An agent whose parking backend answers returns as `mode` says.
+    fn session_parking(mode: u8) -> (Home, Arc<std::sync::atomic::AtomicU8>, Returns) {
+        let mut h = home();
+        let mode = Arc::new(std::sync::atomic::AtomicU8::new(mode));
+        let returns: Returns = Arc::new(Mutex::new(Vec::new()));
+        h.rig.agent.platform.parking = Some(Box::new(SessionParking {
+            mode: mode.clone(),
+            returns: returns.clone(),
+        }));
+        h.rig.agent.parking_start();
+        (h, mode, returns)
+    }
+
+    fn session_state(lock: crosspane_platform::LockState, active: Option<bool>) -> Input {
+        Input::Session(crosspane_platform::SessionEvent::State(
+            crosspane_platform::SessionState { lock, active },
+        ))
+    }
+
+    fn unknown_session() -> Input {
+        session_state(crosspane_platform::LockState::Unknown, None)
+    }
+
+    fn unlocked_session() -> Input {
+        session_state(crosspane_platform::LockState::Unlocked, Some(true))
+    }
+
+    /// The incident: the session state flickers to Unknown, the projection ends and asks for the
+    /// window back, the OS refuses while it cannot prove the session open, and 1.7 s later the
+    /// session is Unlocked again. The window must come back then, without anyone asking again.
+    #[test]
+    fn a_return_refused_while_the_session_is_unknown_is_retried_when_it_unlocks() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (mut h, mode, returns) = session_parking(RETURN_SECURE_INPUT);
+        let window = WindowId(10);
+        // The backend closes the gate before it announces anything.
+        h.gate.set_session_permits(false);
+        step(&mut h, unknown_session());
+        h.rig.agent.execute_one(Output::Restore {
+            window,
+            place: None,
+        });
+        process_events(&mut h);
+        assert_eq!(*returns.lock().unwrap(), [window]);
+        assert!(
+            h.rig.agent.restore_retry.contains_key(&window),
+            "a refused return stays tracked"
+        );
+        // While the session stays closed, passes of the loop do not retry (nor give up).
+        for _ in 0..3 {
+            h.rig.agent.housekeeping();
+        }
+        process_events(&mut h);
+        assert_eq!(returns.lock().unwrap().len(), 1);
+        assert!(h.rig.agent.restore_retry.contains_key(&window));
+        // The session opens: the backend opens the gate first, then the event reaches the loop.
+        mode.store(RETURN_OK, SeqCst);
+        h.gate.set_session_permits(true);
+        step(&mut h, unlocked_session());
+        h.rig.agent.housekeeping();
+        process_events(&mut h);
+        assert_eq!(*returns.lock().unwrap(), [window, window]);
+        assert!(
+            h.rig.agent.restore_retry.is_empty(),
+            "a successful return is done"
+        );
+        // Nothing is submitted again once it succeeded.
+        h.rig.agent.housekeeping();
+        process_events(&mut h);
+        assert_eq!(returns.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_locked_refusal_is_retried_like_a_secure_input_one_and_other_failures_are_not() {
+        for (mode, retried) in [
+            (RETURN_SECURE_INPUT, true),
+            (RETURN_LOCKED, true),
+            (RETURN_OTHER, false),
+        ] {
+            let (mut h, _, returns) = session_parking(mode);
+            h.rig.agent.execute_one(Output::Restore {
+                window: WindowId(10),
+                place: None,
+            });
+            process_events(&mut h);
+            assert_eq!(returns.lock().unwrap().len(), 1);
+            assert_eq!(
+                h.rig.agent.restore_retry.contains_key(&WindowId(10)),
+                retried,
+                "mode {mode}"
+            );
+        }
+    }
+
+    /// The gate stays open and the OS keeps refusing (a window of a more privileged process, say):
+    /// three retries over about five seconds, then the journal's startup recovery has it.
+    #[test]
+    fn a_return_refused_with_the_session_open_gives_up_after_three_retries() {
+        let (mut h, _, returns) = session_parking(RETURN_SECURE_INPUT);
+        let window = WindowId(10);
+        assert!(h.gate.is_open());
+        h.rig.agent.execute_one(Output::Restore {
+            window,
+            place: None,
+        });
+        process_events(&mut h);
+        assert_eq!(returns.lock().unwrap().len(), 1);
+        // The backoff holds the retry back until it has passed.
+        h.rig.agent.housekeeping();
+        process_events(&mut h);
+        assert_eq!(
+            returns.lock().unwrap().len(),
+            1,
+            "the backoff has not passed"
+        );
+        for retry in 1..=3 {
+            h.rig
+                .agent
+                .restore_retry
+                .get_mut(&window)
+                .unwrap()
+                .not_before = Instant::now();
+            h.rig.agent.housekeeping();
+            process_events(&mut h);
+            assert_eq!(returns.lock().unwrap().len(), 1 + retry);
+        }
+        assert!(
+            h.rig.agent.restore_retry.is_empty(),
+            "the retries are used up"
+        );
+        h.rig.agent.housekeeping();
+        process_events(&mut h);
+        assert_eq!(returns.lock().unwrap().len(), 4);
+    }
+
+    /// A refusal that comes from the session closing again does not spend the budget: the window
+    /// is retried as often as the session opens.
+    #[test]
+    fn refusals_met_with_the_session_closed_do_not_spend_the_retries() {
+        let (mut h, mode, returns) = session_parking(RETURN_SECURE_INPUT);
+        let window = WindowId(10);
+        h.gate.set_session_permits(false);
+        h.rig.agent.execute_one(Output::Restore {
+            window,
+            place: None,
+        });
+        process_events(&mut h);
+        for round in 2..=6 {
+            h.gate.set_session_permits(true);
+            h.rig.agent.housekeeping();
+            // The session closes again before the OS answers: refused with the gate closed.
+            h.gate.set_session_permits(false);
+            process_events(&mut h);
+            assert_eq!(returns.lock().unwrap().len(), round);
+            assert!(h.rig.agent.restore_retry.contains_key(&window));
+        }
+        mode.store(RETURN_OK, std::sync::atomic::Ordering::SeqCst);
+        h.gate.set_session_permits(true);
+        h.rig.agent.housekeeping();
+        process_events(&mut h);
+        assert!(h.rig.agent.restore_retry.is_empty());
+    }
+
+    /// A window that is projected again is not returned behind the projection's back.
+    #[test]
+    fn a_new_park_cancels_the_return_that_waits_for_the_session() {
+        let (mut h, mode, returns) = session_parking(RETURN_SECURE_INPUT);
+        let window = WindowId(10);
+        h.gate.set_session_permits(false);
+        h.rig.agent.execute_one(Output::Restore {
+            window,
+            place: None,
+        });
+        process_events(&mut h);
+        assert!(h.rig.agent.restore_retry.contains_key(&window));
+        h.rig.agent.execute_one(Output::Park {
+            window,
+            size: PixelSize::new(400, 300),
+            scale: 1.0,
+        });
+        process_events(&mut h);
+        assert!(h.rig.agent.restore_retry.is_empty());
+        mode.store(RETURN_OK, std::sync::atomic::Ordering::SeqCst);
+        h.gate.set_session_permits(true);
+        h.rig.agent.housekeeping();
+        process_events(&mut h);
+        assert_eq!(returns.lock().unwrap().len(), 1, "no return was retried");
+    }
+
+    /// A second return of the window replaces the first one's retry state, and an older answer
+    /// cannot touch the newer one.
+    #[test]
+    fn an_older_answer_does_not_touch_the_newer_return_of_a_window() {
+        let t0 = Instant::now();
+        let mut retry = RestoreRetry::new(None, 7, t0);
+        assert_eq!(retry.refused(6, true, t0), RetryStep::Stale);
+        assert_eq!(retry.in_flight, Some(7));
+        assert_eq!(retry.spent, 0);
+        assert_eq!(retry.refused(7, true, t0), RetryStep::Waiting);
+        assert_eq!(retry.in_flight, None);
+        assert_eq!(retry.refused(7, true, t0), RetryStep::Stale);
+    }
+
+    #[test]
+    fn the_return_backoff_is_three_steps_over_about_five_seconds() {
+        let t0 = Instant::now();
+        let mut retry = RestoreRetry::new(Some((DisplayId(1), PointDevice::new(2.0, 3.0))), 1, t0);
+        let mut waited = Duration::ZERO;
+        for (index, delay) in RESTORE_BACKOFF.iter().enumerate() {
+            let id = 1 + index as u64;
+            retry.in_flight = Some(id);
+            assert_eq!(retry.refused(id, true, t0), RetryStep::Waiting);
+            assert!(!retry.due(t0), "step {index} waits");
+            assert!(!retry.due(t0 + *delay - Duration::from_millis(1)));
+            assert!(retry.due(t0 + *delay));
+            waited += *delay;
+        }
+        assert_eq!(waited, Duration::from_secs(5));
+        retry.in_flight = Some(9);
+        assert_eq!(retry.refused(9, true, t0), RetryStep::GaveUp);
+        // The place survives the retries.
+        assert_eq!(
+            retry.place,
+            Some((DisplayId(1), PointDevice::new(2.0, 3.0)))
+        );
+    }
+
+    #[test]
+    fn a_refusal_met_with_the_session_closed_costs_nothing_and_is_due_at_once() {
+        let t0 = Instant::now();
+        let mut retry = RestoreRetry::new(None, 1, t0);
+        for id in 1..=10 {
+            retry.in_flight = Some(id);
+            assert_eq!(retry.refused(id, false, t0), RetryStep::Waiting);
+            assert!(retry.due(t0));
+            assert_eq!(retry.spent, 0);
+        }
+        // In flight, a return is not due.
+        retry.in_flight = Some(11);
+        assert!(!retry.due(t0));
     }
 
     fn at() -> MonoTime {
