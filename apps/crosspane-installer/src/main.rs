@@ -5,7 +5,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use clap::Parser;
-use crosspane_installer::gui::{LaunchMode, ReviewOptions, run};
+#[cfg(windows)]
+use crosspane_installer::gui::LaunchMode;
+use crosspane_installer::gui::{ReviewOptions, run};
 use crosspane_ui_kit::art::BrandBytes;
 
 #[derive(Parser)]

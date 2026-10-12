@@ -662,6 +662,7 @@ pub(crate) mod rebuilding_capture {
     }
 
     impl RebuildingCapture {
+        #[cfg(windows)]
         pub(crate) fn new(first: Built, build: Build) -> Self {
             Self::with_clock(first, build, Box::new(Instant::now))
         }
