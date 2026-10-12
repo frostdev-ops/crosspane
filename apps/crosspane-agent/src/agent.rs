@@ -3318,6 +3318,12 @@ impl Agent {
                     peer_name(self, peer)
                 )
             }
+            // The window refused to be parked: it is mirrored where it stands, so ending the
+            // projection returns nothing (and is not a failed return).
+            Notice::ProjectionShownInPlace { key, title } => {
+                self.tracker.projection_in_place(*key);
+                format!("{title} is shown in place: it could not be hidden")
+            }
             Notice::SpeakerInUseBy(p) => {
                 format!("{} is playing sound on these speakers", peer_name(self, p))
             }
@@ -7044,6 +7050,10 @@ mod installer {
         /// Projections of this node's windows that are parked but whose capture hasn't started:
         /// what `ProjectionStarted` said, kept until the matching `CaptureStarted` succeeds.
         pending_sources: BTreeMap<ProjectionKey, (NodeId, ParkingKind)>,
+        /// Projections of this node's windows that are mirrored where the window stands because
+        /// it could not be parked (`ProjectionShownInPlace`): their end returns nothing, so it
+        /// is neither a return nor a failed return.
+        in_place: BTreeSet<ProjectionKey>,
         /// How the latest projection of this node's window to each peer is parked (`twin` or
         /// `mirror`). Never reset, and absent until the first projection to that peer.
         last_parking: BTreeMap<NodeId, &'static str>,
@@ -7099,6 +7109,7 @@ mod installer {
                 backends: RefCell::new(BackendsSeen::default()),
                 sources: BTreeMap::new(),
                 pending_sources: BTreeMap::new(),
+                in_place: BTreeSet::new(),
                 last_parking: BTreeMap::new(),
                 proxies: BTreeSet::new(),
                 last_restore: None,
@@ -7295,6 +7306,11 @@ mod installer {
             }
         }
 
+        /// This node's projection `key` is mirrored in place: its window could not be parked.
+        pub fn projection_in_place(&mut self, key: ProjectionKey) {
+            self.in_place.insert(key);
+        }
+
         /// A `CloseProxy` was carried out; `queued` says whether the proxy host was sent its
         /// `Close` (the host doesn't acknowledge it).
         pub fn proxy_closed(&mut self, queued: bool) {
@@ -7327,9 +7343,12 @@ mod installer {
             if key.source == local {
                 self.pending_sources.remove(&key);
                 let operation = self.last_restore.take();
+                let in_place = self.in_place.remove(&key);
                 if let Some(peer) = self.sources.remove(&key) {
                     match reason {
                         ProjectionEndReason::WindowClosed => {}
+                        // Nothing was parked, so nothing was returned and none failed to come back.
+                        _ if in_place => {}
                         _ => {
                             if let Some(pending) =
                                 operation.and_then(|id| self.restores.get_mut(&id))
@@ -20622,6 +20641,129 @@ mod home_tests {
         );
         // The journal entry is still there: the window is not restored.
         assert_eq!(status_installer(&h)["recovery_pending"], json!(1));
+    }
+
+    /// Parking that refuses every window as the Mac's does when it has no accessibility window
+    /// for it: nothing is moved, and a return finds nothing to put back.
+    struct Unparkable;
+
+    impl crosspane_platform::WindowParking for Unparkable {
+        fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+            Err(PlatformError::Unsupported("fullscreen is not implemented"))
+        }
+        fn park(
+            &mut self,
+            _: WindowId,
+            _: PixelSize,
+            _: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            Err(PlatformError::NotFound)
+        }
+        fn resize(
+            &mut self,
+            _: WindowId,
+            _: PixelSize,
+            _: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            Err(PlatformError::NotFound)
+        }
+        fn geometry(&self, _: WindowId) -> Result<crosspane_platform::Parked, PlatformError> {
+            Err(PlatformError::NotFound)
+        }
+        fn restore(&mut self, _: WindowId) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_window_that_refuses_to_be_parked_is_mirrored_in_place_and_its_end_returns_nothing() {
+        let mut h = bare_scenario();
+        replace_parking(&mut h.rig.agent, Box::new(Unparkable));
+        let peer = h.rig.peer;
+        let mut out = step(
+            &mut h,
+            Input::Command(Command::Project {
+                window: WindowId(10),
+                to: peer,
+                place: None,
+            }),
+        );
+        out.extend(step(
+            &mut h,
+            projection_input(
+                peer,
+                ProjectionMessage::Accepted {
+                    projection: ProjectionId(1),
+                    size: PixelSize::new(400, 300),
+                    scale: 1.0,
+                },
+            ),
+        ));
+        // The failed park is balanced once, and the window is captured where it stands.
+        let restores = |out: &[Output]| {
+            out.iter()
+                .filter(|o| {
+                    matches!(
+                        o,
+                        Output::Restore {
+                            window: WindowId(10),
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        assert_eq!(restores(&out), 1, "{out:?}");
+        assert!(
+            out.iter().any(|o| matches!(
+                o,
+                Output::StartCapture {
+                    target: CaptureTarget::Window(WindowId(10)),
+                    crop: None,
+                    ..
+                }
+            )),
+            "{out:?}"
+        );
+        // The projection is live as a mirror, and the user is told so once.
+        let said = |h: &Home| {
+            h.rig
+                .agent
+                .notices
+                .iter()
+                .filter(|n| n.as_str() == "fixture is shown in place: it could not be hidden")
+                .count()
+        };
+        assert_eq!(said(&h), 1, "{:?}", h.rig.agent.notices);
+        assert!(
+            !h.rig.agent.notices.iter().any(|n| n.contains("ended")),
+            "{:?}",
+            h.rig.agent.notices
+        );
+        assert_eq!(nonzero(&h), json!({ "e2_source_started": 1 }));
+        let shown = status_installer(&h);
+        assert_eq!(shown["peers"][0]["last_source_parking"], json!("mirror"));
+        assert_eq!(shown["recovery_pending"], json!(0));
+        // Its end puts nothing back, and that is not a failed return.
+        let before = h.rig.agent.emitted.len();
+        give_back(&mut h, 1);
+        let out = h.rig.agent.emitted[before..].to_vec();
+        assert_eq!(restores(&out), 0, "{out:?}");
+        assert!(
+            h.rig
+                .agent
+                .notices
+                .iter()
+                .any(|n| n.contains("projection 1 ended: Returned")),
+            "{:?}",
+            h.rig.agent.notices
+        );
+        assert_eq!(nonzero(&h), json!({ "e2_source_started": 1 }));
+        assert_eq!(status_installer(&h)["recovery_pending"], json!(0));
+        assert_eq!(said(&h), 1);
     }
 
     #[test]

@@ -669,6 +669,15 @@ pub enum Notice {
         peer: NodeId,
         reason: Refusal,
     },
+    /// E2 source: the window could not be parked (it refused to move), so its projection
+    /// continues as a mirror of the window where it stands, and it stays visible on this node.
+    /// Emitted once per such projection, right after its `ProjectionStarted`. Nothing was moved:
+    /// the projection's end returns nothing (no `Output::Restore` at the end). `title` is the
+    /// window's, capped as on the wire.
+    ProjectionShownInPlace {
+        key: ProjectionKey,
+        title: String,
+    },
     /// WP-2.43: this node's input went home into its own projected window (`entered`), or left it.
     Home {
         key: ProjectionKey,

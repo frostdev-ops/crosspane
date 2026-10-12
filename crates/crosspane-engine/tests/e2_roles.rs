@@ -1520,6 +1520,8 @@ fn parking_capture_failures_and_late_results_are_cleaned_up() {
             0,
         );
         f.handle(control(B, accepted()), 0);
+        // No display geometry is known to this fixture, so a refused park has no place to be
+        // mirrored at (the M1 fallback tests below give it one): it ends.
         let out = if failure {
             f.handle(
                 Input::Parked {
@@ -4594,6 +4596,656 @@ fn grace_expired_projections_cannot_resume_without_a_tick() {
                 reason: Reason::LinkLost
             }),
         ]
+    );
+}
+
+// ---- M1 fallback: a window that refuses its first park is mirrored in place ----
+
+fn display_at(origin: PointLogical, scale: f64) -> Input {
+    Input::LocalDisplays(vec![DisplayInfo {
+        id: DISPLAY,
+        name: "test".into(),
+        geometry: DisplayGeometry {
+            physical_size: SizeMm::new(200.0, 100.0),
+            pixel_size: PixelSize::new(2000, 2000),
+            scale,
+            logical_origin: origin,
+        },
+        refresh_millihz: 60_000,
+        color_space: ColorSpace::Srgb,
+        hdr: false,
+    }])
+}
+
+/// The window's (fixture) frame is 320.25 x 240.25 logical at the origin of a display of scale 2:
+/// 641 x 481 device pixels, as `Start` offered it.
+fn mirrored_size() -> PixelSize {
+    PixelSize::new(641, 481)
+}
+
+fn mirror_geometry(size: PixelSize, fullscreen: bool, answers: u32) -> Output {
+    Output::SendControl {
+        peer: B,
+        msg: ControlMessage::Projection(Message::Geometry {
+            fullscreen: Some(fullscreen),
+            projection: ID,
+            size,
+            parking: ParkingKind::Mirror,
+            answers,
+        }),
+    }
+}
+
+/// A source with the display known and the destination's `Accepted` handled: its first park is in
+/// flight.
+fn parking_in_flight(display: bool) -> Fixture {
+    let mut f = Fixture::ready(A, B);
+    if display {
+        f.handle(display_at(PointLogical::zero(), 2.0), 0);
+    }
+    f.handle(
+        Input::Command(Command::Project {
+            window: WINDOW,
+            to: B,
+            place: None,
+        }),
+        0,
+    );
+    f.handle(control(B, accepted()), 1);
+    f
+}
+
+/// `parking_in_flight`, whose park the window refused, and whose capture has started: live in
+/// place.
+fn in_place() -> Fixture {
+    let mut f = parking_in_flight(true);
+    f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Err(Failure::Other),
+        },
+        2,
+    );
+    f.handle(
+        Input::CaptureStarted {
+            projection: ID,
+            result: Ok(StreamId(1)),
+        },
+        3,
+    );
+    f
+}
+
+fn motion(seq: u32, x: f64, y: f64) -> Input {
+    input(
+        B,
+        ProjInput::Motion {
+            projection: ID,
+            seq,
+            position: PointDevice::new(x, y),
+        },
+    )
+}
+
+fn no_restore(out: &[Output]) -> bool {
+    !out.iter().any(|o| matches!(o, Output::Restore { .. }))
+}
+
+fn changed_frame(frame: RectLogical, state: WindowState) -> Input {
+    let mut info = window(WINDOW);
+    info.frame = frame;
+    info.state = state;
+    Input::Windows(WindowEvent::Changed(info))
+}
+
+#[test]
+fn a_first_park_the_window_refuses_continues_as_a_mirror_where_the_window_stands() {
+    let mut f = parking_in_flight(true);
+    let out = f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Err(Failure::Other),
+        },
+        2,
+    );
+    assert_eq!(
+        out,
+        vec![
+            // The failed park's own return, once, at the moment it failed.
+            Output::Restore {
+                window: WINDOW,
+                place: None
+            },
+            Output::StartCapture {
+                projection: ID,
+                peer: B,
+                target: CaptureTarget::Window(WINDOW),
+                crop: None,
+                max_fps: 60
+            },
+            mirror_geometry(mirrored_size(), false, 0),
+            Output::Notice(Notice::ProjectionStarted {
+                key: key(A),
+                peer: B,
+                parking: ParkingKind::Mirror
+            }),
+            Output::Notice(Notice::ProjectionShownInPlace {
+                key: key(A),
+                title: "fixture".into()
+            }),
+        ]
+    );
+    assert_eq!(f.e2.next_deadline(), Some(ms(10_002)));
+    let live = f.handle(
+        Input::CaptureStarted {
+            projection: ID,
+            result: Ok(StreamId(1)),
+        },
+        3,
+    );
+    assert!(live.is_empty(), "{live:?}");
+    assert_eq!(f.e2.next_deadline(), None);
+    // The only notice: a repeated geometry or window change says nothing more.
+    assert!(
+        f.handle(Input::Windows(WindowEvent::Changed(window(WINDOW))), 4)
+            .is_empty()
+    );
+}
+
+#[test]
+fn an_in_place_window_is_never_resized_and_destination_requests_get_its_actual_geometry() {
+    let mut f = in_place();
+    for (request, size, scale, fullscreen) in [
+        (1, PixelSize::new(800, 600), 1.5, false),
+        // Its own size, as the destination asks when the proxy opens, is no different.
+        (2, mirrored_size(), 2.0, false),
+        (3, PixelSize::new(900, 700), 2.0, true),
+        // An absurd size is refused as before: answered, not acted on.
+        (4, PixelSize::new(0, 0), 2.0, false),
+    ] {
+        let out = f.handle(
+            control(
+                B,
+                Message::Resize {
+                    fullscreen,
+                    projection: ID,
+                    request,
+                    size,
+                    scale,
+                },
+            ),
+            10,
+        );
+        assert_eq!(
+            out,
+            vec![mirror_geometry(mirrored_size(), false, request)],
+            "request {request}"
+        );
+    }
+    // Nor does the source re-park it when it differs from what was asked, later.
+    assert!(f.handle(Input::Tick, 5_000).is_empty());
+    assert_eq!(f.e2.next_deadline(), None);
+}
+
+#[test]
+fn a_request_received_before_an_in_place_capture_is_live_is_answered_when_it_is() {
+    let mut f = parking_in_flight(true);
+    f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Err(Failure::Other),
+        },
+        2,
+    );
+    // Capturing: queued, newest wins.
+    for request in 1..=2 {
+        assert!(
+            f.handle(
+                control(
+                    B,
+                    Message::Resize {
+                        fullscreen: false,
+                        projection: ID,
+                        request,
+                        size: PixelSize::new(800, 600),
+                        scale: 1.0,
+                    },
+                ),
+                2,
+            )
+            .is_empty()
+        );
+    }
+    assert_eq!(
+        f.handle(
+            Input::CaptureStarted {
+                projection: ID,
+                result: Ok(StreamId(1)),
+            },
+            3,
+        ),
+        vec![mirror_geometry(mirrored_size(), false, 2)]
+    );
+}
+
+#[test]
+fn in_place_input_follows_the_window_where_the_user_puts_it() {
+    let mut f = in_place();
+    // Where it stands: content.min is the frame's top-left in device pixels on the display.
+    assert_eq!(
+        commands(&f.handle(motion(1, 10.0, 20.0), 4)),
+        vec![InjectCmd::MoveTo {
+            display: DISPLAY,
+            position: PointDevice::new(10.0, 20.0)
+        }]
+    );
+    // Moved on the source by the user: nothing is sent or undone, input follows.
+    let moved = RectLogical::new(
+        PointLogical::new(100.0, 50.0),
+        SizeLogical::new(320.25, 240.25),
+    );
+    assert!(
+        f.handle(changed_frame(moved, WindowState::Normal), 5)
+            .is_empty()
+    );
+    assert!(f.handle(Input::Tick, 60_000).is_empty());
+    assert_eq!(
+        commands(&f.handle(motion(2, 10.0, 20.0), 6)),
+        vec![InjectCmd::MoveTo {
+            display: DISPLAY,
+            position: PointDevice::new(210.0, 120.0)
+        }]
+    );
+    // Resized by the user: the destination is told the new size (its proxy follows), once.
+    let resized = RectLogical::new(
+        PointLogical::new(100.0, 50.0),
+        SizeLogical::new(400.0, 300.0),
+    );
+    assert_eq!(
+        f.handle(changed_frame(resized, WindowState::Normal), 7),
+        vec![mirror_geometry(PixelSize::new(800, 600), false, 0)]
+    );
+    assert!(
+        f.handle(changed_frame(resized, WindowState::Normal), 8)
+            .is_empty()
+    );
+    // Fullscreen by itself: told with its flag, the frame being the display's.
+    let display = RectLogical::new(PointLogical::zero(), SizeLogical::new(1000.0, 1000.0));
+    assert_eq!(
+        f.handle(changed_frame(display, WindowState::Fullscreen), 9),
+        vec![mirror_geometry(PixelSize::new(2000, 2000), true, 0)]
+    );
+    // Off its Space: no frames are produced, and its (meaningless) frame is not learned from.
+    let off_screen = RectLogical::new(
+        PointLogical::new(-30_000.0, -30_000.0),
+        SizeLogical::new(10.0, 10.0),
+    );
+    assert_eq!(
+        f.handle(changed_frame(off_screen, WindowState::Hidden), 10),
+        vec![Output::StopCapture {
+            stream: StreamId(1)
+        }]
+    );
+}
+
+#[test]
+fn in_place_geometry_is_relative_to_the_display_and_rounds_outward() {
+    let mut f = Fixture::ready(A, B);
+    f.handle(display_at(PointLogical::new(100.0, 50.0), 2.0), 0);
+    let mut info = window(WINDOW);
+    info.frame = RectLogical::new(
+        PointLogical::new(110.0, 60.0),
+        SizeLogical::new(50.25, 30.25),
+    );
+    f.handle(Input::Windows(WindowEvent::Changed(info)), 0);
+    f.handle(
+        Input::Command(Command::Project {
+            window: WINDOW,
+            to: B,
+            place: None,
+        }),
+        0,
+    );
+    f.handle(control(B, accepted()), 1);
+    let out = f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Err(Failure::Other),
+        },
+        2,
+    );
+    // (110-100)*2 = 20 .. ceil((160.25-100)*2) = 121; (60-50)*2 = 20 .. ceil((90.25-50)*2) = 81.
+    assert!(out.contains(&mirror_geometry(PixelSize::new(101, 61), false, 0)));
+    f.handle(
+        Input::CaptureStarted {
+            projection: ID,
+            result: Ok(StreamId(1)),
+        },
+        3,
+    );
+    assert_eq!(
+        commands(&f.handle(motion(1, 1.0, 2.0), 4)),
+        vec![InjectCmd::MoveTo {
+            display: DISPLAY,
+            position: PointDevice::new(21.0, 22.0)
+        }]
+    );
+}
+
+#[test]
+fn the_end_of_an_in_place_projection_returns_nothing() {
+    // Returned by the user.
+    let mut f = in_place();
+    let out = f.handle(Input::Command(Command::Return(key(A))), 20);
+    assert!(no_restore(&out), "{out:?}");
+    assert_eq!(
+        out,
+        vec![
+            Output::StopCapture {
+                stream: StreamId(1)
+            },
+            Output::SendControl {
+                peer: B,
+                msg: ControlMessage::Projection(Message::End {
+                    projection: ID,
+                    reason: Reason::Returned
+                })
+            },
+            Output::Notice(Notice::ProjectionEnded {
+                key: key(A),
+                reason: Reason::Returned
+            }),
+        ]
+    );
+    assert_eq!(f.e2.next_deadline(), None);
+    // The window can be projected again at once (nothing is pending on it).
+    assert!(matches!(
+        messages(&f.handle(
+            Input::Command(Command::Project {
+                window: WINDOW,
+                to: B,
+                place: None,
+            }),
+            21
+        ))
+        .as_slice(),
+        [Message::Start {
+            projection: ProjectionId(2),
+            ..
+        }]
+    ));
+
+    // The destination closes it, the window goes away, the capture ends, the peer drops out for
+    // good (grace expires), and the capture failing to start: none of them returns anything.
+    let mut f = in_place();
+    let out = f.handle(
+        control(
+            B,
+            Message::Close {
+                projection: ID,
+                reason: Reason::Returned,
+            },
+        ),
+        20,
+    );
+    assert!(no_restore(&out), "{out:?}");
+    assert_eq!(
+        out.last(),
+        Some(&Output::Notice(Notice::ProjectionEnded {
+            key: key(A),
+            reason: Reason::Returned
+        }))
+    );
+    let mut f = in_place();
+    let out = f.handle(Input::Windows(WindowEvent::Removed(WINDOW)), 20);
+    assert!(no_restore(&out), "{out:?}");
+    assert_eq!(
+        out.last(),
+        Some(&Output::Notice(Notice::ProjectionEnded {
+            key: key(A),
+            reason: Reason::WindowClosed
+        }))
+    );
+    for (reason, expected) in [
+        (StreamEndReason::TargetGone, Reason::WindowClosed),
+        (StreamEndReason::Blocked, Reason::Locked),
+        (StreamEndReason::Failed, Reason::Failed),
+    ] {
+        let mut f = in_place();
+        let out = f.handle(
+            Input::CaptureEnded {
+                stream: StreamId(1),
+                reason,
+            },
+            20,
+        );
+        assert!(no_restore(&out), "{reason:?}: {out:?}");
+        assert_eq!(
+            out.last(),
+            Some(&Output::Notice(Notice::ProjectionEnded {
+                key: key(A),
+                reason: expected
+            }))
+        );
+    }
+    let mut f = parking_in_flight(true);
+    f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Err(Failure::Other),
+        },
+        2,
+    );
+    let out = f.handle(
+        Input::CaptureStarted {
+            projection: ID,
+            result: Err(Failure::Other),
+        },
+        3,
+    );
+    assert!(no_restore(&out), "{out:?}");
+    assert_eq!(
+        messages(&out),
+        vec![Message::End {
+            projection: ID,
+            reason: Reason::Failed
+        }]
+    );
+    // Locked: everything ends, an in-place window with it, and nothing is put back.
+    let mut f = in_place();
+    let out = f.handle(locked(), 20);
+    assert!(no_restore(&out), "{out:?}");
+    assert!(
+        out.iter()
+            .any(|o| matches!(o, Output::Notice(Notice::ProjectionEnded { .. }))),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn an_in_place_projection_resumes_without_resizing_the_window() {
+    let mut f = in_place();
+    assert_eq!(
+        f.handle(closed(B), 100),
+        vec![Output::StopCapture {
+            stream: StreamId(1)
+        }]
+    );
+    // The user resizes the window while the link is down: the restart reports what it is.
+    let resized = RectLogical::new(PointLogical::zero(), SizeLogical::new(400.0, 300.0));
+    assert!(
+        f.handle(changed_frame(resized, WindowState::Normal), 110)
+            .is_empty()
+    );
+    assert_eq!(messages(&f.handle(Input::PeerUp { peer: B }, 120)).len(), 1);
+    // The destination resumes with a size the window is not: it is not resized to it.
+    let out = f.handle(
+        control(
+            B,
+            Message::Accepted {
+                projection: ID,
+                size: PixelSize::new(900, 700),
+                scale: 1.0,
+            },
+        ),
+        121,
+    );
+    assert_eq!(
+        out,
+        vec![
+            Output::StartCapture {
+                projection: ID,
+                peer: B,
+                target: CaptureTarget::Window(WINDOW),
+                crop: None,
+                max_fps: 60
+            },
+            mirror_geometry(PixelSize::new(800, 600), false, 0),
+        ]
+    );
+    // Until the grace runs out, and then the projection ends without a return.
+    let mut f = in_place();
+    f.handle(closed(B), 100);
+    let out = f.handle(Input::Tick, 100 + 20_000);
+    assert!(no_restore(&out), "{out:?}");
+    assert!(matches!(
+        out.last(),
+        Some(Output::Notice(Notice::ProjectionEnded {
+            reason: Reason::LinkLost,
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn only_a_window_specific_failure_of_the_first_park_falls_back_to_a_mirror() {
+    // The session's and the user's: the projection ends and the (possibly changed) window is put
+    // back, as before.
+    for failure in [
+        Failure::Locked,
+        Failure::SecureInput,
+        Failure::PermissionDenied,
+        Failure::PointerButtonHeld,
+    ] {
+        let mut f = parking_in_flight(true);
+        let out = f.handle(
+            Input::Parked {
+                window: WINDOW,
+                result: Err(failure),
+            },
+            2,
+        );
+        assert_ended(&out, Reason::Failed);
+        assert!(
+            !out.iter().any(|o| matches!(
+                o,
+                Output::StartCapture { .. }
+                    | Output::Notice(Notice::ProjectionStarted { .. })
+                    | Output::Notice(Notice::ProjectionShownInPlace { .. })
+            )),
+            "{failure:?}: {out:?}"
+        );
+    }
+    // The window's place is not known (a display the engine has no geometry for, or none): there
+    // is nothing to map its input from, so it ends as before as well.
+    let mut f = parking_in_flight(false);
+    let out = f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Err(Failure::Other),
+        },
+        2,
+    );
+    assert_ended(&out, Reason::Failed);
+    let mut f = parking_in_flight(true);
+    let mut info = window(WINDOW);
+    info.display = None;
+    f.handle(Input::Windows(WindowEvent::Changed(info)), 1);
+    let out = f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Err(Failure::Other),
+        },
+        2,
+    );
+    assert_ended(&out, Reason::Failed);
+    // A degenerate frame cannot be mirrored either.
+    let mut f = parking_in_flight(true);
+    f.handle(
+        changed_frame(
+            RectLogical::new(PointLogical::zero(), SizeLogical::new(0.0, 0.0)),
+            WindowState::Normal,
+        ),
+        1,
+    );
+    let out = f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Err(Failure::Other),
+        },
+        2,
+    );
+    assert_ended(&out, Reason::Failed);
+}
+
+#[test]
+fn a_later_failure_of_a_parked_window_still_ends_its_projection() {
+    // With the display known, a window that was parked and then fails a resize is not mirrored:
+    // it was moved, so it is put back, and the projection ends as before.
+    let mut f = Fixture::ready(A, B);
+    f.handle(display_at(PointLogical::zero(), 2.0), 0);
+    f.handle(
+        Input::Command(Command::Project {
+            window: WINDOW,
+            to: B,
+            place: None,
+        }),
+        0,
+    );
+    f.handle(control(B, accepted()), 1);
+    f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Ok(parked(WINDOW, PlatformParking::Twin, size())),
+        },
+        2,
+    );
+    f.handle(
+        Input::CaptureStarted {
+            projection: ID,
+            result: Ok(StreamId(1)),
+        },
+        3,
+    );
+    let resize = f.handle(
+        control(
+            B,
+            Message::Resize {
+                fullscreen: false,
+                projection: ID,
+                request: 1,
+                size: PixelSize::new(800, 600),
+                scale: 1.0,
+            },
+        ),
+        4,
+    );
+    assert!(
+        resize
+            .iter()
+            .any(|o| matches!(o, Output::ResizeParked { .. }))
+    );
+    let out = f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Err(Failure::Other),
+        },
+        5,
+    );
+    assert_ended(&out, Reason::Failed);
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o, Output::Notice(Notice::ProjectionShownInPlace { .. })))
     );
 }
 
