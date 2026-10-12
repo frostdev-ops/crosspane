@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use crosspane_media::audio::{
-    AudioError, AudioPull, Decoder, Encoder, JitterBuffer, wire::AudioPacket,
+    AudioError, AudioPull, Decoder, Encoder, JitterBuffer, JitterConfig, wire::AudioPacket,
 };
 use crosspane_types::{
     audio::{AUDIO_FRAME_SAMPLES, AudioKind, AudioStreamId, MAX_OPUS_PACKET},
@@ -597,6 +597,303 @@ fn clocks_plus_and_minus_100_ppm_for_180_seconds() {
             "occupancy trend {means:?}"
         );
         assert_eq!(jitter.stats().lost, 0);
+    }
+}
+
+fn config(base: u64, min: u64, max: u64) -> JitterConfig {
+    JitterConfig {
+        base: Duration::from_millis(base),
+        min: Duration::from_millis(min),
+        max: Duration::from_millis(max),
+    }
+}
+
+#[test]
+fn playout_sample_time_tracks_pulls_and_clears_on_rebase() {
+    let kind = AudioKind::Speaker;
+    let mut encoder = Encoder::new(kind).unwrap();
+    let mut jitter = JitterBuffer::new(kind, AudioStreamId(1)).unwrap();
+    let mut out = vec![0.0; 960];
+    assert_eq!(jitter.playout_sample_time(), None);
+    for seq in 0..8u32 {
+        jitter
+            .push(
+                packet(&mut encoder, kind, seq, 1000 + u64::from(seq) * 480),
+                time(u64::from(seq) * 10),
+            )
+            .unwrap();
+    }
+    assert_eq!(jitter.pull(time(39), &mut out).unwrap(), AudioPull::Waiting);
+    assert_eq!(jitter.playout_sample_time(), None);
+    assert_eq!(jitter.pull(time(40), &mut out).unwrap(), AudioPull::Packet);
+    assert_eq!(jitter.playout_sample_time(), Some(1000));
+    let mut previous = 1000;
+    for ms in (50..=100).step_by(10) {
+        jitter.pull(time(ms), &mut out).unwrap();
+        let now = jitter.playout_sample_time().unwrap();
+        assert!(
+            (478..=482).contains(&(now - previous)),
+            "{previous} -> {now}"
+        );
+        previous = now;
+    }
+    // A Waiting pull does not change it.
+    assert_eq!(
+        jitter.pull(time(105), &mut out).unwrap(),
+        AudioPull::Waiting
+    );
+    assert_eq!(jitter.playout_sample_time(), Some(previous));
+    // A lateness rebase clears it until the next pull.
+    assert_eq!(
+        jitter.pull(time(5_000), &mut out).unwrap(),
+        AudioPull::Concealed
+    );
+    assert_eq!(jitter.playout_sample_time(), None);
+    assert_ne!(
+        jitter.pull(time(5_010), &mut out).unwrap(),
+        AudioPull::Waiting
+    );
+    assert!(jitter.playout_sample_time().is_some());
+}
+
+#[test]
+fn default_config_matches_new() {
+    assert_eq!(JitterConfig::default(), config(40, 20, 80));
+    let kind = AudioKind::Microphone;
+    let mut encoder = Encoder::new(kind).unwrap();
+    let mut a = JitterBuffer::new(kind, AudioStreamId(1)).unwrap();
+    let mut b = JitterBuffer::with_config(kind, AudioStreamId(1), JitterConfig::default()).unwrap();
+    let mut out_a = vec![0.0; 480];
+    let mut out_b = vec![0.0; 480];
+    let mut seq = 0u32;
+    for tick in 0..600u64 {
+        let now = tick * 10;
+        // Jittered arrivals with periodic loss and a burst.
+        while seq < 1000 && u64::from(seq) * 10 + u64::from(seq * 7 % 13) <= now {
+            if seq % 17 != 5 && !(300..304).contains(&seq) {
+                let p = AudioPacket {
+                    stream: AudioStreamId(1),
+                    seq,
+                    sample_time: u64::from(seq) * 480,
+                    opus: encoder.encode(&tone(kind, seq as usize)).unwrap(),
+                };
+                assert_eq!(
+                    a.push(p.clone(), time(now)).unwrap(),
+                    b.push(p, time(now)).unwrap()
+                );
+            }
+            seq += 1;
+        }
+        assert_eq!(
+            a.pull(time(now), &mut out_a).unwrap(),
+            b.pull(time(now), &mut out_b).unwrap()
+        );
+        assert_eq!(out_a, out_b);
+        assert_eq!(a.stats(), b.stats());
+        assert_eq!(a.playout_sample_time(), b.playout_sample_time());
+        bounds(&a);
+    }
+    assert!(a.stats().lost > 0 && a.stats().target_delay > Duration::from_millis(40));
+}
+
+#[test]
+fn pull_next_waits_only_for_startup_and_never_rebases() {
+    let kind = AudioKind::Speaker;
+    let mut encoder = Encoder::new(kind).unwrap();
+    let mut jitter = JitterBuffer::new(kind, AudioStreamId(1)).unwrap();
+    let mut out = vec![0.9; 960];
+    assert_eq!(
+        jitter.pull_next(time(0), &mut out).unwrap(),
+        AudioPull::Waiting
+    );
+    assert!(out.iter().all(|v| *v == 0.0));
+    for seq in 0..5u32 {
+        jitter
+            .push(
+                packet(&mut encoder, kind, seq, u64::from(seq) * 480),
+                time(u64::from(seq) * 10),
+            )
+            .unwrap();
+    }
+    for ms in 0..40 {
+        assert_eq!(
+            jitter.pull_next(time(ms), &mut out).unwrap(),
+            AudioPull::Waiting
+        );
+    }
+    assert_eq!(jitter.playout_sample_time(), None);
+    assert_eq!(
+        jitter.pull_next(time(40), &mut out).unwrap(),
+        AudioPull::Packet
+    );
+    assert_eq!(jitter.playout_sample_time(), Some(0));
+    // Called again immediately (the device wants more now): still a frame, not Waiting.
+    assert_eq!(
+        jitter.pull_next(time(40), &mut out).unwrap(),
+        AudioPull::Packet
+    );
+    // Ten seconds late: `pull` would rebase; `pull_next` plays the next queued audio.
+    let mut previous = jitter.playout_sample_time().unwrap();
+    assert_eq!(
+        jitter.pull_next(time(10_000), &mut out).unwrap(),
+        AudioPull::Packet
+    );
+    assert!(out.iter().any(|v| v.abs() > 0.01));
+    let now = jitter.playout_sample_time().unwrap();
+    assert!((478..=482).contains(&(now - previous)));
+    previous = now;
+    // Starved: concealment and then silence, always a frame, continuous sender time.
+    let mut concealed = 0;
+    for tick in 1..60u64 {
+        let result = jitter.pull_next(time(10_000 + tick), &mut out).unwrap();
+        assert_ne!(result, AudioPull::Waiting);
+        concealed += usize::from(result == AudioPull::Concealed);
+        assert!(out.iter().all(|v| v.is_finite()));
+        let now = jitter.playout_sample_time().unwrap();
+        assert!(
+            (478..=482).contains(&(now - previous)),
+            "{previous} -> {now}"
+        );
+        previous = now;
+        bounds(&jitter);
+    }
+    assert!(concealed > 50);
+    assert_eq!(jitter.stats().dropped, 0);
+    // Packets that continue the sender clock are still accepted and played.
+    // The ring ends at most two frames past the last playout point, so `next` is not behind.
+    let next = (previous / 480) as u32 + 3;
+    for ahead in 0..4u32 {
+        assert!(
+            jitter
+                .push(
+                    packet(
+                        &mut encoder,
+                        kind,
+                        next + ahead,
+                        u64::from(next + ahead) * 480
+                    ),
+                    time(10_100)
+                )
+                .unwrap()
+        );
+    }
+    let mut played = false;
+    for tick in 0..4u64 {
+        played |= jitter.pull_next(time(10_100 + tick), &mut out).unwrap() == AudioPull::Packet;
+    }
+    assert!(played);
+}
+
+#[test]
+fn pull_next_trims_an_overfull_queue_to_the_target() {
+    let kind = AudioKind::Speaker;
+    let mut encoder = Encoder::new(kind).unwrap();
+    let mut out = vec![0.0; 960];
+    // Exactly target slots + 8 = 12 queued: no trim.
+    let mut jitter = JitterBuffer::new(kind, AudioStreamId(1)).unwrap();
+    for seq in 0..12u32 {
+        jitter
+            .push(
+                packet(&mut encoder, kind, seq, 1000 + u64::from(seq) * 480),
+                time(u64::from(seq) * 10),
+            )
+            .unwrap();
+    }
+    assert_eq!(jitter.stats().target_delay, Duration::from_millis(40));
+    jitter.pull_next(time(110), &mut out).unwrap();
+    assert_eq!(jitter.stats().dropped, 0);
+    assert_eq!(jitter.stats().buffered_packets, 10);
+    assert_eq!(jitter.playout_sample_time(), Some(1000));
+    // 30 queued: the oldest 26 go, the newest 4 (40 ms) remain, then two are decoded.
+    let mut jitter = JitterBuffer::new(kind, AudioStreamId(1)).unwrap();
+    for seq in 0..30u32 {
+        jitter
+            .push(
+                packet(&mut encoder, kind, seq, 1000 + u64::from(seq) * 480),
+                time(u64::from(seq) * 10),
+            )
+            .unwrap();
+    }
+    assert_eq!(jitter.stats().target_delay, Duration::from_millis(40));
+    assert_eq!(
+        jitter.pull_next(time(290), &mut out).unwrap(),
+        AudioPull::Packet
+    );
+    assert_eq!(jitter.stats().dropped, 26);
+    assert_eq!(jitter.stats().buffered_packets, 2);
+    assert_eq!(jitter.stats().lost, 0);
+    assert_eq!(jitter.playout_sample_time(), Some(1000 + 26 * 480));
+    assert!(out.iter().any(|v| v.abs() > 0.01));
+    // Below the threshold again: no further trimming.
+    jitter.pull_next(time(300), &mut out).unwrap();
+    assert_eq!(jitter.stats().dropped, 26);
+}
+
+#[test]
+fn lower_base_settles_at_lower_occupancy() {
+    let kind = AudioKind::Speaker;
+    let mut encoder = Encoder::new(kind).unwrap();
+    let encoded = encoder.encode(&vec![0.0; 960]).unwrap();
+    let mut means = Vec::new();
+    for c in [JitterConfig::default(), config(15, 10, 80)] {
+        let mut jitter = JitterBuffer::with_config(kind, AudioStreamId(1), c).unwrap();
+        let mut out = vec![0.0; 960];
+        let (mut sum, mut count) = (0.0, 0);
+        for tick in 0..3000u32 {
+            jitter
+                .push(
+                    AudioPacket {
+                        stream: AudioStreamId(1),
+                        seq: tick,
+                        sample_time: u64::from(tick) * 480,
+                        opus: encoded.clone(),
+                    },
+                    time(u64::from(tick) * 10),
+                )
+                .unwrap();
+            jitter
+                .pull_next(time(u64::from(tick) * 10), &mut out)
+                .unwrap();
+            if tick >= 2000 {
+                sum += jitter.stats().buffered_packets as f64;
+                count += 1;
+            }
+        }
+        assert_eq!(jitter.stats().target_delay, c.base);
+        assert_eq!(jitter.stats().lost, 0, "{c:?}");
+        assert_eq!(jitter.stats().dropped, 0, "{c:?}");
+        means.push(sum / f64::from(count));
+    }
+    eprintln!(
+        "steady occupancy (packets): default {} base 15 ms {}",
+        means[0], means[1]
+    );
+    assert!(means[1] + 1.0 < means[0], "{means:?}");
+}
+
+#[test]
+fn bad_configs_are_rejected() {
+    let kind = AudioKind::Speaker;
+    for bad in [
+        config(40, 0, 80),
+        config(10, 20, 80),
+        config(90, 20, 80),
+        config(40, 50, 30),
+        config(40, 20, 201),
+    ] {
+        assert_eq!(
+            JitterBuffer::with_config(kind, AudioStreamId(1), bad).err(),
+            Some(AudioError::InvalidFormat),
+            "{bad:?}"
+        );
+    }
+    assert_eq!(
+        JitterBuffer::with_config(kind, AudioStreamId(0), JitterConfig::default()).err(),
+        Some(AudioError::WrongStream)
+    );
+    for good in [config(200, 200, 200), config(1, 1, 1), config(15, 10, 80)] {
+        let jitter = JitterBuffer::with_config(kind, AudioStreamId(1), good).unwrap();
+        assert_eq!(jitter.stats().target_delay, good.base);
     }
 }
 

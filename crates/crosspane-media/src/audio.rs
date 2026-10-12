@@ -4,7 +4,7 @@
 //! No Debug implementation exposes samples or encoded payloads.
 
 mod jitter;
-pub use jitter::JitterBuffer;
+pub use jitter::{JitterBuffer, JitterConfig};
 mod resample;
 pub use resample::{Processed, Resampler};
 pub mod wire {
