@@ -487,7 +487,8 @@ pub enum Output {
     },
     /// The latest set of process ids whose audio this node sends `peer`; empty stops it. The host
     /// passes it to `AudioHost::set_peer_sources`. Emitted only when the set changes, and again
-    /// after `RemoveAudioPeer` followed by a re-add.
+    /// after `RemoveAudioPeer` followed by a re-add. A bare pid can be reused by another process,
+    /// so the host must bind each pid to the projected window's process identity before capturing.
     AudioProjectionSources {
         peer: NodeId,
         pids: Vec<u32>,

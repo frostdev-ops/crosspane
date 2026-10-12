@@ -11,8 +11,11 @@
 //! as a device loss always did. Process-tree capture is endpoint-independent and is not affected.
 //! \[E\] Process-tree loopback needs build20348; it does not mute the original application.
 //! <https://learn.microsoft.com/en-us/windows/win32/api/audioclientactivationparams/ns-audioclientactivationparams-audioclient_process_loopback_params>
-//! \[U\] The frozen source API carries PIDs, not original process claims. Refreshing projected
-//! PIDs and retaining a liveness handle mitigates, but cannot authenticate against PID reuse.
+//! The frozen source API still carries bare PIDs. Before any capture each PID is checked against
+//! the process identity the window source verified for a live projected window (the
+//! `model::process_claims` registry: the PID and its process creation time), and the handle
+//! opened for that check is retained for the capture's lifetime, which pins the PID: a reused
+//! PID is refused and never reaches another process.
 
 #![allow(unsafe_code)]
 
@@ -22,6 +25,7 @@ use crate::model::audio::{
     SourceLifecycle, SourceSet, SpeakerMixer, StreamControl, capture_excess,
     endpoint_event_relevant, frames_to_mix, wait_open,
 };
+use crate::model::process_claims;
 use crosspane_platform::{
     AudioCapture, AudioDeviceError, AudioEvent, AudioFormat, AudioHost, AudioKind, AudioPlayback,
     AudioStop, EventSink, IoGate, PlatformError, VirtualPorts,
@@ -56,14 +60,14 @@ use windows::{
     core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, PCWSTR},
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, WAIT_FAILED, WAIT_OBJECT_0},
+    Foundation::{CloseHandle, FILETIME, WAIT_FAILED, WAIT_OBJECT_0},
     System::{
         Diagnostics::Debug::OutputDebugStringW,
         LibraryLoader::{GetModuleHandleW, GetProcAddress},
         SystemInformation::OSVERSIONINFOW,
         Threading::{
-            CreateEventW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-            SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+            CreateEventW, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
         },
     },
 };
@@ -814,6 +818,18 @@ impl ProcessHandle {
         // SAFETY: retained process handle; zero wait observes termination without changing it.
         unsafe { WaitForSingleObject(self.0, 0) == windows_sys::Win32::Foundation::WAIT_TIMEOUT }
     }
+    /// The creation time of exactly the process this handle refers to, as a FILETIME `u64`.
+    fn created(&self) -> Option<u64> {
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: retained process handle with query rights; initialized exact FILETIME outputs.
+        let ok =
+            unsafe { GetProcessTimes(self.0, &mut created, &mut exited, &mut kernel, &mut user) }
+                != 0;
+        ok.then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
 }
 struct SourceCapture {
     pid: u32,
@@ -848,7 +864,16 @@ impl SourceCapture {
         };
         check()?;
         let process = ProcessHandle::open(pid)?;
-        if !process.alive() {
+        // Bind the bare PID to the projected window's process before any activation: a claim
+        // with a live window must exist for `pid`, and the process this handle opened must have
+        // been created exactly when the claimed one was, and still be running. Windows never
+        // reuses a PID while any handle to its process is open, so holding `process` (kept for
+        // the capture's lifetime) while activating by PID reaches exactly the verified process.
+        if !process
+            .created()
+            .is_some_and(|created| process_claims::claim_admits(pid, created))
+            || !process.alive()
+        {
             return Err(unavailable());
         }
         let event = Arc::new(Wake::new()?);
