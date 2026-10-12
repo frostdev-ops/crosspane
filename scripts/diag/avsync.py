@@ -30,7 +30,9 @@ Definitions (all times in ns on the logging machine's monotonic clock, 48 kHz au
     rx playout time                 = rx.at_ns + rx.ring_frames / 48 kHz
     audio latency(sample_time)      = rx playout - tx capture (rx sample_time is matched to the
                                       tx at or below it, within 0.5 s, and interpolated)
-    video present time              = video.sent_ns + present.after_us
+    video present time              = video.sent_ns + present.after_us (matched on the present's
+                                      id = video.proxy, the proxy the Stamp named, and seq;
+                                      logs without `proxy` match on projection, then seq alone)
     video latency(seq)              = present time - video.captured_ns
     offset = median(audio latency) - median(video latency); positive = audio lags video.
 """
@@ -210,8 +212,11 @@ def join_video(dst, projection=None):
         proj = ev.get("projection")
         if None in (seq, cap, dec, sent) or (projection is not None and proj != projection):
             continue
-        after = presents.get((proj, seq))
-        if after is None and len(by_seq.get(seq, ())) == 1:
+        # The agent logs the Stamp's proxy id as `proxy`: the present's `id` is that, not the
+        # projection id. Older logs without it fall back to the projection id, then to seq alone.
+        proxy = ev.get("proxy")
+        after = presents.get((proxy if proxy is not None else proj, seq))
+        if after is None and proxy is None and len(by_seq.get(seq, ())) == 1:
             after = by_seq[seq][0]  # proxy id differs from projection id: unique seq match
             loose += 1
         if after is None:
@@ -384,6 +389,16 @@ def self_test():
                       '"at_ns":2,"ring_frames":0}}')[0] == "rx"
     assert parse_line("2026 TRACE crosspane::avsync: present id=1 seq=2 after_us=3")[0] == "present"
     assert parse_line("2026  INFO crosspane_agent: side=\"tx\" queued_frames=1") is None
+    # The agent's video events carry the proxy id (`proxy`), which the present's `id` names.
+    vid = parse_line('2026 TRACE crosspane::avsync: side="video" source=ab12 projection=3 proxy=8 '
+                     'seq=5 captured_ns=100 decoded_ns=200 sent_ns=300')
+    assert vid[0] == "video" and vid[1]["proxy"] == 8, vid
+    pres = {"present": [{"id": 8, "seq": 5, "after_us": 7}, {"id": 3, "seq": 5, "after_us": 99}]}
+    matched, loose = join_video({**pres, "video": [vid[1]]})
+    assert loose == 0 and len(matched) == 1 and matched[0]["latency"] == 300 + 7000 - 100, matched
+    # With a proxy id, an unmatched present is never matched by seq alone.
+    matched, _ = join_video({"present": [{"id": 3, "seq": 5, "after_us": 99}], "video": [vid[1]]})
+    assert matched == [], matched
 
     src = load([os.path.join(FIXTURES, FIX_SOURCE)])
     dst = load([os.path.join(FIXTURES, FIX_DEST), os.path.join(FIXTURES, FIX_RENDER)])

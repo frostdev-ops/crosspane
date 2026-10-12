@@ -15,7 +15,7 @@
 //!   playout, then the send side. It never calls the host and never waits on a lock for longer than
 //!   a few moves.
 //! - **Callers** (`submit`, `packet`, `cancel_peer`) only take a short lock to append to a queue
-//!   (and, for `packet`, to read the clock), then return.
+//!   (and, for `packet`, to read the clock), wake the data thread, then return.
 //!
 //! # Queues and their bounds
 //!
@@ -119,6 +119,7 @@ mod host;
 mod tests;
 
 use std::collections::VecDeque;
+use std::ffi::OsStr;
 use std::fmt;
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -129,6 +130,7 @@ use std::time::{Duration, Instant};
 
 use crosspane_engine::io::{AudioEndpoint, AudioKey};
 use crosspane_engine::{Failure, Output};
+use crosspane_media::audio::JitterConfig;
 use crosspane_platform::{AudioEvent, AudioHost, EventSink};
 use crosspane_protocol::audio::AudioPacket;
 use crosspane_protocol::link::LinkError;
@@ -146,9 +148,17 @@ const MAX_SESSIONS: usize = 8;
 const MAX_QUEUED_PACKETS: usize = 8;
 /// A pass encodes at most this many 10 ms frames per sender, so one stream cannot starve the rest.
 const MAX_TX_FRAMES_PER_PASS: usize = 16;
-/// A pass pulls at most this many 10 ms frames per receiver (the jitter buffer rebases beyond 8
-/// late slots anyway).
+/// A pass pulls at most this many 10 ms frames per receiver. Playout is device-paced (it tops the
+/// playback ring up to two frames), so a pass normally pulls one or two; this only bounds a pass.
 const MAX_PULLS_PER_PASS: usize = 8;
+/// Sets the jitter buffers' base target delay in whole milliseconds (`JitterConfig::base`),
+/// from 20 to 80 ms inclusive (the default clamp). Read once, when the worker starts.
+const JITTER_BASE_ENV: &str = "CROSSPANE_AUDIO_JITTER_BASE_MS";
+const JITTER_BASE_MS: u64 = 40;
+const JITTER_MIN_MS: u64 = 20;
+const JITTER_MAX_MS: u64 = 80;
+/// Trace target of the A/V sync measurement events (metadata only, never samples).
+const AVSYNC: &str = "crosspane::avsync";
 /// High-water mark of the command queue: counted and logged, never a drop threshold (see the
 /// module docs).
 const COMMAND_SOFT_CAP: usize = 1024;
@@ -238,10 +248,11 @@ impl AudioWorker {
             }
         }
 
+        let jitter = jitter_config(std::env::var_os(JITTER_BASE_ENV).as_deref());
         let data_thread = spawn_thread("cp-audio-data", {
             let shared = Arc::clone(&shared);
             let clock = Arc::clone(&clock);
-            move || data::Core::new(shared, send, clock).run()
+            move || data::Core::new(shared, send, clock, jitter).run()
         });
         let data_thread = match data_thread {
             Ok(thread) => thread,
@@ -307,9 +318,19 @@ impl AudioWorker {
             Some(slot) if slot.queue.len() < MAX_QUEUED_PACKETS => {
                 slot.queue.push_back((arrival, packet));
             }
-            Some(_) => bump(&counters.rx_overflow),
-            None => bump(&counters.rx_unknown),
+            Some(_) => {
+                bump(&counters.rx_overflow);
+                return;
+            }
+            None => {
+                bump(&counters.rx_unknown);
+                return;
+            }
         }
+        drop(rx);
+        // As for every other submission: the data thread moves the packet into its jitter
+        // buffer now, not up to a `TICK` later.
+        self.shared.wake_data();
     }
 
     /// Stop every stream with `peer` at once (link closed or connection replaced); late results
@@ -896,6 +917,38 @@ fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
+/// The jitter buffers' policy from `CROSSPANE_AUDIO_JITTER_BASE_MS` (`value`; `None` when unset):
+/// a whole number of milliseconds from 20 to 80 sets the base, and min and max stay 20 and 80
+/// ms. Anything else is warned about and the default (40 ms) is used.
+fn jitter_config(value: Option<&OsStr>) -> JitterConfig {
+    let default = JitterConfig {
+        base: Duration::from_millis(JITTER_BASE_MS),
+        min: Duration::from_millis(JITTER_MIN_MS),
+        max: Duration::from_millis(JITTER_MAX_MS),
+    };
+    let Some(value) = value else {
+        return default;
+    };
+    let parsed = value.to_str().and_then(|v| v.trim().parse::<u64>().ok());
+    match parsed {
+        Some(ms) if (JITTER_MIN_MS..=JITTER_MAX_MS).contains(&ms) => JitterConfig {
+            base: Duration::from_millis(ms),
+            ..default
+        },
+        _ => {
+            tracing::warn!(
+                variable = JITTER_BASE_ENV,
+                value = ?value,
+                min_ms = JITTER_MIN_MS,
+                max_ms = JITTER_MAX_MS,
+                default_ms = JITTER_BASE_MS,
+                "invalid audio jitter base: using the default"
+            );
+            default
+        }
+    }
+}
+
 /// Lock a mutex, ignoring poisoning: every critical section here is a handful of moves that
 /// cannot leave the data half-updated.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -956,5 +1009,122 @@ fn wait_finished(handle: JoinHandle<()>, deadline: Instant) {
             return;
         }
         thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(test)]
+mod avsync_tests {
+    use std::sync::mpsc;
+
+    use crosspane_types::audio::AudioStreamId;
+
+    use super::*;
+
+    fn worker() -> AudioWorker {
+        AudioWorker {
+            shared: Arc::new(Shared::new(Arc::new(|_| {}))),
+            clock: Arc::new(|| MonoTime::from_nanos(1)),
+            threads: Mutex::new(None),
+        }
+    }
+
+    fn packet(stream: u16) -> AudioPacket {
+        AudioPacket {
+            stream: AudioStreamId(stream),
+            seq: 0,
+            sample_time: 0,
+            opus: vec![0xf8],
+        }
+    }
+
+    /// A stand-in data thread that parks for up to 30 s and reports how long it was parked.
+    fn parked_thread(shared: &Shared) -> (JoinHandle<()>, mpsc::Receiver<Duration>) {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (woke_tx, woke_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            ready_tx.send(()).expect("ready");
+            let parked = Instant::now();
+            thread::park_timeout(Duration::from_secs(30));
+            woke_tx.send(parked.elapsed()).expect("woke");
+        });
+        shared
+            .data_thread
+            .set(handle.thread().clone())
+            .expect("the data thread is set once");
+        ready_rx.recv().expect("thread started");
+        (handle, woke_rx)
+    }
+
+    #[test]
+    fn a_queued_packet_wakes_the_data_thread() {
+        let w = worker();
+        let peer = NodeId([3; 32]);
+        let key = AudioKey {
+            peer,
+            stream: AudioStreamId(5),
+            generation: 1,
+        };
+        lock(&w.shared.rx).slots.push(RxSlot {
+            key,
+            queue: VecDeque::with_capacity(MAX_QUEUED_PACKETS),
+        });
+        let (handle, woke) = parked_thread(&w.shared);
+        // Give the thread time to park (an unpark before the park is not lost either: the token
+        // makes that park return at once).
+        thread::sleep(Duration::from_millis(50));
+        w.packet(peer, packet(5));
+        let parked = woke
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the data thread woke");
+        assert!(
+            parked < Duration::from_secs(10),
+            "woke only after {parked:?}"
+        );
+        assert_eq!(lock(&w.shared.rx).slots[0].queue.len(), 1);
+        handle.join().expect("joined");
+    }
+
+    #[test]
+    fn the_jitter_base_comes_from_the_environment_value() {
+        let ms = Duration::from_millis;
+        let default = jitter_config(None);
+        assert_eq!(default, JitterConfig::default());
+        assert_eq!(
+            (default.base, default.min, default.max),
+            (ms(40), ms(20), ms(80))
+        );
+        for (value, base) in [("20", 20), ("25", 25), (" 60 ", 60), ("80", 80)] {
+            let config = jitter_config(Some(OsStr::new(value)));
+            assert_eq!(
+                (config.base, config.min, config.max),
+                (ms(base), ms(20), ms(80))
+            );
+        }
+        // Out of range or not a whole number of milliseconds: the default.
+        for value in [
+            "19",
+            "81",
+            "0",
+            "-40",
+            "40ms",
+            "4.5",
+            "",
+            "abc",
+            "99999999999999999999",
+        ] {
+            assert_eq!(jitter_config(Some(OsStr::new(value))), default, "{value:?}");
+        }
+        // Every accepted value builds a jitter buffer.
+        for base in 20..=80 {
+            let config = jitter_config(Some(OsStr::new(&base.to_string())));
+            assert!(
+                crosspane_media::audio::JitterBuffer::with_config(
+                    AudioKind::Speaker,
+                    AudioStreamId(1),
+                    config
+                )
+                .is_ok()
+            );
+        }
     }
 }

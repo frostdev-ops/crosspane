@@ -58,7 +58,9 @@ impl JitterConfig {
 /// starts a new target-delay wait; delayed forward packets cannot be distinguished from fresh
 /// packets without a wire freshness signal. No catch-up decoding or stored latency.
 /// `pull_next` is the device-paced alternative to `pull`: it never rebases on lateness and
-/// instead trims an overfull queue. All queues and scratch are allocated by `new`.
+/// instead trims an overfull queue. After 200 ms of concealment with nothing queued it arms the
+/// same one-time reanchor, so a sender resuming after a pause restarts playout instead of being
+/// dropped as late. All queues and scratch are allocated by `new`.
 pub struct JitterBuffer {
     kind: AudioKind,
     stream: AudioStreamId,
@@ -371,7 +373,19 @@ impl JitterBuffer {
         self.trim();
         // Keep `pull` coherent if a caller mixes the two: the next slot is due in 10 ms.
         self.due = Some(now.saturating_add(SLOT));
-        self.render(pcm)
+        let result = self.render(pcm)?;
+        // Audio/video sync work prompted by Thiago Goncalves (2026-10).
+        // A device-paced pull is never late, so the recovery reanchor that a late `pull` arms
+        // never arms here. A sender that paused (it sends nothing while its source is silent)
+        // resumes with seq and sample_time continuing from before the pause: behind the playout
+        // cursor, so `push` would drop it forever. Once `STARVATION` frames (200 ms) were
+        // concealed with nothing queued, arm the same one-time reanchor: the next forward packet
+        // consistent with the last one restarts playout after the target, as at stream start.
+        if self.starving >= STARVATION && self.packets.is_empty() && self.recovery_anchor.is_none()
+        {
+            self.recovery_anchor = self.anchor;
+        }
+        Ok(result)
     }
 
     /// Drops the oldest queued packets when more than target + `TRIM_SLACK` slots are queued,

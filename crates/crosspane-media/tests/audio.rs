@@ -759,8 +759,9 @@ fn pull_next_waits_only_for_startup_and_never_rebases() {
     }
     assert!(concealed > 50);
     assert_eq!(jitter.stats().dropped, 0);
-    // Packets that continue the sender clock are still accepted and played.
-    // The ring ends at most two frames past the last playout point, so `next` is not behind.
+    // Packets that continue the sender clock are still accepted and played. After 200 ms of
+    // concealment with nothing queued the buffer has armed its one-time reanchor, so they
+    // restart playout after the target, as at stream start.
     let next = (previous / 480) as u32 + 3;
     for ahead in 0..4u32 {
         assert!(
@@ -777,11 +778,149 @@ fn pull_next_waits_only_for_startup_and_never_rebases() {
                 .unwrap()
         );
     }
-    let mut played = false;
-    for tick in 0..4u64 {
-        played |= jitter.pull_next(time(10_100 + tick), &mut out).unwrap() == AudioPull::Packet;
+    let target = jitter.stats().target_delay.as_millis() as u64;
+    assert_eq!(
+        jitter.pull_next(time(10_100), &mut out).unwrap(),
+        AudioPull::Waiting
+    );
+    assert_eq!(
+        jitter.pull_next(time(10_100 + target), &mut out).unwrap(),
+        AudioPull::Packet
+    );
+    assert_eq!(jitter.playout_sample_time(), Some(u64::from(next) * 480));
+}
+
+/// Feed packets `seqs` one per 10 ms from `start_ms`, pulling once (device-paced) after each.
+fn steady_pull_next(
+    jitter: &mut JitterBuffer,
+    encoder: &mut Encoder,
+    out: &mut [f32],
+    seqs: std::ops::Range<u32>,
+    start_ms: u64,
+) {
+    let kind = AudioKind::Speaker;
+    for (i, seq) in seqs.enumerate() {
+        let now = start_ms + i as u64 * 10;
+        jitter
+            .push(
+                AudioPacket {
+                    stream: AudioStreamId(1),
+                    seq,
+                    sample_time: 1000 + u64::from(seq) * 480,
+                    opus: encoder.encode(&tone(kind, seq as usize)).unwrap(),
+                },
+                time(now),
+            )
+            .unwrap();
+        jitter.pull_next(time(now), out).unwrap();
     }
-    assert!(played);
+}
+
+// Audio/video sync work prompted by Thiago Goncalves (2026-10).
+#[test]
+fn pull_next_recovers_after_a_sender_pause_with_continuous_seq() {
+    let kind = AudioKind::Speaker;
+    let mut encoder = Encoder::new(kind).unwrap();
+    let mut jitter = JitterBuffer::new(kind, AudioStreamId(1)).unwrap();
+    let mut out = vec![0.0; 960];
+    // One second of steady playout: packets 0..100 at 0..990 ms.
+    steady_pull_next(&mut jitter, &mut encoder, &mut out, 0..100, 0);
+    assert_eq!(
+        jitter.pull_next(time(1_000), &mut out).unwrap(),
+        AudioPull::Packet
+    );
+    // The sender pauses for 2 s (its source went silent): it sends nothing, and its seq and
+    // sample_time stand still. The device keeps pulling every 10 ms.
+    for tick in 1..=200u64 {
+        let result = jitter.pull_next(time(1_000 + tick * 10), &mut out).unwrap();
+        assert_ne!(result, AudioPull::Waiting, "tick {tick}");
+    }
+    // It resumes where it left off: seq 100, sample_time continuous, one packet per 10 ms.
+    let resumed = 3_010u64;
+    let mut first_packet = None;
+    for i in 0..30u32 {
+        let now = resumed + u64::from(i) * 10;
+        let seq = 100 + i;
+        let accepted = jitter
+            .push(
+                AudioPacket {
+                    stream: AudioStreamId(1),
+                    seq,
+                    sample_time: 1000 + u64::from(seq) * 480,
+                    opus: encoder.encode(&tone(kind, seq as usize)).unwrap(),
+                },
+                time(now),
+            )
+            .unwrap();
+        assert!(accepted, "packet {seq} was dropped");
+        let target = jitter.stats().target_delay.as_millis() as u64;
+        // Device-paced: one pull per 10 ms.
+        if jitter.pull_next(time(now), &mut out).unwrap() == AudioPull::Packet
+            && first_packet.is_none()
+        {
+            first_packet = Some((now, target));
+            assert_eq!(jitter.playout_sample_time(), Some(1000 + 100 * 480));
+        }
+    }
+    let (at, target) = first_packet.expect("playout never resumed");
+    assert!(
+        at - resumed <= target + 10,
+        "resumed after {} ms, target {target} ms",
+        at - resumed
+    );
+    assert!(out.iter().any(|v| v.abs() > 0.01));
+}
+
+// Audio/video sync work prompted by Thiago Goncalves (2026-10).
+#[test]
+fn pull_next_does_not_reanchor_after_a_short_gap() {
+    let kind = AudioKind::Speaker;
+    let mut encoder = Encoder::new(kind).unwrap();
+    let mut jitter = JitterBuffer::new(kind, AudioStreamId(1)).unwrap();
+    let mut out = vec![0.0; 960];
+    steady_pull_next(&mut jitter, &mut encoder, &mut out, 0..100, 0);
+    let mut previous = jitter.playout_sample_time().unwrap();
+    // 150 ms of packets are lost (seq and sample_time move on with time); pulls go on.
+    for tick in 0..15u64 {
+        let result = jitter.pull_next(time(1_000 + tick * 10), &mut out).unwrap();
+        assert_ne!(result, AudioPull::Waiting);
+        let now = jitter.playout_sample_time().unwrap();
+        assert!(
+            (478..=482).contains(&(now - previous)),
+            "{previous} -> {now}"
+        );
+        previous = now;
+    }
+    // Packets resume: no restart (never Waiting), sender time stays continuous, audio plays.
+    let mut played = 0;
+    for i in 0..20u32 {
+        let now = 1_150 + u64::from(i) * 10;
+        let seq = 115 + i;
+        assert!(
+            jitter
+                .push(
+                    AudioPacket {
+                        stream: AudioStreamId(1),
+                        seq,
+                        sample_time: 1000 + u64::from(seq) * 480,
+                        opus: encoder.encode(&tone(kind, seq as usize)).unwrap(),
+                    },
+                    time(now),
+                )
+                .unwrap()
+        );
+        let result = jitter.pull_next(time(now), &mut out).unwrap();
+        assert_ne!(result, AudioPull::Waiting, "a short gap restarted playout");
+        played += usize::from(result == AudioPull::Packet);
+        let now = jitter.playout_sample_time().unwrap();
+        assert!(
+            (478..=482).contains(&(now - previous)),
+            "{previous} -> {now}"
+        );
+        previous = now;
+    }
+    assert!(played >= 15, "{played}");
+    assert_eq!(jitter.stats().dropped, 0);
 }
 
 #[test]

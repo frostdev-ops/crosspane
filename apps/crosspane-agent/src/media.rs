@@ -2535,6 +2535,15 @@ fn apply(
     };
     match result {
         Ok((header, video_size, dirty)) => {
+            // A/V sync measurement (`crosspane::avsync` TRACE): when the picture was decoded.
+            let stamp =
+                tracing::enabled!(target: AVSYNC, tracing::Level::TRACE).then(|| PictureStamp {
+                    key,
+                    id,
+                    seq,
+                    captured_ns: header.captured_ns,
+                    decoded_ns: crate::platform::now().as_nanos(),
+                });
             d.last = seq.max(header.seq);
             ids.shown(key, data.len(), header.captured_ns);
             #[cfg(all(windows, feature = "video"))]
@@ -2582,7 +2591,9 @@ fn apply(
                 }
             };
             if let Some(host) = host {
-                let _ = host.send(command);
+                send_picture(stamp, command, |command| {
+                    let _ = host.send(command);
+                });
             }
         }
         Err(e) => {
@@ -2596,6 +2607,56 @@ fn apply(
             }
         }
     }
+}
+
+/// Trace target of the A/V sync measurement events (metadata only, never pixels).
+const AVSYNC: &str = "crosspane::avsync";
+
+/// A decoded picture's A/V sync measurement, taken only while `crosspane::avsync` TRACE is on.
+#[derive(Clone, Copy, Debug)]
+struct PictureStamp {
+    key: ProjectionKey,
+    /// The proxy the picture goes to (`HostCommand::Stamp::id`).
+    id: u64,
+    /// The picture's number in its projection (`HostCommand::Stamp::seq`).
+    seq: u64,
+    /// When the source captured it, on the source's monotonic clock.
+    captured_ns: u64,
+    /// When it was decoded, on this node's monotonic clock.
+    decoded_ns: u64,
+}
+
+/// Send a picture's content command. With a `stamp`, a `HostCommand::Stamp` for the same proxy and
+/// picture goes immediately before it, so the proxy logs that picture's first present, and a
+/// `video` event records when the stamp was sent.
+fn send_picture(
+    stamp: Option<PictureStamp>,
+    command: HostCommand,
+    mut send: impl FnMut(HostCommand),
+) {
+    let Some(stamp) = stamp else {
+        send(command);
+        return;
+    };
+    // Audio/video sync work prompted by Thiago Goncalves (2026-10).
+    let sent_ns = crate::platform::now().as_nanos();
+    send(HostCommand::Stamp {
+        id: stamp.id,
+        seq: stamp.seq,
+    });
+    send(command);
+    // Logged after both sends, so formatting it never delays the content behind its stamp.
+    tracing::trace!(
+        target: AVSYNC,
+        side = "video",
+        source = %stamp.key.source.short(),
+        projection = stamp.key.projection.0,
+        proxy = stamp.id,
+        seq = stamp.seq,
+        captured_ns = stamp.captured_ns,
+        decoded_ns = stamp.decoded_ns,
+        sent_ns,
+    );
 }
 
 /// Show a cursor frame on the proxy unless a newer one was already shown.
@@ -3607,6 +3668,55 @@ mod destination_numbering_tests {
         assert!(!read_header(&last).unwrap().key, "applied in number order");
         let shown = recorded::shown(NodeId([8; 32]), projection, &[first, last]);
         assert_eq!(shown.map(|(_, pixels)| pixels[0]), Some(32));
+    }
+}
+
+#[cfg(test)]
+mod avsync_stamp_tests {
+    use super::*;
+
+    fn content(id: u64) -> HostCommand {
+        HostCommand::Frame {
+            id,
+            size: PixelSize::new(2, 2),
+            pixels: Arc::from(vec![0u8; 16]),
+            dirty: Vec::new(),
+        }
+    }
+
+    fn sent(stamp: Option<PictureStamp>, command: HostCommand) -> Vec<String> {
+        let mut out = Vec::new();
+        send_picture(stamp, command, |command| out.push(format!("{command:?}")));
+        out
+    }
+
+    #[test]
+    fn the_stamp_goes_right_before_the_content_with_its_proxy_and_picture() {
+        let stamp = PictureStamp {
+            key: ProjectionKey {
+                source: NodeId([4; 32]),
+                projection: ProjectionId(9),
+            },
+            id: 17,
+            seq: 1234,
+            captured_ns: 1,
+            decoded_ns: 2,
+        };
+        let out = sent(Some(stamp), content(17));
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(
+            out[0],
+            format!("{:?}", HostCommand::Stamp { id: 17, seq: 1234 })
+        );
+        assert_eq!(out[1], format!("{:?}", content(17)));
+    }
+
+    #[test]
+    fn without_avsync_tracing_only_the_content_is_sent() {
+        let out = sent(None, content(17));
+        assert_eq!(out, vec![format!("{:?}", content(17))]);
+        // And `apply` takes no stamp while the trace is off (no subscriber in this test).
+        assert!(!tracing::enabled!(target: AVSYNC, tracing::Level::TRACE));
     }
 }
 

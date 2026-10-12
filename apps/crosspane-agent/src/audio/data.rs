@@ -6,7 +6,8 @@
 //! 1. applies queued commands, in submission order;
 //! 2. applies host replies (open completions, peer devices);
 //! 3. moves received packets into their jitter buffers;
-//! 4. pulls due 10 ms frames out of each jitter buffer into its playback ring;
+//! 4. tops each playback ring up to two 10 ms frames from its jitter buffer: the device's
+//!    consumption of the ring paces the pulls, not this thread's clock;
 //! 5. encodes and sends whole 10 ms frames from each started virtual speaker, and drains the PCM
 //!    of every virtual speaker that has no started stream.
 //!
@@ -23,7 +24,7 @@ use std::thread;
 
 use crosspane_engine::Failure;
 use crosspane_engine::io::{AudioEndpoint, AudioKey};
-use crosspane_media::audio::{AudioPull, Encoder, JitterBuffer};
+use crosspane_media::audio::{AudioPull, Encoder, JitterBuffer, JitterConfig};
 use crosspane_platform::{
     AudioDeviceError, AudioEvent, AudioKind, AudioPlayback, PlatformError, VirtualPorts,
 };
@@ -36,13 +37,19 @@ use rtrb::{Consumer, Producer};
 
 use super::host::{Reply, Request};
 use super::{
-    AudioClock, AudioSend, Command, Counters, ExitGuard, MAX_PEERS, MAX_PULLS_PER_PASS,
+    AVSYNC, AudioClock, AudioSend, Command, Counters, ExitGuard, MAX_PEERS, MAX_PULLS_PER_PASS,
     MAX_QUEUED_PACKETS, MAX_SESSIONS, MAX_TX_FRAMES_PER_PASS, RxSlot, Shared, Stage, TICK,
     WorkerEvent, bump, lock,
 };
 
 /// Interleaved samples in one 10 ms stereo frame: the unit of everything here.
 const SPEAKER_FRAME: usize = AudioKind::Speaker.format().frame_samples();
+/// Interleaved samples per 48 kHz frame (one sample per channel).
+const SPEAKER_CHANNELS: usize = AudioKind::Speaker.format().channels as usize;
+/// Playout pulls while the playback ring holds fewer samples than this: two 10 ms frames.
+const PLAYOUT_LOW_WATER: usize = 2 * SPEAKER_FRAME;
+/// How often a receiving stream's jitter-buffer stats are logged (debug, `crosspane::avsync`).
+const STATS_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// One audio session, found by its complete key.
 struct Session {
@@ -67,6 +74,8 @@ struct Receiving {
     playback: AudioPlayback,
     jitter: JitterBuffer,
     frame: Vec<f32>,
+    /// When the jitter-buffer stats were last logged (only while that debug log is on).
+    stats_at: Option<MonoTime>,
 }
 
 struct Sending {
@@ -112,6 +121,8 @@ pub(super) struct Core {
     shared: Arc<Shared>,
     send: AudioSend,
     clock: AudioClock,
+    /// Every jitter buffer's target-delay policy (`CROSSPANE_AUDIO_JITTER_BASE_MS`).
+    jitter: JitterConfig,
     /// At most `MAX_PEERS`.
     peers: Vec<PeerEntry>,
     /// At most `MAX_SESSIONS`.
@@ -131,11 +142,17 @@ pub(super) struct Core {
 }
 
 impl Core {
-    pub(super) fn new(shared: Arc<Shared>, send: AudioSend, clock: AudioClock) -> Self {
+    pub(super) fn new(
+        shared: Arc<Shared>,
+        send: AudioSend,
+        clock: AudioClock,
+        jitter: JitterConfig,
+    ) -> Self {
         Core {
             shared,
             send,
             clock,
+            jitter,
             peers: Vec::with_capacity(MAX_PEERS),
             sessions: Vec::with_capacity(MAX_SESSIONS),
             open_requests: Vec::with_capacity(MAX_SESSIONS),
@@ -300,7 +317,7 @@ impl Core {
             State::Opened(_) => {}
             State::Opening | State::Sending(_) => return self.emit_failed(key),
         }
-        let jitter = JitterBuffer::new(AudioKind::Speaker, key.stream);
+        let jitter = JitterBuffer::with_config(AudioKind::Speaker, key.stream, self.jitter);
         if jitter.is_ok() {
             bump(&self.shared.counters.jitters_created);
         }
@@ -314,6 +331,7 @@ impl Core {
                     playback,
                     jitter,
                     frame: vec![0.0; SPEAKER_FRAME],
+                    stats_at: None,
                 }));
                 self.rx_register(key);
                 tracing::info!(
@@ -735,9 +753,15 @@ impl Core {
     }
 
     fn playout(&mut self, now: MonoTime) {
-        let shared = &self.shared;
         let mut failed = mem::take(&mut self.failed);
-        for session in self.sessions.iter_mut() {
+        let Core {
+            shared,
+            sessions,
+            clock,
+            ..
+        } = self;
+        let rx_trace = tracing::enabled!(target: AVSYNC, tracing::Level::TRACE);
+        for session in sessions.iter_mut() {
             let State::Receiving(receiving) = &mut session.state else {
                 continue;
             };
@@ -746,6 +770,7 @@ impl Core {
                 playback,
                 jitter,
                 frame,
+                stats_at,
             } = &mut **receiving;
             if !shared.deliverable(key) {
                 // Stopped, cancelled or shut down, whether or not the call has been applied yet.
@@ -756,12 +781,21 @@ impl Core {
                 failed.push(key);
                 continue;
             }
+            log_stats(key, jitter, stats_at, now);
             for _ in 0..MAX_PULLS_PER_PASS {
                 // Before every pull: a multi-frame batch must notice a stop between its frames.
                 if !shared.deliverable(key) {
                     break;
                 }
-                match jitter.pull(now, frame) {
+                // Audio/video sync work prompted by Thiago Goncalves (2026-10).
+                // Device-paced playout: pull only while the ring holds less than two frames. The
+                // device's consumption of the ring clocks the pulls, so a drift between this
+                // thread's clock and the device's can neither fill the ring nor starve it.
+                let queued = ring_queued(&playback.pcm);
+                if queued >= PLAYOUT_LOW_WATER {
+                    break;
+                }
+                match jitter.pull_next(now, frame) {
                     Ok(AudioPull::Waiting) => break,
                     Ok(_) => {
                         shared.stage(Stage::Pulled, key, &frame[..]);
@@ -770,6 +804,9 @@ impl Core {
                             break;
                         }
                         if write_frame(&mut playback.pcm, &frame[..]) {
+                            if rx_trace {
+                                trace_rx(key, jitter, clock(), queued);
+                            }
                             bump(&shared.counters.played);
                             shared.stage(Stage::Written, key, &frame[..]);
                         } else {
@@ -801,6 +838,7 @@ impl Core {
                 sessions,
                 send,
                 shared,
+                clock,
                 ..
             } = self;
             for entry in peers.iter_mut() {
@@ -818,7 +856,7 @@ impl Core {
                     // Nothing is sending: what apps play now must not be sent later.
                     None => discard_pcm(&mut ports.speaker_out, mid_pair, &shared.counters),
                     Some((key, sending)) => {
-                        if !pump(ports, mid_pair, sending, key, send, shared) {
+                        if !pump(ports, mid_pair, sending, key, send, shared, clock) {
                             failed.push(key);
                         }
                     }
@@ -845,6 +883,7 @@ fn pump(
     key: AudioKey,
     send: &AudioSend,
     shared: &Shared,
+    clock: &AudioClock,
 ) -> bool {
     let counters = &shared.counters;
     if !finish_stale_pair(&mut ports.speaker_out, mid_pair, counters) {
@@ -852,11 +891,15 @@ fn pump(
         // can be assembled before it does.
         return !endpoint_gone(ports);
     }
+    let tx_trace = tracing::enabled!(target: AVSYNC, tracing::Level::TRACE);
     for _ in 0..MAX_TX_FRAMES_PER_PASS {
         if !shared.deliverable(key) {
             // The session goes when the data thread applies the stop (or the death).
             return true;
         }
+        // When this frame is read, and how much was queued from its first sample on: the
+        // newest queued sample was just produced, so the first was produced that long ago.
+        let probe = tx_trace.then(|| (clock().as_nanos(), ports.speaker_out.slots()));
         // Fails when fewer than a whole frame is available: a partial frame is never encoded,
         // so left and right always stay paired.
         let Ok(chunk) = ports.speaker_out.read_chunk(SPEAKER_FRAME) else {
@@ -906,7 +949,12 @@ fn pump(
             .sample_time
             .saturating_add(AUDIO_FRAME_SAMPLES as u64);
         match send(key.peer, &packet) {
-            Ok(()) => bump(&counters.sent),
+            Ok(()) => {
+                bump(&counters.sent);
+                if let Some((at_ns, queued)) = probe {
+                    trace_tx(key, &packet, at_ns, queued);
+                }
+            }
             Err(LinkError::Congested) => bump(&counters.congested),
             Err(error) => {
                 tracing::warn!(error = ?error, "audio send failed");
@@ -988,6 +1036,109 @@ fn write_frame(pcm: &mut Producer<f32>, frame: &[f32]) -> bool {
     }
 }
 
+/// Interleaved samples already in a playback ring, waiting for the device.
+fn ring_queued(pcm: &Producer<f32>) -> usize {
+    pcm.buffer().capacity().saturating_sub(pcm.slots())
+}
+
+// ---- A/V sync measurement (`crosspane::avsync`; metadata only, never samples) ----
+
+/// The fields of a source `tx` event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TxTrace {
+    seq: u32,
+    sample_time: u64,
+    /// The source's monotonic clock when the packet's first frame was read (the clock video
+    /// `captured_ns` is on).
+    at_ns: u64,
+    /// Per-channel 48 kHz frames queued in the virtual speaker at that moment, from the packet's
+    /// first frame to the newest sample: its first frame was produced that long before `at_ns`.
+    queued_frames: u64,
+}
+
+impl TxTrace {
+    fn new(packet: &AudioPacket, at_ns: u64, queued_samples: usize) -> Self {
+        TxTrace {
+            seq: packet.seq,
+            sample_time: packet.sample_time,
+            at_ns,
+            queued_frames: (queued_samples / SPEAKER_CHANNELS) as u64,
+        }
+    }
+}
+
+/// The fields of a destination `rx` event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RxTrace {
+    /// Sender `sample_time` of the first frame just pulled (`JitterBuffer::playout_sample_time`).
+    sample_time: u64,
+    /// The destination's monotonic clock just after the frame was written to the playback ring.
+    at_ns: u64,
+    /// Per-channel 48 kHz frames that were in the playback ring ahead of it: it plays about
+    /// `ring_frames / 48 kHz` after `at_ns`.
+    ring_frames: u64,
+    /// The jitter buffer's current target delay.
+    target_ms: u64,
+}
+
+impl RxTrace {
+    fn new(jitter: &JitterBuffer, at_ns: u64, queued_samples: usize) -> Option<Self> {
+        Some(RxTrace {
+            sample_time: jitter.playout_sample_time()?,
+            at_ns,
+            ring_frames: (queued_samples / SPEAKER_CHANNELS) as u64,
+            target_ms: jitter.stats().target_delay.as_millis() as u64,
+        })
+    }
+}
+
+fn trace_tx(key: AudioKey, packet: &AudioPacket, at_ns: u64, queued_samples: usize) {
+    let t = TxTrace::new(packet, at_ns, queued_samples);
+    tracing::trace!(
+        target: AVSYNC,
+        side = "tx",
+        peer = %key.peer.short(),
+        stream = key.stream.0,
+        seq = t.seq,
+        sample_time = t.sample_time,
+        at_ns = t.at_ns,
+        queued_frames = t.queued_frames,
+    );
+}
+
+fn trace_rx(key: AudioKey, jitter: &JitterBuffer, at: MonoTime, queued_samples: usize) {
+    let Some(t) = RxTrace::new(jitter, at.as_nanos(), queued_samples) else {
+        return;
+    };
+    tracing::trace!(
+        target: AVSYNC,
+        side = "rx",
+        peer = %key.peer.short(),
+        stream = key.stream.0,
+        sample_time = t.sample_time,
+        at_ns = t.at_ns,
+        ring_frames = t.ring_frames,
+        target_ms = t.target_ms,
+    );
+}
+
+/// The stream's jitter-buffer stats, at debug level, at most once per `STATS_EVERY`.
+fn log_stats(key: AudioKey, jitter: &JitterBuffer, last: &mut Option<MonoTime>, now: MonoTime) {
+    if !tracing::enabled!(target: AVSYNC, tracing::Level::DEBUG)
+        || last.is_some_and(|at| now.saturating_duration_since(at) < STATS_EVERY)
+    {
+        return;
+    }
+    *last = Some(now);
+    tracing::debug!(
+        target: AVSYNC,
+        peer = %key.peer.short(),
+        stream = key.stream.0,
+        stats = ?jitter.stats(),
+        "audio jitter stats"
+    );
+}
+
 fn failure(error: &PlatformError) -> Failure {
     match error {
         PlatformError::Locked => Failure::Locked,
@@ -1004,5 +1155,321 @@ fn device_error(error: &PlatformError) -> AudioDeviceError {
         PlatformError::PermissionDenied(_) => AudioDeviceError::PermissionDenied,
         PlatformError::Unsupported(_) | PlatformError::NotFound => AudioDeviceError::Unavailable,
         _ => AudioDeviceError::Failed,
+    }
+}
+
+/// Device-paced playout and the A/V sync traces, driven directly on a `Core` (no threads).
+#[cfg(test)]
+mod avsync_tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+
+    use crosspane_platform::AudioStop;
+    use crosspane_types::audio::AudioStreamId;
+    use rtrb::RingBuffer;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct NoStop;
+
+    impl AudioStop for NoStop {
+        fn stop(&mut self) {}
+    }
+
+    /// One event's fields, formatted with `Debug`.
+    type Fields = Vec<(String, String)>;
+
+    /// Events on `crosspane::avsync`.
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<Fields>>>);
+
+    impl Recorder {
+        fn events(&self, side: &str) -> Vec<Fields> {
+            let side = format!("{side:?}");
+            lock(&self.0)
+                .iter()
+                .filter(|fields| fields.iter().any(|(k, v)| k == "side" && *v == side))
+                .cloned()
+                .collect()
+        }
+    }
+
+    fn field<'a>(fields: &'a [(String, String)], name: &str) -> &'a str {
+        fields
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_else(|| panic!("no field {name} in {fields:?}"))
+    }
+
+    impl tracing::Subscriber for Recorder {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(Fields);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push((field.name().to_owned(), format!("{value:?}")));
+                }
+            }
+            if event.metadata().target() != AVSYNC {
+                return;
+            }
+            let mut fields = Visitor(Vec::new());
+            event.record(&mut fields);
+            lock(&self.0).push(fields.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    const NOW_NS: u64 = 5_000_000_000;
+
+    fn test_key() -> AudioKey {
+        AudioKey {
+            peer: NodeId([7; 32]),
+            stream: AudioStreamId(3),
+            generation: 1,
+        }
+    }
+
+    /// A core with one receiving session on `key`, whose playback ring the test consumes.
+    fn receiving_core(key: AudioKey, ring: usize) -> (Core, Consumer<f32>) {
+        let shared = Arc::new(Shared::new(Arc::new(|_| {})));
+        let send: AudioSend = Arc::new(|_, _| Ok(()));
+        let nanos = Arc::new(AtomicU64::new(NOW_NS));
+        let clock: AudioClock =
+            Arc::new(move || MonoTime::from_nanos(nanos.load(Ordering::SeqCst)));
+        let mut core = Core::new(Arc::clone(&shared), send, clock, JitterConfig::default());
+        lock(&shared.shadow).live.push(key);
+        let (producer, consumer) = RingBuffer::<f32>::new(ring);
+        core.sessions.push(Session {
+            key,
+            state: State::Receiving(Box::new(Receiving {
+                playback: AudioPlayback::new(producer, Box::new(NoStop)),
+                jitter: JitterBuffer::with_config(AudioKind::Speaker, key.stream, core.jitter)
+                    .expect("jitter buffer"),
+                frame: vec![0.0; SPEAKER_FRAME],
+                stats_at: None,
+            })),
+        });
+        (core, consumer)
+    }
+
+    fn jitter(core: &mut Core) -> &mut JitterBuffer {
+        match &mut core.sessions[0].state {
+            State::Receiving(receiving) => &mut receiving.jitter,
+            _ => panic!("not receiving"),
+        }
+    }
+
+    fn tone(index: usize) -> Vec<f32> {
+        (0..SPEAKER_FRAME)
+            .map(|i| {
+                let n = (index * SPEAKER_FRAME + i) / 2;
+                0.3 * (std::f32::consts::TAU * 1000.0 * n as f32 / 48_000.0).sin()
+            })
+            .collect()
+    }
+
+    /// Queue `count` packets of `key`'s stream, arriving 10 ms apart from `NOW_NS` (no jitter,
+    /// so the target stays at its 40 ms base). At most 12, so `pull_next` never trims.
+    fn feed(core: &mut Core, key: AudioKey, count: u32) {
+        let mut encoder = Encoder::new(AudioKind::Speaker).expect("encoder");
+        for seq in 0..count {
+            let packet = AudioPacket {
+                stream: key.stream,
+                seq,
+                sample_time: u64::from(seq) * AUDIO_FRAME_SAMPLES as u64,
+                opus: encoder.encode(&tone(seq as usize)).expect("encode"),
+            };
+            let arrival = MonoTime::from_nanos(NOW_NS + u64::from(seq) * 10_000_000);
+            assert!(jitter(core).push(packet, arrival).expect("push"));
+        }
+    }
+
+    fn consume(pcm: &mut Consumer<f32>, samples: usize) {
+        pcm.read_chunk(samples)
+            .expect("queued samples")
+            .commit_all();
+    }
+
+    fn played(core: &Core) -> u64 {
+        core.shared.counters.played.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn playout_pulls_only_below_two_frames_and_follows_the_draining_ring() {
+        let key = test_key();
+        let (mut core, mut pcm) = receiving_core(key, 4800);
+        feed(&mut core, key, 10);
+        let start = MonoTime::from_nanos(NOW_NS);
+        // Before the jitter target nothing is pulled.
+        core.playout(start);
+        assert_eq!((played(&core), pcm.slots()), (0, 0));
+        // At the target the ring is topped up to two frames, and no further.
+        let due = MonoTime::from_nanos(NOW_NS + 40_000_000);
+        core.playout(due);
+        assert_eq!((played(&core), pcm.slots()), (2, 2 * SPEAKER_FRAME));
+        // The local clock moving on pulls nothing while the device has not consumed.
+        for ms in 1..10 {
+            core.playout(MonoTime::from_nanos(NOW_NS + (40 + ms * 10) * 1_000_000));
+        }
+        assert_eq!((played(&core), pcm.slots()), (2, 2 * SPEAKER_FRAME));
+        // The device consumes part of a frame: one pull tops the ring back up.
+        consume(&mut pcm, 500);
+        core.playout(due);
+        assert_eq!(played(&core), 3);
+        assert_eq!(pcm.slots(), 3 * SPEAKER_FRAME - 500);
+        // Exactly at the low-water mark nothing is pulled; one sample below it, one frame is.
+        consume(&mut pcm, SPEAKER_FRAME - 500);
+        core.playout(due);
+        assert_eq!((played(&core), pcm.slots()), (3, 2 * SPEAKER_FRAME));
+        consume(&mut pcm, 1);
+        core.playout(due);
+        assert_eq!((played(&core), pcm.slots()), (4, 3 * SPEAKER_FRAME - 1));
+        // Drained: two pulls in one pass, with the clock standing still.
+        let queued = pcm.slots();
+        consume(&mut pcm, queued);
+        core.playout(due);
+        assert_eq!((played(&core), pcm.slots()), (6, 2 * SPEAKER_FRAME));
+        assert_eq!(
+            core.shared
+                .counters
+                .playback_overflow
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[test]
+    fn rx_traces_carry_the_playout_point_and_the_ring_ahead_of_it() {
+        let key = test_key();
+        let (mut core, mut pcm) = receiving_core(key, 4800);
+        feed(&mut core, key, 10);
+        let recorder = Recorder::default();
+        tracing::subscriber::with_default(recorder.clone(), || {
+            core.playout(MonoTime::from_nanos(NOW_NS + 40_000_000));
+            consume(&mut pcm, 2 * SPEAKER_FRAME);
+            core.playout(MonoTime::from_nanos(NOW_NS + 50_000_000));
+        });
+        let rx = recorder.events("rx");
+        assert_eq!(rx.len(), 4, "{rx:?}");
+        // Two passes of two pulls each: the first of each pass had an empty ring ahead of it,
+        // the second one frame (480 per-channel frames).
+        let expected = [(0, 0), (480, 480), (960, 0), (1440, 480)];
+        for (fields, (sample_time, ring)) in rx.iter().zip(expected) {
+            assert_eq!(field(fields, "peer"), key.peer.short());
+            assert_eq!(field(fields, "stream"), "3");
+            let st: u64 = field(fields, "sample_time").parse().expect("sample_time");
+            assert!(
+                st.abs_diff(sample_time) <= 2,
+                "sample_time {st}, expected {sample_time}"
+            );
+            assert_eq!(field(fields, "at_ns"), NOW_NS.to_string());
+            assert_eq!(field(fields, "ring_frames"), ring.to_string());
+            assert_eq!(field(fields, "target_ms"), "40");
+        }
+        // Stats at debug level, once per second: once here.
+        let stats = lock(&recorder.0)
+            .iter()
+            .filter(|f| f.iter().any(|(k, _)| k == "stats"))
+            .count();
+        assert_eq!(stats, 1);
+    }
+
+    #[test]
+    fn trace_fields_are_per_channel_frames_and_need_a_playout_point() {
+        let key = test_key();
+        let (mut core, _pcm) = receiving_core(key, 4800);
+        feed(&mut core, key, 10);
+        // No playout point before the first pull: no rx event can be built.
+        assert_eq!(RxTrace::new(jitter(&mut core), 1, 0), None);
+        // With no subscriber (avsync tracing off) playout works the same.
+        core.playout(MonoTime::from_nanos(NOW_NS + 40_000_000));
+        assert_eq!(played(&core), 2);
+        let rx = RxTrace::new(jitter(&mut core), 1, SPEAKER_FRAME + 1).expect("playout point");
+        assert_eq!((rx.at_ns, rx.ring_frames, rx.target_ms), (1, 480, 40));
+        let packet = AudioPacket {
+            stream: key.stream,
+            seq: 9,
+            sample_time: 4320,
+            opus: vec![0xf8],
+        };
+        assert_eq!(
+            TxTrace::new(&packet, 11, 2 * SPEAKER_FRAME + 1),
+            TxTrace {
+                seq: 9,
+                sample_time: 4320,
+                at_ns: 11,
+                queued_frames: 960,
+            }
+        );
+    }
+
+    #[test]
+    fn tx_traces_carry_capture_backlog_and_send_clock() {
+        let key = test_key();
+        let shared = Arc::new(Shared::new(Arc::new(|_| {})));
+        lock(&shared.shadow).live.push(key);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let send: AudioSend = {
+            let sent = Arc::clone(&sent);
+            Arc::new(move |_, packet: &AudioPacket| {
+                lock(&sent).push(packet.seq);
+                Ok(())
+            })
+        };
+        let clock: AudioClock = Arc::new(|| MonoTime::from_nanos(NOW_NS));
+        let (mut speaker_in, speaker_out) = RingBuffer::<f32>::new(8 * SPEAKER_FRAME);
+        let (mic_in, _mic_out) = RingBuffer::<f32>::new(SPEAKER_FRAME);
+        let mut ports = VirtualPorts {
+            speaker_out,
+            mic_in,
+        };
+        let pcm: Vec<f32> = (0..3).flat_map(tone).collect();
+        speaker_in.push_entire_slice(&pcm).expect("room");
+        let mut sending = Sending {
+            encoder: Encoder::new(AudioKind::Speaker).expect("encoder"),
+            frame: vec![0.0; SPEAKER_FRAME],
+            seq: 0,
+            sample_time: 0,
+        };
+        let recorder = Recorder::default();
+        let ok = tracing::subscriber::with_default(recorder.clone(), || {
+            pump(
+                &mut ports,
+                &mut false,
+                &mut sending,
+                key,
+                &send,
+                &shared,
+                &clock,
+            )
+        });
+        assert!(ok);
+        assert_eq!(*lock(&sent), vec![0, 1, 2]);
+        let tx = recorder.events("tx");
+        assert_eq!(tx.len(), 3, "{tx:?}");
+        for (i, fields) in tx.iter().enumerate() {
+            assert_eq!(field(fields, "peer"), key.peer.short());
+            assert_eq!(field(fields, "stream"), "3");
+            assert_eq!(field(fields, "seq"), i.to_string());
+            assert_eq!(field(fields, "sample_time"), (i * 480).to_string());
+            assert_eq!(field(fields, "at_ns"), NOW_NS.to_string());
+            // Three frames were queued before the first read, then two, then one.
+            assert_eq!(field(fields, "queued_frames"), ((3 - i) * 480).to_string());
+        }
     }
 }
