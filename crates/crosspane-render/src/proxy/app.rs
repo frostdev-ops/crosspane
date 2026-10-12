@@ -77,6 +77,8 @@ struct ProxyWindow {
     input: InputState,
     consecutive_surface_losses: u8,
     presents: PresentCounter,
+    /// The A/V sync stamp waiting for its picture's first present (`HostCommand::Stamp`).
+    stamp: PresentStamp,
     /// What `HostEvent::Placed` last said about this window, and the occlusion it is built on.
     placement: PlacementTracker,
     #[cfg(target_os = "windows")]
@@ -310,6 +312,7 @@ impl App {
             input: InputState::default(),
             consecutive_surface_losses: 0,
             presents: PresentCounter::new(Instant::now()),
+            stamp: PresentStamp::default(),
             placement: PlacementTracker::for_new_window(),
             #[cfg(target_os = "windows")]
             dpi_correction: None,
@@ -568,6 +571,7 @@ impl App {
             } => {
                 if let (Some(gpu), Some(window)) = (&self.gpu, self.windows.get_mut(&id)) {
                     window.presents.content();
+                    window.stamp.content();
                     match window
                         .presenter
                         .upload(&gpu.device, &gpu.queue, size, &pixels, &dirty)
@@ -588,6 +592,7 @@ impl App {
             } => {
                 if let (Some(gpu), Some(window)) = (&self.gpu, self.windows.get_mut(&id)) {
                     window.presents.content();
+                    window.stamp.content();
                     match window.presenter.set_video(&gpu.device, size, rect, picture) {
                         Ok(()) => window.window.request_redraw(),
                         Err(error) => {
@@ -605,6 +610,7 @@ impl App {
             } => {
                 if let (Some(gpu), Some(window)) = (&self.gpu, self.windows.get_mut(&id)) {
                     window.presents.content();
+                    window.stamp.content();
                     match window
                         .presenter
                         .set_native_video(&gpu.device, size, rect, picture)
@@ -632,6 +638,11 @@ impl App {
                     window.window.set_cursor(CursorIcon::Default);
                     window.window.set_cursor_visible(true);
                 }
+            }
+            HostCommand::Stamp { id, seq } => {
+                record_stamp(&mut self.windows, id, seq, Instant::now(), |window| {
+                    &mut window.stamp
+                });
             }
             HostCommand::Shutdown => {
                 #[cfg(target_os = "windows")]
@@ -1475,6 +1486,15 @@ impl ProxyWindow {
         self.window.pre_present_notify();
         gpu.queue.present(frame);
         self.presents.present(true);
+        if let Some(stamped) = self.stamp.present(true, Instant::now()) {
+            tracing::trace!(
+                target: "crosspane::avsync",
+                side = "present",
+                id = stamped.id,
+                seq = stamped.seq,
+                after_us = stamped.after_us,
+            );
+        }
         if suboptimal {
             self.resize(gpu, self.window.inner_size())?;
         }
@@ -1525,6 +1545,78 @@ impl PresentCounter {
         } else {
             None
         }
+    }
+}
+
+// Audio/video sync work prompted by Thiago Goncalves (2026-10).
+/// A/V sync measurement (`HostCommand::Stamp`): the picture the next content command carries,
+/// held until the first successful present that shows it. Only the newest stamp is kept.
+#[derive(Debug, Default)]
+struct PresentStamp {
+    pending: Option<PendingStamp>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingStamp {
+    id: u64,
+    seq: u64,
+    at: Instant,
+    /// A content command arrived after the stamp, so the next present shows picture `seq`.
+    content: bool,
+}
+
+/// A stamped picture's first present: `after_us` microseconds after its `Stamp` arrived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamped {
+    id: u64,
+    seq: u64,
+    after_us: u64,
+}
+
+impl PresentStamp {
+    /// A `Stamp` arrived at `now`; it replaces any stamp still waiting for its present.
+    fn stamp(&mut self, id: u64, seq: u64, now: Instant) {
+        self.pending = Some(PendingStamp {
+            id,
+            seq,
+            at: now,
+            content: false,
+        });
+    }
+
+    /// A content command (`Frame`, `Video`, `VideoNative`) for this proxy arrived.
+    fn content(&mut self) {
+        if let Some(pending) = &mut self.pending {
+            pending.content = true;
+        }
+    }
+
+    /// A present finished at `now`. Returns the stamp it consumed, if it was the first
+    /// successful present after the stamped content arrived.
+    fn present(&mut self, successful: bool, now: Instant) -> Option<Stamped> {
+        if !successful || !self.pending.is_some_and(|pending| pending.content) {
+            return None;
+        }
+        let pending = self.pending.take()?;
+        let after = now.saturating_duration_since(pending.at).as_micros();
+        Some(Stamped {
+            id: pending.id,
+            seq: pending.seq,
+            after_us: u64::try_from(after).unwrap_or(u64::MAX),
+        })
+    }
+}
+
+/// Applies `HostCommand::Stamp` to proxy `id`'s stamp; a stamp for an unknown proxy is ignored.
+fn record_stamp<W>(
+    windows: &mut HashMap<u64, W>,
+    id: u64,
+    seq: u64,
+    now: Instant,
+    stamp: impl FnOnce(&mut W) -> &mut PresentStamp,
+) {
+    if let Some(window) = windows.get_mut(&id) {
+        stamp(window).stamp(id, seq, now);
     }
 }
 
@@ -2218,6 +2310,79 @@ mod tests {
         assert_eq!(counter.deadline(), None);
         counter.present(true);
         assert_eq!(counter.report(now + PRESENT_REPORT_INTERVAL), Some(1));
+    }
+
+    #[test]
+    fn stamp_is_consumed_by_the_first_present_after_its_content() {
+        let at = Instant::now();
+        let mut stamp = PresentStamp::default();
+        stamp.stamp(7, 41, at);
+        // A present before the stamped content arrives shows older content: not consumed.
+        assert_eq!(stamp.present(true, at + Duration::from_millis(1)), None);
+        stamp.content();
+        // A failed present doesn't consume it either.
+        assert_eq!(stamp.present(false, at + Duration::from_millis(2)), None);
+        assert_eq!(
+            stamp.present(true, at + Duration::from_micros(16_500)),
+            Some(Stamped {
+                id: 7,
+                seq: 41,
+                after_us: 16_500
+            })
+        );
+        // Consumed: later content and presents emit nothing until the next stamp.
+        stamp.content();
+        assert_eq!(stamp.present(true, at + Duration::from_millis(33)), None);
+    }
+
+    #[test]
+    fn a_newer_stamp_replaces_one_still_waiting() {
+        let at = Instant::now();
+        let mut stamp = PresentStamp::default();
+        stamp.stamp(7, 1, at);
+        stamp.content();
+        stamp.stamp(7, 2, at + Duration::from_millis(10));
+        // The replacement waits for its own content.
+        assert_eq!(stamp.present(true, at + Duration::from_millis(11)), None);
+        stamp.content();
+        assert_eq!(
+            stamp.present(true, at + Duration::from_millis(15)),
+            Some(Stamped {
+                id: 7,
+                seq: 2,
+                after_us: 5_000
+            })
+        );
+    }
+
+    #[test]
+    fn no_stamp_means_no_event() {
+        let at = Instant::now();
+        let mut stamp = PresentStamp::default();
+        stamp.content();
+        assert_eq!(stamp.present(true, at), None);
+    }
+
+    #[test]
+    fn a_stamp_for_an_unknown_proxy_is_ignored() {
+        let at = Instant::now();
+        let mut windows = HashMap::from([(7, PresentStamp::default())]);
+        record_stamp(&mut windows, 8, 1, at, |stamp| stamp);
+        assert!(!windows.contains_key(&8));
+        let known = windows.get_mut(&7).expect("known proxy");
+        known.content();
+        assert_eq!(known.present(true, at), None);
+        record_stamp(&mut windows, 7, 2, at, |stamp| stamp);
+        let known = windows.get_mut(&7).expect("known proxy");
+        known.content();
+        assert_eq!(
+            known.present(true, at + Duration::from_micros(3)),
+            Some(Stamped {
+                id: 7,
+                seq: 2,
+                after_us: 3
+            })
+        );
     }
 
     #[test]

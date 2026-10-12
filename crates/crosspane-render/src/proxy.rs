@@ -125,6 +125,16 @@ pub enum HostCommand {
     DefaultCursor {
         id: u64,
     },
+    /// The next content command (`Frame`, `Video` or `VideoNative`) for proxy `id` is picture
+    /// `seq`. At the first successful present of new content after it, the host emits a TRACE
+    /// event on target `crosspane::avsync` (`side = "present"`, `id`, `seq`, and `after_us`, the
+    /// microseconds since this command arrived). A newer `Stamp` before that present replaces
+    /// it; a `Stamp` for an unknown proxy is ignored. Measurement only: it changes no drawing.
+    // Audio/video sync work prompted by Thiago Goncalves (2026-10).
+    Stamp {
+        id: u64,
+        seq: u64,
+    },
     /// Close every proxy and leave the event loop.
     Shutdown,
     /// Run a closure on the main thread.
@@ -203,6 +213,11 @@ impl fmt::Debug for HostCommand {
                 .field("hotspot", hotspot)
                 .finish_non_exhaustive(),
             Self::DefaultCursor { id } => f.debug_struct("DefaultCursor").field("id", id).finish(),
+            Self::Stamp { id, seq } => f
+                .debug_struct("Stamp")
+                .field("id", id)
+                .field("seq", seq)
+                .finish(),
             Self::Shutdown => f.write_str("Shutdown"),
             Self::Run(_) => f.write_str("Run(..)"),
         }
