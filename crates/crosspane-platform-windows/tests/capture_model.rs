@@ -89,11 +89,16 @@ fn gate_epoch_catches_close_reopen_and_pump_is_not_keyboard_attestation() {
 }
 
 #[test]
-fn raw_mouse_without_hook_observation_aborts_both_after_short_window() {
+fn raw_mouse_without_hook_observation_needs_sustained_window_and_reports() {
+    // One report and then silence is not evidence of a silent hook.
     let mut w = Watchdog::new(7);
     assert!(!w.lost(1, true, 7, 1, 0, 1));
-    assert!(!w.lost(100, true, 7, 100, 0, 1));
-    assert!(w.lost(101, true, 7, 101, 0, 1));
+    assert!(!w.lost(601, true, 7, 601, 0, 1));
+    // Sixteen reports after the mismatch opened, but only 499 ms: not yet.
+    let mut w = Watchdog::new(7);
+    assert!(!w.lost(1, true, 7, 1, 0, 1));
+    assert!(!w.lost(500, true, 7, 500, 0, 17));
+    assert!(w.lost(501, true, 7, 501, 0, 17));
     let mut w = Watchdog::new(7);
     assert!(!w.lost(1, true, 7, 1, 0, 1));
     assert!(!w.lost(50, true, 7, 50, 1, 1));

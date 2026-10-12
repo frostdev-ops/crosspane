@@ -33,6 +33,62 @@ pub struct Foreground {
     pub integrity: u32,
 }
 
+/// Oldest a monitor table may be for the pointer injector to consult it without a fresh
+/// acquisition. Even a younger table is reused only after it matches the live monitors.
+pub const MONITOR_CACHE_MAX_AGE_MS: u64 = 1000;
+
+/// Pure age rule: a table is consultable only if it has rows and was read strictly less than
+/// `MONITOR_CACHE_MAX_AGE_MS` ago. `None` means never read (or invalidated), which is never fresh.
+pub fn monitor_cache_fresh(rows: usize, age_ms: Option<u64>) -> bool {
+    rows != 0 && age_ms.is_some_and(|age| age < MONITOR_CACHE_MAX_AGE_MS)
+}
+
+/// Reuse rule for the cached monitor table. `validate` (the live comparison and the move
+/// resolution against the cached rows) runs only for a fresh table, so a stale, empty or
+/// invalidated table never reaches it, and a table that fails it is never reused.
+pub fn reuse_monitors(rows: usize, age_ms: Option<u64>, validate: impl FnOnce() -> bool) -> bool {
+    monitor_cache_fresh(rows, age_ms) && validate()
+}
+
+/// The identity under which an admitted foreground decision may be reused. Any difference in the
+/// window, process, thread or foreground-event generation forces the full process and token check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionKey {
+    pub window: u64,
+    pub process: u32,
+    pub thread: u32,
+    pub generation: u64,
+}
+
+/// The last foreground that passed the full process and token check, with the process creation
+/// time and integrity it was admitted with. It holds an admission only: a refusal or a changed
+/// key empties it, so a refusal is never reused and the full check always follows a key change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdmissionCache {
+    admitted: Option<Foreground>,
+}
+impl AdmissionCache {
+    /// The cached admission, only for exactly this key.
+    pub fn reuse(&self, key: AdmissionKey) -> Option<Foreground> {
+        self.admitted.filter(|f| {
+            f.window != 0
+                && f.process != 0
+                && f.thread != 0
+                && f.born != 0
+                && (f.window, f.process, f.thread, f.generation)
+                    == (key.window, key.process, key.thread, key.generation)
+        })
+    }
+    /// Remembers a foreground that has just passed the full check and its post-check.
+    pub fn admit(&mut self, foreground: Foreground) {
+        self.admitted = Some(foreground);
+    }
+    /// Forgets the admission; the next observation runs the full check.
+    pub fn invalidate(&mut self) {
+        self.admitted = None;
+    }
+}
+
 /// `[E]` Native packets contain physical scancodes, never text or virtual keys.
 /// <https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-keybdinput>
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -678,4 +734,115 @@ pub fn absolute_move(
         },
         probe.clone(),
     ))
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn admitted(window: u64, process: u32, thread: u32, generation: u64) -> Foreground {
+        Foreground {
+            window,
+            process,
+            thread,
+            born: 77,
+            generation,
+            integrity: 0x2000,
+        }
+    }
+    fn key(window: u64, process: u32, thread: u32, generation: u64) -> AdmissionKey {
+        AdmissionKey {
+            window,
+            process,
+            thread,
+            generation,
+        }
+    }
+
+    #[test]
+    fn monitor_cache_age_rule_is_strict_and_needs_rows_and_a_read() {
+        assert_eq!(MONITOR_CACHE_MAX_AGE_MS, 1000);
+        assert!(monitor_cache_fresh(1, Some(0)));
+        assert!(monitor_cache_fresh(3, Some(MONITOR_CACHE_MAX_AGE_MS - 1)));
+        assert!(!monitor_cache_fresh(3, Some(MONITOR_CACHE_MAX_AGE_MS)));
+        assert!(!monitor_cache_fresh(3, Some(u64::MAX)));
+        assert!(!monitor_cache_fresh(0, Some(0)));
+        assert!(!monitor_cache_fresh(3, None));
+    }
+
+    #[test]
+    fn monitor_reuse_validates_only_a_fresh_table_and_needs_the_validation_to_pass() {
+        let runs = Cell::new(0);
+        let validate = |passes: bool| {
+            let runs = &runs;
+            move || {
+                runs.set(runs.get() + 1);
+                passes
+            }
+        };
+        // Stale, empty and never-read tables never reach the live validation.
+        assert!(!reuse_monitors(
+            2,
+            Some(MONITOR_CACHE_MAX_AGE_MS),
+            validate(true)
+        ));
+        assert!(!reuse_monitors(0, Some(1), validate(true)));
+        assert!(!reuse_monitors(2, None, validate(true)));
+        assert_eq!(runs.get(), 0);
+        // A fresh table is reused only when the validation passes, and is validated once.
+        assert!(reuse_monitors(2, Some(1), validate(true)));
+        assert_eq!(runs.get(), 1);
+        assert!(!reuse_monitors(2, Some(1), validate(false)));
+        assert_eq!(runs.get(), 2);
+    }
+
+    #[test]
+    fn admission_is_reused_only_for_exactly_the_admitted_key() {
+        let mut cache = AdmissionCache::default();
+        assert_eq!(cache.reuse(key(1, 2, 3, 4)), None);
+        cache.admit(admitted(1, 2, 3, 4));
+        assert_eq!(cache.reuse(key(1, 2, 3, 4)), Some(admitted(1, 2, 3, 4)));
+        // Each key field changes the decision: a new window, pid, thread or event generation.
+        for changed in [
+            key(9, 2, 3, 4),
+            key(1, 9, 3, 4),
+            key(1, 2, 9, 4),
+            key(1, 2, 3, 9),
+        ] {
+            assert_eq!(cache.reuse(changed), None, "{changed:?}");
+        }
+        // A miss does not forget the admission; the caller invalidates before the full check.
+        assert_eq!(cache.reuse(key(1, 2, 3, 4)), Some(admitted(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn admission_invalidate_and_replacement_drop_the_old_identity() {
+        let mut cache = AdmissionCache::default();
+        cache.admit(admitted(1, 2, 3, 4));
+        cache.invalidate();
+        assert_eq!(cache.reuse(key(1, 2, 3, 4)), None);
+        cache.admit(admitted(1, 2, 3, 4));
+        cache.admit(admitted(5, 6, 7, 8));
+        assert_eq!(cache.reuse(key(1, 2, 3, 4)), None);
+        assert_eq!(cache.reuse(key(5, 6, 7, 8)), Some(admitted(5, 6, 7, 8)));
+    }
+
+    #[test]
+    fn admission_never_reuses_an_incomplete_identity() {
+        for (window, process, thread, born) in
+            [(0, 2, 3, 77), (1, 0, 3, 77), (1, 2, 0, 77), (1, 2, 3, 0)]
+        {
+            let mut cache = AdmissionCache::default();
+            cache.admit(Foreground {
+                window,
+                process,
+                thread,
+                born,
+                generation: 4,
+                integrity: 0x2000,
+            });
+            assert_eq!(cache.reuse(key(window, process, thread, 4)), None);
+        }
+    }
 }

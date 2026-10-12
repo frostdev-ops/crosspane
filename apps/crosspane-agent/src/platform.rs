@@ -314,6 +314,10 @@ pub struct Platform {
     pub permissions: Box<dyn Permissions>,
     // E2 window projection
     pub windows: Option<Box<dyn WindowSource>>,
+    /// Focuses a window from the parking worker's thread, for a source whose focus call can wait
+    /// (Windows: it waits up to two seconds when the OS denies the foreground request). `None`:
+    /// the agent calls `WindowSource::activate` itself. The worker takes it when it starts.
+    pub window_activator: Option<crate::parking_worker::Activator>,
     pub parking: Option<Box<dyn WindowParking>>,
     pub frames: Option<Box<dyn FrameCapture>>,
     /// The tray / menu-bar icon (WP-1.34).
@@ -559,6 +563,660 @@ fn optional<T>(what: &str, result: Result<T, PlatformError>) -> Option<T> {
         Err(e) => {
             tracing::warn!(backend = what, error = %e, "backend unavailable");
             None
+        }
+    }
+}
+
+/// An input-capture backend that replaces itself when it reports that it is permanently lost
+/// (WP-W4.1d CAP-REBUILD).
+///
+/// The Windows backend turns every fault into a terminal state: its owner thread leaves its loop
+/// and every later request answers "observation lost". The agent builds that backend once, so
+/// without this wrapper E1 stays broken until the agent restarts. The wrapper is the capture the
+/// agent holds (`Platform::capture`); it forwards every request to the current backend and, when a
+/// request fails and the backend says it can never serve again, drops it, builds a new one through
+/// the same factory, gives it back the agent's subscription, portals and local-activity setting,
+/// and runs the request once more on it. Rebuilds are bounded (`MAX_REBUILDS` per
+/// `REBUILD_WINDOW`); beyond that the backend stays down until the window slides, with one
+/// `error!` per episode and no retry loop. The `InputCapture` contract is unchanged.
+#[cfg(any(windows, test))]
+pub(crate) mod rebuilding_capture {
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use crosspane_platform::{
+        CaptureAbort, CaptureEvent, CaptureId, CapturePortal, CaptureStart, EventSink,
+        InputCapture, PlatformError, PortalId,
+    };
+    use crosspane_types::geom::PointDevice;
+    use crosspane_types::hid::MouseButton;
+    use crosspane_types::id::DisplayId;
+
+    /// At most this many rebuilds in any `REBUILD_WINDOW`, whether they succeed or not.
+    pub(crate) const MAX_REBUILDS: usize = 3;
+    pub(crate) const REBUILD_WINDOW: Duration = Duration::from_secs(60);
+
+    /// A backend and the way to ask whether it can never serve another request.
+    pub(crate) struct Built {
+        pub(crate) backend: Box<dyn InputCapture>,
+        /// `Some(cause)` once `backend` is permanently lost. A fixed label (a fault site, never
+        /// input data). Cheap, and it must not keep the backend alive.
+        pub(crate) lost: Box<dyn Fn() -> Option<&'static str> + Send>,
+    }
+
+    /// Builds a replacement. It runs after the lost backend has been dropped, so it may wait for
+    /// that backend's native owner to let go.
+    pub(crate) type Build = Box<dyn FnMut() -> Result<Built, PlatformError> + Send>;
+
+    /// The rebuild budget: a sliding window over the times a rebuild was taken.
+    #[derive(Debug, Default)]
+    pub(crate) struct RebuildLimiter {
+        taken: VecDeque<Instant>,
+    }
+
+    impl RebuildLimiter {
+        /// Takes one rebuild at `now`. `false` once `MAX_REBUILDS` were taken within the last
+        /// `REBUILD_WINDOW`.
+        pub(crate) fn try_take(&mut self, now: Instant) -> bool {
+            while self
+                .taken
+                .front()
+                .is_some_and(|&at| now.saturating_duration_since(at) >= REBUILD_WINDOW)
+            {
+                self.taken.pop_front();
+            }
+            if self.taken.len() >= MAX_REBUILDS {
+                return false;
+            }
+            self.taken.push_back(now);
+            true
+        }
+    }
+
+    struct NoAbort;
+    impl CaptureAbort for NoAbort {
+        fn abort(&self) {}
+    }
+
+    pub(crate) struct RebuildingCapture {
+        /// `None` after a rebuild failed: the next request tries again, within the budget.
+        slot: Option<Built>,
+        build: Build,
+        limiter: RebuildLimiter,
+        now: Box<dyn Fn() -> Instant + Send>,
+        /// The exhaustion `error!` was written for this episode (reset by the next rebuild).
+        exhausted_logged: bool,
+        /// What the agent asked of the first backend, replayed on each replacement.
+        sink: Option<Arc<dyn EventSink<CaptureEvent>>>,
+        portals: Vec<CapturePortal>,
+        monitor_local_activity: bool,
+    }
+
+    impl std::fmt::Debug for RebuildingCapture {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RebuildingCapture")
+                .field("serving", &self.slot.is_some())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl RebuildingCapture {
+        pub(crate) fn new(first: Built, build: Build) -> Self {
+            Self::with_clock(first, build, Box::new(Instant::now))
+        }
+
+        pub(crate) fn with_clock(
+            first: Built,
+            build: Build,
+            now: Box<dyn Fn() -> Instant + Send>,
+        ) -> Self {
+            Self {
+                slot: Some(first),
+                build,
+                limiter: RebuildLimiter::default(),
+                now,
+                exhausted_logged: false,
+                sink: None,
+                portals: Vec::new(),
+                monitor_local_activity: false,
+            }
+        }
+
+        /// Why the current backend can never serve again; `None` while it serves.
+        fn lost(&self) -> Option<&'static str> {
+            match &self.slot {
+                Some(built) => (built.lost)(),
+                None => Some("the previous rebuild failed"),
+            }
+        }
+
+        /// Replaces a permanently lost backend, if the budget allows. `true` when a working
+        /// replacement is installed.
+        fn rebuild(&mut self) -> bool {
+            let Some(cause) = self.lost() else {
+                return false;
+            };
+            if !self.limiter.try_take((self.now)()) {
+                // The lost backend stays in place (and keeps answering with its own error).
+                if !std::mem::replace(&mut self.exhausted_logged, true) {
+                    tracing::error!(
+                        cause,
+                        max = MAX_REBUILDS,
+                        window_s = REBUILD_WINDOW.as_secs(),
+                        "capture backend lost and the rebuild limit is reached: input capture stays down"
+                    );
+                }
+                return false;
+            }
+            self.exhausted_logged = false;
+            tracing::info!(cause, "capture backend lost: rebuilding it");
+            // The lost backend goes first: its native owner must be gone before another can exist.
+            self.slot = None;
+            let rebuilt = (self.build)().and_then(|built| self.restore(built));
+            match rebuilt {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(%error, cause, "capture backend rebuild failed");
+                    false
+                }
+            }
+        }
+
+        /// Gives `built` what the agent had set up on the backend it replaces, then installs it.
+        /// The portals and the local-activity setting are best effort: the engine re-sends its
+        /// portals when its layout changes, and the first request fails visibly if they are missing.
+        fn restore(&mut self, mut built: Built) -> Result<(), PlatformError> {
+            if let Some(sink) = &self.sink {
+                built.backend.subscribe(sink.clone())?;
+            }
+            if !self.portals.is_empty()
+                && let Err(error) = built.backend.set_portals(&self.portals)
+            {
+                tracing::warn!(%error, "capture portals were not restored on the rebuilt backend");
+            }
+            if self.monitor_local_activity
+                && let Err(error) = built.backend.set_monitor_local_activity(true)
+                && !matches!(error, PlatformError::Unsupported(_))
+            {
+                tracing::warn!(%error, "local-activity monitoring was not restored on the rebuilt backend");
+            }
+            self.slot = Some(built);
+            Ok(())
+        }
+
+        /// Runs `op` on the current backend. If it fails and the backend is permanently lost, the
+        /// backend is replaced and `op` runs once more on the replacement.
+        fn run<T>(
+            &mut self,
+            op: impl Fn(&mut dyn InputCapture) -> Result<T, PlatformError>,
+        ) -> Result<T, PlatformError> {
+            let first = match self.slot.as_mut() {
+                Some(built) => match op(built.backend.as_mut()) {
+                    Ok(value) => return Ok(value),
+                    Err(error) => error,
+                },
+                None => PlatformError::Backend("capture backend unavailable".into()),
+            };
+            if self.rebuild()
+                && let Some(built) = self.slot.as_mut()
+            {
+                return op(built.backend.as_mut());
+            }
+            Err(first)
+        }
+    }
+
+    impl InputCapture for RebuildingCapture {
+        fn set_portals(&mut self, portals: &[CapturePortal]) -> Result<(), PlatformError> {
+            self.run(|backend| backend.set_portals(portals))?;
+            self.portals = portals.to_vec();
+            Ok(())
+        }
+
+        fn subscribe(
+            &mut self,
+            sink: Arc<dyn EventSink<CaptureEvent>>,
+        ) -> Result<(), PlatformError> {
+            // Called once, before anything can be lost: no rebuild here (a replacement is
+            // subscribed by `restore`, which a second `subscribe` on it would contradict).
+            let built = self
+                .slot
+                .as_mut()
+                .ok_or_else(|| PlatformError::Backend("capture backend unavailable".into()))?;
+            built.backend.subscribe(sink.clone())?;
+            self.sink = Some(sink);
+            Ok(())
+        }
+
+        fn begin(
+            &mut self,
+            id: CaptureId,
+            portal: PortalId,
+        ) -> Result<CaptureStart, PlatformError> {
+            self.run(|backend| backend.begin(id, portal))
+        }
+
+        fn begin_drag(
+            &mut self,
+            id: CaptureId,
+            portal: PortalId,
+            button: MouseButton,
+        ) -> Result<CaptureStart, PlatformError> {
+            self.run(|backend| backend.begin_drag(id, portal, button))
+        }
+
+        fn end(&mut self, warp_to: Option<(DisplayId, PointDevice)>) -> Result<(), PlatformError> {
+            self.run(|backend| backend.end(warp_to))
+        }
+
+        /// The handle of the current backend. One taken before a rebuild reaches only the backend
+        /// it was taken from, and keeps that backend's native owner from being released: the
+        /// agent takes none.
+        fn abort_handle(&self) -> Arc<dyn CaptureAbort> {
+            match &self.slot {
+                Some(built) => built.backend.abort_handle(),
+                None => Arc::new(NoAbort),
+            }
+        }
+
+        fn set_monitor_local_activity(&mut self, on: bool) -> Result<(), PlatformError> {
+            self.run(|backend| backend.set_monitor_local_activity(on))?;
+            self.monitor_local_activity = on;
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    mod tests {
+        use super::*;
+        use crosspane_platform::Edge;
+        use crosspane_types::input::LockKeys;
+        use std::collections::BTreeSet;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// What the fake backends did and which of them are lost, shared with the test.
+        #[derive(Default)]
+        struct World {
+            /// In order: "build 1", "0 drop", "1 begin 9", ...
+            events: Vec<String>,
+            /// Backends that report themselves permanently lost and refuse every request.
+            lost: BTreeSet<usize>,
+            builds: usize,
+            refuse_builds: usize,
+            refuse_subscribe: BTreeSet<usize>,
+            refuse_portals: bool,
+            sinks: Vec<(usize, Arc<dyn EventSink<CaptureEvent>>)>,
+        }
+        type Handle = Arc<Mutex<World>>;
+
+        fn world(handle: &Handle) -> std::sync::MutexGuard<'_, World> {
+            handle.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        struct Fake {
+            index: usize,
+            world: Handle,
+        }
+
+        impl Fake {
+            fn note(&self, what: &str) {
+                world(&self.world)
+                    .events
+                    .push(format!("{} {what}", self.index));
+            }
+            fn check(&self) -> Result<(), PlatformError> {
+                if world(&self.world).lost.contains(&self.index) {
+                    Err(PlatformError::Backend(
+                        "capture observation lost (test)".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        impl Drop for Fake {
+            fn drop(&mut self) {
+                self.note("drop");
+            }
+        }
+
+        impl InputCapture for Fake {
+            fn set_portals(&mut self, portals: &[CapturePortal]) -> Result<(), PlatformError> {
+                self.check()?;
+                if world(&self.world).refuse_portals {
+                    return Err(PlatformError::NotFound);
+                }
+                let ids: Vec<u32> = portals.iter().map(|p| p.id.0).collect();
+                self.note(&format!("portals {ids:?}"));
+                Ok(())
+            }
+            fn subscribe(
+                &mut self,
+                sink: Arc<dyn EventSink<CaptureEvent>>,
+            ) -> Result<(), PlatformError> {
+                if world(&self.world).refuse_subscribe.contains(&self.index) {
+                    return Err(PlatformError::Backend("subscribe refused".into()));
+                }
+                self.note("subscribe");
+                world(&self.world).sinks.push((self.index, sink));
+                Ok(())
+            }
+            fn begin(
+                &mut self,
+                id: CaptureId,
+                _portal: PortalId,
+            ) -> Result<CaptureStart, PlatformError> {
+                self.check()?;
+                self.note(&format!("begin {}", id.0));
+                Ok(CaptureStart {
+                    held_keys: Vec::new(),
+                    lock_keys: LockKeys::default(),
+                })
+            }
+            fn end(
+                &mut self,
+                warp_to: Option<(DisplayId, PointDevice)>,
+            ) -> Result<(), PlatformError> {
+                self.check()?;
+                self.note(&format!("end warp={}", warp_to.is_some()));
+                Ok(())
+            }
+            fn abort_handle(&self) -> Arc<dyn CaptureAbort> {
+                Arc::new(NoAbort)
+            }
+            fn set_monitor_local_activity(&mut self, on: bool) -> Result<(), PlatformError> {
+                self.check()?;
+                self.note(&format!("monitor {on}"));
+                Ok(())
+            }
+        }
+
+        fn built(index: usize, handle: &Handle) -> Built {
+            let probe = handle.clone();
+            Built {
+                backend: Box::new(Fake {
+                    index,
+                    world: handle.clone(),
+                }),
+                lost: Box::new(move || world(&probe).lost.contains(&index).then_some("test fault")),
+            }
+        }
+
+        /// A wrapper over backend 0 whose factory makes backends 1, 2, ..., and a clock the test
+        /// moves (milliseconds after a fixed start).
+        fn rig() -> (RebuildingCapture, Handle, Arc<AtomicU64>) {
+            let handle = Handle::default();
+            let factory = handle.clone();
+            let build: Build = Box::new(move || {
+                let index = {
+                    let mut state = world(&factory);
+                    if state.refuse_builds > 0 {
+                        state.refuse_builds -= 1;
+                        state.events.push("build refused".into());
+                        return Err(PlatformError::Backend("build refused".into()));
+                    }
+                    state.builds += 1;
+                    let index = state.builds;
+                    state.events.push(format!("build {index}"));
+                    index
+                };
+                Ok(built(index, &factory))
+            });
+            let start = Instant::now();
+            let offset = Arc::new(AtomicU64::new(0));
+            let clock = offset.clone();
+            let capture = RebuildingCapture::with_clock(
+                built(0, &handle),
+                build,
+                Box::new(move || start + Duration::from_millis(clock.load(Ordering::SeqCst))),
+            );
+            (capture, handle, offset)
+        }
+
+        fn events(handle: &Handle) -> Vec<String> {
+            world(handle).events.clone()
+        }
+
+        fn count(handle: &Handle, what: &str) -> usize {
+            world(handle)
+                .events
+                .iter()
+                .filter(|e| e.ends_with(what))
+                .count()
+        }
+
+        fn kill(handle: &Handle, index: usize) {
+            world(handle).lost.insert(index);
+        }
+
+        fn portal(id: u32) -> CapturePortal {
+            CapturePortal {
+                id: PortalId(id),
+                display: DisplayId(1),
+                edge: Edge::Right,
+                from: 0.0,
+                to: 100.0,
+            }
+        }
+
+        fn begin(capture: &mut RebuildingCapture) -> Result<CaptureStart, PlatformError> {
+            capture.begin(CaptureId(9), PortalId(1))
+        }
+
+        #[test]
+        fn a_serving_backend_is_used_as_it_is() {
+            let (mut capture, handle, _) = rig();
+            capture.set_portals(&[portal(1)]).unwrap();
+            begin(&mut capture).unwrap();
+            capture.end(None).unwrap();
+            assert_eq!(world(&handle).builds, 0);
+            assert_eq!(
+                events(&handle),
+                ["0 portals [1]", "0 begin 9", "0 end warp=false"]
+            );
+        }
+
+        #[test]
+        fn a_request_that_fails_on_a_lost_backend_rebuilds_and_runs_on_the_replacement() {
+            let (mut capture, handle, _) = rig();
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let collector = received.clone();
+            capture
+                .subscribe(Arc::new(move |event: CaptureEvent| {
+                    collector.lock().unwrap().push(event)
+                }))
+                .unwrap();
+            capture.set_portals(&[portal(1), portal(2)]).unwrap();
+            capture.set_monitor_local_activity(true).unwrap();
+            kill(&handle, 0);
+            begin(&mut capture).unwrap();
+            // The lost backend is gone before its replacement is built, and the replacement has
+            // the subscription, the portals and the monitoring setting before the request runs.
+            assert_eq!(
+                events(&handle),
+                [
+                    "0 subscribe",
+                    "0 portals [1, 2]",
+                    "0 monitor true",
+                    "0 drop",
+                    "build 1",
+                    "1 subscribe",
+                    "1 portals [1, 2]",
+                    "1 monitor true",
+                    "1 begin 9",
+                ]
+            );
+            // Its events reach the sink the agent gave the first backend.
+            let sink = world(&handle)
+                .sinks
+                .iter()
+                .find(|(index, _)| *index == 1)
+                .map(|(_, sink)| sink.clone())
+                .unwrap();
+            sink.send(CaptureEvent::KeyboardBlinded(true));
+            assert_eq!(
+                *received.lock().unwrap(),
+                [CaptureEvent::KeyboardBlinded(true)]
+            );
+            // A later request goes straight to the replacement.
+            capture.end(None).unwrap();
+            assert_eq!(world(&handle).builds, 1);
+        }
+
+        #[test]
+        fn the_new_portal_set_replaces_the_replayed_one_when_the_set_itself_is_what_failed() {
+            let (mut capture, handle, _) = rig();
+            capture.set_portals(&[portal(1)]).unwrap();
+            kill(&handle, 0);
+            capture.set_portals(&[portal(2), portal(3)]).unwrap();
+            assert_eq!(
+                events(&handle),
+                [
+                    "0 portals [1]",
+                    "0 drop",
+                    "build 1",
+                    "1 portals [1]",
+                    "1 portals [2, 3]",
+                ]
+            );
+            // The newest set is the one a later replacement gets back.
+            kill(&handle, 1);
+            capture.end(None).unwrap();
+            assert_eq!(events(&handle).last().unwrap(), "2 end warp=false");
+            assert!(events(&handle).contains(&"2 portals [2, 3]".to_string()));
+        }
+
+        #[test]
+        fn a_cleared_portal_set_and_a_monitoring_switched_off_are_not_replayed() {
+            let (mut capture, handle, _) = rig();
+            capture.set_portals(&[portal(1)]).unwrap();
+            capture.set_portals(&[]).unwrap();
+            capture.set_monitor_local_activity(true).unwrap();
+            capture.set_monitor_local_activity(false).unwrap();
+            kill(&handle, 0);
+            begin(&mut capture).unwrap();
+            let after: Vec<String> = events(&handle)
+                .into_iter()
+                .skip_while(|e| e != "build 1")
+                .collect();
+            assert_eq!(after, ["build 1", "1 begin 9"]);
+        }
+
+        #[test]
+        fn a_refused_request_on_a_serving_backend_neither_rebuilds_nor_is_remembered() {
+            let (mut capture, handle, _) = rig();
+            capture.set_portals(&[portal(1)]).unwrap();
+            world(&handle).refuse_portals = true;
+            assert!(capture.set_portals(&[portal(2)]).is_err());
+            world(&handle).refuse_portals = false;
+            assert_eq!(world(&handle).builds, 0);
+            kill(&handle, 0);
+            begin(&mut capture).unwrap();
+            assert!(events(&handle).contains(&"1 portals [1]".to_string()));
+            assert!(!events(&handle).iter().any(|e| e.contains("[2]")));
+        }
+
+        #[test]
+        fn end_after_the_loss_gives_input_back_through_the_replacement() {
+            let (mut capture, handle, _) = rig();
+            kill(&handle, 0);
+            capture
+                .end(Some((DisplayId(1), PointDevice::new(5.0, 5.0))))
+                .unwrap();
+            assert_eq!(
+                events(&handle),
+                ["0 drop", "build 1", "1 end warp=true"],
+                "the warp that the lost backend could not complete runs on the replacement"
+            );
+        }
+
+        #[test]
+        fn rebuilds_are_bounded_per_window_and_the_lost_backend_stays_once_the_budget_is_spent() {
+            let (mut capture, handle, offset) = rig();
+            for round in 0..MAX_REBUILDS {
+                kill(&handle, round);
+                begin(&mut capture).unwrap();
+                assert_eq!(world(&handle).builds, round + 1);
+            }
+            // The budget is spent: the lost backend stays, every request fails at once, and
+            // nothing is built, dropped or retried in a loop.
+            kill(&handle, MAX_REBUILDS);
+            let drops = count(&handle, "drop");
+            for _ in 0..5 {
+                assert!(begin(&mut capture).is_err());
+            }
+            assert_eq!(world(&handle).builds, MAX_REBUILDS);
+            assert_eq!(count(&handle, "drop"), drops);
+            assert!(capture.exhausted_logged, "the error is written once");
+            // Once the window has slid past the first rebuilds, one more is allowed.
+            offset.store(
+                u64::try_from(REBUILD_WINDOW.as_millis()).unwrap() + 1,
+                Ordering::SeqCst,
+            );
+            begin(&mut capture).unwrap();
+            assert_eq!(world(&handle).builds, MAX_REBUILDS + 1);
+            assert!(!capture.exhausted_logged);
+        }
+
+        #[test]
+        fn the_limiter_allows_three_per_window_and_forgets_old_rebuilds() {
+            let mut limiter = RebuildLimiter::default();
+            let t0 = Instant::now();
+            let at = |s: u64| t0 + Duration::from_secs(s);
+            assert!(limiter.try_take(at(0)));
+            assert!(limiter.try_take(at(10)));
+            assert!(limiter.try_take(at(20)));
+            assert!(!limiter.try_take(at(59)));
+            assert!(
+                limiter.try_take(at(60)),
+                "the rebuild at 0 s has left the window"
+            );
+            assert!(!limiter.try_take(at(61)));
+            assert!(
+                limiter.try_take(at(70)),
+                "the rebuild at 10 s has left the window"
+            );
+        }
+
+        #[test]
+        fn a_failed_build_leaves_no_backend_and_the_next_request_tries_again_within_the_budget() {
+            let (mut capture, handle, _) = rig();
+            world(&handle).refuse_builds = 1;
+            kill(&handle, 0);
+            let error = begin(&mut capture).unwrap_err();
+            assert!(error.to_string().contains("observation lost"), "{error}");
+            assert!(capture.slot.is_none());
+            // A request with no backend asks for one again, and that attempt is counted too.
+            begin(&mut capture).unwrap();
+            assert_eq!(world(&handle).builds, 1);
+            assert_eq!(capture.limiter.taken.len(), 2);
+        }
+
+        #[test]
+        fn a_replacement_that_cannot_subscribe_is_dropped_and_the_next_request_builds_another() {
+            let (mut capture, handle, _) = rig();
+            capture.subscribe(Arc::new(|_: CaptureEvent| {})).unwrap();
+            kill(&handle, 0);
+            world(&handle).refuse_subscribe.insert(1);
+            assert!(begin(&mut capture).is_err());
+            assert!(capture.slot.is_none());
+            assert!(events(&handle).contains(&"1 drop".to_string()));
+            begin(&mut capture).unwrap();
+            assert_eq!(world(&handle).builds, 2);
+            assert_eq!(events(&handle).last().unwrap(), "2 begin 9");
+        }
+
+        #[test]
+        fn subscribing_is_never_retried_on_a_replacement() {
+            let (mut capture, handle, _) = rig();
+            world(&handle).refuse_subscribe.insert(0);
+            kill(&handle, 0);
+            assert!(capture.subscribe(Arc::new(|_: CaptureEvent| {})).is_err());
+            assert_eq!(world(&handle).builds, 0);
         }
     }
 }
@@ -1083,6 +1741,369 @@ pub(crate) fn recover_windows_mirror_before_host(
     })
 }
 
+/// Backends the Windows agent shares between threads (WP-W4.1d AGENT-WIN).
+///
+/// The window source is used by the agent loop (catalog reads), by the parking worker (focus
+/// requests, which can wait for the OS) and by the capture's drag observer (which needs the very
+/// same source to resolve window identities). The pointer injector is used by the loop and, for
+/// each capture build, to mint the drag observer's settlement capability. Each is shared behind one
+/// mutex, and these adapters are what the agent holds as `Box<dyn ...>`.
+#[cfg(any(windows, test))]
+pub(crate) mod shared {
+    use std::sync::{Arc, Mutex, PoisonError, TryLockError};
+    use std::time::{Duration, Instant};
+
+    use crosspane_platform::{
+        EventSink, PlatformError, PointerInjector, WindowEvent, WindowInfo, WindowSource,
+    };
+    use crosspane_types::geom::PointDevice;
+    use crosspane_types::hid::MouseButton;
+    use crosspane_types::id::{DisplayId, WindowId};
+    use crosspane_types::input::ScrollDelta;
+
+    /// How long a catalog read waits for the source while a focus request holds it. The agent
+    /// loop must not wait longer: it reports the source as busy and its caller degrades.
+    const READ_WAIT: Duration = Duration::from_millis(25);
+
+    fn poisoned(what: &'static str) -> PlatformError {
+        PlatformError::Backend(what.into())
+    }
+
+    /// The agent loop's handle on a window source that other threads also hold.
+    ///
+    /// A panic in one caller (a focus request caught by the parking worker) poisons the mutex. Every
+    /// lock recovers the guard instead: the source keeps answering, and a single caught panic does
+    /// not turn every later read into a backend error.
+    pub(crate) struct SharedSource<S>(pub(crate) Arc<Mutex<S>>);
+
+    impl<S> SharedSource<S> {
+        fn read<T>(
+            &self,
+            read: impl FnOnce(&S) -> Result<T, PlatformError>,
+        ) -> Result<T, PlatformError> {
+            let deadline = Instant::now() + READ_WAIT;
+            loop {
+                match self.0.try_lock() {
+                    Ok(source) => return read(&source),
+                    Err(TryLockError::Poisoned(error)) => return read(&error.into_inner()),
+                    Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(TryLockError::WouldBlock) => return Err(PlatformError::Timeout),
+                }
+            }
+        }
+    }
+
+    impl<S: WindowSource> WindowSource for SharedSource<S> {
+        fn windows(&self) -> Result<Vec<WindowInfo>, PlatformError> {
+            self.read(|source| source.windows())
+        }
+        fn focused(&self) -> Result<Option<WindowId>, PlatformError> {
+            self.read(|source| source.focused())
+        }
+        fn activate(&mut self, window: WindowId) -> Result<(), PlatformError> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .activate(window)
+        }
+        fn subscribe(
+            &mut self,
+            sink: Arc<dyn EventSink<WindowEvent>>,
+        ) -> Result<(), PlatformError> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .subscribe(sink)
+        }
+    }
+
+    /// A focus request for the parking worker's thread: it holds the source for as long as the
+    /// source's own call takes. A poisoned source is recovered, as in `SharedSource`.
+    pub(crate) fn activator<S: WindowSource + 'static>(
+        source: Arc<Mutex<S>>,
+    ) -> crate::parking_worker::Activator {
+        Box::new(move |window| {
+            source
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .activate(window)
+        })
+    }
+
+    /// The pointer injector as the agent loop holds it, while the capture factory can still ask it
+    /// for a new drag settlement.
+    pub(crate) struct SharedPointer<P>(pub(crate) Arc<Mutex<P>>);
+
+    impl<P: PointerInjector> SharedPointer<P> {
+        fn with<T>(
+            &self,
+            call: impl FnOnce(&mut P) -> Result<T, PlatformError>,
+        ) -> Result<T, PlatformError> {
+            call(
+                &mut *self
+                    .0
+                    .lock()
+                    .map_err(|_| poisoned("pointer injector state"))?,
+            )
+        }
+    }
+
+    impl<P: PointerInjector> PointerInjector for SharedPointer<P> {
+        fn move_to(
+            &mut self,
+            display: DisplayId,
+            position: PointDevice,
+        ) -> Result<(), PlatformError> {
+            self.with(|p| p.move_to(display, position))
+        }
+        fn button(&mut self, button: MouseButton, down: bool) -> Result<(), PlatformError> {
+            self.with(|p| p.button(button, down))
+        }
+        fn scroll(&mut self, delta: ScrollDelta) -> Result<(), PlatformError> {
+            self.with(|p| p.scroll(delta))
+        }
+        fn release_all(&mut self) -> Result<(), PlatformError> {
+            self.with(|p| p.release_all())
+        }
+        fn recover_buttons(&mut self, buttons: &[MouseButton]) -> Result<(), PlatformError> {
+            self.with(|p| p.recover_buttons(buttons))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::mpsc;
+
+        #[derive(Default)]
+        struct Source {
+            activated: Vec<WindowId>,
+        }
+        impl WindowSource for Source {
+            fn windows(&self) -> Result<Vec<WindowInfo>, PlatformError> {
+                Ok(Vec::new())
+            }
+            fn focused(&self) -> Result<Option<WindowId>, PlatformError> {
+                Ok(Some(WindowId(9)))
+            }
+            fn activate(&mut self, window: WindowId) -> Result<(), PlatformError> {
+                // WindowId(13) stands in for an OS call that panics while the source is held.
+                assert_ne!(window, WindowId(13), "fixture: activation panics");
+                self.activated.push(window);
+                Ok(())
+            }
+            fn subscribe(
+                &mut self,
+                _: Arc<dyn EventSink<WindowEvent>>,
+            ) -> Result<(), PlatformError> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn a_read_waits_a_bounded_time_for_a_focus_request_and_then_reports_busy() {
+            let source = Arc::new(Mutex::new(Source::default()));
+            let shared = SharedSource(source.clone());
+            assert_eq!(shared.focused().unwrap(), Some(WindowId(9)));
+            // A holder stands in for a focus request that waits for the OS.
+            let (held, holding) = mpsc::channel();
+            let (release, released) = mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                let _guard = source.lock().unwrap();
+                held.send(()).unwrap();
+                released.recv().unwrap();
+            });
+            holding.recv_timeout(Duration::from_secs(1)).unwrap();
+            let started = Instant::now();
+            assert!(matches!(shared.windows(), Err(PlatformError::Timeout)));
+            assert!(matches!(shared.focused(), Err(PlatformError::Timeout)));
+            assert!(started.elapsed() < Duration::from_secs(1));
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            assert!(shared.windows().unwrap().is_empty());
+        }
+
+        #[test]
+        fn the_activator_and_the_loops_handle_reach_the_same_source() {
+            let source = Arc::new(Mutex::new(Source::default()));
+            let mut activate = activator(source.clone());
+            let mut shared = SharedSource(source.clone());
+            activate(WindowId(3)).unwrap();
+            shared.activate(WindowId(4)).unwrap();
+            assert_eq!(source.lock().unwrap().activated, [WindowId(3), WindowId(4)]);
+            let poisoner = source.clone();
+            let _ = std::thread::spawn(move || {
+                let _guard = poisoner.lock().unwrap();
+                panic!("fixture: poison the source");
+            })
+            .join();
+            // The poisoned source still answers its reads and still takes focus requests.
+            assert!(shared.windows().unwrap().is_empty());
+            assert_eq!(shared.focused().unwrap(), Some(WindowId(9)));
+            activate(WindowId(5)).unwrap();
+            shared.activate(WindowId(6)).unwrap();
+            assert_eq!(
+                source
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .activated,
+                [WindowId(3), WindowId(4), WindowId(5), WindowId(6)]
+            );
+        }
+
+        #[test]
+        fn a_caught_activation_panic_leaves_the_window_source_usable() {
+            let source = Arc::new(Mutex::new(Source::default()));
+            let mut activate = activator(source.clone());
+            let shared = SharedSource(source.clone());
+            // The parking worker catches the panic and keeps running.
+            let caught =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| activate(WindowId(13))));
+            assert!(caught.is_err());
+            // The next read succeeds, with no busy or backend error, and so does the next focus.
+            assert_eq!(shared.focused().unwrap(), Some(WindowId(9)));
+            assert!(shared.windows().unwrap().is_empty());
+            activate(WindowId(3)).unwrap();
+            assert_eq!(
+                source
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .activated,
+                [WindowId(3)]
+            );
+        }
+
+        #[derive(Default)]
+        struct Pointer {
+            calls: AtomicU32,
+        }
+        impl PointerInjector for Pointer {
+            fn move_to(&mut self, _: DisplayId, _: PointDevice) -> Result<(), PlatformError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn button(&mut self, _: MouseButton, _: bool) -> Result<(), PlatformError> {
+                self.calls.fetch_add(10, Ordering::SeqCst);
+                Ok(())
+            }
+            fn scroll(&mut self, _: ScrollDelta) -> Result<(), PlatformError> {
+                Ok(())
+            }
+            fn release_all(&mut self) -> Result<(), PlatformError> {
+                self.calls.fetch_add(100, Ordering::SeqCst);
+                Ok(())
+            }
+            fn recover_buttons(&mut self, _: &[MouseButton]) -> Result<(), PlatformError> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn the_shared_pointer_forwards_to_the_injector_the_factory_also_holds() {
+            let inner = Arc::new(Mutex::new(Pointer::default()));
+            let mut shared = SharedPointer(inner.clone());
+            shared
+                .move_to(DisplayId(1), PointDevice::new(1.0, 2.0))
+                .unwrap();
+            shared.button(MouseButton::PRIMARY, true).unwrap();
+            shared.release_all().unwrap();
+            assert_eq!(inner.lock().unwrap().calls.load(Ordering::SeqCst), 111);
+        }
+    }
+}
+
+/// The two backends the capture's drag observer needs besides the gate: the window source it
+/// resolves identities through, and the pointer injector it mints a settlement capability from.
+/// A capture owns its observer's configuration, so each build (the first and every rebuild)
+/// makes a new one from these.
+#[cfg(windows)]
+#[derive(Clone)]
+struct DragWiring {
+    source: Arc<std::sync::Mutex<crosspane_platform_windows::window::WindowsWindowSource>>,
+    pointer: Arc<std::sync::Mutex<crosspane_platform_windows::inject::WindowsPointerInjector>>,
+}
+
+#[cfg(windows)]
+impl DragWiring {
+    fn config(&self) -> Result<crosspane_platform_windows::drag::DragConfig, PlatformError> {
+        // The configuration reads the source without waiting. A focus request holding it makes
+        // that fail for a moment, so a few short retries, not an immediate loss of drag. Each try
+        // mints its own settlement capability: `DragConfig::new` consumes it either way.
+        let mut last = PlatformError::Timeout;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let settlement = self
+                .pointer
+                .lock()
+                .map_err(|_| PlatformError::Backend("pointer injector state".into()))?
+                .drag_settlement();
+            match crosspane_platform_windows::drag::DragConfig::new(self.source.clone(), settlement)
+            {
+                Ok(config) => return Ok(config),
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
+    }
+}
+
+/// How long a rebuild waits for a lost capture backend's native owner to let go of the
+/// process-wide owner slot. A dead owner removes its hooks and ends its helper threads within tens
+/// of milliseconds; one still containing the tail of a physical drag does not, and that rebuild
+/// then fails and counts against the budget.
+#[cfg(windows)]
+const CAPTURE_OWNER_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// One Windows capture backend with its health handle. Both the first build (the startup
+/// observation) and each rebuild (a fresh one) go through here, with the same gate and the same
+/// monitor refresh, which `set_portals` re-reads the monitor table through (WP-W1.11 G2).
+#[cfg(windows)]
+fn build_windows_capture(
+    gate: &Arc<IoGate>,
+    probes: &[crosspane_platform_windows::model::geometry::MonitorProbe],
+    ids: &mut crosspane_platform_windows::model::geometry::DisplayIds,
+    refresh: &crosspane_platform_windows::inject::MonitorRefresh,
+    drag: Option<&DragWiring>,
+) -> Result<rebuilding_capture::Built, PlatformError> {
+    use crosspane_platform_windows::capture::WindowsCapture;
+    // With `drag`, the capture also detects a window being dragged by its title bar against a
+    // portal (`InputCapture::begin_drag`). Detection is an addition: if the capture cannot be
+    // built with it, it is built without, and E1 keeps working.
+    let capture = match drag.map(DragWiring::config) {
+        Some(Ok(config)) => {
+            match WindowsCapture::new_with_drag(gate.clone(), probes, ids, config) {
+                Ok(capture) => capture,
+                Err(error) => {
+                    tracing::warn!(%error, "drag detection unavailable: capture without it");
+                    // A capture that failed to start is gone once its owner lets go.
+                    if !crosspane_platform_windows::capture::wait_owner_released(
+                        CAPTURE_OWNER_RELEASE_WAIT,
+                    ) {
+                        return Err(error);
+                    }
+                    WindowsCapture::new(gate.clone(), probes, ids)?
+                }
+            }
+        }
+        Some(Err(error)) => {
+            tracing::warn!(%error, "drag detection unavailable: capture without it");
+            WindowsCapture::new(gate.clone(), probes, ids)?
+        }
+        None => WindowsCapture::new(gate.clone(), probes, ids)?,
+    }
+    .with_monitor_refresh(refresh.clone());
+    let health = capture.health();
+    Ok(rebuilding_capture::Built {
+        backend: Box::new(capture),
+        lost: Box::new(move || health.lost()),
+    })
+}
+
 #[cfg(windows)]
 pub fn create(
     state_dir: &std::path::Path,
@@ -1091,8 +2112,8 @@ pub fn create(
 ) -> anyhow::Result<Platform> {
     use anyhow::Context;
     use crosspane_platform_windows::{
-        capture::WindowsCapture, displays::WindowsDisplays, frame_capture::WindowsFrameCapture,
-        inject, link::WindowsLinkInfo, overlay::WindowsOverlay, permissions::WindowsPermissions,
+        displays::WindowsDisplays, frame_capture::WindowsFrameCapture, inject,
+        link::WindowsLinkInfo, overlay::WindowsOverlay, permissions::WindowsPermissions,
         session::WindowsSession, tray::WindowsTray, window::WindowsWindowSource,
     };
     let e1_only = acceptance_e1(state_dir, config)?;
@@ -1109,17 +2130,8 @@ pub fn create(
     let placement_rows = windows_placement_rows(displays.monitor_refresh());
     let host_placement_mapping = Some(windows_placement_mapping(placement_rows.clone()));
     let mut ids = snapshot.ids;
-    let capture = if source_only {
-        None
-    } else {
-        // set_portals re-reads the monitor table through this refresh (WP-W1.11 G2).
-        optional(
-            "capture",
-            WindowsCapture::new(gate.clone(), &snapshot.probes, &mut ids)
-                .map(|capture| capture.with_monitor_refresh(displays.monitor_refresh())),
-        )
-        .map(|backend| Box::new(backend) as Box<dyn InputCapture>)
-    };
+    // The injectors and the window source come before the capture: the capture's drag observer is
+    // built from both (`DragWiring`), and so is every rebuilt capture.
     let injectors = if source_only {
         None
     } else {
@@ -1136,7 +2148,7 @@ pub fn create(
     let (keys, pointer) = match injectors {
         Some((keys, pointer)) => (
             Some(Box::new(keys) as Box<dyn KeyInjector>),
-            Some(Box::new(pointer) as Box<dyn PointerInjector>),
+            Some(Arc::new(std::sync::Mutex::new(pointer))),
         ),
         None => (None, None),
     };
@@ -1163,35 +2175,67 @@ pub fn create(
                 .context("Windows window source (required for mirror recovery binding)")?,
         )
     };
-    let parking = if let Some(windows) = windows.as_ref() {
+    // The resolvers read the source's identity table without the source; take them before the
+    // source is shared behind its mutex.
+    let resolver = windows.as_ref().map(WindowsWindowSource::resolver);
+    let windows = windows.map(|source| Arc::new(std::sync::Mutex::new(source)));
+    // Detecting a window dragged across a portal needs the real source and the real injector, and
+    // is for the normal agent only (the isolated acceptance modes have neither).
+    let drag = windows
+        .as_ref()
+        .zip(pointer.as_ref())
+        .filter(|_| !scratch_only)
+        .map(|(source, pointer)| DragWiring {
+            source: source.clone(),
+            pointer: pointer.clone(),
+        });
+    let capture = if source_only {
+        None
+    } else {
+        let refresh = displays.monitor_refresh();
+        optional(
+            "capture",
+            build_windows_capture(&gate, &snapshot.probes, &mut ids, &refresh, drag.as_ref()),
+        )
+        .map(|first| {
+            // A backend that reports itself permanently lost is dropped and built again through
+            // the same factory, from a fresh observation of the monitors and once its native
+            // owner has let go (WP-W4.1d CAP-REBUILD; bounded in `rebuilding_capture`). The
+            // replacement gets the same drag wiring as the first backend.
+            let (gate, refresh) = (gate.clone(), refresh.clone());
+            let build: rebuilding_capture::Build = Box::new(move || {
+                if !crosspane_platform_windows::capture::wait_owner_released(
+                    CAPTURE_OWNER_RELEASE_WAIT,
+                ) {
+                    return Err(PlatformError::Backend(
+                        "the lost capture owner has not released yet".into(),
+                    ));
+                }
+                let (probes, mut ids) = refresh()?;
+                build_windows_capture(&gate, &probes, &mut ids, &refresh, drag.as_ref())
+            });
+            Box::new(rebuilding_capture::RebuildingCapture::new(first, build))
+                as Box<dyn InputCapture>
+        })
+    };
+    let parking = if let Some(resolver) = resolver.as_ref() {
         use crosspane_platform_windows::{drag::WindowsRestorePlacer, model::drag::PlacedRestore};
         recovered
             .parking
-            .bind_source(
-                windows.resolver(),
-                displays.ids(),
-                displays.monitor_reader(),
-            )
+            .bind_source(resolver.clone(), displays.ids(), displays.monitor_reader())
             .context("Windows mirror source binding (required)")?;
         // DRAG-v0 D-6 placed return decorates the final stack. The decorator needs the concrete
         // stack, so each arm wraps and then boxes its own; a boxed mirror cannot be wrapped.
-        let placer = WindowsRestorePlacer::new(
-            windows.resolver(),
-            displays.ids(),
-            displays.monitor_reader(),
-        );
+        let placer =
+            WindowsRestorePlacer::new(resolver.clone(), displays.ids(), displays.monitor_reader());
         let report: Box<dyn Fn(&PlatformError) + Send> = Box::new(|error: &PlatformError| {
             tracing::warn!(%error, "restored window placement refused; restore remains successful");
         });
         match recovered.twin.take() {
             // Scratch modes keep M1 alone.
             Some(mut twin) if !scratch_only => {
-                twin.bind_source(
-                    windows.resolver(),
-                    displays.ids(),
-                    displays.monitor_reader(),
-                )
-                .context("Windows twin parking source binding (required)")?;
+                twin.bind_source(resolver.clone(), displays.ids(), displays.monitor_reader())
+                    .context("Windows twin parking source binding (required)")?;
                 let stack =
                     crate::twin::TwinOrMirror::new(Box::new(twin), Box::new(recovered.parking));
                 let placed = PlacedRestore::new(stack, placer, report);
@@ -1205,16 +2249,16 @@ pub fn create(
     } else {
         None
     };
-    let frames = windows.as_ref().and_then(|windows| {
+    let frames = resolver.as_ref().and_then(|resolver| {
         optional(
             "frame capture",
             if source_only {
                 // The owned source permits per-window WGC only, never the VM's monitor.
-                WindowsFrameCapture::new(gate.clone(), windows.resolver())
+                WindowsFrameCapture::new(gate.clone(), resolver.clone())
             } else {
                 WindowsFrameCapture::new_with_monitor_reader(
                     gate.clone(),
-                    windows.resolver(),
+                    resolver.clone(),
                     displays.monitor_snapshot_reader(),
                 )
             },
@@ -1230,6 +2274,11 @@ pub fn create(
     } else {
         None
     };
+    // The OS can deny a foreground request and the source then waits for it for up to two
+    // seconds: that wait belongs on the parking worker, not on the agent loop.
+    let window_activator = windows
+        .as_ref()
+        .map(|source| shared::activator(source.clone()));
     Ok(Platform {
         gate,
         session: Box::new(session),
@@ -1238,7 +2287,8 @@ pub fn create(
         displays: Box::new(displays),
         capture,
         keys,
-        pointer,
+        pointer: pointer
+            .map(|backend| Box::new(shared::SharedPointer(backend)) as Box<dyn PointerInjector>),
         overlay,
         // Startup constructs and subscribes this required observer after the host has
         // relinquished winit's keyboard/mouse registrations. A failure aborts startup.
@@ -1247,7 +2297,9 @@ pub fn create(
         // Nothing to grant on Windows (v0).
         // required=[] is benign in the agent: no OS request/subscription, notice or retry.
         permissions: Box::new(WindowsPermissions),
-        windows: windows.map(|backend| Box::new(backend) as Box<dyn WindowSource>),
+        windows: windows
+            .map(|source| Box::new(shared::SharedSource(source)) as Box<dyn WindowSource>),
+        window_activator,
         parking,
         frames: frames.map(|backend| Box::new(backend) as Box<dyn FrameCapture>),
         tray: optional("tray", WindowsTray::new())
@@ -1642,6 +2694,7 @@ pub fn create(
         keystore: keystore(),
         permissions: Box::new(LinuxPermissions),
         windows: windows.map(|w| Box::new(w) as Box<dyn WindowSource>),
+        window_activator: None,
         parking,
         frames: frames.map(|f| Box::new(f) as Box<dyn FrameCapture>),
         links: Some(Box::new(
@@ -1756,6 +2809,7 @@ pub fn create(
         // Microphone is required while audio is on: the speaker loopback input is gated by it.
         permissions: Box::new(MacPermissions::new(audio_enabled())),
         windows: windows.map(|w| Box::new(w) as Box<dyn WindowSource>),
+        window_activator: None,
         parking,
         frames: frames.map(|f| Box::new(f) as Box<dyn FrameCapture>),
         tray: Some(Box::new(crosspane_platform_macos::tray::MacTray::new())),

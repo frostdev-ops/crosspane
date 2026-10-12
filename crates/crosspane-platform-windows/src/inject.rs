@@ -4,7 +4,9 @@
 //! `[P]` P9d: read-only foreground/token checks cannot atomically bind SendInput to a HWND.
 //! Cleanup ups intentionally reach the current foreground. No activation or UIPI bypass is used.
 //! `[P]` An owned WinEvent/message/repeat thread detects foreground ABA and gate epochs.
-//! `[U]` Event delivery can lag; fresh foreground/PID/start/token checks also precede submissions.
+//! `[U]` Event delivery can lag; a fresh foreground HWND/PID/thread/generation read also precedes
+//! each submission. The process start time and token integrity are read once per such identity
+//! and reused only while it is unchanged; any change, or a refusal, runs the full check again.
 //! `[U]` Native-call stalls and arbitrary application/IME delivery remain outside submission proof.
 //! `[P]` Lock bits come only from a fresh, settled owned-thread snapshot, else they stay unknown.
 
@@ -14,8 +16,8 @@ use crate::model::{
     geometry::{DisplayIds, MonitorProbe, displays},
     hook::DragSettlementResult,
     inject::{
-        Driver, Foreground, InjectionPort, LocalSettlementOutcome, Packet, RepeatSettings,
-        ScrollSettings, absolute_move,
+        AdmissionCache, AdmissionKey, Driver, Foreground, InjectionPort, LocalSettlementOutcome,
+        Packet, RepeatSettings, ScrollSettings, absolute_move, reuse_monitors,
     },
 };
 use crosspane_platform::{
@@ -33,7 +35,7 @@ use std::{
     mem::size_of,
     ptr::{null, null_mut},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -76,11 +78,14 @@ impl Drop for Handle {
     }
 }
 
-fn integrity(process: HANDLE) -> Result<u32, PlatformError> {
+/// Token integrity RID of `process` (0x2000 medium, 0x3000 high), or `None` when it cannot be read.
+/// The one token reader for this crate: the injector's admission and the capture's foreground
+/// classification both refuse an unreadable token the same way.
+fn token_integrity(process: HANDLE) -> Option<u32> {
     let mut token = null_mut();
     // SAFETY: read-only query, valid process handle and initialized output storage.
     if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
-        return Err(PlatformError::SecureInput);
+        return None;
     }
     let token = Handle(token);
     let mut needed = 0;
@@ -89,7 +94,7 @@ fn integrity(process: HANDLE) -> Result<u32, PlatformError> {
         GetTokenInformation(token.0, TokenIntegrityLevel, null_mut(), 0, &mut needed);
     }
     if needed < size_of::<TOKEN_MANDATORY_LABEL>() as u32 || needed > 4096 {
-        return Err(PlatformError::SecureInput);
+        return None;
     }
     // usize storage provides pointer alignment for TOKEN_MANDATORY_LABEL and its SID.
     let mut buffer = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
@@ -103,7 +108,7 @@ fn integrity(process: HANDLE) -> Result<u32, PlatformError> {
             &mut needed,
         ) == 0
         {
-            return Err(PlatformError::SecureInput);
+            return None;
         }
         let label = &*(buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>());
         let sid = label.Label.Sid;
@@ -111,7 +116,7 @@ fn integrity(process: HANDLE) -> Result<u32, PlatformError> {
         let end = start + buffer.len() * size_of::<usize>();
         let address = sid as usize;
         if address < start || address.checked_add(8).is_none_or(|a| a > end) {
-            return Err(PlatformError::SecureInput);
+            return None;
         }
         let count = *GetSidSubAuthorityCount(sid);
         if count == 0
@@ -120,25 +125,47 @@ fn integrity(process: HANDLE) -> Result<u32, PlatformError> {
                 .is_none_or(|a| a > end)
             || IsValidSid(sid) == 0
         {
-            return Err(PlatformError::SecureInput);
+            return None;
         }
-        Ok(*GetSidSubAuthority(sid, u32::from(count - 1)))
+        Some(*GetSidSubAuthority(sid, u32::from(count - 1)))
     }
 }
 
-fn foreground(generation: &AtomicU64) -> Result<Foreground, PlatformError> {
-    let before = generation.load(Ordering::Acquire);
-    // SAFETY: read-only Win32 identity queries; no titles or content are acquired.
+/// `token_integrity` for the injector's admission reads, where an unreadable token is refused.
+fn integrity(process: HANDLE) -> Result<u32, PlatformError> {
+    token_integrity(process).ok_or(PlatformError::SecureInput)
+}
+
+/// Token integrity RID of process `pid`, or `None` when it cannot be opened or its token read.
+pub(crate) fn process_integrity(pid: u32) -> Option<u32> {
+    // SAFETY: read-only limited-information open; the RAII handle is closed on every exit and no
+    // titles or content are acquired.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let process = Handle(process);
+    token_integrity(process.0)
+}
+
+/// This process's own token integrity. Fixed for the life of a process, so a success is kept; a
+/// failure is not, and reads as unknown (fail closed).
+pub(crate) fn own_integrity() -> Option<u32> {
+    static OWN: OnceLock<u32> = OnceLock::new();
+    if let Some(rid) = OWN.get() {
+        return Some(*rid);
+    }
+    // SAFETY: GetCurrentProcess is a pseudo-handle that needs no closing.
+    let rid = token_integrity(unsafe { GetCurrentProcess() })?;
+    Some(*OWN.get_or_init(|| rid))
+}
+
+/// The full admission read of one foreground process: opens it once, reads its creation time and
+/// token integrity, and refuses an integrity above our own. Returns `(born, integrity)`.
+fn admit_process(pid: u32) -> Result<(u64, u32), PlatformError> {
+    // SAFETY: read-only Win32 process queries; the RAII handle is closed on every exit and no
+    // titles or content are acquired.
     unsafe {
-        let window = GetForegroundWindow();
-        if window.is_null() {
-            return Err(PlatformError::SecureInput);
-        }
-        let mut pid = 0;
-        let thread = GetWindowThreadProcessId(window, &mut pid);
-        if pid == 0 || thread == 0 {
-            return Err(PlatformError::SecureInput);
-        }
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if process.is_null() {
             return Err(PlatformError::SecureInput);
@@ -155,22 +182,69 @@ fn foreground(generation: &AtomicU64) -> Result<Foreground, PlatformError> {
         if rid > integrity(GetCurrentProcess())? {
             return Err(PlatformError::SecureInput);
         }
+        Ok((
+            (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime),
+            rid,
+        ))
+    }
+}
+
+/// Reads the foreground identity. The window, pid, thread and event generation are read on every
+/// call, and a null foreground (a secure desktop or no window) is refused on every call. The
+/// process creation time and token integrity are the expensive part: they are read once by
+/// `admit_process` and reused from `admitted` only while that exact identity is unchanged. Any
+/// key change or refusal empties `admitted`, so a refusal is never reused and a different
+/// window or process always runs the full check.
+fn foreground(
+    generation: &AtomicU64,
+    admitted: &mut AdmissionCache,
+) -> Result<Foreground, PlatformError> {
+    let before = generation.load(Ordering::Acquire);
+    // SAFETY: read-only Win32 identity queries; no titles or content are acquired.
+    unsafe {
+        let window = GetForegroundWindow();
+        if window.is_null() {
+            admitted.invalidate();
+            return Err(PlatformError::SecureInput);
+        }
+        let mut pid = 0;
+        let thread = GetWindowThreadProcessId(window, &mut pid);
+        if pid == 0 || thread == 0 {
+            admitted.invalidate();
+            return Err(PlatformError::SecureInput);
+        }
+        let key = AdmissionKey {
+            window: window as u64,
+            process: pid,
+            thread,
+            generation: before,
+        };
+        let observed = match admitted.reuse(key) {
+            Some(cached) => cached,
+            None => {
+                admitted.invalidate();
+                let (born, rid) = admit_process(pid)?;
+                Foreground {
+                    window: key.window,
+                    process: pid,
+                    thread,
+                    born,
+                    generation: before,
+                    integrity: rid,
+                }
+            }
+        };
         let mut after_pid = 0;
         if GetForegroundWindow() != window
             || GetWindowThreadProcessId(window, &mut after_pid) != thread
             || after_pid != pid
             || generation.load(Ordering::Acquire) != before
         {
+            admitted.invalidate();
             return Err(PlatformError::SecureInput);
         }
-        Ok(Foreground {
-            window: window as u64,
-            process: pid,
-            thread,
-            born: (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime),
-            generation: before,
-            integrity: rid,
-        })
+        admitted.admit(observed);
+        Ok(observed)
     }
 }
 
@@ -251,6 +325,11 @@ struct NativePort {
     probes: Vec<MonitorProbe>,
     ids: DisplayIds,
     refresh: MonitorRefresh,
+    /// When `probes` and `ids` were requested from `refresh`. `None` until the first move and
+    /// after any failed move, so such a table is never reused; see `plan_move`.
+    monitors_read: Option<Instant>,
+    /// The last foreground admitted by the full process and token check; see `foreground`.
+    admitted: AdmissionCache,
     locks: Arc<LockSnapshot>,
     /// Time of our most recent lock-scan submit, set before SendInput; `None` until one happens.
     lock_submit_ms: Option<u64>,
@@ -279,7 +358,47 @@ impl NativePort {
         if let Some(observer) = &mut self.observer {
             return observer();
         }
-        foreground(&self.generation)
+        foreground(&self.generation, &mut self.admitted)
+    }
+    /// Same read, but always through the full process and token check. Only the rare drag
+    /// settlement uses it for its identity fences; the per-event paths reuse an unchanged admission.
+    fn observe_fresh(&mut self) -> Result<Foreground, PlatformError> {
+        self.admitted.invalidate();
+        self.observe()
+    }
+    /// Resolves one absolute move. A monitor table read less than `MONITOR_CACHE_MAX_AGE_MS` ago
+    /// is reused only if the move resolves against it and it still matches the live monitors
+    /// (`validate_monitors`: same count, device names and rectangles). Anything else, including
+    /// no table yet, drops the cache and reads the monitors fresh exactly once; a failure on that
+    /// fresh read is returned, never retried. Every failure leaves the cache empty.
+    fn plan_move(
+        &mut self,
+        display: DisplayId,
+        position: PointDevice,
+    ) -> Result<Packet, PlatformError> {
+        let age_ms = self
+            .monitors_read
+            .map(|read| read.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+        let (probes, ids) = (&self.probes, &mut self.ids);
+        let mut cached = None;
+        let reused = reuse_monitors(probes.len(), age_ms, || {
+            cached = absolute_move(probes, ids, display, position)
+                .ok()
+                .map(|(packet, _)| packet);
+            cached.is_some() && validate_monitors(probes).is_ok()
+        });
+        if let Some(packet) = cached.filter(|_| reused) {
+            return Ok(packet);
+        }
+        self.monitors_read = None;
+        let requested = Instant::now();
+        let (probes, ids) = (self.refresh)()?;
+        self.probes = probes;
+        self.ids = ids;
+        let (packet, _) = absolute_move(&self.probes, &mut self.ids, display, position)?;
+        validate_monitors(&self.probes)?;
+        self.monitors_read = Some(requested);
+        Ok(packet)
     }
 }
 impl InjectionPort for NativePort {
@@ -626,7 +745,7 @@ impl DragSettlement {
         if nonce == 0 || nonce == driver.port().tag {
             return Err(unavailable());
         }
-        let expected = driver.port_mut().observe()?;
+        let expected = driver.port_mut().observe_fresh()?;
         if [
             expected.window,
             u64::from(expected.process),
@@ -647,7 +766,7 @@ impl DragSettlement {
                 // after entering SendInput is ever translated into a resend obligation.
                 let refused = if !port.gate.is_open() || port.gate.epoch() != epoch {
                     Some(PlatformError::Locked)
-                } else if !port.observe().is_ok_and(|f| f == expected) {
+                } else if !port.observe_fresh().is_ok_and(|f| f == expected) {
                     Some(PlatformError::SecureInput)
                 } else if !port.gate.is_open() || port.gate.epoch() != epoch {
                     Some(PlatformError::Locked)
@@ -747,6 +866,8 @@ mod drag_tests {
             probes: Vec::new(),
             ids: DisplayIds::default(),
             refresh: Arc::new(|| Err(PlatformError::NotFound)),
+            monitors_read: None,
+            admitted: AdmissionCache::default(),
             locks: Arc::new(LockSnapshot::new(Instant::now())),
             lock_submit_ms: None,
             owned_fixture: None,
@@ -994,6 +1115,10 @@ pub fn injectors(
         probes: probes.to_vec(),
         ids: ids.clone(),
         refresh,
+        // The caller's snapshot only validates the supplied geometry here; the first move reads
+        // the monitors fresh.
+        monitors_read: None,
+        admitted: AdmissionCache::default(),
         locks: locks.clone(),
         lock_submit_ms: None,
         #[cfg(test)]
@@ -1095,12 +1220,7 @@ impl KeyInjector for WindowsKeyInjector {
 impl PointerInjector for WindowsPointerInjector {
     fn move_to(&mut self, display: DisplayId, position: PointDevice) -> Result<(), PlatformError> {
         let mut driver = lock(&self.0.shared.driver)?;
-        let port = driver.port_mut();
-        let (probes, ids) = (port.refresh)()?;
-        port.probes = probes;
-        port.ids = ids;
-        let (packet, _) = absolute_move(&port.probes, &mut port.ids, display, position)?;
-        validate_monitors(&port.probes)?;
+        let packet = driver.port_mut().plan_move(display, position)?;
         driver.submit_guarded(packet)
     }
     fn button(&mut self, button: MouseButton, down: bool) -> Result<(), PlatformError> {
@@ -1176,6 +1296,285 @@ fn validate_monitors(probes: &[MonitorProbe]) -> Result<(), PlatformError> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    /// The live monitors at scale 1, so the cached-table validation matches them. `None` when
+    /// the process has no display session to enumerate (the tests then skip).
+    fn live_probes() -> Option<Vec<MonitorProbe>> {
+        let mut observed = Vec::<MONITORINFOEXW>::new();
+        // SAFETY: the same read-only enumeration as `validate_monitors`; PMv2 scope is restored
+        // on every exit and the callback borrows the vector that outlives the call.
+        let result = unsafe {
+            let old = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            if old.is_null() {
+                return None;
+            }
+            let result = EnumDisplayMonitors(
+                null_mut(),
+                null(),
+                Some(monitor_callback),
+                (&mut observed as *mut Vec<_>) as isize,
+            );
+            SetThreadDpiAwarenessContext(old);
+            result
+        };
+        if result == 0 || observed.is_empty() {
+            return None;
+        }
+        Some(
+            observed
+                .iter()
+                .map(|info| {
+                    let end = info
+                        .szDevice
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(info.szDevice.len());
+                    let name = String::from_utf16_lossy(&info.szDevice[..end]);
+                    let (m, w) = (info.monitorInfo.rcMonitor, info.monitorInfo.rcWork);
+                    MonitorProbe {
+                        device_path: name.clone(),
+                        name,
+                        rc_monitor: [m.left, m.top, m.right, m.bottom],
+                        rc_work: [w.left, w.top, w.right, w.bottom],
+                        primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+                        dpi: 96,
+                        refresh_millihz: 60_000,
+                        edid: None,
+                        twin: false,
+                        quarter_turns: 0,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    fn port(refresh: MonitorRefresh) -> NativePort {
+        NativePort {
+            gate: IoGate::new(),
+            generation: Arc::new(AtomicU64::new(0)),
+            expected: None,
+            expected_gate_epoch: 0,
+            cancel: Arc::new(AtomicU64::new(0)),
+            repeat_fence: None,
+            repeat_owner: 0,
+            tag: 0,
+            probes: Vec::new(),
+            ids: DisplayIds::default(),
+            refresh,
+            monitors_read: None,
+            admitted: AdmissionCache::default(),
+            locks: Arc::new(LockSnapshot::new(Instant::now())),
+            lock_submit_ms: None,
+            owned_fixture: None,
+            submitted: 0,
+            observer: None,
+            sender: None,
+            tainted: None,
+        }
+    }
+
+    struct Fixture {
+        calls: Arc<AtomicU32>,
+        mode: Arc<AtomicU32>,
+        port: NativePort,
+        display: DisplayId,
+    }
+    /// A port whose refresh counts calls and behaves per `mode`: 0 returns the live table, 1
+    /// fails with `Timeout`, 2 returns a table that no longer matches the live monitors.
+    fn fixture() -> Option<Fixture> {
+        let live = live_probes()?;
+        let mut ids = DisplayIds::default();
+        let display = ids
+            .assign(&live.iter().find(|p| p.primary)?.device_path)
+            .ok()?;
+        for probe in &live {
+            ids.assign(&probe.device_path).ok()?;
+        }
+        // A table that does not resolve a move against itself, such as an overlapping layout,
+        // cannot exercise the cache. Checked here so the refresh below counts only the port's calls.
+        absolute_move(&live, &mut ids.clone(), display, PointDevice::new(5.0, 5.0)).ok()?;
+        let calls = Arc::new(AtomicU32::new(0));
+        let mode = Arc::new(AtomicU32::new(0));
+        let (counted, selected) = (calls.clone(), mode.clone());
+        let refresh: MonitorRefresh = Arc::new(move || {
+            counted.fetch_add(1, Ordering::AcqRel);
+            match selected.load(Ordering::Acquire) {
+                0 => Ok((live.clone(), ids.clone())),
+                1 => Err(PlatformError::Timeout),
+                _ => {
+                    let mut skewed = live.clone();
+                    skewed[0].rc_monitor[2] += 1;
+                    Ok((skewed, ids.clone()))
+                }
+            }
+        });
+        Some(Fixture {
+            calls,
+            mode,
+            port: port(refresh),
+            display,
+        })
+    }
+    fn at(x: f64) -> PointDevice {
+        PointDevice::new(x, 5.0)
+    }
+    fn skip() {
+        eprintln!("skipped: no enumerable display session for the monitor cache fixture");
+    }
+
+    #[test]
+    fn move_reads_the_monitors_first_then_reuses_a_validated_table() {
+        let Some(mut f) = fixture() else {
+            return skip();
+        };
+        let first = f.port.plan_move(f.display, at(5.0)).unwrap();
+        assert_eq!(f.calls.load(Ordering::Acquire), 1);
+        assert!(f.port.monitors_read.is_some());
+        // Within the cache age, and still matching the live monitors: no new acquisition.
+        let second = f.port.plan_move(f.display, at(5.0)).unwrap();
+        assert_eq!(second, first);
+        assert!(f.port.plan_move(f.display, at(9.0)).is_ok());
+        assert_eq!(f.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn move_rereads_after_the_cache_age_or_when_never_read() {
+        let Some(mut f) = fixture() else {
+            return skip();
+        };
+        f.port.plan_move(f.display, at(5.0)).unwrap();
+        let Some(old) = Instant::now().checked_sub(Duration::from_millis(1001)) else {
+            return;
+        };
+        f.port.monitors_read = Some(old);
+        f.port.plan_move(f.display, at(5.0)).unwrap();
+        assert_eq!(f.calls.load(Ordering::Acquire), 2);
+        // The re-read restarts the age, so the next move reuses it again.
+        f.port.plan_move(f.display, at(5.0)).unwrap();
+        assert_eq!(f.calls.load(Ordering::Acquire), 2);
+        f.port.monitors_read = None;
+        f.port.plan_move(f.display, at(5.0)).unwrap();
+        assert_eq!(f.calls.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn a_cached_table_that_no_longer_matches_is_dropped_and_retried_once() {
+        let Some(mut f) = fixture() else {
+            return skip();
+        };
+        let good = f.port.plan_move(f.display, at(5.0)).unwrap();
+        // Validation failure on the cached rows: one fresh read, and the move succeeds.
+        f.port.probes[0].rc_monitor[2] += 1;
+        assert_eq!(f.port.plan_move(f.display, at(5.0)).unwrap(), good);
+        assert_eq!(f.calls.load(Ordering::Acquire), 2);
+        assert!(f.port.monitors_read.is_some());
+        // A cached table that cannot resolve the display fails `absolute_move`: one fresh read.
+        for probe in &mut f.port.probes {
+            probe.device_path.push('x');
+        }
+        assert_eq!(f.port.plan_move(f.display, at(5.0)).unwrap(), good);
+        assert_eq!(f.calls.load(Ordering::Acquire), 3);
+        // The retry is a single fresh read: its failure is returned, not retried again.
+        f.port.probes[0].rc_monitor[2] += 1;
+        f.mode.store(1, Ordering::Release);
+        assert!(matches!(
+            f.port.plan_move(f.display, at(5.0)),
+            Err(PlatformError::Timeout)
+        ));
+        assert_eq!(f.calls.load(Ordering::Acquire), 4);
+        assert!(f.port.monitors_read.is_none());
+    }
+
+    #[test]
+    fn a_failing_fresh_read_is_never_cached_or_retried() {
+        let Some(mut f) = fixture() else {
+            return skip();
+        };
+        f.mode.store(2, Ordering::Release);
+        assert!(matches!(
+            f.port.plan_move(f.display, at(5.0)),
+            Err(PlatformError::NotFound)
+        ));
+        assert_eq!(f.calls.load(Ordering::Acquire), 1);
+        assert!(f.port.monitors_read.is_none());
+        // Each later move reads fresh again until one validates; nothing stale is reused.
+        assert!(f.port.plan_move(f.display, at(5.0)).is_err());
+        assert_eq!(f.calls.load(Ordering::Acquire), 2);
+        f.mode.store(0, Ordering::Release);
+        assert!(f.port.plan_move(f.display, at(5.0)).is_ok());
+        assert_eq!(f.calls.load(Ordering::Acquire), 3);
+        // A point off the display fails on a fresh table too, and leaves the cache empty.
+        assert!(matches!(
+            f.port.plan_move(f.display, at(-1.0)),
+            Err(PlatformError::NotFound)
+        ));
+        assert!(f.port.monitors_read.is_none());
+    }
+
+    #[test]
+    fn foreground_admission_holds_only_the_last_admitted_observation() {
+        let generation = AtomicU64::new(0);
+        let mut cache = AdmissionCache::default();
+        for _ in 0..3 {
+            match foreground(&generation, &mut cache) {
+                Ok(f) => assert_eq!(
+                    cache.reuse(AdmissionKey {
+                        window: f.window,
+                        process: f.process,
+                        thread: f.thread,
+                        generation: f.generation,
+                    }),
+                    Some(f)
+                ),
+                Err(_) => assert_eq!(cache, AdmissionCache::default()),
+            }
+        }
+    }
+
+    #[test]
+    fn foreground_reuses_an_unchanged_admission_and_replaces_a_changed_one() {
+        let generation = AtomicU64::new(0);
+        let mut cache = AdmissionCache::default();
+        let Ok(real) = foreground(&generation, &mut cache) else {
+            return eprintln!("skipped: no admissible foreground window");
+        };
+        // A marker no full check can produce (born 1) proves the unchanged key skipped it.
+        let marked = Foreground {
+            born: 1,
+            integrity: 0,
+            ..real
+        };
+        cache.admit(marked);
+        let same = |f: &Foreground| {
+            (f.window, f.process, f.thread) == (real.window, real.process, real.thread)
+        };
+        match foreground(&generation, &mut cache) {
+            Ok(f) if same(&f) => assert_eq!(f, marked),
+            _ => return eprintln!("skipped: the foreground changed during the test"),
+        }
+        // A different pid under the same window is a different key: the full check replaces it.
+        cache.admit(Foreground {
+            process: real.process ^ 1,
+            ..marked
+        });
+        match foreground(&generation, &mut cache) {
+            Ok(f) if same(&f) => assert_ne!(f.born, 1),
+            _ => eprintln!("skipped: the foreground changed during the test"),
+        }
+        // A different event generation is a different key too.
+        cache.admit(marked);
+        generation.fetch_add(1, Ordering::AcqRel);
+        match foreground(&generation, &mut cache) {
+            Ok(f) if same(&f) => assert_ne!(f.born, 1),
+            _ => eprintln!("skipped: the foreground changed during the test"),
+        }
     }
 }
 
@@ -1308,6 +1707,8 @@ mod lock_snapshot_tests {
             probes: Vec::new(),
             ids: DisplayIds::default(),
             refresh: Arc::new(|| Err(PlatformError::NotFound)),
+            monitors_read: None,
+            admitted: AdmissionCache::default(),
             locks: Arc::new(LockSnapshot::new(Instant::now())),
             lock_submit_ms: None,
             owned_fixture: None,
@@ -1421,6 +1822,8 @@ mod probe_tests {
                 probes: Vec::new(),
                 ids: DisplayIds::default(),
                 refresh: Arc::new(|| Err(PlatformError::NotFound)),
+                monitors_read: None,
+                admitted: AdmissionCache::default(),
                 locks: Arc::new(LockSnapshot::new(Instant::now())),
                 lock_submit_ms: None,
                 owned_fixture: None,
@@ -1500,6 +1903,8 @@ mod probe_tests {
                 probes: vec![probe],
                 ids,
                 refresh,
+                monitors_read: None,
+                admitted: AdmissionCache::default(),
                 locks: Arc::new(LockSnapshot::new(Instant::now())),
                 lock_submit_ms: None,
                 owned_fixture: None,

@@ -1046,9 +1046,13 @@ impl Agent {
         // The first look at the backends: later differences advance `epochs.backends`.
         self.backends_now();
         loop {
+            let t0 = Instant::now();
             self.settle();
+            let settled = t0.elapsed();
             let now = platform::now();
             let timeout = self.receive_timeout(now, Instant::now());
+            let received;
+            let t1;
             match events.recv_timeout(timeout) {
                 Ok(Event::Shutdown) => {
                     return Stopped {
@@ -1056,8 +1060,15 @@ impl Agent {
                         restart: false,
                     };
                 }
-                Ok(event) => self.on_event(event),
-                Err(RecvTimeoutError::Timeout) => {}
+                Ok(event) => {
+                    received = Instant::now();
+                    self.on_event(event);
+                    t1 = received.elapsed();
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    received = Instant::now();
+                    t1 = Duration::ZERO;
+                }
                 Err(RecvTimeoutError::Disconnected) => {
                     return Stopped {
                         outcomes: self.shutdown(),
@@ -1065,6 +1076,7 @@ impl Agent {
                     };
                 }
             }
+            let t2 = Instant::now();
             if self
                 .engine
                 .next_deadline()
@@ -1072,8 +1084,25 @@ impl Agent {
             {
                 self.feed(Input::Tick);
             }
+            let ticked = t2.elapsed();
+            let t3 = Instant::now();
             self.housekeeping();
+            let kept = t3.elapsed();
+            let t4 = Instant::now();
             self.update_tray();
+            let trayed = t4.elapsed();
+            let busy = settled + received.elapsed();
+            if busy >= Duration::from_millis(8) {
+                tracing::debug!(
+                    total_ms = busy.as_millis() as u64,
+                    settle_ms = settled.as_millis() as u64,
+                    event_ms = t1.as_millis() as u64,
+                    tick_ms = ticked.as_millis() as u64,
+                    housekeeping_ms = kept.as_millis() as u64,
+                    tray_ms = trayed.as_millis() as u64,
+                    "slow loop pass"
+                );
+            }
             if self.quit_requested {
                 return Stopped {
                     outcomes: self.shutdown(),
@@ -1650,7 +1679,12 @@ impl Agent {
         }
         if let Some(backend) = self.platform.parking.take() {
             self.parking_available = true;
-            match crate::parking_worker::Worker::start(backend, self.events.clone()) {
+            let activator = self.platform.window_activator.take();
+            match crate::parking_worker::Worker::start_with_activator(
+                backend,
+                activator,
+                self.events.clone(),
+            ) {
                 Ok(worker) => self.parking = Some(worker),
                 Err(error) => {
                     tracing::error!(%error, "parking worker could not start; recovery remains pending")
@@ -1669,6 +1703,8 @@ impl Agent {
                 self.parking_latest.insert(window, id);
             }
             crate::parking_worker::Command::Restore { .. } => self.tracker.restore_started(id),
+            // A focus request leaves no state to settle: a failure is logged when it completes.
+            crate::parking_worker::Command::Activate { .. } => {}
         }
         if let Some(worker) = &mut self.parking
             && id != 0
@@ -1746,6 +1782,18 @@ impl Agent {
                 self.tracker.restored(*window, completion.id, *ok);
                 if *ok {
                     self.home.twins.remove(window);
+                }
+            }
+            crate::parking_worker::Outcome::Activated { window, result } => {
+                // The focus change itself reaches the engine as a window event. A refused request
+                // leaves the keys held back, as when the focus call ran on the loop.
+                if let Err(failure) = result {
+                    tracing::warn!(
+                        operation = completion.id,
+                        window = window.0,
+                        ?failure,
+                        "a projected window was not focused: its keys are held back"
+                    );
                 }
             }
             crate::parking_worker::Outcome::Panicked => {}
@@ -2264,7 +2312,9 @@ impl Agent {
             }
             Output::BeginDrag { id, portal, button } => {
                 self.capture_motion_seen = false;
-                #[cfg(target_os = "linux")]
+                // Hyprland and Windows detect the gesture natively (the Windows capture is built
+                // with its drag observer in `platform::create`); the Mac has no detector yet.
+                #[cfg(any(target_os = "linux", windows))]
                 let result = self
                     .platform
                     .capture
@@ -2272,7 +2322,7 @@ impl Agent {
                     .ok_or(PlatformError::Unsupported("no capture backend"))
                     .and_then(|capture| capture.begin_drag(id, portal, button))
                     .map_err(failure);
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", windows)))]
                 let result = {
                     let _ = (portal, button);
                     Err(failure(PlatformError::Unsupported(
@@ -2496,7 +2546,16 @@ impl Agent {
                 self.parking_submit(crate::parking_worker::Command::Restore { window, place });
             }
             Output::ActivateWindow { window } => {
-                if let Some(w) = &mut self.platform.windows
+                // A backend whose focus call can wait (Windows: up to two seconds when the OS
+                // denies the foreground request) hands the call to the parking worker: the loop
+                // does not wait, the result comes back as a completion event, and a later park or
+                // return of the same window queues behind it. Others focus in place.
+                if self.platform.window_activator.is_some() {
+                    self.parking_start();
+                }
+                if self.parking.as_ref().is_some_and(|w| w.can_activate()) {
+                    self.parking_submit(crate::parking_worker::Command::Activate { window });
+                } else if let Some(w) = &mut self.platform.windows
                     && let Err(e) = w.activate(window)
                 {
                     tracing::warn!(error = %e, "could not focus a projected window: its keys are held back");
@@ -6183,7 +6242,16 @@ fn write_snapshot(
     for pixel in bgra[..w * h * 4].as_chunks::<4>().0 {
         ppm.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
     }
-    let path = std::env::temp_dir().join(format!(
+    // Windows' %TEMP% grants SYSTEM and Administrators too; a private file needs a private parent.
+    #[cfg(windows)]
+    let dir = {
+        let dir = std::env::temp_dir().join("Crosspane snapshots");
+        crate::paths::create_private_dir(&dir)?;
+        dir
+    };
+    #[cfg(not(windows))]
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
         "crosspane-snapshot-{}-{}.ppm",
         key.source.short(),
         key.projection.0
@@ -6427,6 +6495,17 @@ fn log_input(input: &Input) {
         }
         Input::CaptureReleased { op, result } => {
             tracing::debug!(op = op.0, ?result, "in: capture released")
+        }
+        // The end reason is a fixed enum: no key or pointer data.
+        Input::Capture(crosspane_platform::CaptureEvent::Ended { reason, .. }) => {
+            #[cfg(windows)]
+            if *reason == crosspane_platform::EndReason::Lost {
+                tracing::info!(
+                    cause = crosspane_platform_windows::capture::last_loss(),
+                    "capture lost"
+                );
+            }
+            tracing::debug!(?reason, "in: capture ended")
         }
         Input::HomeBindSet {
             op,
@@ -9485,6 +9564,7 @@ mod audio_tests {
             keystore: None,
             permissions: Box::new(FakePermissions),
             windows: None,
+            window_activator: None,
             parking: None,
             frames: None,
             tray: None,
@@ -12054,7 +12134,7 @@ mod home_tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn begin_drag_routes_button_and_preserves_pointer_button_held_after_physical_callbacks() {
         for error in [
@@ -12113,6 +12193,117 @@ mod home_tests {
                 ..
             })
         ));
+    }
+
+    /// AGENT-WIN: a Mac has no drag detector, so its `BeginDrag` is refused without reaching the
+    /// capture (Linux and Windows route it, in the test above).
+    #[cfg(not(any(target_os = "linux", windows)))]
+    #[test]
+    fn begin_drag_is_refused_without_reaching_the_capture_where_no_detector_exists() {
+        let mut h = home();
+        h.rig.agent.execute_one(Output::BeginDrag {
+            id: CaptureId(7),
+            portal: PortalId(9),
+            button: MouseButton::PRIMARY,
+        });
+        assert!(h.capture.lock().unwrap().drags.is_empty());
+        assert!(matches!(
+            h.rig.events.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Event::Input(Input::CaptureBegun { result: Err(_), .. })
+        ));
+    }
+
+    /// AGENT-WIN: the focus request of a projected window leaves the agent loop. A request that
+    /// waits for the OS runs on the parking worker; its result comes back as a completion event;
+    /// the return of the same window queues behind it and cannot overtake it.
+    #[test]
+    fn activation_runs_on_the_parking_worker_and_reports_back_without_blocking_the_loop() {
+        let mut h = home();
+        let (backend, controls) = crate::parking_worker::tests::fake(None);
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        h.rig.agent.platform.parking = Some(Box::new(backend));
+        h.rig.agent.platform.window_activator = Some(Box::new(move |window| {
+            entered_tx.send(window).unwrap();
+            gate.recv().unwrap();
+            Ok(())
+        }));
+        let began = Instant::now();
+        h.rig.agent.execute_one(Output::ActivateWindow {
+            window: WindowId(5),
+        });
+        // The loop is free while the request waits.
+        assert!(began.elapsed() < Duration::from_millis(500));
+        assert_eq!(
+            entered.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WindowId(5)
+        );
+        h.rig.agent.execute_one(Output::Restore {
+            window: WindowId(5),
+            place: None,
+        });
+        assert!(
+            controls
+                .observed
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "the return of the window waits behind its activation"
+        );
+        open.send(()).unwrap();
+        let mut activated = false;
+        let mut restored = false;
+        while !(activated && restored) {
+            let Event::Parking(completion) =
+                h.rig.events.recv_timeout(Duration::from_secs(2)).unwrap()
+            else {
+                continue;
+            };
+            match &completion.outcome {
+                crate::parking_worker::Outcome::Activated { window, result } => {
+                    assert_eq!((*window, *result), (WindowId(5), Ok(())));
+                    assert!(!restored, "the activation completed before the return ran");
+                    activated = true;
+                }
+                crate::parking_worker::Outcome::Restored { window, ok } => {
+                    assert_eq!((*window, *ok), (WindowId(5), true));
+                    restored = true;
+                }
+                _ => {}
+            }
+            h.rig.agent.on_event(Event::Parking(completion));
+        }
+    }
+
+    /// AGENT-WIN: without an activator (Linux, the Mac, a Windows source in an isolated mode) the
+    /// agent focuses the window itself, as before.
+    #[test]
+    fn activation_without_an_activator_calls_the_window_source_on_the_loop() {
+        struct Focus(Arc<Mutex<Vec<WindowId>>>);
+        impl crosspane_platform::WindowSource for Focus {
+            fn windows(&self) -> Result<Vec<WindowInfo>, PlatformError> {
+                Ok(Vec::new())
+            }
+            fn focused(&self) -> Result<Option<WindowId>, PlatformError> {
+                Ok(None)
+            }
+            fn activate(&mut self, window: WindowId) -> Result<(), PlatformError> {
+                self.0.lock().unwrap().push(window);
+                Ok(())
+            }
+            fn subscribe(
+                &mut self,
+                _: Arc<dyn EventSink<WindowEvent>>,
+            ) -> Result<(), PlatformError> {
+                Ok(())
+            }
+        }
+        let mut h = home();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        h.rig.agent.platform.windows = Some(Box::new(Focus(seen.clone())));
+        h.rig.agent.execute_one(Output::ActivateWindow {
+            window: WindowId(6),
+        });
+        assert_eq!(*seen.lock().unwrap(), [WindowId(6)]);
     }
 
     struct CommandHost {
