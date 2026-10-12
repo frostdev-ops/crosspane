@@ -294,6 +294,226 @@ pub fn prefer_hardware<T>(
         .map_or_else(software, Ok)
 }
 
+/// One bounded start-up budget for the whole selection (hardware candidates, then software).
+pub const START_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
+/// Each hardware candidate gets its own budget, so one slow driver cannot starve the rest.
+pub const CANDIDATE_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+const HARDWARE_BUDGET_CAP: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// All hardware candidates together get at most two thirds of what is left (and two seconds), so
+/// the inbox software codec always keeps a share of the total budget.
+pub fn hardware_deadline(now: std::time::Instant, total: std::time::Instant) -> std::time::Instant {
+    let remaining = total.saturating_duration_since(now);
+    now + (remaining * 2 / 3).min(HARDWARE_BUDGET_CAP)
+}
+/// The deadline of one hardware candidate: its own second, never past the hardware phase.
+pub fn candidate_deadline(
+    now: std::time::Instant,
+    hardware: std::time::Instant,
+) -> std::time::Instant {
+    (now + CANDIDATE_BOUND).min(hardware)
+}
+
+/// The phase in which a hardware candidate was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    Enumerate,
+    Activate,
+    SetTypes,
+    CodecApi,
+    StartStreaming,
+    FirstSample,
+    Deadline,
+    Other,
+}
+impl Stage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enumerate => "enumerate",
+            Self::Activate => "activate",
+            Self::SetTypes => "set types",
+            Self::CodecApi => "codec api",
+            Self::StartStreaming => "start streaming",
+            Self::FirstSample => "first sample",
+            Self::Deadline => "deadline",
+            Self::Other => "other",
+        }
+    }
+    /// Classify a failed step by its label; labels are the operation names used by the adapter.
+    pub fn of_step(step: &str) -> Self {
+        let step = step.to_ascii_lowercase();
+        if step.contains("deadline") || step.contains("cancellation") {
+            Self::Deadline
+        } else if step.contains("enum") {
+            Self::Enumerate
+        } else if step.contains("activate") || step.contains("cocreateinstance") {
+            Self::Activate
+        } else if step.contains("icodecapi") {
+            Self::CodecApi
+        } else if step.contains("begin streaming") || step.contains("start stream") {
+            Self::StartStreaming
+        } else if step.contains("first sample")
+            || step.contains("processinput")
+            || step.contains("processoutput")
+        {
+            Self::FirstSample
+        } else if step.contains("getstream")
+            || step.contains("async unlock")
+            || step.contains("mediaeventgenerator")
+            || step.contains("attributes")
+            || step.contains("d3d11")
+            || step.contains("dxgi manager")
+        {
+            // Opening the transform itself: stream layout, async unlock, device manager.
+            Self::Activate
+        } else if step.contains("type") || step.contains("media") || step.contains("bitrate") {
+            Self::SetTypes
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// A well-known HRESULT name, for the report only.
+pub fn hresult_name(code: u32) -> Option<&'static str> {
+    Some(match code {
+        0x8000_4001 => "E_NOTIMPL",
+        0x8000_4002 => "E_NOINTERFACE",
+        0x8000_4005 => "E_FAIL",
+        0x8000_FFFF => "E_UNEXPECTED",
+        0x8007_0005 => "E_ACCESSDENIED",
+        0x8007_000E => "E_OUTOFMEMORY",
+        0x8007_0057 => "E_INVALIDARG",
+        0x8004_0310 => "VFW_E_CODECAPI_LINEAR_RANGE",
+        0x8004_0311 => "VFW_E_CODECAPI_ENUMERATED",
+        0x8004_0313 => "VFW_E_CODECAPI_NO_DEFAULT",
+        0x8004_0314 => "VFW_E_CODECAPI_NO_CURRENT_VALUE",
+        0x887A_0005 => "DXGI_ERROR_DEVICE_REMOVED",
+        0x887A_0007 => "DXGI_ERROR_DEVICE_RESET",
+        0xC00D_36B2 => "MF_E_INVALIDREQUEST",
+        0xC00D_36B3 => "MF_E_INVALIDSTREAMNUMBER",
+        0xC00D_36B4 => "MF_E_INVALIDMEDIATYPE",
+        0xC00D_36B5 => "MF_E_NOTACCEPTING",
+        0xC00D_36B6 => "MF_E_NOT_INITIALIZED",
+        0xC00D_36B9 => "MF_E_NO_MORE_TYPES",
+        0xC00D_36BD => "MF_E_INVALIDTYPE",
+        0xC00D_36C4 => "MF_E_UNSUPPORTED_BYTESTREAM_TYPE",
+        0xC00D_36D6 => "MF_E_NOT_AVAILABLE",
+        0xC00D_36E6 => "MF_E_ATTRIBUTENOTFOUND",
+        0xC00D_6D60 => "MF_E_TRANSFORM_TYPE_NOT_SET",
+        0xC00D_6D61 => "MF_E_TRANSFORM_STREAM_CHANGE",
+        0xC00D_6D72 => "MF_E_TRANSFORM_NEED_MORE_INPUT",
+        0xC00D_6D76 => "MF_E_UNSUPPORTED_D3D_TYPE",
+        0xC00D_6D77 => "MF_E_TRANSFORM_ASYNC_LOCKED",
+        _ => return None,
+    })
+}
+
+/// One refused hardware candidate: what was tried, where it failed and with which HRESULT.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    pub candidate: String,
+    pub stage: Stage,
+    /// The exact adapter step (operation or property name) that failed.
+    pub step: String,
+    pub hresult: Option<u32>,
+}
+impl Refusal {
+    /// Split the adapter's `"<step>: HRESULT xxxxxxxx"` error text; other text is kept as the step.
+    pub fn from_error(candidate: &str, error: &CodecError) -> Self {
+        let text = match error {
+            CodecError::Unavailable(text) | CodecError::Failed(text) => text.as_str(),
+            CodecError::BadInput(text) => text,
+        };
+        let (step, hresult) = match text.rsplit_once(": HRESULT ") {
+            Some((step, code)) => (step, u32::from_str_radix(code.trim(), 16).ok()),
+            None => (text, None),
+        };
+        Self {
+            candidate: candidate.into(),
+            stage: Stage::of_step(step),
+            step: step.into(),
+            hresult,
+        }
+    }
+    pub fn at(candidate: &str, stage: Stage, step: &str, hresult: Option<u32>) -> Self {
+        Self {
+            candidate: candidate.into(),
+            stage,
+            step: step.into(),
+            hresult,
+        }
+    }
+}
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "hardware candidate refused: {} at {} ({})",
+            self.candidate,
+            self.stage.as_str(),
+            self.step
+        )?;
+        fmt_hresult(f, self.hresult)
+    }
+}
+fn fmt_hresult(f: &mut std::fmt::Formatter<'_>, code: Option<u32>) -> std::fmt::Result {
+    match code {
+        Some(code) => match hresult_name(code) {
+            Some(name) => write!(f, " HRESULT 0x{code:08x} {name}"),
+            None => write!(f, " HRESULT 0x{code:08x}"),
+        },
+        None => Ok(()),
+    }
+}
+
+/// A non-essential ICodecAPI property the transform rejected; it was skipped, not fatal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedProperty {
+    pub candidate: String,
+    pub property: String,
+    pub hresult: u32,
+}
+impl std::fmt::Display for SkippedProperty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "codec property skipped: {} rejected {}",
+            self.candidate, self.property
+        )?;
+        fmt_hresult(f, Some(self.hresult))
+    }
+}
+
+/// Why this codec was chosen: every refused hardware candidate and every skipped property.
+/// Never holds frame contents.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SelectionReport {
+    pub refused: Vec<Refusal>,
+    pub skipped: Vec<SkippedProperty>,
+    pub chosen: Option<String>,
+    /// The chosen codec is a hardware MFT (false for the inbox software codec).
+    pub hardware: bool,
+}
+impl SelectionReport {
+    /// One human-readable line per refusal, per skipped property, and one naming the choice.
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self.refused.iter().map(ToString::to_string).collect();
+        lines.extend(self.skipped.iter().map(ToString::to_string));
+        if let Some(chosen) = &self.chosen {
+            lines.push(format!(
+                "codec chosen: {chosen} ({})",
+                if self.hardware {
+                    "hardware"
+                } else {
+                    "software"
+                }
+            ));
+        }
+        lines
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Params {
     pub size: PixelSize,
@@ -1238,5 +1458,104 @@ mod gpu_decode_tests {
         assert!(lease.check_in_ready(true));
         lease.return_completed();
         assert!(lease.release_sample());
+    }
+}
+
+#[cfg(test)]
+mod video_selection_report_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn video_refusal_splits_step_and_hresult() {
+        let error = CodecError::Failed("ICodecAPI AVEncMPVGOPSize: HRESULT 80004001".into());
+        let refusal = Refusal::from_error("NVIDIA H.264 Encoder MFT (hardware)", &error);
+        assert_eq!(refusal.stage, Stage::CodecApi);
+        assert_eq!(refusal.step, "ICodecAPI AVEncMPVGOPSize");
+        assert_eq!(refusal.hresult, Some(0x8000_4001));
+        let line = refusal.to_string();
+        assert!(
+            line.contains("NVIDIA H.264 Encoder MFT (hardware)"),
+            "{line}"
+        );
+        assert!(line.contains("codec api"), "{line}");
+        assert!(line.contains("E_NOTIMPL"), "{line}");
+    }
+    #[test]
+    fn video_refusal_without_hresult_keeps_the_text() {
+        let error = CodecError::Failed("MFT deadline or cancellation".into());
+        let refusal = Refusal::from_error("x", &error);
+        assert_eq!(refusal.stage, Stage::Deadline);
+        assert_eq!(refusal.hresult, None);
+    }
+    #[test]
+    fn video_stage_follows_the_adapter_step_labels() {
+        for (step, stage) in [
+            ("MFTEnumEx hardware", Stage::Enumerate),
+            ("ActivateObject", Stage::Activate),
+            ("GetStreamIDs", Stage::Activate),
+            ("async unlock", Stage::Activate),
+            ("MFT DXGI manager", Stage::Activate),
+            ("encoder SetOutputType", Stage::SetTypes),
+            ("encoder SetInputType", Stage::SetTypes),
+            ("begin streaming", Stage::StartStreaming),
+            ("start stream", Stage::StartStreaming),
+            ("ProcessInput", Stage::FirstSample),
+            ("something new", Stage::Other),
+        ] {
+            assert_eq!(Stage::of_step(step), stage, "{step}");
+        }
+    }
+    #[test]
+    fn video_hardware_phase_leaves_software_a_share_of_the_total() {
+        let now = Instant::now();
+        let total = now + START_BOUND;
+        let hardware = hardware_deadline(now, total);
+        assert_eq!(hardware, now + Duration::from_secs(2));
+        // A short remaining budget keeps a third for software.
+        let late = now + Duration::from_millis(2_400);
+        assert_eq!(
+            hardware_deadline(late, total),
+            late + Duration::from_millis(400)
+        );
+        assert_eq!(hardware_deadline(total, total), total);
+        assert_eq!(
+            hardware_deadline(total + Duration::from_secs(1), total),
+            total + Duration::from_secs(1)
+        );
+    }
+    #[test]
+    fn video_each_candidate_gets_its_own_second_within_the_hardware_phase() {
+        let now = Instant::now();
+        let hardware = now + Duration::from_secs(2);
+        assert_eq!(
+            candidate_deadline(now, hardware),
+            now + Duration::from_secs(1)
+        );
+        let later = now + Duration::from_millis(1_500);
+        assert_eq!(candidate_deadline(later, hardware), hardware);
+    }
+    #[test]
+    fn video_report_lists_refusals_skips_and_the_choice() {
+        let report = SelectionReport {
+            refused: vec![Refusal::at(
+                "A (hardware)",
+                Stage::SetTypes,
+                "encoder SetOutputType",
+                Some(0xC00D_36B4),
+            )],
+            skipped: vec![SkippedProperty {
+                candidate: "B (hardware)".into(),
+                property: "AVEncMPVGOPSize".into(),
+                hresult: 0x8007_0057,
+            }],
+            chosen: Some("B (hardware)".into()),
+            hardware: true,
+        };
+        let lines = report.lines();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("MF_E_INVALIDMEDIATYPE"), "{lines:?}");
+        assert!(lines[1].contains("E_INVALIDARG"), "{lines:?}");
+        assert!(lines[2].contains("B (hardware)") && lines[2].contains("hardware"));
     }
 }

@@ -1013,6 +1013,7 @@ dependencies = [
  "rtrb",
  "serde",
  "serde_json",
+ "tracing",
  "wgpu",
  "windows",
  "windows-core",

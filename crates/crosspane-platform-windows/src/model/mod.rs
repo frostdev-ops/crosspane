@@ -26,6 +26,7 @@ pub mod tray;
 pub mod twin;
 pub mod twin_ledger;
 pub mod twin_parking;
+pub mod twin_place;
 #[cfg(feature = "video")]
 pub mod video;
 pub mod window;

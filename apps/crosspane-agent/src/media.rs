@@ -55,6 +55,87 @@ use crosspane_types::id::{NodeId, ProjectionId};
 
 use crate::agent::Event;
 
+/// Live source-throughput probe (ignored): a real window through the real capture and encoder.
+#[cfg(all(test, windows, feature = "video"))]
+mod e2_pace_probe;
+
+/// Per-frame stage timings of the encoder thread, emitted as one `frame stages` trace event per
+/// frame (`name_us=N` pairs, in the order the stages ran). Off the hot path unless the target is
+/// traced: a lap is one clock read and a push into a reused buffer.
+mod stage {
+    use std::cell::RefCell;
+    use std::time::Instant;
+
+    struct Clock {
+        last: Instant,
+        laps: Vec<(&'static str, u64)>,
+    }
+    thread_local! {
+        static CLOCK: RefCell<Option<Clock>> = const { RefCell::new(None) };
+    }
+
+    /// Closes the frame's timing when dropped, whichever way the frame's work ends.
+    #[derive(Debug)]
+    pub struct Frame;
+    impl Frame {
+        pub fn begin() -> Self {
+            CLOCK.with(|clock| {
+                if let Ok(mut clock) = clock.try_borrow_mut() {
+                    let laps = clock
+                        .take()
+                        .map(|mut old| {
+                            old.laps.clear();
+                            old.laps
+                        })
+                        .unwrap_or_default();
+                    *clock = Some(Clock {
+                        last: Instant::now(),
+                        laps,
+                    });
+                }
+            });
+            Self
+        }
+    }
+    impl Drop for Frame {
+        fn drop(&mut self) {
+            CLOCK.with(|clock| {
+                let Ok(mut clock) = clock.try_borrow_mut() else {
+                    return;
+                };
+                let Some(state) = clock.as_mut() else { return };
+                if !tracing::enabled!(tracing::Level::TRACE) {
+                    return;
+                }
+                let mut text = String::new();
+                let mut total = 0;
+                for (name, us) in &state.laps {
+                    total += us;
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    text.push_str(&format!("{name}_us={us}"));
+                }
+                tracing::trace!("frame stages total_us={total} {text}");
+            });
+        }
+    }
+
+    /// Time since the previous lap (or the frame's start), recorded under `name`.
+    pub fn lap(name: &'static str) {
+        CLOCK.with(|clock| {
+            if let Ok(mut clock) = clock.try_borrow_mut()
+                && let Some(state) = clock.as_mut()
+            {
+                let now = Instant::now();
+                let us = now.duration_since(state.last).as_micros() as u64;
+                state.last = now;
+                state.laps.push((name, us));
+            }
+        });
+    }
+}
+
 /// Proxy ids for the window host, shared by the engine loop (which opens and closes proxies) and
 /// the decoder thread (which feeds them frames).
 #[derive(Clone, Debug, Default)]
@@ -1476,6 +1557,7 @@ fn encode_frame(
     out: &mut Vec<u8>,
 ) {
     out.clear();
+    let _stages = stage::Frame::begin();
     #[cfg(windows)]
     let mut lease = match frame.native().zip(video.gpu.as_ref()) {
         Some((image, gpu)) => match crosspane_platform_windows::frame_capture::capture_lease(
@@ -1533,6 +1615,7 @@ fn encode_frame(
     if let Some(lease) = lease.as_mut() {
         lease.submitted();
     }
+    stage::lap("lease");
     let (scan, on_gpu) = match scan_frame(enc, frame, texture.as_ref()) {
         Ok(scanned) => scanned,
         Err(e) => {
@@ -1540,6 +1623,7 @@ fn encode_frame(
             return;
         }
     };
+    stage::lap("scan");
     #[cfg(windows)]
     if let Some(lease) = lease.as_ref()
         && lease.check().is_err()
@@ -1551,6 +1635,7 @@ fn encode_frame(
         .report(|path| path.hashed(on_gpu, video.gpu.is_some()));
     let available = enc.peer_video && video.codecs.is_some();
     let plan = plan(enc, &scan, frame.size, now, available);
+    stage::lap("plan");
     tracing::trace!(
         changed = scan.changed(),
         total = scan.total(),
@@ -1572,6 +1657,7 @@ fn encode_frame(
                 #[cfg(windows)]
                 lease.as_ref(),
             );
+            stage::lap("tiles");
         }
         Plan::Video { region, key } => {
             match region {
@@ -1596,6 +1682,7 @@ fn encode_frame(
                     lease.as_ref(),
                 ),
             }
+            stage::lap("tiles");
             if idle {
                 return;
             }
@@ -1868,6 +1955,7 @@ fn send_video(
         tracing::info!(encoder = encoder.name(), "video on");
         enc.video = Some(encoder);
         enc.video_key = true;
+        stage::lap("encoder_new");
     }
     let force_key = key || enc.video_key;
     let mut access_unit = Vec::new();
@@ -1886,6 +1974,7 @@ fn send_video(
         #[cfg(windows)]
         &mut enc.native_encode_failed,
     )?;
+    stage::lap("encode");
     #[cfg(windows)]
     if let Some(lease) = lease.as_ref() {
         lease.check().map_err(|error| error.to_string())?;
@@ -1911,6 +2000,7 @@ fn send_video(
         #[cfg(windows)]
         lease.as_deref(),
     );
+    stage::lap("send");
     Ok(())
 }
 
@@ -1941,6 +2031,7 @@ fn encode_picture(
                 return Ok(None);
             };
             let input = pool.acquire().map_err(|e| e.to_string())?;
+            stage::lap("pool");
             let Some((buffer, layout)) =
                 crosspane_platform_windows::video::gpu::nv12_buffer(input.as_ref())
             else {
@@ -1964,8 +2055,10 @@ fn encode_picture(
                 },
             )
             .map_err(|e| e.to_string())?;
+            stage::lap("nv12_write");
             crosspane_platform_windows::video::gpu::finish_input(input.as_ref(), admission)
                 .map_err(|e| e.to_string())?;
+            stage::lap("nv12_copy");
             encoder
                 .encode_native(input.as_ref(), size, force_key, out)
                 .map(Some)
@@ -2035,14 +2128,17 @@ fn encode_picture(
         }
     }
     with_pixels(frame, |pixels, stride| {
+        stage::lap("readback");
         let offset = origin.1 as usize * stride as usize + origin.0 as usize * 4;
-        encoder.encode(
+        let encoded = encoder.encode(
             pixels.get(offset..).unwrap_or_default(),
             stride,
             size,
             force_key,
             out,
-        )
+        );
+        stage::lap("mft_cpu");
+        encoded
     })
 }
 

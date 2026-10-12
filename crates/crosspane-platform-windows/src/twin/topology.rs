@@ -1,7 +1,8 @@
 //! Own-adapter topology for the twin client (WP-W3.1b). `own_paths` finds the active display paths
 //! that belong to our IddCx adapter, and `monitor_dpi` reads a twin's DPI from a never-shown PMv2
-//! helper window. Foreign adapters are read only for their adapter interface comparison: no
-//! foreign name, monitor, source or geometry is queried, stored or printed.
+//! helper window. Foreign adapters are read for their adapter interface comparison and, for
+//! placement (`place.rs`), for their source rects: no foreign name or monitor is queried, stored or
+//! printed, and a foreign rect is only compared with the twin's, never kept or logged.
 #![allow(unsafe_code)]
 
 use crate::model::twin::{OwnPath, TwinError, interface_path_eq};
@@ -119,8 +120,8 @@ pub(crate) fn monitor_dpi(rect: [i32; 4]) -> Result<u32, TwinError> {
 }
 
 /// Reads the active paths and modes, bounded and retried as `src/displays.rs` does.
-fn active_paths() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), TwinError>
-{
+pub(super) fn active_paths()
+-> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), TwinError> {
     for _ in 0..=QUERY_RETRIES {
         let (mut path_count, mut mode_count) = (0u32, 0u32);
         // SAFETY: initialized count outputs; active paths only, no topology or system change.
@@ -255,10 +256,29 @@ fn source_gdi_name(path: &DISPLAYCONFIG_PATH_INFO) -> Result<String, TwinError> 
 
 /// The source's rect, from its mode. QDC runs without `QDC_VIRTUAL_MODE_AWARE`, so a path
 /// source's active union member is `modeInfoIdx`, and a source mode's is `sourceMode`.
-fn source_rect(
+pub(super) fn source_rect(
     path: &DISPLAYCONFIG_PATH_INFO,
     modes: &[DISPLAYCONFIG_MODE_INFO],
 ) -> Result<[i32; 4], TwinError> {
+    let index = source_mode_index(path, modes)?;
+    // SAFETY: `source_mode_index` checked that this mode's infoType is SOURCE, so the sourceMode
+    // union member is the active one.
+    let source = unsafe { modes[index].Anonymous.sourceMode };
+    let left = source.position.x;
+    let top = source.position.y;
+    let right = edge(left, source.width)?;
+    let bottom = edge(top, source.height)?;
+    if left >= right || top >= bottom {
+        return Err(TwinError::Protocol("own source rect is empty"));
+    }
+    Ok([left, top, right, bottom])
+}
+
+/// The index of a path's source mode, checked to be a SOURCE mode for that same source.
+pub(super) fn source_mode_index(
+    path: &DISPLAYCONFIG_PATH_INFO,
+    modes: &[DISPLAYCONFIG_MODE_INFO],
+) -> Result<usize, TwinError> {
     // SAFETY: without QDC_VIRTUAL_MODE_AWARE, modeInfoIdx is the active union member.
     let index = unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
     let mode = modes.get(index).ok_or(TwinError::Protocol(
@@ -270,16 +290,7 @@ fn source_rect(
     {
         return Err(TwinError::Protocol("own source mode identity mismatch"));
     }
-    // SAFETY: infoType was checked to be SOURCE, so the sourceMode union member is the active one.
-    let source = unsafe { mode.Anonymous.sourceMode };
-    let left = source.position.x;
-    let top = source.position.y;
-    let right = edge(left, source.width)?;
-    let bottom = edge(top, source.height)?;
-    if left >= right || top >= bottom {
-        return Err(TwinError::Protocol("own source rect is empty"));
-    }
-    Ok([left, top, right, bottom])
+    Ok(index)
 }
 
 fn edge(start: i32, length: u32) -> Result<i32, TwinError> {
@@ -302,7 +313,7 @@ fn own_text(field: &[u16], what: &'static str) -> Result<String, TwinError> {
         .ok_or(TwinError::Protocol(what))
 }
 
-fn luid_bits(luid: LUID) -> u64 {
+pub(super) fn luid_bits(luid: LUID) -> u64 {
     u64::from(luid.LowPart) | (u64::from(luid.HighPart as u32) << 32)
 }
 

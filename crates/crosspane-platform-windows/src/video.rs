@@ -4,6 +4,10 @@
 //! incompatible hardware falls back to the inbox Microsoft software codec. Native
 //! jobs and event waits have a two-second deadline. A native call already running
 //! cannot be preempted; a timed-out facade is retired and never accepts another frame.
+//! Start-up selection has a three-second total budget: the hardware candidates share at most
+//! two thirds of it and each gets its own second, so software always keeps a share.
+//! Every refused hardware candidate (name, failed step, HRESULT) and every best-effort codec
+//! property the transform rejected is kept in a [`SelectionReport`] and logged at INFO.
 //! Windows receive GPU output uses one copy-only NV12 import and fresh immutable Y/UV
 //! textures. Optional GPU encode uses the source's protected D3D11 device; both paths
 //! retain the original CPU fallback.
@@ -16,12 +20,12 @@ use crosspane_media::{
 };
 use crosspane_types::geom::PixelSize;
 pub use decode_gpu::{MfDecodeGpu, MfGpuPicture, MfPathObserver};
-pub use model::{MfDecodePath, MfGpuFallback};
+pub use model::{MfDecodePath, MfGpuFallback, Refusal, SelectionReport, SkippedProperty, Stage};
 use std::{
     mem::ManuallyDrop,
     ptr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -54,12 +58,66 @@ fn failure(reason: &str) -> CodecError {
     model::failed(reason)
 }
 
+/// Shared, append-only selection diagnostics of one codec session. Diagnostics never fail a codec,
+/// so a poisoned lock is ignored. Holds names, step labels and HRESULTs only, never frame data.
+#[derive(Clone, Debug, Default)]
+struct Report(Arc<Mutex<SelectionReport>>);
+impl Report {
+    fn with(&self, update: impl FnOnce(&mut SelectionReport)) {
+        if let Ok(mut report) = self.0.lock() {
+            update(&mut report);
+        }
+    }
+    fn snapshot(&self) -> SelectionReport {
+        self.0
+            .lock()
+            .map(|report| report.clone())
+            .unwrap_or_default()
+    }
+    /// A hardware candidate failed while it was being opened.
+    fn refuse(&self, candidate: &str, error: &CodecError) {
+        self.refuse_with(Refusal::from_error(candidate, error));
+    }
+    fn refuse_with(&self, refusal: Refusal) {
+        tracing::info!("{refusal}");
+        self.with(|report| report.refused.push(refusal));
+    }
+    /// A hardware session opened but failed on real data; `first` marks the very first sample.
+    fn refuse_sample(&self, candidate: &str, error: &CodecError, first: bool) {
+        let mut refusal = Refusal::from_error(candidate, error);
+        if first && refusal.stage != Stage::Deadline {
+            refusal.stage = Stage::FirstSample;
+        }
+        self.refuse_with(refusal);
+    }
+    fn skip(&self, candidate: &str, error: &CodecError, property: &str) {
+        let skipped = SkippedProperty {
+            candidate: candidate.into(),
+            property: property.into(),
+            hresult: Refusal::from_error(candidate, error).hresult.unwrap_or(0),
+        };
+        tracing::info!("{skipped}");
+        self.with(|report| report.skipped.push(skipped));
+    }
+    fn choose(&self, name: &str, hardware: bool) {
+        tracing::info!(
+            "H.264 codec chosen: {name} ({})",
+            if hardware { "hardware" } else { "software" }
+        );
+        self.with(|report| {
+            report.chosen = Some(name.into());
+            report.hardware = hardware;
+        });
+    }
+}
+
 /// Per-session hardware-first factory. Construction does not touch native resources.
 #[derive(Debug, Default)]
 pub struct MfCodecs {
     decode_gpu: Option<Arc<MfDecodeGpu>>,
     #[cfg(feature = "gpu")]
     gpu: Option<Arc<crate::gpu::WindowsGpu>>,
+    last: Mutex<Option<Report>>,
 }
 impl MfCodecs {
     pub fn new() -> Self {
@@ -75,6 +133,21 @@ impl MfCodecs {
         self.gpu = Some(gpu);
         self
     }
+    /// Why the most recently requested codec was chosen: every refused hardware candidate, every
+    /// skipped codec property and the chosen name. Kept even when no codec could be opened.
+    pub fn last_selection_report(&self) -> Option<SelectionReport> {
+        self.last
+            .lock()
+            .ok()
+            .and_then(|last| last.as_ref().map(Report::snapshot))
+    }
+    fn begin_report(&self) -> Report {
+        let report = Report::default();
+        if let Ok(mut last) = self.last.lock() {
+            *last = Some(report.clone());
+        }
+        report
+    }
     pub fn encoder_cpu(
         &self,
         size: PixelSize,
@@ -82,7 +155,7 @@ impl MfCodecs {
         fps: u32,
     ) -> Result<MfEncoder, CodecError> {
         let params = Params::new(size, bitrate, fps)?;
-        let (worker, name) = Worker::new(Mode::Encoder(params))?;
+        let (worker, name) = Worker::new(Mode::Encoder(params), self.begin_report())?;
         Ok(MfEncoder {
             worker,
             name,
@@ -96,7 +169,7 @@ impl MfCodecs {
         })
     }
     pub fn decoder_cpu(&self) -> Result<MfDecoder, CodecError> {
-        let (worker, name) = Worker::new(Mode::Decoder)?;
+        let (worker, name) = Worker::new(Mode::Decoder, self.begin_report())?;
         Ok(MfDecoder {
             worker,
             name,
@@ -114,8 +187,11 @@ impl VideoCodecs for MfCodecs {
         #[cfg(feature = "gpu")]
         if let Some(gpu) = &self.gpu {
             let params = Params::new(size, bits_per_second, fps)?;
-            let (worker, name) =
-                Worker::new_with_source_gpu(Mode::Encoder(params), Some(gpu.clone()))?;
+            let (worker, name) = Worker::new_with_source_gpu(
+                Mode::Encoder(params),
+                Some(gpu.clone()),
+                self.begin_report(),
+            )?;
             return Ok(Box::new(MfEncoder {
                 worker,
                 name,
@@ -129,7 +205,8 @@ impl VideoCodecs for MfCodecs {
         Ok(Box::new(self.encoder_cpu(size, bits_per_second, fps)?))
     }
     fn decoder(&self) -> Result<Box<dyn VideoDecoder>, CodecError> {
-        let (worker, name) = Worker::new_with_gpu(Mode::Decoder, self.decode_gpu.clone())?;
+        let (worker, name) =
+            Worker::new_with_gpu(Mode::Decoder, self.decode_gpu.clone(), self.begin_report())?;
         Ok(Box::new(MfDecoder {
             worker,
             name,
@@ -161,6 +238,10 @@ impl MfEncoder {
     /// Wait for native shutdown and join; failure reports that a native call is still running.
     pub fn close(mut self) -> Result<(), CodecError> {
         self.worker.close()
+    }
+    /// Refused hardware candidates, skipped codec properties and the chosen codec so far.
+    pub fn selection_report(&self) -> SelectionReport {
+        self.worker.report.snapshot()
     }
 }
 impl VideoEncoder for MfEncoder {
@@ -247,7 +328,7 @@ impl VideoEncoder for MfEncoder {
         #[cfg(feature = "gpu")]
         if self.worker.send.is_none() {
             // Old native work retains its own resources. A fresh CPU worker never reuses them.
-            let (worker, name) = Worker::new(Mode::Encoder(params))?;
+            let (worker, name) = Worker::new(Mode::Encoder(params), self.worker.report.clone())?;
             self.worker = worker;
             self.name = name;
             self.gpu = None;
@@ -297,6 +378,10 @@ impl std::fmt::Debug for MfDecoder {
 impl MfDecoder {
     pub fn close(mut self) -> Result<(), CodecError> {
         self.worker.close()
+    }
+    /// Refused hardware candidates, skipped codec properties and the chosen codec so far.
+    pub fn selection_report(&self) -> SelectionReport {
+        self.worker.report.snapshot()
     }
     fn picture(&mut self, data: &[u8]) -> Result<Nv12, CodecError> {
         let (at, duration) = self.clock.next(30)?;
@@ -438,20 +523,23 @@ struct Worker {
     done: mpsc::Receiver<()>,
     join: Option<thread::JoinHandle<()>>,
     control: Option<mpsc::SyncSender<()>>,
+    report: Report,
     #[cfg(feature = "gpu")]
     selection: crate::model::gpu::Path,
 }
 impl Worker {
-    fn new(mode: Mode) -> Result<(Self, String), CodecError> {
-        Self::new_with_gpu(mode, None)
+    fn new(mode: Mode, report: Report) -> Result<(Self, String), CodecError> {
+        Self::new_with_gpu(mode, None, report)
     }
     fn new_with_gpu(
         mode: Mode,
         gpu: Option<Arc<MfDecodeGpu>>,
+        report: Report,
     ) -> Result<(Self, String), CodecError> {
         Self::spawn(
             mode,
             gpu,
+            report,
             #[cfg(feature = "gpu")]
             None,
         )
@@ -460,12 +548,14 @@ impl Worker {
     fn new_with_source_gpu(
         mode: Mode,
         source_gpu: Option<Arc<crate::gpu::WindowsGpu>>,
+        report: Report,
     ) -> Result<(Self, String), CodecError> {
-        Self::spawn(mode, None, source_gpu)
+        Self::spawn(mode, None, report, source_gpu)
     }
     fn spawn(
         mode: Mode,
         gpu: Option<Arc<MfDecodeGpu>>,
+        report: Report,
         #[cfg(feature = "gpu")] source_gpu: Option<Arc<crate::gpu::WindowsGpu>>,
     ) -> Result<(Self, String), CodecError> {
         let (send, receive) = mpsc::sync_channel::<Envelope>(1);
@@ -475,7 +565,8 @@ impl Worker {
         let control = gpu.as_ref().map(|_| control_send.clone());
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        let deadline = Instant::now() + BOUND;
+        let deadline = Instant::now() + model::START_BOUND;
+        let native_report = report.clone();
         let join = thread::Builder::new()
             .name("crosspane-mf".into())
             .spawn(move || {
@@ -491,6 +582,7 @@ impl Worker {
                         mode,
                         gpu,
                         control_send,
+                        native_report,
                         deadline,
                         &flag,
                         #[cfg(feature = "gpu")]
@@ -586,10 +678,11 @@ impl Worker {
             done,
             join: Some(join),
             control,
+            report,
             #[cfg(feature = "gpu")]
             selection: crate::model::gpu::Path::default(),
         };
-        match start.recv_timeout(BOUND) {
+        match start.recv_timeout(model::START_BOUND) {
             Ok(Ok(name)) => {
                 #[cfg(feature = "gpu")]
                 {
@@ -720,6 +813,7 @@ struct Native {
     gpu_mta: Option<decode_gpu::GpuMta>,
     control: mpsc::SyncSender<()>,
     leases: Vec<decode_gpu::SourceLease>,
+    report: Report,
     #[cfg(feature = "gpu")]
     source_gpu: Option<Arc<crate::gpu::WindowsGpu>>,
 }
@@ -728,13 +822,27 @@ impl Native {
         mode: Mode,
         gpu: Option<Arc<MfDecodeGpu>>,
         control: mpsc::SyncSender<()>,
+        report: Report,
         deadline: Instant,
         stop: &AtomicBool,
         #[cfg(feature = "gpu")] source_gpu: Option<Arc<crate::gpu::WindowsGpu>>,
     ) -> Result<Self, CodecError> {
         #[cfg(feature = "gpu")]
         let native = match (&source_gpu, mode) {
-            (Some(gpu), Mode::Encoder(params)) => gpu::select(gpu, params, deadline, stop).ok(),
+            (Some(gpu), Mode::Encoder(params)) => {
+                // The GPU-input path shares the hardware phase with the CPU path below.
+                let until = model::hardware_deadline(Instant::now(), deadline);
+                match gpu::select(gpu, params, until, stop, &report) {
+                    Ok(session) => {
+                        report.choose(&session.name, true);
+                        Some(session)
+                    }
+                    Err(error) => {
+                        report.refuse("GPU-input hardware H.264 encoder", &error);
+                        None
+                    }
+                }
+            }
             _ => None,
         };
         Ok(Self {
@@ -743,11 +851,11 @@ impl Native {
                 if let Some(native) = native {
                     native
                 } else {
-                    Session::select(mode, false, deadline, stop)?
+                    Session::select(mode, false, deadline, stop, &report)?
                 }
                 #[cfg(not(feature = "gpu"))]
                 {
-                    Session::select(mode, false, deadline, stop)?
+                    Session::select(mode, false, deadline, stop, &report)?
                 }
             },
             mode,
@@ -759,6 +867,7 @@ impl Native {
             gpu_mta: None,
             control,
             leases: Vec::new(),
+            report,
             #[cfg(feature = "gpu")]
             source_gpu,
         })
@@ -809,7 +918,7 @@ impl Native {
             if let Some(host) = bridge.host()
                 && model::gpu_idr_binding(idr, Some(host.generation)).is_some()
                 && let Ok(gpu) = decode_gpu::GpuMta::new(host)
-                && let Ok(session) = Session::select_gpu(&gpu.manager, deadline, stop)
+                && let Ok(session) = Session::select_gpu(&gpu.manager, deadline, stop, &self.report)
             {
                 self.session = session;
                 self.gpu_mta = Some(gpu);
@@ -914,7 +1023,7 @@ impl Native {
                 .source_gpu
                 .as_ref()
                 .ok_or_else(|| failure("missing native GPU"))?;
-            self.session = gpu::select(gpu, params, deadline, stop)?;
+            self.session = gpu::select(gpu, params, deadline, stop, &self.report)?;
             self.headers = Headers::default();
             self.references = References::default();
             self.first = true;
@@ -939,13 +1048,26 @@ impl Native {
                 .and_then(|attrs| attrs.GetUINT32(&MF_SA_D3D11_BINDFLAGS))
         } {
             Ok(bind) => bind,
-            Err(error) if error.code() == MF_E_ATTRIBUTENOTFOUND => 0,
-            Err(error) => return Err(failure(&error.to_string())),
+            // The NVIDIA encoder MFT doesn't implement GetInputStreamAttributes at all (E_NOTIMPL):
+            // like an absent attribute, that means it asks for no extra bind flags.
+            Err(error)
+                if error.code() == MF_E_ATTRIBUTENOTFOUND
+                    || error.code() == windows::Win32::Foundation::E_NOTIMPL =>
+            {
+                0
+            }
+            Err(error) => {
+                return Err(failure(&format!("native input bind flags: {error}")));
+            }
         };
         let sample = input.sample(at, duration, bind)?;
         let output = self
             .session
-            .exchange_guarded(&sample, at, deadline, stop, &|| input.permitted())?;
+            .exchange_guarded(&sample, at, deadline, stop, &|| input.permitted())
+            .inspect_err(|error| {
+                self.report
+                    .refuse_sample(&self.session.name, error, self.first)
+            })?;
         let data = sample_bytes(&output, MAX_PACKET)?;
         let (bytes, key) = self.headers.packet(&data, force)?;
         self.references.check(&bytes)?;
@@ -986,7 +1108,8 @@ impl Native {
             self.session.invalid = true;
         }
         if self.session.invalid || params.size != previous.size {
-            self.session = Session::select(Mode::Encoder(params), false, deadline, stop)?;
+            self.session =
+                Session::select(Mode::Encoder(params), false, deadline, stop, &self.report)?;
             self.first = true;
             self.headers = Headers::default();
         } else if params.bitrate != previous.bitrate {
@@ -1002,9 +1125,11 @@ impl Native {
         let sample = sample(&bytes, at, duration)?;
         let output = self.session.exchange(&sample, at, deadline, stop);
         let output = match output {
-            Err(_) if self.session.hardware => {
+            Err(error) if self.session.hardware => {
+                self.report
+                    .refuse_sample(&self.session.name, &error, self.first);
                 // This CPU frame was not published. A software retry starts with an IDR.
-                self.session = Session::select(self.mode, true, deadline, stop)?;
+                self.session = Session::select(self.mode, true, deadline, stop, &self.report)?;
                 self.headers = Headers::default();
                 self.first = true;
                 self.session
@@ -1057,13 +1182,15 @@ impl Native {
     ) -> Result<Reply, CodecError> {
         // An IDR is independent of all prior samples, including after damage or resize.
         if idr || self.session.invalid {
-            self.session = Session::select(Mode::Decoder, false, deadline, stop)?;
+            self.session = Session::select(Mode::Decoder, false, deadline, stop, &self.report)?;
         }
         let sample = sample(bytes, at, duration)?;
         let output = self.session.exchange(&sample, at, deadline, stop);
         let output = match output {
-            Err(_) if self.session.hardware && idr => {
-                self.session = Session::select(Mode::Decoder, true, deadline, stop)?;
+            Err(error) if self.session.hardware && idr => {
+                self.report
+                    .refuse_sample(&self.session.name, &error, self.first);
+                self.session = Session::select(Mode::Decoder, true, deadline, stop, &self.report)?;
                 self.session.exchange(&sample, at, deadline, stop)?
             }
             result => result?,
@@ -1119,30 +1246,21 @@ impl Session {
         software_only: bool,
         deadline: Instant,
         stop: &AtomicBool,
+        report: &Report,
     ) -> Result<Self, CodecError> {
+        let hardware = model::hardware_deadline(Instant::now(), deadline);
         let candidates = if software_only {
             Vec::new()
         } else {
-            enumerate(mode).unwrap_or_default()
-        };
-        let attempts = candidates.into_iter().map(|activate| {
-            check(deadline, stop)?;
-            // SAFETY: enumeration returned an owned activation object, activated on this MTA.
-            let candidate = api(
-                unsafe { activate.ActivateObject::<IMFTransform>() },
-                "ActivateObject",
+            ranked(
+                candidate_kind(mode, false),
+                enumerate_reported(mode, report),
             )
-            .and_then(|transform| Self::configure(transform, true, friendly_name(&activate), mode));
-            if candidate.is_ok() {
-                return candidate;
-            }
-            // SAFETY: failed candidate is no longer used; release its activation cache.
-            unsafe {
-                let _ = activate.ShutdownObject();
-            }
-            candidate
-        });
-        model::prefer_hardware(attempts, || {
+        };
+        let attempts = candidates
+            .into_iter()
+            .map(|activate| Self::attempt_hardware(activate, mode, None, hardware, stop, report));
+        let session = model::prefer_hardware(attempts, || {
             check(deadline, stop)?;
             let (clsid, name) = match mode {
                 Mode::Encoder(_) => (CMSH264EncoderMFT, "Microsoft H.264 encoder (software)"),
@@ -1153,42 +1271,33 @@ impl Session {
                 unsafe { CoCreateInstance::<_, IMFTransform>(&clsid, None, CLSCTX_INPROC_SERVER) },
                 "CoCreateInstance H.264",
             )?;
-            Self::configure(transform, false, name.into(), mode)
-        })
+            Self::configure(transform, false, name.into(), mode, report)
+        })?;
+        report.choose(&session.name, session.hardware);
+        Ok(session)
     }
     fn select_gpu(
         manager: &IMFDXGIDeviceManager,
         deadline: Instant,
         stop: &AtomicBool,
+        report: &Report,
     ) -> Result<Self, CodecError> {
-        let attempts = enumerate(Mode::Decoder)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|activate| {
-                check(deadline, stop)?;
-                // SAFETY: owned enumeration activation, used solely on the decoder MTA.
-                let result = api(
-                    unsafe { activate.ActivateObject::<IMFTransform>() },
-                    "GPU ActivateObject",
-                )
-                .and_then(|transform| {
-                    Self::configure_with_manager(
-                        transform,
-                        true,
-                        friendly_name(&activate),
-                        Mode::Decoder,
-                        Some(manager),
-                    )
-                });
-                if result.is_err() {
-                    // SAFETY: failed candidate has no published output and its cache is no longer used.
-                    unsafe {
-                        let _ = activate.ShutdownObject();
-                    }
-                }
-                result
-            });
-        model::prefer_hardware(attempts, || {
+        let hardware = model::hardware_deadline(Instant::now(), deadline);
+        let candidates = ranked(
+            candidate_kind(Mode::Decoder, true),
+            enumerate_reported(Mode::Decoder, report),
+        );
+        let attempts = candidates.into_iter().map(|activate| {
+            Self::attempt_hardware(
+                activate,
+                Mode::Decoder,
+                Some(manager),
+                hardware,
+                stop,
+                report,
+            )
+        });
+        let session = model::prefer_hardware(attempts, || {
             check(deadline, stop)?;
             // SAFETY: documented inbox decoder, initialized MTA, no aggregation.
             let transform = api(
@@ -1207,16 +1316,59 @@ impl Session {
                 "Microsoft H.264 DXGI decoder".into(),
                 Mode::Decoder,
                 Some(manager),
+                report,
             )
-        })
+        })?;
+        report.choose(&session.name, session.hardware);
+        Ok(session)
+    }
+    /// Open one enumerated hardware transform within its own bounded deadline. A refusal is
+    /// recorded with its failed step and HRESULT; the caller moves on to the next candidate.
+    fn attempt_hardware(
+        activate: IMFActivate,
+        mode: Mode,
+        manager: Option<&IMFDXGIDeviceManager>,
+        hardware: Instant,
+        stop: &AtomicBool,
+        report: &Report,
+    ) -> Result<Self, CodecError> {
+        let name = friendly_name(&activate);
+        let kind = candidate_kind(mode, manager.is_some());
+        let until = model::candidate_deadline(Instant::now(), hardware);
+        let opened = (|| {
+            check(until, stop)?;
+            // SAFETY: enumeration returned an owned activation object, activated on this MTA.
+            let transform = api(
+                unsafe { activate.ActivateObject::<IMFTransform>() },
+                "ActivateObject",
+            )?;
+            let session =
+                Self::configure_with_manager(transform, true, name.clone(), mode, manager, report)?;
+            // A candidate that used up its second is refused, however far it got.
+            check(until, stop)?;
+            Ok(session)
+        })();
+        if opened.is_ok() {
+            memory::worked(kind, &name);
+        }
+        if let Err(error) = &opened {
+            memory::refused(kind, &name);
+            report.refuse(&name, error);
+            // SAFETY: failed candidate is no longer used; release its activation cache.
+            unsafe {
+                let _ = activate.ShutdownObject();
+            }
+        }
+        opened
     }
     fn configure(
         transform: IMFTransform,
         hardware: bool,
         name: String,
         mode: Mode,
+        report: &Report,
     ) -> Result<Self, CodecError> {
-        Self::configure_with_manager(transform, hardware, name, mode, None)
+        Self::configure_with_manager(transform, hardware, name, mode, None, report)
     }
     fn configure_with_manager(
         transform: IMFTransform,
@@ -1224,6 +1376,7 @@ impl Session {
         name: String,
         mode: Mode,
         manager: Option<&IMFDXGIDeviceManager>,
+        report: &Report,
     ) -> Result<Self, CodecError> {
         let mut session = Self {
             transform,
@@ -1244,6 +1397,18 @@ impl Session {
         };
         // SAFETY: live transform, documented stream and attribute getters and writable one-element IDs.
         unsafe {
+            // An asynchronous (hardware) MFT is locked until the caller unlocks it: GetStreamIDs and
+            // most other methods fail with MF_E_TRANSFORM_ASYNC_LOCKED before that, which made every
+            // hardware encoder look incompatible. Unlock first.
+            if let Ok(attrs) = session.transform.GetAttributes()
+                && attrs.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 0
+            {
+                api(
+                    attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1),
+                    "async unlock",
+                )?;
+                session.events = Some(api(session.transform.cast(), "IMFMediaEventGenerator")?);
+            }
             let mut inputs = 0;
             let mut outputs = 0;
             api(
@@ -1264,15 +1429,6 @@ impl Session {
                 error => {
                     api(error, "GetStreamIDs")?;
                 }
-            }
-            if let Ok(attrs) = session.transform.GetAttributes()
-                && attrs.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 0
-            {
-                api(
-                    attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1),
-                    "async unlock",
-                )?;
-                session.events = Some(api(session.transform.cast(), "IMFMediaEventGenerator")?);
             }
         }
         if let Some(manager) = manager {
@@ -1300,16 +1456,24 @@ impl Session {
         } else {
             true.into()
         };
-        session.property(&CODECAPI_AVLowLatencyMode, low_latency)?;
+        // None of these is essential to opening the codec: a transform may implement only some of
+        // them, and the frame checks (no B-frame reordering, coded geometry, IDR headers) reject a
+        // stream that really is unusable. A rejected property is skipped and recorded.
+        session.best_effort(report, &CODECAPI_AVLowLatencyMode, low_latency);
         match mode {
             Mode::Encoder(params) => {
-                session.property(&CODECAPI_AVEncMPVDefaultBPictureCount, 0_u32.into())?;
-                session.property(
+                session.best_effort(report, &CODECAPI_AVEncMPVDefaultBPictureCount, 0_u32.into());
+                session.best_effort(
+                    report,
                     &CODECAPI_AVEncCommonRateControlMode,
                     (eAVEncCommonRateControlMode_CBR.0 as u32).into(),
-                )?;
-                session.property(&CODECAPI_AVEncCommonMeanBitRate, params.bitrate.into())?;
-                session.property(&CODECAPI_AVEncMPVGOPSize, model::GOP.into())?;
+                );
+                session.best_effort(
+                    report,
+                    &CODECAPI_AVEncCommonMeanBitRate,
+                    params.bitrate.into(),
+                );
+                session.best_effort(report, &CODECAPI_AVEncMPVGOPSize, model::GOP.into());
                 let output = video_type(MFVideoFormat_H264, Some(params))?;
                 let input = video_type(MFVideoFormat_NV12, Some(params))?;
                 // SAFETY: matching even-sized NV12/H.264 media types; encoder output set first.
@@ -1362,9 +1526,20 @@ impl Session {
         Ok(session)
     }
     fn property(&self, key: &GUID, value: VARIANT) -> Result<(), CodecError> {
-        let codec: ICodecAPI = api(self.transform.cast(), "ICodecAPI")?;
+        let name = property_name(key);
+        let codec: ICodecAPI = api(self.transform.cast(), &format!("ICodecAPI {name}"))?;
         // SAFETY: codec property GUID and correctly typed owning VARIANT, borrowed for this call.
-        api(unsafe { codec.SetValue(key, &value) }, "ICodecAPI SetValue")
+        api(
+            unsafe { codec.SetValue(key, &value) },
+            &format!("ICodecAPI {name}"),
+        )
+    }
+    /// Set a non-essential property; a transform that rejects it keeps its own default and the
+    /// rejection (property name and HRESULT) is recorded instead of failing the candidate.
+    fn best_effort(&self, report: &Report, key: &GUID, value: VARIANT) {
+        if let Err(error) = self.property(key, value) {
+            report.skip(&self.name, &error, property_name(key));
+        }
     }
     fn output_type(&mut self) -> Result<(), CodecError> {
         for index in 0..64 {
@@ -1689,6 +1864,104 @@ fn output_aperture(ty: &IMFMediaType) -> Result<Option<model::Aperture>, CodecEr
     Ok(None)
 }
 
+/// What [`probe_hardware_encoders`] saw for one hardware H.264 encoder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeOutcome {
+    pub candidate: String,
+    /// Where it was refused; `None` when it opened and produced a first access unit.
+    pub refusal: Option<Refusal>,
+    /// Codec properties it rejected (skipped, not fatal).
+    pub skipped: Vec<SkippedProperty>,
+    /// Size in bytes of the first access unit (never its contents).
+    pub first_frame_bytes: Option<usize>,
+}
+
+/// Diagnostic: open every hardware H.264 encoder one by one with the settings the agent uses
+/// (CPU NV12 input, CBR, low latency, one second per candidate) and encode one synthetic frame
+/// through each. Used by the `mft_probe` example; the agent never calls it.
+pub fn probe_hardware_encoders(
+    size: PixelSize,
+    bitrate: u32,
+    fps: u32,
+) -> Result<Vec<ProbeOutcome>, CodecError> {
+    let params = Params::new(size, bitrate, fps)?;
+    let (done, result) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("crosspane-mf-probe".into())
+        .spawn(move || {
+            let _ = done.try_send(probe_on_this_thread(params));
+        })
+        .map_err(|error| CodecError::Unavailable(error.to_string()))?;
+    result
+        .recv_timeout(Duration::from_secs(30))
+        .map_err(|_| failure("hardware encoder probe timed out"))?
+}
+fn probe_on_this_thread(params: Params) -> Result<Vec<ProbeOutcome>, CodecError> {
+    let _runtime = Runtime::new()?;
+    let mode = Mode::Encoder(params);
+    let stop = AtomicBool::new(false);
+    let coded = params.coded()?;
+    let luma = coded.width as usize * coded.height as usize;
+    let frame: Vec<u8> = (0..luma * 3 / 2).map(|index| (index % 251) as u8).collect();
+    let mut outcomes = Vec::new();
+    for activate in enumerate(mode)? {
+        let name = friendly_name(&activate);
+        let report = Report::default();
+        // A real candidate gets its own second; the shared phase budget is not the question here.
+        let hardware = Instant::now() + Duration::from_secs(60);
+        let opened = Session::attempt_hardware(activate, mode, None, hardware, &stop, &report);
+        let mut snapshot = report.snapshot();
+        let (refusal, first_frame_bytes) = match opened {
+            Ok(mut session) => {
+                let until = Instant::now() + Duration::from_secs(2);
+                let first = (|| {
+                    session.property(&CODECAPI_AVEncVideoForceKeyFrame, 1_u32.into())?;
+                    let duration = i64::from(10_000_000 / params.fps.max(1));
+                    let input = sample(&frame, 0, duration)?;
+                    let output = session.exchange(&input, 0, until, &stop)?;
+                    sample_bytes(&output, MAX_PACKET).map(|bytes| bytes.len())
+                })();
+                match first {
+                    Ok(bytes) => (None, Some(bytes)),
+                    Err(error) => {
+                        let mut refusal = Refusal::from_error(&name, &error);
+                        if refusal.stage != Stage::Deadline {
+                            refusal.stage = Stage::FirstSample;
+                        }
+                        (Some(refusal), None)
+                    }
+                }
+            }
+            Err(_) => (snapshot.refused.pop(), None),
+        };
+        outcomes.push(ProbeOutcome {
+            candidate: name,
+            refusal,
+            skipped: snapshot.skipped,
+            first_frame_bytes,
+        });
+    }
+    Ok(outcomes)
+}
+/// Enumeration that never hides why the list is empty: an error or an empty answer is recorded.
+fn enumerate_reported(mode: Mode, report: &Report) -> Vec<IMFActivate> {
+    match enumerate(mode) {
+        Ok(found) if found.is_empty() => {
+            report.refuse_with(Refusal::at(
+                "hardware H.264 MFT enumeration",
+                Stage::Enumerate,
+                "no hardware H.264 MFT enumerated",
+                None,
+            ));
+            found
+        }
+        Ok(found) => found,
+        Err(error) => {
+            report.refuse("hardware H.264 MFT enumeration", &error);
+            Vec::new()
+        }
+    }
+}
 fn enumerate(mode: Mode) -> Result<Vec<IMFActivate>, CodecError> {
     let (category, input, output) = match mode {
         Mode::Encoder(_) => (
@@ -1744,6 +2017,140 @@ fn enumerate(mode: Mode) -> Result<Vec<IMFActivate>, CodecError> {
         CoTaskMemFree(Some(items.cast()));
     }
     Ok(owned)
+}
+/// The ICodecAPI properties this adapter sets, by name, for the selection report.
+fn property_name(key: &GUID) -> &'static str {
+    if *key == CODECAPI_AVLowLatencyMode {
+        "AVLowLatencyMode"
+    } else if *key == CODECAPI_AVEncMPVDefaultBPictureCount {
+        "AVEncMPVDefaultBPictureCount"
+    } else if *key == CODECAPI_AVEncCommonRateControlMode {
+        "AVEncCommonRateControlMode"
+    } else if *key == CODECAPI_AVEncCommonMeanBitRate {
+        "AVEncCommonMeanBitRate"
+    } else if *key == CODECAPI_AVEncMPVGOPSize {
+        "AVEncMPVGOPSize"
+    } else if *key == CODECAPI_AVEncVideoForceKeyFrame {
+        "AVEncVideoForceKeyFrame"
+    } else {
+        "unknown property"
+    }
+}
+/// How hardware candidates fared earlier in this process. A video size change opens a fresh
+/// encoder session, and on this machine the integrated GPU's MFT is listed first and takes
+/// ~130 ms to refuse every time (twice: it is registered twice), so each re-selection stalled
+/// the encoder for ~300 ms before the discrete GPU's MFT was even tried. Remembering which
+/// candidate worked, and which one was just refused, puts the working one first. Nothing is
+/// ever dropped from the list: a candidate refused long ago, or only once, is still tried.
+mod memory {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    /// How long a refusal moves a candidate to the back of the list.
+    const REFUSAL_MEMORY: Duration = Duration::from_secs(60);
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Verdict {
+        Worked,
+        Refused(Instant),
+    }
+    /// Verdicts per (kind of session, candidate name).
+    #[derive(Debug, Default)]
+    pub struct Book {
+        seen: HashMap<(&'static str, String), Verdict>,
+    }
+    impl Book {
+        pub fn worked(&mut self, kind: &'static str, name: &str) {
+            self.seen.insert((kind, name.into()), Verdict::Worked);
+        }
+        pub fn refused(&mut self, kind: &'static str, name: &str, now: Instant) {
+            self.seen.insert((kind, name.into()), Verdict::Refused(now));
+        }
+        /// 0 = worked before, 1 = unknown (or a refusal that has expired), 2 = refused recently.
+        pub fn rank(&self, kind: &'static str, name: &str, now: Instant) -> u8 {
+            match self.seen.get(&(kind, name.to_owned())) {
+                Some(Verdict::Worked) => 0,
+                Some(Verdict::Refused(at))
+                    if now.saturating_duration_since(*at) < REFUSAL_MEMORY =>
+                {
+                    2
+                }
+                _ => 1,
+            }
+        }
+    }
+    fn book() -> &'static Mutex<Book> {
+        static BOOK: OnceLock<Mutex<Book>> = OnceLock::new();
+        BOOK.get_or_init(Mutex::default)
+    }
+    pub fn worked(kind: &'static str, name: &str) {
+        if let Ok(mut book) = book().lock() {
+            book.worked(kind, name);
+        }
+    }
+    pub fn refused(kind: &'static str, name: &str) {
+        if let Ok(mut book) = book().lock() {
+            book.refused(kind, name, Instant::now());
+        }
+    }
+    pub fn rank(kind: &'static str, name: &str) -> u8 {
+        book()
+            .lock()
+            .map_or(1, |book| book.rank(kind, name, Instant::now()))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_working_candidate_goes_first_and_a_fresh_refusal_goes_last() {
+            let now = Instant::now();
+            let mut book = Book::default();
+            book.refused("enc", "AMD", now);
+            book.worked("enc", "NVIDIA");
+            assert_eq!(book.rank("enc", "NVIDIA", now), 0);
+            assert_eq!(book.rank("enc", "other", now), 1);
+            assert_eq!(book.rank("enc", "AMD", now), 2);
+            // Kinds are separate: a decoder's verdict says nothing about an encoder.
+            assert_eq!(book.rank("dec", "AMD", now), 1);
+        }
+
+        #[test]
+        fn a_refusal_is_forgotten_after_its_memory_and_overrides_an_earlier_success() {
+            let now = Instant::now();
+            let mut book = Book::default();
+            book.worked("enc", "NVIDIA");
+            book.refused("enc", "NVIDIA", now);
+            assert_eq!(book.rank("enc", "NVIDIA", now), 2);
+            assert_eq!(
+                book.rank(
+                    "enc",
+                    "NVIDIA",
+                    now + REFUSAL_MEMORY + Duration::from_secs(1)
+                ),
+                1
+            );
+            book.worked("enc", "NVIDIA");
+            assert_eq!(book.rank("enc", "NVIDIA", now), 0);
+        }
+    }
+}
+/// The kind of session a hardware candidate is opened for, for [`memory`].
+fn candidate_kind(mode: Mode, manager: bool) -> &'static str {
+    match (mode, manager) {
+        (Mode::Encoder(_), false) => "encoder",
+        (Mode::Encoder(_), true) => "encoder-gpu-input",
+        (Mode::Decoder, false) => "decoder",
+        (Mode::Decoder, true) => "decoder-gpu",
+    }
+}
+/// `candidates` with the ones that worked before first and the recently refused ones last (the
+/// order is otherwise the enumeration's).
+fn ranked(kind: &'static str, mut candidates: Vec<IMFActivate>) -> Vec<IMFActivate> {
+    candidates.sort_by_cached_key(|candidate| memory::rank(kind, &friendly_name(candidate)));
+    candidates
 }
 fn friendly_name(activate: &IMFActivate) -> String {
     let mut name = [0_u16; 1024];

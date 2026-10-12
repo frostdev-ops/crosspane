@@ -20,6 +20,7 @@ use crosspane_platform::{
 use crosspane_types::{
     geom::{PixelRect, PixelSize},
     id::WindowId,
+    time::MonoTime,
 };
 use std::{
     any::Any,
@@ -35,7 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 use windows::{
-    Foundation::TypedEventHandler,
+    Foundation::{TimeSpan, TypedEventHandler},
     Graphics::{
         Capture::{
             Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
@@ -66,7 +67,123 @@ use windows::{
 };
 
 const BOUND: Duration = Duration::from_secs(2);
-const POLL: Duration = Duration::from_millis(5);
+/// The longest the worker sleeps with nothing due. A frame arrival, a command or a stream's
+/// delivery deadline wakes it sooner. (It used to sleep in `recv_timeout(5 ms)`, which on Windows
+/// lasts a whole system timer tick, 15.6 ms: with a 16.7 ms delivery interval a frame waited for
+/// the second tick, and every window was captured at half rate, ~32 fps.)
+const IDLE: Duration = Duration::from_millis(8);
+/// How long one fresh monitor observation vouches for a display stream's binding. A fresh
+/// coherent observation costs ~14 ms on a three-monitor desktop (several `QueryDisplayConfig`
+/// rounds on the monitors thread), and the worker used to take 5 to 7 of them for every frame it
+/// delivered: display capture ran at ~10 fps while the same WGC session delivers 33 to 55 fps.
+/// The binding is therefore verified against a fresh observation when the stream starts, when its
+/// content size changes and when its crop is set; otherwise right after a delivery, when the next
+/// frame is not due for a frame interval and the observation hides in that gap, once this much
+/// time has passed since the last one. A monitor that goes away still ends the stream at once
+/// through the capture item's `Closed` event; one that merely moves or is re-pathed ends it within
+/// this interval (plus a frame). The gate/epoch checks are cheap and still run at every point they
+/// ran before.
+const DISPLAY_RECHECK: Duration = Duration::from_millis(250);
+/// The longest any check inside a frame's processing (or an idle poll) relies on an earlier
+/// observation. Past it the check observes afresh itself, which is what keeps a display stream
+/// that delivers nothing (a static screen) verified without the post-delivery slot.
+const DISPLAY_RECHECK_LIMIT: Duration = Duration::from_millis(1000);
+
+/// The worker's sleeping and waking, without the 15.6 ms system timer tick.
+mod wait {
+    use crosspane_platform::PlatformError;
+    use std::{ptr::null, sync::Arc, time::Duration};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        System::Threading::{
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW, CreateWaitableTimerExW, INFINITE,
+            SetEvent, SetWaitableTimer, TIMER_ALL_ACCESS, WaitForMultipleObjects,
+        },
+    };
+
+    /// An auto-reset event the capture callbacks and commands set to wake the worker.
+    #[derive(Debug)]
+    pub struct Wake {
+        event: usize,
+    }
+    impl Wake {
+        pub fn new() -> Result<Arc<Self>, PlatformError> {
+            // SAFETY: an anonymous auto-reset, initially clear event without security attributes.
+            let event = unsafe { CreateEventW(null(), 0, 0, null()) };
+            if event.is_null() {
+                return Err(PlatformError::Backend("wake event".into()));
+            }
+            Ok(Arc::new(Self {
+                event: event as usize,
+            }))
+        }
+        pub fn signal(&self) {
+            // SAFETY: the event handle is owned by `self` and open until it drops.
+            unsafe { SetEvent(self.event as HANDLE) };
+        }
+    }
+    impl Drop for Wake {
+        fn drop(&mut self) {
+            // SAFETY: closes exactly the event `new` created, once.
+            unsafe { CloseHandle(self.event as HANDLE) };
+        }
+    }
+
+    /// A high-resolution waitable timer owned by the worker thread.
+    #[derive(Debug)]
+    pub struct Pacer {
+        timer: usize,
+    }
+    impl Pacer {
+        pub fn new() -> Self {
+            // SAFETY: anonymous timer without security attributes; the flag needs Windows 10 1803,
+            // so an older system falls back to the ordinary (tick-resolution) timer.
+            let mut timer = unsafe {
+                CreateWaitableTimerExW(
+                    null(),
+                    null(),
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_ALL_ACCESS,
+                )
+            };
+            if timer.is_null() {
+                // SAFETY: as above, without the high-resolution flag.
+                timer = unsafe { CreateWaitableTimerExW(null(), null(), 0, TIMER_ALL_ACCESS) };
+            }
+            Self {
+                timer: timer as usize,
+            }
+        }
+        /// Sleep for `timeout`, or until `wake` is signalled.
+        pub fn wait(&self, wake: &Wake, timeout: Duration) {
+            let handles = [wake.event as HANDLE, self.timer as HANDLE];
+            if self.timer == 0 {
+                let ms = timeout.as_millis().clamp(1, 1000) as u32;
+                // SAFETY: waits on the wake event we own, bounded.
+                unsafe { WaitForMultipleObjects(1, handles.as_ptr(), 0, ms) };
+                return;
+            }
+            // Relative due time: negative, in 100 ns units.
+            let due = -((timeout.as_nanos() / 100).clamp(1, i64::MAX as u128) as i64);
+            // SAFETY: our timer and a valid due time; no completion routine.
+            let armed = unsafe { SetWaitableTimer(handles[1], &due, 0, None, null(), 0) } != 0;
+            let wait_ms = if armed { INFINITE } else { 1 };
+            // SAFETY: two handles we own, both open for the duration of the call.
+            unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, wait_ms) };
+        }
+    }
+    impl Drop for Pacer {
+        fn drop(&mut self) {
+            if self.timer != 0 {
+                // SAFETY: closes exactly the timer `new` created, once.
+                unsafe { CloseHandle(self.timer as HANDLE) };
+            }
+        }
+    }
+}
+/// How long a stream keeps CPU-only slots after a GPU context failed to make surfaces.
+#[cfg(feature = "gpu")]
+const SURFACE_RETRY: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 fn popup_diagnostics() -> bool {
@@ -169,8 +286,13 @@ struct Shared {
     monitor_reader: Option<MonitorSnapshotReader>,
     alive: AtomicBool,
     fault: AtomicBool,
+    /// Wakes the worker: a command is queued, a frame arrived, or the facade is dropping.
+    wake: Arc<wait::Wake>,
     #[cfg(feature = "gpu")]
     gpu: Mutex<Option<Arc<crate::gpu::WindowsGpu>>>,
+    /// Bounds how often a retired GPU is rebuilt.
+    #[cfg(feature = "gpu")]
+    gpu_rebuild: Mutex<crate::model::gpu::Rebuild>,
     #[cfg(test)]
     popup_probes: Mutex<BTreeMap<StreamId, PopupProbeSnapshot>>,
 }
@@ -278,6 +400,13 @@ impl WindowsFrameCapture {
             .clone()
             .ok_or_else(|| backend("GPU initialization missing"))
     }
+    /// The GPU context currently serving new capture slots: the one `enable_gpu` returned, or
+    /// the replacement built after it was retired by a device fault. A caller holding an older
+    /// one keeps working (its frames fall back to CPU readback) and may switch to this one.
+    #[cfg(feature = "gpu")]
+    pub fn gpu(&self) -> Option<Arc<crate::gpu::WindowsGpu>> {
+        self.shared.gpu.lock().ok().and_then(|gpu| gpu.clone())
+    }
     pub fn new(gate: Arc<IoGate>, resolver: WindowResolver) -> Result<Self, PlatformError> {
         Self::with_reader(gate, resolver, None)
     }
@@ -304,8 +433,11 @@ impl WindowsFrameCapture {
             monitor_reader,
             alive: AtomicBool::new(true),
             fault: AtomicBool::new(false),
+            wake: wait::Wake::new()?,
             #[cfg(feature = "gpu")]
             gpu: Mutex::new(None),
+            #[cfg(feature = "gpu")]
+            gpu_rebuild: Mutex::new(crate::model::gpu::Rebuild::default()),
             #[cfg(test)]
             popup_probes: Mutex::new(BTreeMap::new()),
         });
@@ -366,6 +498,7 @@ impl WindowsFrameCapture {
                 reply,
             })
             .map_err(|_| backend("WGC worker busy"))?;
+        self.shared.wake.signal();
         match receive.recv_timeout(until.saturating_duration_since(Instant::now())) {
             Ok(result) => result,
             Err(_) => {
@@ -379,6 +512,7 @@ impl WindowsFrameCapture {
     #[allow(dead_code)] // Used only by the separately compiled, ignored fixture harness.
     pub(crate) fn stop_verified(mut self) -> bool {
         self.shared.alive.store(false, Ordering::Release);
+        self.shared.wake.signal();
         let Some(thread) = self.thread.take() else {
             return false;
         };
@@ -464,6 +598,7 @@ impl FrameCapture for WindowsFrameCapture {
 impl Drop for WindowsFrameCapture {
     fn drop(&mut self) {
         self.shared.alive.store(false, Ordering::Release);
+        self.shared.wake.signal();
         if let Some(thread) = self.thread.take()
             && self.done.recv_timeout(BOUND).is_ok()
         {
@@ -598,6 +733,9 @@ struct Image {
     epoch: u64,
     #[cfg(feature = "gpu")]
     surface: Option<Arc<crate::gpu::Surface>>,
+    /// The CPU-readable copy `read` maps, made once and reused. Only touched while the D3D
+    /// context is locked.
+    staging: Mutex<Option<ID3D11Texture2D>>,
 }
 impl fmt::Debug for Image {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -657,13 +795,29 @@ impl NativeImage for Image {
             }
             thread::sleep(Duration::from_millis(1));
         };
-        let staging = self.gpu.texture(self.size, true)?;
+        // Made on the first read of this image and kept (the context lock is held, so no other
+        // reader is between its copy and its unmap).
+        let staging = {
+            let mut slot = self
+                .staging
+                .lock()
+                .map_err(|_| backend("capture staging poisoned"))?;
+            match slot.as_ref() {
+                Some(staging) => staging.clone(),
+                None => {
+                    let staging = self.gpu.texture(self.size, true)?;
+                    *slot = Some(staging.clone());
+                    staging
+                }
+            }
+        };
         if !self.permitted() {
             return Err(PlatformError::Locked);
         }
         // SAFETY: same-device identical-size/format single-subresource textures; context locked.
         unsafe { context.CopyResource(&staging, &self.texture) };
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        let waiting = Instant::now();
         loop {
             if !self.permitted() {
                 return Err(PlatformError::Locked);
@@ -683,7 +837,13 @@ impl NativeImage for Image {
             } {
                 Ok(()) => break,
                 Err(e) if e.code() == DXGI_ERROR_WAS_STILL_DRAWING => {
-                    thread::sleep(Duration::from_millis(1))
+                    // The copy of a window-sized frame finishes within a millisecond or two; a
+                    // 1 ms sleep lasts a whole 15.6 ms system tick, so yield instead at first.
+                    if waiting.elapsed() < Duration::from_millis(4) {
+                        thread::yield_now();
+                    } else {
+                        thread::sleep(Duration::from_millis(1));
+                    }
                 }
                 Err(e) => return Err(api("map captured image", e)),
             }
@@ -708,7 +868,8 @@ impl NativeImage for Image {
             return Err(PlatformError::Locked);
         }
         // Exclude driver row padding: only copied pixels are exposed to the consumer.
-        let mut pixels = zeroize::Zeroizing::new(vec![0_u8; len]);
+        // Rows are appended, not copied over a zero-filled buffer (a second pass over 2.7 MB).
+        let mut pixels = zeroize::Zeroizing::new(Vec::<u8>::with_capacity(len));
         for y in 0..self.size.height as usize {
             let offset = y
                 .checked_mul(mapped.RowPitch as usize)
@@ -722,7 +883,7 @@ impl NativeImage for Image {
             let source = unsafe {
                 std::slice::from_raw_parts(mapped.pData.cast::<u8>().add(offset), row as usize)
             };
-            pixels[y * row as usize..(y + 1) * row as usize].copy_from_slice(source);
+            pixels.extend_from_slice(source);
         }
         if !self.permitted() {
             return Err(PlatformError::Locked);
@@ -745,17 +906,76 @@ pub fn capture_lease<'a>(
         return Ok(None);
     };
     if !surface.belongs(gpu) {
-        return Err(backend("capture GPU device mismatch"));
+        // The slot was built on another GPU context (the caller's was retired and rebuilt, or
+        // the reverse). That is not a fault: the frame has no lease for this caller and takes
+        // the CPU readback, which `Image::read` still gates on the slot's own context.
+        return Ok(None);
     }
-    match surface.begin(gpu, image.gate.clone(), image.epoch) {
-        Ok(lease) => Ok(Some(lease)),
+    // No blanket retirement here. A gate or epoch refusal is `Locked` (the node locked or
+    // the capture ended), a lock or fence timeout quarantines only this surface, and a real
+    // device fault retires the context from inside `begin`, where its cause is known.
+    surface
+        .begin(gpu, image.gate.clone(), image.epoch)
+        .map(Some)
+}
+
+/// The GPU context that new slots should use. A retired context is replaced by a fresh one (new
+/// D3D12 device, queue and shared objects) at most once per `REBUILD_INTERVAL_MS`, and never
+/// when the retirement says the adapter cannot do the sharing. The retired context stays
+/// retired: every surface, lease and encoder slot bound to it remains refused, so an unconfirmed
+/// handoff is never inherited. None means CPU slots for now.
+#[cfg(feature = "gpu")]
+fn serving_gpu(
+    shared: &Shared,
+    graphics: &Graphics,
+) -> Result<Option<Arc<crate::gpu::WindowsGpu>>, PlatformError> {
+    let mut slot = shared
+        .gpu
+        .lock()
+        .map_err(|_| backend("GPU context poisoned"))?;
+    let Some(current) = slot.clone() else {
+        return Ok(None);
+    };
+    if current.healthy().is_ok() {
+        return Ok(Some(current));
+    }
+    let permitted = shared
+        .gpu_rebuild
+        .lock()
+        .map_err(|_| backend("GPU rebuild state poisoned"))?
+        .permit(current.retired(), crate::gpu::now_ms());
+    if !permitted {
+        return Ok(None);
+    }
+    match crate::gpu::WindowsGpu::new(
+        graphics.gpu.device.clone(),
+        graphics.gpu.context.clone(),
+        current.wanted(),
+    ) {
+        Ok(fresh) => {
+            *slot = Some(fresh.clone());
+            // Best-effort drain of what the retired context still retains.
+            let _ = current.healthy();
+            Ok(Some(fresh))
+        }
         Err(error) => {
-            if !matches!(error, PlatformError::Locked) {
-                gpu.retire();
-            }
-            Err(error)
+            // Stays retired; the next attempt is one interval away. Keep the cause readable.
+            current.note_refusal(&error);
+            Ok(None)
         }
     }
+}
+
+/// How long the worker may sleep until the next delivery is allowed, when that is still ahead:
+/// `interval` after the last delivery, plus a small pad so the wake never lands a hair before
+/// the delivery clock allows it (which would cost a whole idle sleep).
+fn delivery_wait(
+    delivered: Option<MonoTime>,
+    interval: Duration,
+    now: MonoTime,
+) -> Option<Duration> {
+    let due = delivered?.saturating_add(interval + Duration::from_micros(150));
+    Some(due.saturating_duration_since(now)).filter(|left| !left.is_zero())
 }
 
 struct Held(Direct3D11CaptureFrame);
@@ -824,6 +1044,14 @@ impl Binding {
 
     fn unchanged(&self, shared: &Shared) -> bool {
         self.refresh(shared).is_ok_and(|fresh| fresh == *self)
+    }
+
+    /// [`unchanged`](Self::unchanged), except that a display binding verified less than
+    /// [`DISPLAY_RECHECK_LIMIT`] ago (`verified`) counts as unchanged without another observation.
+    fn unchanged_within(&self, shared: &Shared, verified: Option<Instant>) -> bool {
+        (matches!(self, Self::Display(_))
+            && verified.is_some_and(|at| at.elapsed() < DISPLAY_RECHECK_LIMIT))
+            || self.unchanged(shared)
     }
 
     fn state(&self) -> TargetState {
@@ -1548,11 +1776,26 @@ struct Stream {
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
     token: i64,
+    /// The pool's `FrameArrived` registration, which wakes the worker (None if it was refused:
+    /// the worker then still polls every [`IDLE`]).
+    arrived: Option<i64>,
     closed: Arc<AtomicBool>,
     pool_size: SizeInt32,
     latest: Latest<Held>,
+    /// The shortest time between two deliveries (`max_fps`), and when the last one was taken (the
+    /// poll's clock reading, the one `latest` paces by), so the worker can sleep exactly until
+    /// the next one is allowed.
+    interval: Duration,
+    delivered_at: Option<MonoTime>,
     crop: Option<PixelRect>,
+    /// When a display binding was last checked against a fresh monitor observation (the instant
+    /// the observation started); None forces the next [`Stream::refresh`] to observe. Always None
+    /// for window streams, whose resolver is cheap and never memoized.
+    verified: Option<Instant>,
     slots: Vec<Arc<Image>>,
+    /// When CPU-only slots (a GPU context existed but slot creation failed) are tried again.
+    #[cfg(feature = "gpu")]
+    surface_retry: Option<Instant>,
     cursor: crate::cursor::StreamCursor,
     popups: Option<PopupState>,
     delivery_popup: Option<(popup::Snapshot, Instant)>,
@@ -1568,6 +1811,9 @@ impl Drop for Stream {
         let _ = self.session.Close();
         #[cfg(test)]
         popup_stage(42);
+        if let Some(arrived) = self.arrived {
+            let _ = self.pool.RemoveFrameArrived(arrived);
+        }
         let _ = self.pool.Close();
         #[cfg(test)]
         popup_stage(43);
@@ -1641,6 +1887,19 @@ impl Stream {
                 return Err(api("WGC close event", e));
             }
         };
+        // A free-threaded pool raises this on its own thread: the worker wakes for each frame
+        // instead of finding it at its next poll.
+        let arrived = {
+            let wake = Arc::clone(&shared.wake);
+            let handler = TypedEventHandler::<
+                Direct3D11CaptureFramePool,
+                windows::core::IInspectable,
+            >::new(move |_, _| {
+                wake.signal();
+                Ok(())
+            });
+            pool.FrameArrived(&handler).ok()
+        };
         let popups = match &binding {
             Binding::Window { native, .. } => {
                 match PopupState::new(*native, shared.resolver.clone(), call.until) {
@@ -1662,11 +1921,17 @@ impl Stream {
             pool,
             session,
             token,
+            arrived,
             closed,
             pool_size,
             latest: Latest::new(fps)?,
+            interval: Duration::from_nanos(1_000_000_000_u64.div_ceil(u64::from(fps.max(1)))),
+            delivered_at: None,
             crop,
+            verified: None,
             slots: Vec::new(),
+            #[cfg(feature = "gpu")]
+            surface_retry: None,
             cursor: crate::cursor::StreamCursor::default(),
             popups,
             delivery_popup: None,
@@ -1675,6 +1940,16 @@ impl Stream {
             .session
             .SetIsCursorCaptureEnabled(false)
             .map_err(|e| api("disable WGC cursor", e))?;
+        if matches!(stream.binding, Binding::Display(_)) {
+            // WGC's default minimum interval between frames is 16 ms. A monitor is composed on
+            // the output's own cadence (an IDD twin's 60 Hz, a 165 Hz panel), and the 16 ms floor
+            // beats against it: a 165 Hz monitor delivered 33 fps (every sixth composition)
+            // where 50 or more were available. Delivery is paced by `Latest` anyway, so take
+            // every composition. Windows 11 24H2 and later; older builds keep the default.
+            let _ = stream
+                .session
+                .SetMinUpdateInterval(TimeSpan { Duration: 0 });
+        }
         // Leave the border REQUIRED. Setter readback cannot establish borderless consent.
         if matches!(stream.binding, Binding::Window { .. }) {
             stream
@@ -1700,15 +1975,43 @@ impl Stream {
         Ok(stream)
     }
 
+    /// How long until another frame may be delivered, when that is still in the future. The
+    /// small pad keeps the wake from landing a hair before the delivery clock allows it.
+    fn due_in(&self, now: MonoTime) -> Option<Duration> {
+        delivery_wait(self.delivered_at, self.interval, now)
+    }
+
     fn refresh(&mut self, shared: &Shared) -> Result<(), PlatformError> {
         if !shared.permitted(self.epoch) {
             return Err(PlatformError::Locked);
         }
+        if matches!(self.binding, Binding::Display(_))
+            && self
+                .verified
+                .is_some_and(|at| at.elapsed() < DISPLAY_RECHECK_LIMIT)
+        {
+            // Vouched for by an observation made less than DISPLAY_RECHECK_LIMIT ago.
+            return Ok(());
+        }
+        let observing = Instant::now();
         self.binding = self.binding.refresh(shared)?;
+        if matches!(self.binding, Binding::Display(_)) {
+            self.verified = Some(observing);
+        }
         if !shared.permitted(self.epoch) {
             return Err(PlatformError::Locked);
         }
         Ok(())
+    }
+
+    /// True when this is a display stream whose last observation is older than
+    /// [`DISPLAY_RECHECK`]. The worker then observes right after a delivery, in the gap before
+    /// the next frame is due, so no frame waits for it.
+    fn recheck_due(&self) -> bool {
+        matches!(self.binding, Binding::Display(_))
+            && self
+                .verified
+                .is_none_or(|at| at.elapsed() >= DISPLAY_RECHECK)
     }
 
     fn poll(
@@ -1756,6 +2059,8 @@ impl Stream {
                         if !access.ready()? {
                             return Ok(None);
                         }
+                        // A resized target is exactly when the binding may have changed.
+                        self.verified = None;
                         self.refresh(shared)?;
                         if !shared.permitted(self.epoch) {
                             return Err(PlatformError::Locked);
@@ -1817,18 +2122,30 @@ impl Stream {
         };
         let output = PixelSize::new(roi.width() as u32, roi.height() as u32);
         #[cfg(feature = "gpu")]
-        if self.slots.iter().any(|image| {
-            image
-                .surface
-                .as_ref()
-                .is_some_and(|surface| !surface.healthy())
-        }) {
-            // Old resources retire, never become CPU readback. A fresh healthy D3D11 slot may replace them.
-            // SAFETY: read-only status query on the retained WGC device.
-            unsafe { graphics.gpu.device.GetDeviceRemovedReason() }
-                .map_err(|e| api("capture device removed", e))?;
-            self.slots.clear();
-        }
+        let gpu_context = {
+            if self.slots.iter().any(|image| {
+                image
+                    .surface
+                    .as_ref()
+                    .is_some_and(|surface| !surface.healthy())
+            }) {
+                // Old resources retire, never become CPU readback. A fresh healthy D3D11 slot may replace them.
+                // SAFETY: read-only status query on the retained WGC device.
+                unsafe { graphics.gpu.device.GetDeviceRemovedReason() }
+                    .map_err(|e| api("capture device removed", e))?;
+                self.slots.clear();
+            }
+            let context = serving_gpu(shared, graphics)?;
+            // A context that could not make surfaces earlier (or was only rebuilt now) gets
+            // another try, so one failed or retired period never pins the stream to CPU slots.
+            if context.is_some()
+                && self.slots.iter().any(|image| image.surface.is_none())
+                && self.surface_retry.is_none_or(|at| Instant::now() >= at)
+            {
+                self.slots.clear();
+            }
+            context
+        };
         if self.slots.first().is_none_or(|image| image.size != output) {
             self.slots.clear();
             for _ in 0..2 {
@@ -1837,13 +2154,24 @@ impl Stream {
                     return Ok(None);
                 }
                 #[cfg(feature = "gpu")]
-                let surface = shared
-                    .gpu
-                    .lock()
-                    .map_err(|_| backend("GPU context poisoned"))?
-                    .as_ref()
-                    .filter(|gpu| gpu.healthy().is_ok())
-                    .and_then(|gpu| crate::gpu::Surface::new(gpu.clone(), output).ok());
+                let surface = gpu_context.as_ref().and_then(|gpu| {
+                    match crate::gpu::Surface::new(gpu.clone(), output) {
+                        Ok(surface) => {
+                            gpu.surface_created();
+                            Some(surface)
+                        }
+                        Err(error) => {
+                            // Kept for the agent to report; persistent failure latches the
+                            // context as unsupported instead of retrying forever.
+                            gpu.surface_failed(&error);
+                            None
+                        }
+                    }
+                });
+                #[cfg(feature = "gpu")]
+                if surface.is_none() && gpu_context.is_some() {
+                    self.surface_retry = Some(Instant::now() + SURFACE_RETRY);
+                }
                 let texture = {
                     #[cfg(feature = "gpu")]
                     if let Some(surface) = &surface {
@@ -1872,6 +2200,7 @@ impl Stream {
                     epoch: self.epoch,
                     #[cfg(feature = "gpu")]
                     surface,
+                    staging: Mutex::new(None),
                 }));
             }
         }
@@ -2185,10 +2514,11 @@ fn worker(
     }
     let start = Instant::now();
     let mut streams = BTreeMap::new();
+    let pacer = wait::Pacer::new();
     let _ = ready.send(Ok(()));
     while shared.alive.load(Ordering::Acquire) && !shared.fault.load(Ordering::Acquire) {
         crate::window::pump_popups();
-        if let Ok(call) = receive.recv_timeout(POLL) {
+        if let Ok(call) = receive.try_recv() {
             let result = call.check(shared).and_then(|()| match &call.operation {
                 #[cfg(feature = "gpu")]
                 Operation::Gpu(wanted) => {
@@ -2228,6 +2558,8 @@ fn worker(
                 }
                 Operation::Crop(id, crop) => {
                     let stream = streams.get_mut(id).ok_or(PlatformError::NotFound)?;
+                    // A crop is applied against the monitor as it is now, not as it was.
+                    stream.verified = None;
                     stream.refresh(shared)?;
                     call.check(shared)?;
                     stream.latest.clear();
@@ -2298,6 +2630,7 @@ fn worker(
                 continue;
             }
             let binding = stream.binding.clone();
+            let verified = stream.verified;
             let shape = size(stream.pool_size)
                 .ok()
                 .and_then(|content| match &binding {
@@ -2310,13 +2643,14 @@ fn worker(
                         stream
                             .cursor
                             .sample_monitor(monitor.bounds, content, stream.crop, || {
-                                shared.permitted(stream.epoch) && binding.unchanged(shared)
+                                shared.permitted(stream.epoch)
+                                    && binding.unchanged_within(shared, verified)
                             })
                     }
                 });
             if let Some(shape) = shape
                 && shared.permitted(stream.epoch)
-                && binding.unchanged(shared)
+                && binding.unchanged_within(shared, verified)
                 && shared.permitted(stream.epoch)
             {
                 let event = match shape {
@@ -2379,6 +2713,7 @@ fn worker(
                         end(shared, &mut streams, id, reason);
                         continue;
                     }
+                    let polled_at = frame.at;
                     frame.at = crate::clock::now();
                     if !shared.permitted(stream.epoch) {
                         end(shared, &mut streams, id, StreamEndReason::Blocked);
@@ -2410,9 +2745,25 @@ fn worker(
                         end(shared, &mut streams, id, StreamEndReason::Blocked);
                         continue;
                     }
-                    stream.latest.delivered(frame.at);
+                    // Paced from when the poll took the frame, not from after the copy and the
+                    // checks above: otherwise every delivery interval was lengthened by the time
+                    // those took (3 ms), and 60 fps came out as 50.
+                    stream.latest.delivered(polled_at);
+                    stream.delivered_at = Some(polled_at);
                     if !emit(&stream.sink, FrameEvent::Frame { stream: id, frame }) {
                         end(shared, &mut streams, id, StreamEndReason::Failed);
+                    } else if stream.recheck_due() {
+                        // The next frame is a delivery interval away: the monitor observation
+                        // (~14 ms) fits in the gap instead of delaying a frame.
+                        stream.verified = None;
+                        if let Err(error) = stream.refresh(shared) {
+                            let reason = failure_reason(
+                                shared.permitted(stream.epoch),
+                                shared.gate.epoch() == stream.epoch,
+                                &error,
+                            );
+                            end(shared, &mut streams, id, reason);
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -2428,6 +2779,13 @@ fn worker(
                 }
             }
         }
+        // Sleep until a frame arrives, a command is queued, or the next delivery is allowed.
+        let now = crate::clock::now();
+        let timeout = streams
+            .values()
+            .filter_map(|stream| stream.due_in(now))
+            .fold(IDLE, Duration::min);
+        pacer.wait(&shared.wake, timeout);
     }
     let reason = if !shared.gate.is_open() {
         StreamEndReason::Blocked
@@ -2448,6 +2806,21 @@ fn worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_delivery_wait_runs_from_the_last_delivery_to_the_next_allowed_one() {
+        let t = |ms: u64| MonoTime::from_nanos(ms * 1_000_000);
+        let interval = Duration::from_nanos(16_666_667);
+        // Nothing delivered yet: nothing to wait for.
+        assert_eq!(delivery_wait(None, interval, t(5)), None);
+        // 10 ms after a delivery, the rest of the interval plus the pad is left.
+        let left = delivery_wait(Some(t(100)), interval, t(110)).unwrap();
+        assert!(left > Duration::from_millis(6) && left < Duration::from_millis(7));
+        // Once the interval has passed there is no wait (a frame is delivered at once).
+        assert_eq!(delivery_wait(Some(t(100)), interval, t(120)), None);
+        // The pad: exactly at the interval the wake is still ahead, so it never fires early.
+        assert!(delivery_wait(Some(t(100)), Duration::from_millis(20), t(120)).is_some());
+    }
 
     #[test]
     fn successful_null_frame_is_empty_not_stream_failure() {

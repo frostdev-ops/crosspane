@@ -87,7 +87,6 @@ impl NativeInput for Input {
     }
 }
 pub struct InputSlot {
-    gpu: Arc<WindowsGpu>,
     shared: SharedTexture,
     fence: Fence,
     buffer: wgpu::Buffer,
@@ -98,6 +97,8 @@ pub struct InputSlot {
     release: Mutex<InputRelease>,
     origin: Mutex<Option<(Arc<crosspane_platform::IoGate>, u64)>>,
     written: AtomicBool,
+    /// Last on purpose: fields drop in order, so the natives above release before the context.
+    gpu: Arc<WindowsGpu>,
 }
 impl std::fmt::Debug for InputSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -127,8 +128,12 @@ impl InputSlot {
                 Some(&mut bytes),
             );
         }
-        if footprints[0].Footprint.Format != DXGI_FORMAT_R8_UNORM
-            || footprints[1].Footprint.Format != DXGI_FORMAT_R8G8_UNORM
+        // The driver reports the planes of an NV12 resource as the typeless R8 / R8G8 formats
+        // (measured on the NVIDIA driver here: 60 and 48); the typed ones mean the same layout.
+        let y_plane = [DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8_UNORM];
+        let uv_plane = [DXGI_FORMAT_R8G8_TYPELESS, DXGI_FORMAT_R8G8_UNORM];
+        if !y_plane.contains(&footprints[0].Footprint.Format)
+            || !uv_plane.contains(&footprints[1].Footprint.Format)
             || footprints.iter().any(|plane| plane.Footprint.Depth != 1)
             || rows != [size.height, size.height / 2]
             || row_bytes != [u64::from(size.width), u64::from(size.width)]
@@ -512,6 +517,7 @@ pub(super) fn select(
     params: Params,
     deadline: Instant,
     stop: &AtomicBool,
+    report: &Report,
 ) -> Result<Session, CodecError> {
     gpu.healthy().map_err(gpu_error)?;
     if !gpu.video_supported {
@@ -574,37 +580,233 @@ pub(super) fn select(
         }
         CoTaskMemFree(Some(items.cast()));
     }
+    if candidates.is_empty() {
+        return Err(failure("no matching GPU MFT"));
+    }
+    // Candidates that worked before come first and recently refused ones last, so a re-selection
+    // (every video size change) doesn't wait for the same refusals again.
+    let kind = candidate_kind(Mode::Encoder(params), true);
+    let candidates = ranked(kind, candidates);
+    // Every candidate gets its own bounded second inside the hardware share of the budget.
+    let hardware = crate::model::video::hardware_deadline(Instant::now(), deadline);
     for candidate in candidates {
-        check(deadline, stop)?;
-        // SAFETY: activation and metadata from our exact adapter-filtered candidate.
-        let result = unsafe { candidate.ActivateObject::<IMFTransform>() }
-            .map_err(|_| failure("GPU activation failed"))
-            .and_then(|transform| {
-                // SAFETY: query the public awareness attribute before handing it a device manager.
-                let aware = unsafe {
-                    transform
-                        .GetAttributes()
-                        .and_then(|attrs| attrs.GetUINT32(&MF_SA_D3D11_AWARE))
+        let friendly = friendly_name(&candidate);
+        let name = format!("{friendly} / GPU input");
+        let until = crate::model::video::candidate_deadline(Instant::now(), hardware);
+        let result = (|| {
+            check(until, stop)?;
+            // SAFETY: activation and metadata from our exact adapter-filtered candidate.
+            let transform = api(
+                unsafe { candidate.ActivateObject::<IMFTransform>() },
+                "ActivateObject",
+            )?;
+            // SAFETY: query the public awareness attribute before handing it a device manager.
+            let aware = unsafe {
+                transform
+                    .GetAttributes()
+                    .and_then(|attrs| attrs.GetUINT32(&MF_SA_D3D11_AWARE))
+            }
+            .ok()
+                == Some(1);
+            crate::model::gpu::mft_admit(true, aware, true)
+                .map_err(|_| failure("MFT isn't D3D11-aware"))?;
+            let session = Session::configure_with_manager(
+                transform,
+                true,
+                name.clone(),
+                Mode::Encoder(params),
+                Some(&manager),
+                report,
+            )?;
+            check(until, stop)?;
+            Ok(session)
+        })();
+        match result {
+            Ok(session) => {
+                memory::worked(kind, &friendly);
+                return Ok(session);
+            }
+            Err(error) => {
+                memory::refused(kind, &friendly);
+                report.refuse(&name, &error);
+                // SAFETY: failed candidate has no accepted session; release activation cache.
+                unsafe {
+                    let _ = candidate.ShutdownObject();
                 }
-                .ok()
-                    == Some(1);
-                crate::model::gpu::mft_admit(true, aware, true)
-                    .map_err(|_| failure("MFT isn't D3D11-aware"))?;
-                Session::configure_with_manager(
-                    transform,
-                    true,
-                    format!("{} / GPU input", friendly_name(&candidate)),
-                    Mode::Encoder(params),
-                    Some(&manager),
-                )
-            });
-        if result.is_ok() {
-            return result;
-        }
-        // SAFETY: failed candidate has no accepted session; release activation cache.
-        unsafe {
-            let _ = candidate.ShutdownObject();
+            }
         }
     }
     Err(failure("GPU MFT admission refused"))
+}
+
+/// Live diagnostics for the GPU-input encoder path (not run by default).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod live_probe {
+    use super::*;
+    use windows::Win32::{
+        Foundation::HMODULE,
+        Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+        Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1},
+    };
+
+    /// The default-adapter D3D11 device the capture backend builds (`frame_capture::Graphics`).
+    fn capture_device() -> (ID3D11Device, ID3D11DeviceContext) {
+        let mut device = None;
+        let mut context = None;
+        // SAFETY: initialized output Options; same flags and default adapter as the capture backend.
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+        }
+        .expect("D3D11CreateDevice");
+        (device.expect("device"), context.expect("context"))
+    }
+    fn adapter_names() -> Vec<String> {
+        // SAFETY: read-only adapter enumeration through a fresh factory.
+        unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().expect("factory");
+            (0..)
+                .map_while(|index| factory.EnumAdapters1(index).ok())
+                .map(|adapter| {
+                    let adapter: IDXGIAdapter = adapter.cast().expect("adapter");
+                    let desc = adapter.GetDesc().expect("desc");
+                    String::from_utf16_lossy(
+                        &desc.Description[..desc
+                            .Description
+                            .iter()
+                            .position(|c| *c == 0)
+                            .unwrap_or(desc.Description.len())],
+                    )
+                })
+                .collect()
+        }
+    }
+
+    /// Which NV12 input-pool admission step refuses which size (WP-W4.1d pacing: the agent's
+    /// GPU-input path answered `invalid_layout` for ordinary window sizes).
+    #[test]
+    #[ignore = "live probe: NV12 pool layout per size; --ignored --nocapture"]
+    fn nv12_pool_layout_report() {
+        let (device, context) = capture_device();
+        let Ok(gpu) = WindowsGpu::new(
+            device,
+            Arc::new(Mutex::new(context)),
+            wgpu::Features::empty(),
+        ) else {
+            println!("WindowsGpu unavailable");
+            return;
+        };
+        for (w, h) in [
+            (1920, 1080),
+            (1280, 720),
+            (986, 693),
+            (640, 448),
+            (320, 64),
+            (64, 64),
+            (128, 192),
+            (448, 576),
+            (3440, 1440),
+        ] {
+            let display = PixelSize::new(w, h);
+            let size = Params::new(display, 1, 1).unwrap().coded().unwrap();
+            let shared = match gpu.shared(size, DXGI_FORMAT_NV12) {
+                Ok(shared) => shared,
+                Err(error) => {
+                    println!("{w}x{h}: shared(NV12) failed: {error}");
+                    continue;
+                }
+            };
+            let mut footprints = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
+            let mut rows = [0; 2];
+            let mut row_bytes = [0; 2];
+            let mut bytes = 0;
+            // SAFETY: driver-filled output arrays for the exact retained two-plane NV12 resource.
+            unsafe {
+                gpu.d12.GetCopyableFootprints(
+                    &shared.desc,
+                    0,
+                    2,
+                    0,
+                    Some(footprints.as_mut_ptr()),
+                    Some(rows.as_mut_ptr()),
+                    Some(row_bytes.as_mut_ptr()),
+                    Some(&mut bytes),
+                );
+            }
+            println!(
+                "{w}x{h} coded {}x{}: formats {:?}/{:?} rows {rows:?} row_bytes {row_bytes:?} \
+                 offsets {}/{} pitches {}/{} widths {}/{} heights {}/{} total {bytes}",
+                size.width,
+                size.height,
+                footprints[0].Footprint.Format,
+                footprints[1].Footprint.Format,
+                footprints[0].Offset,
+                footprints[1].Offset,
+                footprints[0].Footprint.RowPitch,
+                footprints[1].Footprint.RowPitch,
+                footprints[0].Footprint.Width,
+                footprints[1].Footprint.Width,
+                footprints[0].Footprint.Height,
+                footprints[1].Footprint.Height,
+            );
+            println!(
+                "  Pool::new: {:?}",
+                Pool::new(gpu.clone(), display).map(|_| ())
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "live probe: GPU-input hardware H.264 selection on this machine; --ignored --nocapture"]
+    fn gpu_input_encoder_selection_report() {
+        println!("adapters: {:?}", adapter_names());
+        let (device, context) = capture_device();
+        let gpu = WindowsGpu::new(
+            device,
+            Arc::new(Mutex::new(context)),
+            wgpu::Features::empty(),
+        );
+        let gpu = match gpu {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                println!("WindowsGpu unavailable: {error}");
+                return;
+            }
+        };
+        println!("video_supported={}", gpu.video_supported);
+        for (size, bitrate, fps) in [
+            (PixelSize::new(1920, 1080), 8_000_000, 60),
+            (PixelSize::new(1280, 720), 4_000_000, 30),
+        ] {
+            let codecs = MfCodecs::new().with_gpu(gpu.clone());
+            let started = Instant::now();
+            let encoder = codecs.encoder(size, bitrate, fps);
+            println!(
+                "== {}x{} @ {fps}: encoder() took {} ms",
+                size.width,
+                size.height,
+                started.elapsed().as_millis()
+            );
+            match &encoder {
+                Ok(encoder) => println!("  GPU-path encoder: {}", encoder.name()),
+                Err(error) => println!("  encoder unavailable: {error}"),
+            }
+            if let Some(report) = codecs.last_selection_report() {
+                for line in report.lines() {
+                    println!("    {line}");
+                }
+            }
+            drop(encoder);
+        }
+    }
 }
