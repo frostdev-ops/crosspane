@@ -536,6 +536,37 @@ impl SpeakerMixer {
     }
 }
 
+/// Whole 10 ms frames a capture may keep queued after a mixing pass; anything older is discarded.
+pub const MAX_CAPTURE_BACKLOG: usize = 2; // frames
+/// A capture that has delivered no data for this long is idle: the mixer neither waits for it
+/// nor adds it, so a silent process cannot stall the others.
+pub const CAPTURE_IDLE: Duration = Duration::from_millis(30);
+
+/// Whole 10 ms frames to mix now, clocked by captured data (the audio engine), never by
+/// `Instant`: the minimum over captures not idle (no data for 30 ms), or 0. `queued` is in
+/// interleaved samples.
+///
+/// `queued[i]` pairs with `idle[i]`; extra entries in the longer slice are ignored.
+// Found while reviewing audio/video sync raised by Thiago Goncalves (2026-10).
+pub fn frames_to_mix(queued: &[usize], idle: &[bool]) -> usize {
+    queued
+        .iter()
+        .zip(idle)
+        .filter(|(_, idle)| !**idle)
+        .map(|(queued, _)| queued / SPEAKER_FRAME_SAMPLES)
+        .min()
+        .unwrap_or(0)
+}
+
+/// Samples to discard from the front of a capture holding `queued` after mixing, keeping at
+/// most MAX_CAPTURE_BACKLOG frames.
+///
+/// The result is even, so discarding never rotates left and right; an unmatched half frame at
+/// the back stays queued.
+pub fn capture_excess(queued: usize) -> usize {
+    queued.saturating_sub(MAX_CAPTURE_BACKLOG * SPEAKER_FRAME_SAMPLES) / 2 * 2
+}
+
 /// A reopen attempt may start at most this many times per [`REOPEN_WINDOW`] for one stream.
 pub const REOPEN_MAX_ATTEMPTS: usize = 5;
 /// The sliding window over which [`REOPEN_MAX_ATTEMPTS`] is counted.

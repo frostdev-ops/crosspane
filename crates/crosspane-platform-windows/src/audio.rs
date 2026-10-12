@@ -17,9 +17,10 @@
 #![allow(unsafe_code)]
 
 use crate::model::audio::{
-    BorrowedDescriptor, ChangeSignal, Converter, EndpointEvent, MAX_RENDER_FRAMES, MixFormat,
-    ReopenLimiter, ReopenStep, SPEAKER_FRAME_SAMPLES, SourceLifecycle, SourceSet, SpeakerMixer,
-    StreamControl, endpoint_event_relevant, wait_open,
+    BorrowedDescriptor, CAPTURE_IDLE, ChangeSignal, Converter, EndpointEvent, MAX_PEER_SOURCES,
+    MAX_RENDER_FRAMES, MixFormat, ReopenLimiter, ReopenStep, SPEAKER_FRAME_SAMPLES,
+    SourceLifecycle, SourceSet, SpeakerMixer, StreamControl, capture_excess,
+    endpoint_event_relevant, frames_to_mix, wait_open,
 };
 use crosspane_platform::{
     AudioCapture, AudioDeviceError, AudioEvent, AudioFormat, AudioHost, AudioKind, AudioPlayback,
@@ -824,6 +825,10 @@ struct SourceCapture {
     mix: Consumer<f32>,
     started: bool,
     ready: bool,
+    /// When `drain` last received a packet; `None` until the first. Drives idle detection.
+    heard: Option<Instant>,
+    /// Frames `drain` dropped because `pcm` was full, not yet moved into the worker's counter.
+    dropped: u64,
 }
 impl SourceCapture {
     fn open(
@@ -890,6 +895,8 @@ impl SourceCapture {
             mix,
             started: false,
             ready: false,
+            heard: None,
+            dropped: 0,
         };
         check()?;
         if !client.process.alive() {
@@ -951,8 +958,13 @@ impl SourceCapture {
             let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
             let valid = frames as usize <= MAX_RENDER_FRAMES && (silent || !data.is_null());
             if valid && epoch.permits() && control.permits() {
+                if frames > 0 {
+                    self.heard = Some(Instant::now());
+                }
                 for frame in 0..frames as usize {
                     if self.pcm.slots() < 2 {
+                        let lost = (frames as usize - frame) as u64;
+                        self.dropped = self.dropped.saturating_add(lost);
                         break;
                     }
                     for channel in 0..2 {
@@ -1027,7 +1039,10 @@ fn source_worker(
     let mut revision = 0;
     let mut mixer = SpeakerMixer::new();
     let mut frame = [0.0; SPEAKER_FRAME_SAMPLES];
-    let mut next_mix = Instant::now();
+    // Frames lost to a full capture ring or a full speaker ring; logged only when it changes.
+    let mut overflow: u64 = 0;
+    let mut logged_overflow: u64 = 0;
+    let mut logged_at: Option<Instant> = None;
     while !control.eligibility.is_cancelled() {
         if !epoch.permits() {
             control.eligibility.disable();
@@ -1119,16 +1134,35 @@ fn source_worker(
             captures.clear();
             log_source_failure(pid);
         }
+        // Found while reviewing audio/video sync raised by Thiago Goncalves (2026-10).
+        // Mixing is clocked by the captured data (the audio engine's clock), never by `Instant`:
+        // each pass mixes every whole 10 ms frame that all live captures have delivered, so
+        // consumption matches production. Idle captures (no data for CAPTURE_IDLE) are skipped.
         let now = Instant::now();
-        if !captures.is_empty() && now >= next_mix {
+        let live = captures.len().min(MAX_PEER_SOURCES);
+        let mut queued = [0usize; MAX_PEER_SOURCES];
+        let mut idle = [true; MAX_PEER_SOURCES];
+        for (index, client) in captures.iter_mut().take(live).enumerate() {
+            queued[index] = client.mix.slots();
+            idle[index] = client
+                .heard
+                .is_none_or(|heard| now.saturating_duration_since(heard) >= CAPTURE_IDLE);
+            overflow = overflow.saturating_add(mem::take(&mut client.dropped));
+        }
+        let frames = frames_to_mix(&queued[..live], &idle[..live]);
+        for _ in 0..frames {
             mixer.begin();
-            for client in &mut captures {
-                mixer.add(&mut client.mix);
+            for (index, client) in captures.iter_mut().take(live).enumerate() {
+                if !idle[index] {
+                    mixer.add(&mut client.mix);
+                }
             }
             mixer.finish(&mut frame);
             if epoch.permits() && control.permits() {
-                for pair in frame.as_chunks::<2>().0 {
+                for (index, pair) in frame.as_chunks::<2>().0.iter().enumerate() {
                     if speaker.slots() < 2 {
+                        let lost = (SPEAKER_FRAME_SAMPLES / 2 - index) as u64;
+                        overflow = overflow.saturating_add(lost);
                         break;
                     }
                     if !epoch.permits() || !control.permits() {
@@ -1138,7 +1172,26 @@ fn source_worker(
                     let _ = speaker.push(pair[1]);
                 }
             }
-            next_mix = now + Duration::from_millis(10);
+        }
+        // Only a pass that mixed says which capture sets the pace; a pass stalled on a live
+        // capture with less than a frame (at most CAPTURE_IDLE) trims nothing.
+        if frames > 0 {
+            for client in captures.iter_mut().take(live) {
+                let excess = capture_excess(client.mix.slots());
+                if excess > 0
+                    && let Ok(chunk) = client.mix.read_chunk(excess)
+                {
+                    chunk.commit_all();
+                }
+            }
+        }
+        if overflow != logged_overflow
+            && logged_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(1))
+        {
+            tracing::debug!(dropped_frames = overflow, "Windows source audio overflow");
+            logged_overflow = overflow;
+            logged_at = Some(now);
         }
         let mut handles = [null_mut(); crate::model::audio::MAX_PEER_SOURCES + 1];
         handles[0] = wake.0;
