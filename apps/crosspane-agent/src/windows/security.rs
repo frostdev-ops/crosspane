@@ -593,7 +593,10 @@ pub(crate) fn create_private_directory(path: &Path) -> Result<()> {
             continue;
         }
         let final_leaf = prefix == path;
-        let handle = match open_path(&prefix, final_leaf) {
+        // Every component is first opened read-only. A DELETE-bearing MAXIMUM_ALLOWED open
+        // fails with a sharing violation while another process pins the folder without delete
+        // sharing (the installer's supervisor pins this state directory for its lifetime).
+        let handle = match open_path(&prefix, false) {
             Ok(handle) => handle,
             Err(error)
                 if error
@@ -614,7 +617,7 @@ pub(crate) fn create_private_directory(path: &Path) -> Result<()> {
                 }
                 // Pin and admit this component before creating another below it. If another
                 // creator won the race, accept only the same protected current-user object.
-                let handle = open_path(&prefix, final_leaf)?;
+                let handle = open_path(&prefix, false)?;
                 persistent_acls(handle.0)?;
                 private_dacl(handle.0, &identity.user, true)?;
                 handle
@@ -626,7 +629,16 @@ pub(crate) fn create_private_directory(path: &Path) -> Result<()> {
             "private directory ancestry contains a non-directory"
         );
         if final_leaf {
-            secure_handle(&handle, true)?;
+            persistent_acls(handle.0)?;
+            if !has_private_dacl(handle.0, &identity.user, true)? {
+                // A legacy ACL is rewritten through a modifying open. Release the read-only
+                // leaf first; the admitted ancestors remain pinned (as in private_file_once).
+                drop(handle);
+                let handle = open_path(&prefix, true)?;
+                secure_handle(&handle, true)?;
+                pins.push(handle);
+                continue;
+            }
         }
         pins.push(handle);
     }

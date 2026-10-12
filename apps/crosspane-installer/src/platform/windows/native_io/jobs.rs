@@ -1213,15 +1213,35 @@ mod native {
             proof: &SupportProof,
             deadline: &Deadline,
         ) -> NativeResult<Generation> {
-            self.reverify(proof, deadline)?;
-            self.admission.agent_matches(original, proof, deadline)?;
-            let (process, _) = self.child(child)?;
+            let note = |step: &str, error: &NativeError| {
+                #[cfg(not(test))]
+                crate::platform::windows::setup_log::setup_note!("admit ready {step}: {error:?}");
+                #[cfg(test)]
+                let _ = (step, error);
+            };
+            self.reverify(proof, deadline)
+                .inspect_err(|e| note("owner", e))?;
+            self.admission
+                .agent_matches(original, proof, deadline)
+                .inspect_err(|e| note("agent matches", e))?;
+            let (process, _) = self.child(child).inspect_err(|e| note("child", e))?;
             let bootstrap = original.bootstrap();
-            let creation = original.creation_time(self.io(), proof, deadline)?;
-            if bootstrap.pid != child.pid
-                || creation != child.creation
-                || !original.in_job(self.io(), proof, self.job()?, deadline)?
+            let creation = original
+                .creation_time(self.io(), proof, deadline)
+                .inspect_err(|e| note("creation", e))?;
+            if bootstrap.pid != child.pid || creation != child.creation {
+                #[cfg(not(test))]
+                crate::platform::windows::setup_log::setup_note!(
+                    "admit ready: bootstrap pid or creation differs from the created child"
+                );
+                return Err(NativeError::Foreign);
+            }
+            if !original
+                .in_job(self.io(), proof, self.job()?, deadline)
+                .inspect_err(|e| note("in job", e))?
             {
+                #[cfg(not(test))]
+                crate::platform::windows::setup_log::setup_note!("admit ready: agent not in job");
                 return Err(NativeError::Foreign);
             }
             let budget = deadline.clone();

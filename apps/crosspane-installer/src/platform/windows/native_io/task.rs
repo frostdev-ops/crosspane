@@ -475,12 +475,40 @@ mod native {
             {
                 return Err(NativeError::Foreign);
             }
+            // Task Scheduler's COM API reports the principal as the bare account name and the
+            // logon trigger user as DOMAIN\name, even when both were registered by SID (the
+            // stored XML keeps the SID). A value that names this process's own account, in either
+            // form, is that account's SID; any other value stays as read and does not match.
+            let own = {
+                use crate::platform::windows::native_io::identity::native::{
+                    account_name, observe,
+                };
+                observe().ok().and_then(|facts| {
+                    account_name(&facts.user)
+                        .ok()
+                        .map(|name| (facts.user.sddl(), name))
+                })
+            };
+            let as_sid = |value: String| match &own {
+                Some((sid, name))
+                    if value.eq_ignore_ascii_case(name)
+                        || (!value.contains('\\')
+                            && name
+                                .rsplit_once('\\')
+                                .is_some_and(|(_, bare)| value.eq_ignore_ascii_case(bare))) =>
+                {
+                    sid.clone()
+                }
+                _ => value,
+            };
+            let principal = as_sid(bounded_bstr(&user, 256)?);
+            let trigger_user = as_sid(bounded_bstr(&trigger_user, 256)?);
             Ok(Some(Snapshot {
                 xml,
                 definition: Definition {
                     name: path,
-                    principal: bounded_bstr(&user, 256)?,
-                    trigger_user: bounded_bstr(&trigger_user, 256)?,
+                    principal,
+                    trigger_user,
                     logon: Logon::InteractiveToken,
                     run_level: RunLevel::Limited,
                     action: bounded_bstr(&action_path, 32768)?,

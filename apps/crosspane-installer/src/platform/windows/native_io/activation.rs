@@ -249,31 +249,46 @@ pub(crate) trait ActivationPort: TaskPort {
     fn record_run_result(&mut self, submission: &TaskSubmission) -> NativeResult<()>;
 }
 pub(crate) fn activate(port: &mut impl ActivationPort, desired: &Definition) -> NativeResult<Plan> {
-    port.prepare()?;
-    let decision = reconcile(port, desired)?;
+    port.prepare().inspect_err(|e| note("prepare", e))?;
+    let decision = reconcile(port, desired).inspect_err(|e| note("reconcile", e))?;
     if decision == Plan::PreserveDisabled {
         return Ok(decision);
     }
-    port.record_run_intent()?;
-    port.release_lock()?;
+    port.record_run_intent()
+        .inspect_err(|e| note("record run intent", e))?;
+    port.release_lock()
+        .inspect_err(|e| note("release lock", e))?;
     let submission =
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| port.run_once())) {
             Ok(Ok(value)) => value,
-            _ => {
+            outcome => {
+                match &outcome {
+                    Ok(Err(e)) => note("run", e),
+                    _ => note("run", &NativeError::OutcomeUnknown),
+                }
                 port.retire();
                 return Err(NativeError::OutcomeUnknown);
             }
         };
-    if !matches!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-            || port.record_run_result(&submission)
-        )),
-        Ok(Ok(()))
-    ) {
+    let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        port.record_run_result(&submission)
+    }));
+    if !matches!(recorded, Ok(Ok(()))) {
+        match &recorded {
+            Ok(Err(e)) => note("record run result", e),
+            _ => note("record run result", &NativeError::OutcomeUnknown),
+        }
         port.retire();
         return Err(NativeError::OutcomeUnknown);
     }
     Ok(decision)
+}
+/// Notes which task activation step failed, for the setup log (a panic is noted as unknown).
+fn note(step: &str, error: &NativeError) {
+    #[cfg(all(windows, not(test)))]
+    crate::platform::windows::setup_log::setup_note!("task activation {step}: {error:?}");
+    #[cfg(not(all(windows, not(test))))]
+    let _ = (step, error);
 }
 
 #[cfg(windows)]

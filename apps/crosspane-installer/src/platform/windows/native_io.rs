@@ -784,13 +784,23 @@ mod adapter {
                 return Err(NativeError::Foreign);
             }
             context.validate(budget)?;
-            let slot = self
+            let mut slot = self
                 .0
                 .install
                 .lock()
                 .map_err(|_| NativeError::Unavailable)?;
             if let Some(root) = &*slot {
                 root.revalidate(&context.security, true, budget)?;
+            } else {
+                // A root taken before the install folder existed (a fresh first install) sees it
+                // once staging has created it, through the same admitted open as `payload_root`.
+                *slot = Anchor::open(
+                    context.target.paths.install(),
+                    &context.security,
+                    true,
+                    budget,
+                )?
+                .map(Arc::new);
             }
             Ok(slot.clone())
         }
@@ -13366,14 +13376,16 @@ mod adapter {
                 wall: Instant::now(),
             })
         }
+        #[track_caller]
         pub fn acquire_installer_lock(
             &self,
             proof: &SupportProof,
             deadline: &Deadline,
         ) -> NativeResult<InstallerLock> {
+            let caller = std::panic::Location::caller();
             let budget = proof.budget(self, deadline)?;
             let context = self.context.clone();
-            self.owner.run(Dispatch::Mutation, deadline, move || {
+            let result = self.owner.run(Dispatch::Mutation, deadline, move || {
                 let change = Change::new();
                 change.finish((|| {
                     context.validate(&budget)?;
@@ -13414,7 +13426,18 @@ mod adapter {
                         parent,
                     })))
                 })())
-            })
+            });
+            #[cfg(not(test))]
+            if result.is_err() {
+                crate::platform::windows::setup_log::setup_note!(
+                    "installer lock not taken for {}:{}",
+                    caller.file(),
+                    caller.line()
+                );
+            }
+            #[cfg(test)]
+            let _ = caller;
+            result
         }
         fn lock_binding(
             &self,
@@ -13904,8 +13927,15 @@ mod adapter {
                         .to_str()
                         .ok_or(NativeError::Unsupported)?
                 );
-                let runtime = Anchor::open(&expected_runtime, &context.security, true, &budget)?
-                    .map(Arc::new);
+                // The canonical spelling is \\?\C:\...; Anchor::open takes the literal C:\ path.
+                // The endpoint key keeps the canonical spelling the first-install namespace uses.
+                let runtime = Anchor::open(
+                    &process::literal_path(&expected_runtime)?,
+                    &context.security,
+                    true,
+                    &budget,
+                )?
+                .map(Arc::new);
                 let install = Arc::new(
                     Anchor::open(
                         context.target.paths.install(),
@@ -14073,24 +14103,43 @@ mod adapter {
             owner: &Arc<super::jobs::SupervisorOwner>,
             deadline: &Deadline,
         ) -> NativeResult<OwnedArchiveResult> {
-            self.verify_stop_lock(proof, lock, deadline)?;
-            permit.reverify(self, proof, deadline)?;
-            let namespace = owner.exclusive_lease(proof, deadline)?;
-            namespace.reverify(self, proof, deadline)?;
-            let source = self.read_record(
-                proof,
-                records::RecordName::Supervisor,
-                files::MAX_RECORD_BYTES,
-                deadline,
-            )?;
-            self.check_completed_archive_intent(proof, deadline)?;
+            let note = |step: &str, error: &NativeError| {
+                crate::platform::windows::setup_log::setup_note!(
+                    "supervisor epoch {step}: {error:?}"
+                )
+            };
+            self.verify_stop_lock(proof, lock, deadline)
+                .inspect_err(|e| note("lock", e))?;
+            permit
+                .reverify(self, proof, deadline)
+                .inspect_err(|e| note("permit", e))?;
+            let namespace = owner
+                .exclusive_lease(proof, deadline)
+                .inspect_err(|e| note("lease", e))?;
+            namespace
+                .reverify(self, proof, deadline)
+                .inspect_err(|e| note("namespace", e))?;
+            let source = self
+                .read_record(
+                    proof,
+                    records::RecordName::Supervisor,
+                    files::MAX_RECORD_BYTES,
+                    deadline,
+                )
+                .inspect_err(|e| note("read journal", e))?;
+            self.check_completed_archive_intent(proof, deadline)
+                .inspect_err(|e| note("archive intent", e))?;
             let selected =
-                super::super::payload::recovery::selected_operation(self, proof, deadline)?;
+                super::super::payload::recovery::selected_operation(self, proof, deadline)
+                    .inspect_err(|e| note("selected operation", e))?;
             let Some(source) = source else {
                 // A present cold record is correlation only. The genuine task claim and
                 // kernel-exclusive owner above remain the sole fresh launch admission.
                 #[cfg(not(test))]
-                if let Some(first) = self.read_first_install(proof, deadline)? {
+                if let Some(first) = self
+                    .read_first_install(proof, deadline)
+                    .inspect_err(|e| note("first-install record", e))?
+                {
                     use super::super::first_install::record::Phase as FirstPhase;
                     if first.operation() != permit.operation()
                         || !matches!(
@@ -14101,21 +14150,21 @@ mod adapter {
                         return Err(NativeError::Foreign);
                     }
                 }
-                if read_archive_intent(self, proof, deadline)?.is_some()
+                if read_archive_intent(self, proof, deadline)
+                    .inspect_err(|e| note("read archive intent", e))?
+                    .is_some()
                     || selected.is_some()
-                    || super::activation::SupervisorLogonRecord::read(self, proof, deadline)?
+                    || super::activation::SupervisorLogonRecord::read(self, proof, deadline)
+                        .inspect_err(|e| note("read logon record", e))?
                         .is_some()
                 {
                     return Err(NativeError::Foreign);
                 }
-                publish_epoch_preparing(
-                    self,
-                    proof,
-                    lock,
-                    EpochClaim::Task(permit).epoch(self)?,
-                    None,
-                    deadline,
-                )?;
+                let epoch = EpochClaim::Task(permit)
+                    .epoch(self)
+                    .inspect_err(|e| note("provenance", e))?;
+                publish_epoch_preparing(self, proof, lock, epoch, None, deadline)
+                    .inspect_err(|e| note("publish preparing", e))?;
                 let result = OwnedArchiveResult::First(FirstSupervisorEpoch {
                     io: self.clone(),
                     namespace,

@@ -257,6 +257,53 @@ pub(crate) mod native {
         LimitedIdentity::admit(observe()?)
     }
 
+    /// The `DOMAIN\name` Windows reports for `sid`. Task Scheduler stores a logon trigger's user
+    /// back as this account name even when it was registered by SID; this reverse lookup of a
+    /// known SID lets the two forms be matched. Read-only; no account is resolved by name.
+    // The production task inspection is the only consumer; the library test graph excludes it.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn account_name(sid: &Sid) -> NativeResult<String> {
+        let mut name_length = 0;
+        let mut domain_length = 0;
+        let mut kind = 0;
+        // SAFETY: read-only bounded size query for a valid SID buffer we own; no account mutation.
+        unsafe {
+            LookupAccountSidW(
+                std::ptr::null(),
+                sid.bytes().as_ptr().cast_mut().cast(),
+                std::ptr::null_mut(),
+                &mut name_length,
+                std::ptr::null_mut(),
+                &mut domain_length,
+                &mut kind,
+            );
+        }
+        if name_length == 0 || name_length > 257 || domain_length == 0 || domain_length > 257 {
+            return Err(NativeError::Unavailable);
+        }
+        let mut name = vec![0u16; name_length as usize];
+        let mut domain = vec![0u16; domain_length as usize];
+        // SAFETY: both writable buffers have their reported capacities; exact SID lookup only.
+        if unsafe {
+            LookupAccountSidW(
+                std::ptr::null(),
+                sid.bytes().as_ptr().cast_mut().cast(),
+                name.as_mut_ptr(),
+                &mut name_length,
+                domain.as_mut_ptr(),
+                &mut domain_length,
+                &mut kind,
+            )
+        } == 0
+        {
+            return Err(NativeError::Unavailable);
+        }
+        let text = |units: &[u16]| {
+            let end = units.iter().position(|v| *v == 0).unwrap_or(units.len());
+            String::from_utf16(&units[..end]).map_err(|_| NativeError::Unavailable)
+        };
+        Ok(format!("{}\\{}", text(&domain)?, text(&name)?))
+    }
     pub(crate) fn trusted_installer() -> NativeResult<Sid> {
         let name: Vec<u16> = "NT SERVICE\\TrustedInstaller"
             .encode_utf16()
