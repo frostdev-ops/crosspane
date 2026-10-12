@@ -106,6 +106,172 @@ fn focus_change_releases_both_ledgers_before_refusing_submission() {
     assert!(d.held_keys().is_empty() && d.held_buttons().is_empty());
 }
 
+/// A fake whose every foreground observation is scripted, so a click that activates another
+/// window can be replayed without the default `focus(1, ..)` refilling the queue.
+fn scripted(observations: impl IntoIterator<Item = Result<Foreground, PlatformError>>) -> Fake {
+    Fake {
+        foreground: observations.into_iter().collect(),
+        ..Default::default()
+    }
+}
+fn down(button: MouseButton) -> Packet {
+    Packet::Button { button, down: true }
+}
+fn up(button: MouseButton) -> Packet {
+    Packet::Button {
+        button,
+        down: false,
+    }
+}
+fn ups(sends: &[Packet], button: MouseButton) -> usize {
+    sends.iter().filter(|p| **p == up(button)).count()
+}
+
+#[test]
+fn inject_drag_follows_the_click_into_a_newly_activated_window() {
+    // Move onto an unfocused window, press (this makes window 2 foreground), then drag.
+    let mut d = driver(scripted([
+        Ok(focus(1, 0x2000)),
+        Ok(focus(1, 0x2000)),
+        Ok(focus(2, 0x2000)),
+        Ok(focus(2, 0x2000)),
+    ]));
+    d.submit_guarded(Packet::Move { x: 1, y: 1 }).unwrap();
+    d.button(MouseButton::PRIMARY, true).unwrap();
+    d.submit_guarded(Packet::Move { x: 2, y: 2 }).unwrap();
+    d.submit_guarded(Packet::Move { x: 3, y: 3 }).unwrap();
+    assert_eq!(
+        d.port().sends,
+        [
+            Packet::Move { x: 1, y: 1 },
+            down(MouseButton::PRIMARY),
+            Packet::Move { x: 2, y: 2 },
+            Packet::Move { x: 3, y: 3 },
+        ]
+    );
+    assert!(d.held_buttons().contains(&MouseButton::PRIMARY));
+    // The one up still goes out, exactly once, whatever the foreground is by then.
+    d.button(MouseButton::PRIMARY, false).unwrap();
+    assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 1);
+    assert!(d.held_buttons().is_empty());
+}
+
+#[test]
+fn inject_drag_is_followed_through_several_foreground_changes_and_a_lower_integrity_window() {
+    let mut d = driver(scripted([
+        Ok(focus(1, 0x2000)),
+        Ok(focus(2, 0x1000)), // lower integrity than ours
+        Ok(Foreground {
+            generation: 1,
+            ..focus(2, 0x1000)
+        }),
+        Ok(focus(3, 0x2000)),
+    ]));
+    d.button(MouseButton::PRIMARY, true).unwrap();
+    for n in 0..3 {
+        d.submit_guarded(Packet::Move { x: n, y: n }).unwrap();
+    }
+    assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 0);
+    assert_eq!(d.port().sends.len(), 4);
+    d.release_buttons().unwrap();
+    assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 1);
+}
+
+#[test]
+fn inject_drag_into_a_higher_unknown_or_null_foreground_releases_exactly_once() {
+    let null = Foreground {
+        window: 0,
+        ..focus(1, 0x2000)
+    };
+    for next in [
+        Ok(focus(2, 0x3000)),
+        Ok(null),
+        Ok(Foreground {
+            process: 0,
+            ..focus(2, 0x2000)
+        }),
+        Ok(Foreground {
+            thread: 0,
+            ..focus(2, 0x2000)
+        }),
+        Ok(Foreground {
+            born: 0,
+            ..focus(2, 0x2000)
+        }),
+        Err(PlatformError::SecureInput),
+    ] {
+        let label = format!("{next:?}");
+        let mut d = driver(scripted([Ok(focus(1, 0x2000)), next]));
+        d.button(MouseButton::PRIMARY, true).unwrap();
+        assert!(
+            matches!(
+                d.submit_guarded(Packet::Move { x: 1, y: 1 }),
+                Err(PlatformError::SecureInput)
+            ),
+            "{label}"
+        );
+        // The held button was released exactly once, and the move never went out.
+        assert_eq!(
+            d.port().sends,
+            [down(MouseButton::PRIMARY), up(MouseButton::PRIMARY)],
+            "{label}"
+        );
+        assert!(d.held_buttons().is_empty(), "{label}");
+        // A later release of the already-drained button adds no ledger state and no second up
+        // from the driver itself; only the explicit release the caller asked for goes out.
+        d.release_buttons().unwrap();
+        assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 1, "{label}");
+    }
+}
+
+#[test]
+fn inject_drag_failed_release_stays_owed_until_it_succeeds_once() {
+    let mut d = driver(scripted([Ok(focus(1, 0x2000)), Ok(focus(2, 0x3000))]));
+    d.button(MouseButton::PRIMARY, true).unwrap();
+    d.port_mut().failed = true;
+    assert!(d.submit_guarded(Packet::Move { x: 1, y: 1 }).is_err());
+    // The up was attempted once and failed, so it is still owed.
+    assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 1);
+    assert!(d.held_buttons().contains(&MouseButton::PRIMARY));
+    d.port_mut().failed = false;
+    d.release_buttons().unwrap();
+    assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 2); // retry of the failed one
+    assert!(d.held_buttons().is_empty());
+    d.release_buttons().unwrap();
+    assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 2); // settled: nothing more owed
+}
+
+#[test]
+fn inject_foreground_change_with_a_key_held_still_drains_both_ledgers() {
+    // Only a pure pointer drag follows the click: a held key keeps the original fail-safe.
+    let mut d = driver(scripted([
+        Ok(focus(1, 0x2000)),
+        Ok(focus(1, 0x2000)),
+        Ok(focus(2, 0x1000)),
+    ]));
+    d.key(HidUsage::keyboard(0xe1), true, 0).unwrap();
+    d.button(MouseButton::PRIMARY, true).unwrap();
+    assert!(matches!(
+        d.submit_guarded(Packet::Move { x: 1, y: 1 }),
+        Err(PlatformError::SecureInput)
+    ));
+    assert!(d.held_keys().is_empty() && d.held_buttons().is_empty());
+    assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 1);
+}
+
+#[test]
+fn inject_foreground_change_with_nothing_held_is_normal_admission() {
+    let mut d = driver(scripted([
+        Ok(focus(1, 0x2000)),
+        Ok(focus(2, 0x1000)),
+        Ok(focus(3, 0x2000)),
+    ]));
+    d.submit_guarded(Packet::Move { x: 1, y: 1 }).unwrap();
+    d.submit_guarded(Packet::Move { x: 2, y: 2 }).unwrap();
+    d.button(MouseButton::PRIMARY, true).unwrap();
+    assert_eq!(d.port().sends.len(), 3);
+}
+
 #[test]
 fn partial_down_and_failed_release_remain_owed() {
     let mut d = driver(Fake {

@@ -5,11 +5,17 @@
 //! | Observation before non-release input | Decision |
 //! | --- | --- |
 //! | Closed/changed gate | Cancel repeat, attempt all owed ups, return `Locked` |
-//! | Unknown/higher-integrity foreground | Cancel repeat, attempt owed ups, return `SecureInput` |
-//! | Changed held foreground identity/generation | Drain both ledgers, refuse this submission |
+//! | Unknown/null/incomplete/higher-integrity foreground | Cancel repeat, attempt owed ups, return `SecureInput` |
+//! | Changed foreground, a key or lock toggle owed | Drain both ledgers, refuse this submission |
+//! | Changed foreground, only buttons held, new one complete and integrity <= ours | Adopt it as the owner; the drag continues, nothing is released |
+//! | Changed foreground, nothing held | Normal admission |
 //! | Fresh matching foreground and open gate | Record possible down before submission |
 //! | Any release/recovery | Cancel repeat first; submit ups regardless of the guard |
 //! | Failed up | Retain it as owed; never claim delivery |
+//!
+//! The adoption row exists because a click normally activates the clicked window: the button down
+//! is admitted against the old foreground, so the very next move of the drag sees a new one.
+//! `judge_foreground` is the whole decision; `Driver::guard` only applies it.
 
 use super::geometry::{DisplayIds, MonitorProbe, displays};
 use super::hook::DragSettlementResult;
@@ -31,6 +37,60 @@ pub struct Foreground {
     pub born: u64,
     pub generation: u64,
     pub integrity: u32,
+}
+
+/// What input is still owed an up when a foreground observation is judged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeldInput {
+    /// At least one injected (or owed) pointer button.
+    pub buttons: bool,
+    /// At least one injected (or owed) key, or an owed lock-toggle up.
+    pub keys: bool,
+}
+
+/// The outcome of judging one foreground observation against the foreground that owns the held
+/// input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForegroundVerdict {
+    /// Same owner, or nothing held: admit the submission against the observed foreground.
+    Admit,
+    /// A pointer drag outlives the click that activated another window: the observed foreground
+    /// becomes the owner and the submission is admitted.
+    Adopt,
+    /// Fail safe: release everything owed once and refuse the submission.
+    Release,
+}
+
+/// `[P]` Pure foreground decision for non-release input.
+///
+/// `observed` is `None` when the native read failed (a secure desktop, a null foreground, an
+/// unreadable token or an unstable read). `owned` is the foreground under which the held input was
+/// admitted, `None` while nothing is held. A foreground is usable only with a window, process and
+/// thread and an integrity no higher than `own_integrity`; anything else is released, whatever is
+/// held, so this never injects into a more privileged or unknown target.
+///
+/// A changed foreground follows the click only for a pure pointer drag (buttons held, no key and no
+/// lock-toggle up owed) and only when the new identity is complete (a process creation time, so
+/// PID reuse is still told apart). Held keys keep the original rule: their typematic repeat and
+/// their ups are tied to one focus owner.
+pub fn judge_foreground(
+    observed: Option<Foreground>,
+    owned: Option<Foreground>,
+    own_integrity: u32,
+    held: HeldInput,
+) -> ForegroundVerdict {
+    let Some(now) = observed.filter(|f| {
+        f.window != 0 && f.process != 0 && f.thread != 0 && f.integrity <= own_integrity
+    }) else {
+        return ForegroundVerdict::Release;
+    };
+    match owned {
+        None => ForegroundVerdict::Admit,
+        Some(owner) if owner == now => ForegroundVerdict::Admit,
+        Some(_) if !held.buttons && !held.keys => ForegroundVerdict::Admit,
+        Some(_) if held.buttons && !held.keys && now.born != 0 => ForegroundVerdict::Adopt,
+        Some(_) => ForegroundVerdict::Release,
+    }
 }
 
 /// Oldest a monitor table may be for the pointer injector to consult it without a fresh
@@ -399,13 +459,22 @@ impl<P: InjectionPort> Driver<P> {
             let _ = self.release_everything();
             return Err(PlatformError::Locked);
         }
-        let foreground = match self.port.foreground() {
-            Ok(f)
-                if f.window != 0
-                    && f.process != 0
-                    && f.thread != 0
-                    && f.integrity <= self.own_integrity =>
-            {
+        let observed = self.port.foreground().ok();
+        let verdict = judge_foreground(
+            observed,
+            self.focus.map(|(owned, _)| owned),
+            self.own_integrity,
+            HeldInput {
+                buttons: !self.buttons.is_empty(),
+                keys: !self.keys.is_empty() || !self.toggle_ups.is_empty(),
+            },
+        );
+        let foreground = match (verdict, observed) {
+            (ForegroundVerdict::Admit, Some(f)) => f,
+            (ForegroundVerdict::Adopt, Some(f)) => {
+                // The drag follows the click into the window it activated. Only ownership moves;
+                // every held button keeps its single owed up.
+                self.focus = Some((f, epoch));
                 f
             }
             _ => {
@@ -414,11 +483,6 @@ impl<P: InjectionPort> Driver<P> {
                 return Err(PlatformError::SecureInput);
             }
         };
-        if self.focus.is_some_and(|(old, _)| old != foreground) {
-            self.cancel_repeat();
-            let _ = self.release_everything();
-            return Err(PlatformError::SecureInput);
-        }
         // Re-read the gate after native observation, immediately before submission.
         if !self.gate.is_open() || self.gate.epoch() != epoch {
             self.cancel_repeat();
@@ -734,6 +798,227 @@ pub fn absolute_move(
         },
         probe.clone(),
     ))
+}
+
+#[cfg(test)]
+mod judge_tests {
+    use super::ForegroundVerdict::{Admit, Adopt, Release};
+    use super::*;
+
+    const OWN: u32 = 0x2000;
+    const NOTHING: HeldInput = HeldInput {
+        buttons: false,
+        keys: false,
+    };
+    const BUTTONS: HeldInput = HeldInput {
+        buttons: true,
+        keys: false,
+    };
+    const KEYS: HeldInput = HeldInput {
+        buttons: false,
+        keys: true,
+    };
+    const BOTH: HeldInput = HeldInput {
+        buttons: true,
+        keys: true,
+    };
+
+    fn fg(window: u64, integrity: u32) -> Foreground {
+        Foreground {
+            window,
+            process: 11,
+            thread: 12,
+            born: 13,
+            generation: 0,
+            integrity,
+        }
+    }
+    fn judge(
+        observed: Option<Foreground>,
+        owned: Option<Foreground>,
+        held: HeldInput,
+    ) -> ForegroundVerdict {
+        judge_foreground(observed, owned, OWN, held)
+    }
+
+    #[test]
+    fn inject_same_foreground_or_no_owner_is_normal_admission() {
+        for held in [NOTHING, BUTTONS, KEYS, BOTH] {
+            assert_eq!(judge(Some(fg(1, OWN)), Some(fg(1, OWN)), held), Admit);
+            assert_eq!(judge(Some(fg(1, 0x1000)), Some(fg(1, 0x1000)), held), Admit);
+            assert_eq!(judge(Some(fg(1, OWN)), None, held), Admit);
+        }
+    }
+
+    #[test]
+    fn inject_changed_foreground_with_nothing_held_is_normal_admission() {
+        for observed in [fg(2, OWN), fg(2, 0x1000)] {
+            assert_eq!(judge(Some(observed), Some(fg(1, OWN)), NOTHING), Admit);
+        }
+        // A changed identity of the same window (new generation, new process start) is no
+        // different when nothing is owed.
+        let reborn = Foreground {
+            born: 99,
+            generation: 7,
+            ..fg(1, OWN)
+        };
+        assert_eq!(judge(Some(reborn), Some(fg(1, OWN)), NOTHING), Admit);
+    }
+
+    #[test]
+    fn inject_changed_foreground_with_buttons_held_continues_at_equal_or_lower_integrity() {
+        for integrity in [OWN, 0x1000, 0x0000] {
+            assert_eq!(
+                judge(Some(fg(2, integrity)), Some(fg(1, OWN)), BUTTONS),
+                Adopt,
+                "integrity {integrity:#x}"
+            );
+        }
+        // The owner may also have been a lower-integrity window, and a bumped generation, a
+        // reused pid or a new thread of the same window all count as a changed foreground.
+        let owner = fg(1, 0x1000);
+        for observed in [
+            fg(2, OWN),
+            Foreground {
+                generation: 1,
+                ..owner
+            },
+            Foreground { born: 14, ..owner },
+            Foreground {
+                thread: 99,
+                ..owner
+            },
+            Foreground {
+                process: 99,
+                ..owner
+            },
+        ] {
+            assert_eq!(judge(Some(observed), Some(owner), BUTTONS), Adopt);
+        }
+    }
+
+    #[test]
+    fn inject_changed_foreground_above_our_integrity_or_unusable_releases() {
+        let owner = Some(fg(1, OWN));
+        let unusable = [
+            None,
+            Some(fg(2, OWN + 1)),
+            Some(fg(2, 0x3000)),
+            Some(fg(2, u32::MAX)),
+            Some(fg(0, OWN)),
+            Some(Foreground {
+                process: 0,
+                ..fg(2, OWN)
+            }),
+            Some(Foreground {
+                thread: 0,
+                ..fg(2, OWN)
+            }),
+            // An incomplete identity (no process creation time) never inherits a drag.
+            Some(Foreground {
+                born: 0,
+                ..fg(2, OWN)
+            }),
+        ];
+        for observed in unusable {
+            assert_eq!(judge(observed, owner, BUTTONS), Release, "{observed:?}");
+            assert_eq!(judge(observed, owner, BOTH), Release, "{observed:?}");
+        }
+    }
+
+    #[test]
+    fn inject_unusable_foreground_releases_whatever_is_held_or_owned() {
+        // The same rule applies to a foreground that did not change: unknown, null or more
+        // privileged is never admitted, with or without an owner and with nothing held.
+        let unusable = [
+            None,
+            Some(fg(1, 0x3000)),
+            Some(fg(0, OWN)),
+            Some(Foreground {
+                process: 0,
+                ..fg(1, OWN)
+            }),
+            Some(Foreground {
+                thread: 0,
+                ..fg(1, OWN)
+            }),
+        ];
+        for observed in unusable {
+            for held in [NOTHING, BUTTONS, KEYS, BOTH] {
+                assert_eq!(judge(observed, None, held), Release, "{observed:?}");
+                assert_eq!(
+                    judge(observed, Some(fg(1, OWN)), held),
+                    Release,
+                    "{observed:?}"
+                );
+                assert_eq!(
+                    judge(observed, observed, held),
+                    Release,
+                    "an owner never makes an unusable foreground usable: {observed:?}"
+                );
+            }
+        }
+        // Without an owner, only a missing process creation time is tolerated (unchanged rule).
+        let no_born = Foreground {
+            born: 0,
+            ..fg(1, OWN)
+        };
+        assert_eq!(judge(Some(no_born), None, NOTHING), Admit);
+    }
+
+    #[test]
+    fn inject_changed_foreground_with_a_key_or_lock_toggle_held_keeps_the_fail_safe() {
+        for held in [KEYS, BOTH] {
+            for integrity in [OWN, 0x1000] {
+                assert_eq!(
+                    judge(Some(fg(2, integrity)), Some(fg(1, OWN)), held),
+                    Release
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inject_verdict_matches_the_decision_table_over_a_lattice() {
+        // Exhaustive over a small lattice: Adopt happens exactly when the owner differs, the new
+        // foreground is usable and complete, buttons are held and no key is.
+        let owners = [None, Some(fg(1, OWN)), Some(fg(1, 0x1000))];
+        let observations = [
+            None,
+            Some(fg(1, OWN)),
+            Some(fg(1, 0x1000)),
+            Some(fg(2, OWN)),
+            Some(fg(2, 0x1000)),
+            Some(fg(2, 0x3000)),
+            Some(fg(0, OWN)),
+            Some(Foreground {
+                born: 0,
+                ..fg(2, OWN)
+            }),
+        ];
+        for owned in owners {
+            for observed in observations {
+                for held in [NOTHING, BUTTONS, KEYS, BOTH] {
+                    let usable = observed.is_some_and(|f| f.window != 0 && f.integrity <= OWN);
+                    let changed = owned.is_some() && owned != observed;
+                    let expected = if !usable {
+                        Release
+                    } else if !changed || held == NOTHING {
+                        Admit
+                    } else if held == BUTTONS && observed.is_some_and(|f| f.born != 0) {
+                        Adopt
+                    } else {
+                        Release
+                    };
+                    assert_eq!(
+                        judge(observed, owned, held),
+                        expected,
+                        "{owned:?} -> {observed:?} while {held:?}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

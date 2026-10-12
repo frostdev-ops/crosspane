@@ -1036,6 +1036,123 @@ mod drag_tests {
     }
 }
 
+#[cfg(test)]
+mod inject_drag_follow_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    type Seen = Arc<StdMutex<Result<Foreground, PlatformError>>>;
+    type Sent = Arc<StdMutex<Vec<u32>>>;
+
+    fn foreground_of(window: u64, integrity: u32) -> Foreground {
+        Foreground {
+            window,
+            process: 2,
+            thread: 3,
+            born: 4,
+            generation: 5,
+            integrity,
+        }
+    }
+
+    /// A driver over the real `NativePort` admission (guard observation, then the re-observation
+    /// in `submit`), with a scripted foreground and a recording `SendInput` stand-in. Nothing
+    /// reaches the OS.
+    fn driver(first: Foreground) -> (Driver<NativePort>, Seen, Sent) {
+        let gate = IoGate::new();
+        gate.set_session_permits(true);
+        gate.set_engine_permits(true);
+        let current: Seen = Arc::new(StdMutex::new(Ok(first)));
+        let sent: Sent = Arc::new(StdMutex::new(Vec::new()));
+        let (observed, recorded) = (current.clone(), sent.clone());
+        let port = NativePort {
+            gate: gate.clone(),
+            generation: Arc::new(AtomicU64::new(5)),
+            expected: None,
+            expected_gate_epoch: 0,
+            cancel: Arc::new(AtomicU64::new(0)),
+            repeat_fence: None,
+            repeat_owner: 0,
+            tag: 0x43504e49,
+            probes: Vec::new(),
+            ids: DisplayIds::default(),
+            refresh: Arc::new(|| Err(PlatformError::NotFound)),
+            monitors_read: None,
+            admitted: AdmissionCache::default(),
+            locks: Arc::new(LockSnapshot::new(Instant::now())),
+            lock_submit_ms: None,
+            owned_fixture: None,
+            submitted: 0,
+            observer: Some(Box::new(move || match &*observed.lock().unwrap() {
+                Ok(f) => Ok(*f),
+                Err(_) => Err(PlatformError::SecureInput),
+            })),
+            sender: Some(Box::new(move |input| {
+                // SAFETY: only mouse packets are submitted here; `encode` initialized `mi`.
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(unsafe { input.Anonymous.mi.dwFlags });
+                1
+            })),
+            tainted: None,
+        };
+        let driver = Driver::new(port, gate, 0x2000, RepeatSettings::new(0, 0).unwrap());
+        (driver, current, sent)
+    }
+
+    const MOVE: u32 = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+
+    #[test]
+    fn inject_native_drag_continues_into_the_window_the_click_activated() {
+        let (mut driver, current, sent) = driver(foreground_of(1, 0x2000));
+        driver.button(MouseButton::PRIMARY, true).unwrap();
+        // The click made another window foreground; the drag keeps going through the full
+        // native admission (guard read, then the re-read in `submit`).
+        *current.lock().unwrap() = Ok(foreground_of(9, 0x2000));
+        driver
+            .submit_guarded(Packet::Move { x: 10, y: 10 })
+            .unwrap();
+        driver
+            .submit_guarded(Packet::Move { x: 20, y: 20 })
+            .unwrap();
+        assert_eq!(*sent.lock().unwrap(), [MOUSEEVENTF_LEFTDOWN, MOVE, MOVE]);
+        assert!(driver.held_buttons().contains(&MouseButton::PRIMARY));
+        driver.button(MouseButton::PRIMARY, false).unwrap();
+        assert_eq!(
+            *sent.lock().unwrap(),
+            [MOUSEEVENTF_LEFTDOWN, MOVE, MOVE, MOUSEEVENTF_LEFTUP]
+        );
+        assert!(driver.held_buttons().is_empty());
+        driver.release_buttons().unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn inject_native_drag_into_a_higher_or_unknown_foreground_releases_exactly_once() {
+        for next in [
+            Ok(foreground_of(9, 0x3000)),
+            Err(PlatformError::SecureInput),
+        ] {
+            let (mut driver, current, sent) = driver(foreground_of(1, 0x2000));
+            driver.button(MouseButton::PRIMARY, true).unwrap();
+            *current.lock().unwrap() = next;
+            assert!(matches!(
+                driver.submit_guarded(Packet::Move { x: 10, y: 10 }),
+                Err(PlatformError::SecureInput)
+            ));
+            assert_eq!(
+                *sent.lock().unwrap(),
+                [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP]
+            );
+            assert!(driver.held_buttons().is_empty());
+            // Nothing is owed any more, so a later release request sends nothing.
+            driver.release_buttons().unwrap();
+            assert_eq!(sent.lock().unwrap().len(), 2);
+        }
+    }
+}
+
 /// The caller acquires fresh native probes and its retained allocator snapshot coherently for
 /// the same observation. `[P]` This is a trusted read-only acquisition seam, never a default ID
 /// policy. Failures/unmatched IDs refuse the move; native rectangles are checked again below.
