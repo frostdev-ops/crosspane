@@ -107,7 +107,7 @@ pub fn describe(verb: &Verb) -> Vec<String> {
             "Remove the Crosspane display driver from the Windows driver store.".to_owned(),
         ],
         Verb::AddFirewall(scope) => vec![format!(
-            "Allow {} to receive UDP traffic from your local subnet on private networks (Windows Defender Firewall rule \"{}\").",
+            "Allow {} to receive UDP traffic from your local subnet on private and public networks, not domain networks (Windows Defender Firewall rule \"{}\").",
             scope.program.as_str(),
             scope.id.rule_name()
         )],

@@ -356,7 +356,8 @@ mod firewall_tests {
     #[test]
     fn any_differing_field_or_a_duplicate_is_a_mismatch() {
         let cases: [(&str, Perturb); 5] = [
-            ("profiles", |rule| rule.profiles = 6),
+            // The legacy private-only value: an earlier setup's rule is not yet widened.
+            ("profiles", |rule| rule.profiles = 2),
             ("secure flags", |rule| rule.secure_flags = 1),
             ("remote user list", |rule| {
                 rule.remote_user_authorized_list = "S-1-5-1".into();

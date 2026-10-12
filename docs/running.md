@@ -83,8 +83,9 @@ agent connects.
 **Windows** has no per-app permissions to grant. The installer asks once for administrator approval
 (one UAC prompt) for two things:
 
-- a Windows Defender Firewall rule, `Crosspane.Agent.UDP.Private.<install id>`, that lets the
-  installed agent receive UDP from the local subnet on private networks;
+- a Windows Defender Firewall rule, `Crosspane.Agent.UDP.Private.<install id>` (name kept from
+  earlier setups), that lets the installed agent receive UDP from the local subnet on private and
+  public networks (not domain networks);
 - the Crosspane display driver (preview): one virtual display adapter that shows no display until
   Crosspane needs one. The driver is optional. Without it, projected Windows windows stay visible in
   place (mirror).
@@ -339,8 +340,12 @@ Speakers only: microphones are not shared yet.
 - **Limits (v0):** the Mac resamples the 48 kHz stream to its default output's rate (44.1, 48,
   88.2, 96, 176.4 or 192 kHz); the Mac's driver serves one peer at a time;
   an agent whose audio worker died keeps audio refused until it restarts.
-- **Windows limits (v0):** a change of the default output or audio device ends the stream, and sound
-  resumes only once an app starts playing again.
+- **Windows default-device changes:** the stream follows the default output. When the default
+  playback device changes, or the one in use is unplugged or disabled, the agent reopens playback on
+  the new default with the same format negotiation (a short gap, then sound continues). Reopening
+  is limited to 5 attempts per stream per minute, with backoff; if it fails or the limit is hit
+  (a flapping device), the stream ends as before and sound resumes only once an app starts playing
+  again. Sound captured from a projected app does not depend on the output device.
 - **Check it without touching your audio:** `scripts/test-env.sh scripts/e2e/audio-private.sh`
   runs two agents, each on its own private PipeWire server, plays a 1 kHz tone into one's "speakers"
   and records what comes out of the other's output.

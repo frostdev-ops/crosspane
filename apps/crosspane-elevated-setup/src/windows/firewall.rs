@@ -172,6 +172,21 @@ impl Firewall {
         unsafe { self.rules()?.Remove(&name) }.map_err(com)
     }
 
+    /// Sets the network profiles of the rule with exactly this name. Names outside Crosspane's
+    /// prefix are refused.
+    pub(crate) fn set_profiles(&self, name: &str, profiles: i32) -> HelperResult<()> {
+        if !is_crosspane_name(name) {
+            return Err(HelperError::Refused(
+                "firewall rule is not a Crosspane rule",
+            ));
+        }
+        let name = BSTR::from(name);
+        // SAFETY: reads one rule by exact name from this session's live rule collection.
+        let rule = unsafe { self.rules()?.Item(&name) }.map_err(com)?;
+        // SAFETY: sets the profiles of the rule object just read, on the apartment that owns it.
+        unsafe { rule.SetProfiles(profiles) }.map_err(com)
+    }
+
     /// True when local firewall rules apply, that is `LocalPolicyModifyState` is `OK`.
     pub(crate) fn local_rules_apply(&self) -> HelperResult<bool> {
         // SAFETY: a read-only getter on this session's live policy object.
