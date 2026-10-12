@@ -29,8 +29,11 @@
 //! - **S1** (source sets): `Audio::wanted_sources` and `Audio::reconcile` emit the pids.
 //! - **S2** (legacy peer): `VirtualActive` keeps the edge-triggered `Audio::outgoing`.
 //! - **S3** (audio/1 peer): `Audio::reconcile` opens and ends the projection session level
-//!   triggered; it is exempt from the "peer's `Grants` lack speaker" rule.
-//! - **S4**: `ProjectionAudioOpen` is only sent to a peer in `projection_peers`.
+//!   triggered; it is exempt from the "peer's `Grants` lack speaker" rule. A peer that refuses is
+//!   asked again after a backoff that doubles with each refusal in a row (`projection_backoff`).
+//! - **S4**: `ProjectionAudioOpen` is only sent to a peer in `projection_peers`, that is, only on
+//!   a link whose current connection announced `audio/1`: a connection replacement empties the
+//!   set until the new connection announces the feature again.
 //! - **S5**: microphones never take a projection path.
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -47,13 +50,32 @@ use crate::io::{AudioEndpoint, AudioKey};
 use crate::{Command, Failure, Input, Notice, Output};
 
 /// How long a peer that refused, closed or failed this node's projection stream is left alone
-/// before the level-triggered rule asks again (AUD-PROJ S3). A refusal usually names something
-/// that fixes itself without any event this node sees: the peer's own audio gate reopening after
-/// a panic, an old stream it had not yet ended (the replacement race), or a window it has not
-/// shown yet. Without a retry the sound would stay silent until the pid set happened to change.
-/// Every failed retry sets the backoff again, so a peer that keeps refusing is asked once per
-/// period, never on every input.
+/// before the level-triggered rule asks again (AUD-PROJ S3): the first wait, after a success or
+/// a reset. A refusal usually names something that fixes itself without any event this node
+/// sees: the peer's own audio gate reopening after a panic, an old stream it had not yet ended
+/// (the replacement race), or a window it has not shown yet. Without a retry the sound would
+/// stay silent until the pid set happened to change.
+///
+/// Every failed retry sets the backoff again and doubles it (5 s, 10 s, 20 s, ...) up to
+/// `PROJECTION_RETRY_MAX`, so a peer that keeps refusing is asked less and less often and never
+/// on every input. Anything that can change the answer starts the backoff over (see
+/// `Audio::clear_refusal`), and so does a stream the peer accepts.
 const PROJECTION_RETRY: Duration = Duration::from_secs(5);
+
+/// The longest wait between two asks of a peer that keeps refusing (5 minutes): the doubling
+/// from `PROJECTION_RETRY` stops here, so a refusal that never fixes itself costs one message
+/// per period at worst, and a fix without an event this node sees still takes effect within it.
+const PROJECTION_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// The wait after a peer's consecutive refusals, counted from 0 for the first one:
+/// `PROJECTION_RETRY` doubled once per earlier refusal, never more than `PROJECTION_RETRY_MAX`.
+fn projection_backoff(step: u8) -> Duration {
+    // Five seconds doubled six times is already past the cap, so clamping the shift well before
+    // it could overflow changes no result.
+    PROJECTION_RETRY
+        .saturating_mul(1u32 << step.min(16))
+        .min(PROJECTION_RETRY_MAX)
+}
 
 /// Per-peer admission state. It outlives links: `next` and `remote_high` are the identity
 /// counters that keep a stream ID from being reused for the lifetime of this engine (WP-3.0b),
@@ -127,11 +149,18 @@ pub(crate) struct Audio {
     /// are kept, so an absent entry means "nothing in force". Forgotten with `RemoveAudioPeer`.
     sources_sent: BTreeMap<NodeId, BTreeSet<u32>>,
     /// Peers that refused or closed (or failed) this node's projection stream, with the time a
-    /// retry becomes allowed (`PROJECTION_RETRY` after the refusal). They are asked again at
+    /// retry becomes allowed (`projection_backoff` after the refusal). They are asked again at
     /// that time, or earlier when something changes: their pid set, the capture going inactive
     /// then active, or the link. This is what keeps the level-triggered open from becoming a
-    /// storm, and what keeps a refused peer from staying silent for good.
+    /// storm, and what keeps a refused peer from staying silent for good. The entry goes when
+    /// the retry is sent; `retry_step` remembers how often the peer has refused in a row.
     refused: BTreeMap<NodeId, MonoTime>,
+    /// How many times in a row each peer refused this node's projection stream: the exponent of
+    /// its next backoff (`projection_backoff`). It outlives the `refused` entry, which goes as
+    /// soon as the retry is sent, so that a retry that is refused again waits longer. It is
+    /// cleared with `refused` by whatever can change the answer (`Audio::clear_refusal`), and by
+    /// the peer accepting a stream (`Audio::opened`).
+    retry_step: BTreeMap<NodeId, u8>,
     /// The `now` of the `handle` call being processed, for the places that start a backoff
     /// (`refuse_until`) and have no clock of their own.
     now: MonoTime,
@@ -156,6 +185,7 @@ impl Audio {
             peer_speaker: BTreeSet::new(),
             sources_sent: BTreeMap::new(),
             refused: BTreeMap::new(),
+            retry_step: BTreeMap::new(),
             now: MonoTime::ZERO,
         }
     }
@@ -261,7 +291,7 @@ impl Audio {
                 if changed {
                     // A fresh negotiation: whatever the peer refused under the old one is moot.
                     // A lost feature ends the streams in `reconcile` (S3, D3).
-                    self.refused.remove(peer);
+                    self.clear_refusal(peer);
                 }
             }
             Input::Link(LinkEvent::Closed { peer, .. }) => {
@@ -285,10 +315,18 @@ impl Audio {
                 // app goes inactive and active again.
                 self.end_where(|s| s.key.peer == *peer, None, out);
                 // The new connection sends its own `Grants`, and a peer that refused on the old
-                // one may accept on the new one. An `audio/1` projection stream (S3) does not
-                // wait for an activity edge: `reconcile` reopens it in this very call.
+                // one may accept on the new one.
                 self.peer_speaker.remove(peer);
-                self.refused.remove(peer);
+                self.clear_refusal(peer);
+                // Fail closed (S4): `audio/1` is negotiated per connection, and this input comes
+                // before anyone has looked at the new connection's `Hello`. The peer stops being
+                // an `audio/1` peer here, so `reconcile` withdraws its pid set and no
+                // `ProjectionAudioOpen` can go out on a connection that has not announced the
+                // feature. The new connection must announce `audio/1` again
+                // (`Input::ProjectionAudioPeer`, after this input, only if its `Hello` carries
+                // it); the level-triggered rule then sends the set again and reopens the stream,
+                // whether or not the capture reports a new activity edge.
+                self.projection_peers.remove(peer);
             }
             Input::AudioStreamFailed { key } => {
                 // Only the complete currently admitted key: a stale failure of an older
@@ -363,7 +401,7 @@ impl Audio {
                         // active. No legacy `AudioOpen`; `reconcile` opens the projection
                         // stream (level triggered) once the pid set and the gate allow it.
                         // An inactive -> active edge lets a peer that refused be asked again.
-                        self.refused.remove(peer);
+                        self.clear_refusal(peer);
                     } else {
                         // S2 (and every microphone, S5): edge triggered, as before.
                         self.outgoing(*peer, *kind, now, out);
@@ -495,7 +533,7 @@ impl Audio {
         for (peer, pids) in &wanted {
             if self.sources_sent.get(peer) != Some(pids) {
                 self.sources_sent.insert(*peer, pids.clone());
-                self.refused.remove(peer);
+                self.clear_refusal(peer);
                 out.push(Output::AudioProjectionSources {
                     peer: *peer,
                     pids: pids.iter().copied().collect(),
@@ -510,7 +548,7 @@ impl Audio {
             .collect();
         for peer in emptied {
             self.sources_sent.remove(&peer);
-            self.refused.remove(&peer);
+            self.clear_refusal(&peer);
             out.push(Output::AudioProjectionSources {
                 peer,
                 pids: Vec::new(),
@@ -521,7 +559,8 @@ impl Audio {
         // captured. Level triggered: capture active, set non-empty (it is in `wanted`), gate
         // open, nothing carrying that capture to the peer yet (a legacy stream that predates the
         // peer's `audio/1` already does), and the peer is not in a refusal backoff (a refusal
-        // waits for a change in the pid set, the capture or the link, or `PROJECTION_RETRY`).
+        // waits for a change in the pid set, the capture or the link, or the backoff running out,
+        // which doubles from `PROJECTION_RETRY` with each refusal in a row).
         let peers: Vec<_> = wanted.keys().copied().collect();
         for peer in peers {
             let backed_off = self.refused.get(&peer).is_some_and(|until| now < *until);
@@ -529,7 +568,9 @@ impl Audio {
                 continue;
             }
             if self.open_outgoing(peer, AudioKind::Speaker, Origin::Projection, now, out) {
-                // The retry (if this was one) is over; a new refusal starts a new backoff.
+                // The retry (if this was one) is on its way: the wait is over, but not the count
+                // of refusals in a row. A new refusal starts a longer backoff; only the peer
+                // accepting the stream (`opened`) or a change of the answer clears the count.
                 self.refused.remove(&peer);
             } else {
                 // IDs or generations ran out: do not retry on every input.
@@ -553,10 +594,31 @@ impl Audio {
                 .values()
                 .any(|s| !s.incoming && s.key.peer == peer && s.kind == AudioKind::Speaker)
     }
-    /// Leave `peer` alone for `PROJECTION_RETRY`: it refused, closed or failed the stream.
+    /// Leave `peer` alone for the next backoff (`projection_backoff`: 5 s, doubling with each
+    /// refusal in a row, 5 minutes at most): it refused, closed or failed the stream.
+    ///
+    /// One refusal can get here twice in one call (the peer's `AudioRefused` marks the peer, and
+    /// ending the session for that reason marks it again). A backoff that is still running is
+    /// left as it is, so the refusal counts once.
     fn refuse_until(&mut self, peer: NodeId) {
-        let until = self.now.saturating_add(PROJECTION_RETRY);
-        self.refused.insert(peer, until);
+        if self
+            .refused
+            .get(&peer)
+            .is_some_and(|until| self.now < *until)
+        {
+            return;
+        }
+        let step = self.retry_step.entry(peer).or_insert(0);
+        let wait = projection_backoff(*step);
+        *step = step.saturating_add(1);
+        self.refused.insert(peer, self.now.saturating_add(wait));
+    }
+    /// Something that can change the peer's answer happened (its pid set, the capture going
+    /// inactive then active, its `audio/1`, a replaced or closed link): the next ask is due at
+    /// once, and if it is refused the backoff starts over at `PROJECTION_RETRY`.
+    fn clear_refusal(&mut self, peer: &NodeId) {
+        self.refused.remove(peer);
+        self.retry_step.remove(peer);
     }
     /// S1: the pids each peer's capture should cover. A peer gets `view.sources[peer]` when it is
     /// connected and either negotiated `audio/1` or (a legacy peer) granted this node
@@ -636,12 +698,12 @@ impl Audio {
     /// Forget what was learned about `peer` on a link or audio negotiation that is gone.
     fn forget_projection_link(&mut self, peer: NodeId) {
         self.projection_peers.remove(&peer);
-        self.refused.remove(&peer);
+        self.clear_refusal(&peer);
         self.sources_sent.remove(&peer);
     }
     /// An `AudioClose` or `AudioRefused` from `peer` for our outgoing projection stream: do not
     /// ask again until the pid set, the capture activity or the link changes, or the backoff
-    /// (`PROJECTION_RETRY`) runs out.
+    /// (`projection_backoff`) runs out.
     fn mark_refused_if_projection(&mut self, peer: NodeId, stream: AudioStreamId) {
         if self
             .sessions
@@ -937,6 +999,11 @@ impl Audio {
             if s.phase == Phase::Handshake && self.admitted(s) {
                 if let Some(s) = self.sessions.get_mut(&id) {
                     s.phase = Phase::Active;
+                }
+                if s.origin == Origin::Projection {
+                    // The peer accepted the stream: whatever it refused before is over, so the
+                    // next refusal (it may close the stream later) starts the backoff over.
+                    self.retry_step.remove(&peer);
                 }
                 out.push(Output::StartAudioStream {
                     key: s.key,
@@ -1318,5 +1385,194 @@ mod tests {
         assert_eq!(wanted(&audio), Some(BTreeSet::from([7, 42])));
         audio.session_permits = false;
         assert_eq!(wanted(&audio), None);
+    }
+
+    fn seconds(n: u64) -> MonoTime {
+        MonoTime::from_nanos(n * 1_000_000_000)
+    }
+
+    fn from_peer(msg: ControlMessage) -> Input {
+        Input::Link(LinkEvent::Control { peer: PEER, msg })
+    }
+
+    fn refused_by_peer(stream: u16) -> Input {
+        from_peer(ControlMessage::AudioRefused {
+            stream: AudioStreamId(stream),
+            reason: Refusal::Permission,
+        })
+    }
+
+    #[test]
+    fn the_projection_backoff_doubles_from_five_seconds_up_to_five_minutes() {
+        let waits: Vec<u64> = (0..=8).map(|n| projection_backoff(n).as_secs()).collect();
+        assert_eq!(waits, [5, 10, 20, 40, 80, 160, 300, 300, 300]);
+        // However long a peer keeps refusing, the wait stays at the cap (and cannot overflow).
+        assert_eq!(projection_backoff(u8::MAX), PROJECTION_RETRY_MAX);
+    }
+
+    #[test]
+    fn a_replaced_connection_is_not_an_audio1_connection_until_it_says_so() {
+        let (mut audio, view) = projecting(&[42]);
+        let mut out = Vec::new();
+        audio.handle(&Input::Tick, MonoTime::ZERO, &view, &mut out);
+        assert!(audio.sessions.contains_key(&(PEER, AudioStreamId(1))));
+        out.clear();
+        audio.handle(
+            &Input::AudioConnectionReplaced { peer: PEER },
+            MonoTime::ZERO,
+            &view,
+            &mut out,
+        );
+        // The old stream ended and the set was withdrawn, and nothing was asked of the new
+        // connection: the peer is not an `audio/1` peer until the agent announces it again.
+        assert!(audio.sessions.is_empty());
+        assert!(!audio.projection_peers.contains(&PEER));
+        assert!(out.contains(&Output::AudioProjectionSources {
+            peer: PEER,
+            pids: Vec::new()
+        }));
+        assert!(!out.iter().any(|o| matches!(
+            o,
+            Output::SendControl {
+                msg: ControlMessage::ProjectionAudioOpen { .. } | ControlMessage::AudioOpen { .. },
+                ..
+            }
+        )));
+        out.clear();
+        audio.handle(&Input::Tick, seconds(60), &view, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+        // The announcement brings the set back, and the stream with it (the capture never
+        // reported inactive here, so this is the level-triggered rule alone).
+        audio.handle(
+            &Input::ProjectionAudioPeer {
+                peer: PEER,
+                available: true,
+            },
+            seconds(60),
+            &view,
+            &mut out,
+        );
+        assert!(out.contains(&Output::AudioProjectionSources {
+            peer: PEER,
+            pids: vec![42]
+        }));
+        assert!(out.contains(&Output::SendControl {
+            peer: PEER,
+            msg: ControlMessage::ProjectionAudioOpen {
+                stream: AudioStreamId(3)
+            }
+        }));
+    }
+
+    #[test]
+    fn one_refusal_counts_once_though_the_peer_and_the_ending_session_both_mark_it() {
+        let (mut audio, view) = projecting(&[42]);
+        let mut out = Vec::new();
+        audio.handle(&Input::Tick, seconds(10), &view, &mut out);
+        // `AudioRefused` marks the peer, and ending the session for that reason marks it again.
+        audio.handle(&refused_by_peer(1), seconds(10), &view, &mut out);
+        assert_eq!(audio.refused[&PEER], seconds(15));
+        assert_eq!(audio.retry_step[&PEER], 1);
+    }
+
+    #[test]
+    fn a_sent_retry_keeps_the_count_and_an_accepted_stream_clears_it() {
+        let (mut audio, view) = projecting(&[42]);
+        let mut out = Vec::new();
+        audio.handle(&Input::Tick, seconds(0), &view, &mut out);
+        audio.handle(&refused_by_peer(1), seconds(0), &view, &mut out);
+        assert_eq!(audio.refused[&PEER], seconds(5));
+        // The retry is sent at the end of the wait: the wait is over, the count is not.
+        audio.handle(&Input::Tick, seconds(5), &view, &mut out);
+        assert!(audio.refused.is_empty());
+        assert_eq!(audio.retry_step[&PEER], 1);
+        // Refused again: twice as long.
+        audio.handle(&refused_by_peer(3), seconds(5), &view, &mut out);
+        assert_eq!(audio.refused[&PEER], seconds(15));
+        assert_eq!(audio.retry_step[&PEER], 2);
+        // The retry after that is accepted: the count starts over.
+        audio.handle(&Input::Tick, seconds(15), &view, &mut out);
+        audio.handle(
+            &from_peer(ControlMessage::AudioOpened {
+                stream: AudioStreamId(5),
+            }),
+            seconds(15),
+            &view,
+            &mut out,
+        );
+        assert!(audio.retry_step.is_empty());
+        assert!(audio.refused.is_empty());
+        // So when the peer closes it later, the wait is the first period again, not the third.
+        audio.handle(
+            &from_peer(ControlMessage::AudioClose {
+                stream: AudioStreamId(5),
+            }),
+            seconds(100),
+            &view,
+            &mut out,
+        );
+        assert_eq!(audio.refused[&PEER], seconds(105));
+        assert_eq!(audio.retry_step[&PEER], 1);
+    }
+
+    #[test]
+    fn what_can_change_the_answer_starts_the_backoff_over() {
+        type Cause = fn(&mut Audio, &AudioView, &mut Vec<Output>);
+        let causes: [(&str, Cause); 4] = [
+            ("the pid set changes", |audio, _, out| {
+                let view = AudioView {
+                    sources: BTreeMap::from([(PEER, BTreeSet::from([42, 43]))]),
+                    destinations: BTreeSet::new(),
+                };
+                audio.handle(&Input::Tick, seconds(6), &view, out);
+            }),
+            ("the capture goes off and on", |audio, view, out| {
+                for active in [false, true] {
+                    audio.handle(
+                        &Input::Audio(AudioEvent::VirtualActive {
+                            peer: PEER,
+                            kind: AudioKind::Speaker,
+                            active,
+                        }),
+                        seconds(6),
+                        view,
+                        out,
+                    );
+                }
+            }),
+            ("audio/1 is announced again", |audio, view, out| {
+                for available in [false, true] {
+                    audio.handle(
+                        &Input::ProjectionAudioPeer {
+                            peer: PEER,
+                            available,
+                        },
+                        seconds(6),
+                        view,
+                        out,
+                    );
+                }
+            }),
+            ("the connection is replaced", |audio, view, out| {
+                audio.handle(
+                    &Input::AudioConnectionReplaced { peer: PEER },
+                    seconds(6),
+                    view,
+                    out,
+                );
+            }),
+        ];
+        for (cause, apply) in causes {
+            let (mut audio, view) = projecting(&[42]);
+            let mut out = Vec::new();
+            audio.handle(&Input::Tick, seconds(0), &view, &mut out);
+            audio.handle(&refused_by_peer(1), seconds(0), &view, &mut out);
+            audio.handle(&Input::Tick, seconds(5), &view, &mut out);
+            audio.handle(&refused_by_peer(3), seconds(5), &view, &mut out);
+            assert_eq!(audio.retry_step[&PEER], 2, "{cause}");
+            apply(&mut audio, &view, &mut out);
+            assert!(!audio.refused.contains_key(&PEER), "{cause}");
+            assert!(!audio.retry_step.contains_key(&PEER), "{cause}");
+        }
     }
 }

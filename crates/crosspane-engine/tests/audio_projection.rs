@@ -1309,22 +1309,62 @@ fn losing_audio1_ends_the_stream_at_both_ends_and_regaining_it_restores_the_soun
 // ---- level triggering: replacement, refusal, no storms ----
 
 #[test]
-fn a_replaced_connection_reopens_the_stream_without_a_new_activity_edge() {
+fn a_replaced_connection_reopens_the_stream_once_the_peer_announces_audio1_again() {
     let mut net = Net::new(&[A, B], Setup::default());
     net.project(A, B, W1, PID);
     let (old, _) = only_stream(&net, A);
+    let mark = net.mark();
     let first = net.feed(A, Input::AudioConnectionReplaced { peer: B });
-    // In one call: the old stream ends and a new one is asked for, with the next stream ID.
+    // In one call: the old stream ends and the set is withdrawn. Nothing is asked of the new
+    // connection, whose `Hello` nobody has looked at yet.
     assert_eq!(audio_closes(&first), vec![(B, old.stream)]);
+    assert!(projection_opens(&first).is_empty());
+    assert_eq!(pid_sets(&first), vec![(B, vec![])]);
+    assert_silence(&net, &[A, B]);
+    assert!(projection_opens(&net.since(A, mark)).is_empty());
+    // The agent finds `audio/1` in the new `Hello` and announces it: the set returns and a new
+    // stream is asked for, with the next stream ID, and the destination plays it.
+    let first = audio1(&mut net, A, B, true);
+    assert_eq!(pid_sets(&first), vec![(B, vec![PID])]);
     assert_eq!(
-        projection_opens(&first),
+        projection_opens(&net.since(A, mark)),
         vec![(B, AudioStreamId(old.stream.0 + 2))]
     );
-    assert!(pid_sets(&first).is_empty());
-    // The destination swaps one for the other.
     assert_sound(&net, A, B);
     let (new, _) = only_stream(&net, A);
     assert!(new.generation > old.generation);
+}
+
+#[test]
+fn a_replaced_connection_whose_hello_lacks_audio1_is_never_sent_a_projection_stream() {
+    // The agent feeds `AudioConnectionReplaced` before it has looked at the new `Hello`. When
+    // that `Hello` no longer carries `audio/1` it never announces the feature again, and a
+    // `ProjectionAudioOpen` on that connection would break "never sent unless negotiated".
+    let mut net = Net::new(&[A, B], Setup::default());
+    net.project(A, B, W1, PID);
+    assert_sound(&net, A, B);
+    let mark = net.mark();
+    let first = net.feed(A, Input::AudioConnectionReplaced { peer: B });
+    assert_eq!(audio_closes(&first).len(), 1);
+    assert!(projection_opens(&first).is_empty(), "{first:?}");
+    assert_eq!(pid_sets(&first), vec![(B, vec![])]);
+    // Nothing later opens one either: the passing of time, a changed pid set, many retry periods.
+    net.tick(A, 10_000);
+    net.feed(A, Input::Windows(WindowEvent::Changed(window(W1, 43))));
+    net.tick(A, 400_000);
+    let a = net.since(A, mark);
+    assert!(projection_opens(&a).is_empty(), "{a:?}");
+    assert!(machine_opens(&a).is_empty(), "{a:?}");
+    assert_eq!(
+        pid_sets(&a),
+        vec![(B, vec![])],
+        "no set while it is withdrawn"
+    );
+    assert_silence(&net, &[A, B]);
+    // Only the announcement (what the agent feeds when the new `Hello` does carry it) brings the
+    // sound back.
+    audio1(&mut net, A, B, true);
+    assert_sound(&net, A, B);
 }
 
 fn audio1(net: &mut Net, node: NodeId, peer: NodeId, available: bool) -> Vec<Output> {
@@ -1389,7 +1429,7 @@ fn next_deadline(net: &Net, node: NodeId) -> Option<MonoTime> {
 }
 
 #[test]
-fn a_destination_that_never_answers_is_asked_once_per_retry_period() {
+fn a_destination_that_never_answers_is_asked_at_growing_intervals() {
     let mut net = Net::new(&[A, B], Setup::default());
     net.lose_projection_opens = true;
     net.project(A, B, W1, PID);
@@ -1404,21 +1444,27 @@ fn a_destination_that_never_answers_is_asked_once_per_retry_period() {
             ..
         })
     )));
-    // ... and leaves the peer alone for the retry period, which is the next thing it waits for.
+    // ... and leaves the peer alone for the first retry period (5 s), which is the next thing
+    // it waits for.
     assert_eq!(next_deadline(&net, A), Some(ms(7_100)));
     net.tick(A, 4_500);
     assert_eq!(opens_by(&net, A), 1, "no storm");
-    // The retry fires on the first tick at or after that time, and its own timeout starts a new
-    // backoff from there.
+    // The retry fires on the first tick at or after that time, and its own timeout starts the
+    // next backoff from there, twice as long (10 s).
     net.tick(A, 7_100);
     assert_eq!(opens_by(&net, A), 2);
     net.tick(A, 9_200);
     assert_eq!(opens_by(&net, A), 2);
-    assert_eq!(next_deadline(&net, A), Some(ms(14_200)));
-    net.tick(A, 14_199);
-    assert_eq!(opens_by(&net, A), 2);
+    assert_eq!(next_deadline(&net, A), Some(ms(19_200)));
     net.tick(A, 14_200);
+    assert_eq!(opens_by(&net, A), 2, "the old, shorter period is gone");
+    net.tick(A, 19_199);
+    assert_eq!(opens_by(&net, A), 2);
+    net.tick(A, 19_200);
     assert_eq!(opens_by(&net, A), 3);
+    // And the one after that is twice again (20 s).
+    net.tick(A, 21_300);
+    assert_eq!(next_deadline(&net, A), Some(ms(41_300)));
 }
 
 #[test]
@@ -1487,19 +1533,27 @@ fn a_busy_refusal_in_the_replacement_race_is_retried() {
     let mut net = Net::new(&[A, B], Setup::default());
     net.project(A, B, W1, PID);
     // The connection is replaced and A hears first: its old stream's close is still on the way
-    // when the new stream's open overtakes it, so B (which still has the old one) says Busy.
+    // when the new stream's open (sent as soon as A's agent announces `audio/1` on the new
+    // connection) overtakes it, so B (which still has the old one) says Busy.
     net.lose_audio_closes = true;
     let mark = net.mark();
     let first = net.feed(A, Input::AudioConnectionReplaced { peer: B });
     assert_eq!(audio_closes(&first), vec![(B, AudioStreamId(1))]);
-    assert_eq!(projection_opens(&first), vec![(B, AudioStreamId(3))]);
+    assert!(projection_opens(&first).is_empty());
+    audio1(&mut net, A, B, true);
+    assert_eq!(
+        projection_opens(&net.since(A, mark)),
+        vec![(B, AudioStreamId(3))]
+    );
     assert_eq!(
         audio_refusals(&net.since(B, mark)),
         vec![(AudioStreamId(3), Refusal::Busy)]
     );
-    // B hears the replacement too and ends the old stream: silence, A is backed off.
+    // B hears the replacement too and ends the old stream, then announces `audio/1` on the new
+    // connection: silence, A is backed off.
     net.lose_audio_closes = false;
     net.feed(B, Input::AudioConnectionReplaced { peer: A });
+    audio1(&mut net, B, A, true);
     assert_silence(&net, &[A, B]);
     assert_eq!(opens_by(&net, A), 2);
     assert_eq!(next_deadline(&net, A), Some(ms(5_000)));
@@ -1512,7 +1566,7 @@ fn a_busy_refusal_in_the_replacement_race_is_retried() {
 }
 
 #[test]
-fn a_peer_that_keeps_refusing_is_asked_at_most_once_per_retry_period() {
+fn a_peer_that_keeps_refusing_is_asked_at_doubling_intervals_up_to_five_minutes() {
     let mut net = Net::new(&[A, B], Setup::default());
     let key = net.project(A, B, W1, PID);
     // B returns the window, but everything E2 says about it is lost: A still believes B shows
@@ -1523,17 +1577,66 @@ fn a_peer_that_keeps_refusing_is_asked_at_most_once_per_retry_period() {
     assert_eq!(opens_by(&net, A), 1);
     assert_eq!(net.captured[&(A, B)], vec![PID], "A's view is stale");
     assert_eq!(next_deadline(&net, A), Some(ms(5_000)));
-    // B has no projection from A, so every retry is refused (Permission) and re-arms the backoff.
+    // B has no projection from A, so every retry is refused (Permission) and backs off longer:
+    // the gaps are 5, 10, 20, 40, 80 and 160 s, then 300 s for as long as it keeps refusing.
     let mut at = Vec::new();
-    for t in (500..=20_000).step_by(500) {
+    for _ in 0..9 {
+        let due = next_deadline(&net, A).expect("a retry is waited for");
+        let due = due.as_nanos() / 1_000_000;
         let before = opens_by(&net, A);
-        net.tick(A, t);
-        if opens_by(&net, A) > before {
-            at.push(t);
-        }
+        net.tick(A, due - 1);
+        assert_eq!(opens_by(&net, A), before, "not before its time ({due})");
+        net.tick(A, due);
+        assert_eq!(opens_by(&net, A), before + 1, "asked at {due}");
+        at.push(due);
     }
-    assert_eq!(at, vec![5_000, 10_000, 15_000, 20_000]);
+    assert_eq!(
+        at,
+        vec![
+            5_000, 15_000, 35_000, 75_000, 155_000, 315_000, 615_000, 915_000, 1_215_000
+        ]
+    );
     assert_silence(&net, &[A, B]);
+}
+
+#[test]
+fn a_stream_the_peer_accepts_starts_the_backoff_over() {
+    let mut net = Net::new(&[A, B], Setup::default());
+    net.lose_projection_opens = true;
+    net.project(A, B, W1, PID);
+    // Two timeouts in a row: the waits are 5 s and then 10 s.
+    net.tick(A, 2_100);
+    net.tick(A, 7_100);
+    net.tick(A, 9_200);
+    assert_eq!(next_deadline(&net, A), Some(ms(19_200)));
+    // The next retry gets through and is accepted.
+    net.lose_projection_opens = false;
+    net.tick(A, 19_200);
+    assert_sound(&net, A, B);
+    // When B ends the stream later (it loses `audio/1`), the wait is the first period again, not
+    // the 20 s that the two earlier refusals would make it.
+    audio1(&mut net, B, A, false);
+    assert_silence(&net, &[A, B]);
+    assert_eq!(next_deadline(&net, A), Some(ms(24_200)));
+}
+
+#[test]
+fn a_pid_set_change_starts_the_backoff_over_and_not_only_the_wait() {
+    let mut net = Net::new(&[A, B], Setup::default());
+    let key = net.project(A, B, W1, PID);
+    net.lose_projection_messages = true;
+    net.feed(B, Input::Command(Command::Return(key)));
+    assert_eq!(next_deadline(&net, A), Some(ms(5_000)));
+    // The retry is refused: the next wait is 10 s.
+    net.tick(A, 5_000);
+    assert_eq!(next_deadline(&net, A), Some(ms(15_000)));
+    // A new process in the set: asked at once, and if it is refused again the wait is the first
+    // period (5 s), not the 20 s the three refusals would make it.
+    net.tick(A, 6_000);
+    let before = opens_by(&net, A);
+    net.feed(A, Input::Windows(WindowEvent::Changed(window(W1, 43))));
+    assert_eq!(opens_by(&net, A), before + 1);
+    assert_eq!(next_deadline(&net, A), Some(ms(11_000)));
 }
 
 #[test]

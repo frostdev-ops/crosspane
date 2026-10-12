@@ -160,7 +160,9 @@ struct PeerInfo {
     /// What the engine was last told about audio with this peer (`Input::AudioPeer`).
     audio: bool,
     /// What the engine was last told about projection audio ("sound follows the window") with
-    /// this peer (`Input::ProjectionAudioPeer`).
+    /// this peer (`Input::ProjectionAudioPeer`). A replacement connection resets it to false
+    /// before the engine hears `Input::AudioConnectionReplaced`, which makes the engine forget
+    /// the feature too, so the new `Hello` has to announce it again.
     projection_audio: bool,
     drag: bool,
     /// Last bilateral drag/1 availability fed to the engine.
@@ -2270,8 +2272,12 @@ impl Agent {
     ///
     /// 1. the cache takes the new features and displays;
     /// 2. the worker stops every stream with the peer (they were bound to the old connection),
-    ///    and then the engine is told, so it ends the sessions and keeps its identity counters;
-    /// 3. audio availability is re-evaluated from the new features;
+    ///    and then the engine is told, so it ends the sessions and keeps its identity counters.
+    ///    Projection audio (`audio/1`) is negotiated per connection, so the engine forgets it
+    ///    with that input and the loop's note of what it told the engine goes first: nothing is
+    ///    sent on the new connection until step 3 announces the feature from its `Hello`;
+    /// 3. audio availability is re-evaluated from the new features, and `audio/1` is announced
+    ///    again only if the new `Hello` still carries it;
     /// 4. running video streams pick up the new features (after the cache update).
     fn on_hello_refresh(&mut self, peer: NodeId, hello: &Hello) {
         if !self.peers.get(&peer).is_some_and(|info| info.connected) {
@@ -2296,6 +2302,12 @@ impl Agent {
             peer,
             available: false,
         });
+        // Fail closed: `audio/1` holds per connection, and this is the first the loop hears of
+        // the new one. The engine forgets it for this peer with the replacement (so no projection
+        // stream is opened on a connection that has not announced the feature), and the note of
+        // what it was told goes with it. The sync below feeds `available: true` again only if the
+        // new `Hello` still carries `audio/1`; the engine then reopens by itself.
+        self.peers.entry(peer).or_default().projection_audio = false;
         self.feed(Input::AudioConnectionReplaced { peer });
         self.sync_audio_peer(peer);
         self.sync_projection_audio_peer(peer);
@@ -9657,11 +9669,33 @@ mod audio_tests {
                             });
                             assert!(up < audio && audio < projection, "{what}");
                         }
-                        // Nothing more is said while the state doesn't change.
+                        // A replacement connection that carries the same features: the engine
+                        // forgets `audio/1` with the replacement and hears of it again only
+                        // because this `Hello` still carries it, after the replacement. (It
+                        // is never withdrawn with `available: false`: the replacement does that.)
                         r.agent.fed.clear();
                         r.refresh(&remote);
-                        assert_eq!(availability(&r.agent.fed, true), 0, "{what}");
+                        assert_eq!(
+                            availability(&r.agent.fed, true),
+                            usize::from(wanted),
+                            "{what}"
+                        );
                         assert_eq!(availability(&r.agent.fed, false), 0, "{what}");
+                        if wanted {
+                            let replaced = position(&r.agent.fed, |i| {
+                                matches!(i, Input::AudioConnectionReplaced { .. })
+                            });
+                            let projection = position(&r.agent.fed, |i| {
+                                matches!(
+                                    i,
+                                    Input::ProjectionAudioPeer {
+                                        available: true,
+                                        ..
+                                    }
+                                )
+                            });
+                            assert!(replaced < projection, "{what}");
+                        }
                     }
                 }
             }
@@ -9673,10 +9707,19 @@ mod audio_tests {
             r.agent.features.push(PROJECTION_AUDIO_FEATURE.into());
             r.hello(BOTH);
             r.agent.fed.clear();
-            // A replacement connection whose peer no longer has `audio/1`.
+            // A replacement connection whose peer no longer has `audio/1`: the replacement itself
+            // withdraws it from the engine (it is fed first, before the new `Hello` is looked at),
+            // and nothing announces it again.
             r.refresh(&["e1", "audio"]);
-            assert_eq!(availability(&r.agent.fed, false), 1);
+            assert!(
+                r.agent
+                    .fed
+                    .iter()
+                    .any(|i| matches!(i, Input::AudioConnectionReplaced { .. }))
+            );
             assert_eq!(availability(&r.agent.fed, true), 0);
+            assert_eq!(availability(&r.agent.fed, false), 0);
+            assert!(!r.agent.peers[&r.peer].projection_audio);
             // Audio itself is still available: only the new feature went.
             assert!(
                 !r.agent
@@ -13678,6 +13721,134 @@ mod home_tests {
         assert_eq!(*calls.lock().unwrap(), [(peer, vec![42])]);
         give_back(&mut h, 1);
         assert_eq!(*calls.lock().unwrap(), [(peer, vec![42]), (peer, vec![])]);
+    }
+
+    /// `audio/1` is negotiated per connection, and the loop feeds `AudioConnectionReplaced`
+    /// before it has looked at the replacement's `Hello`. With the projection stream already
+    /// open, a replacement whose `Hello` no longer carries `audio/1` must end the sound and never
+    /// announce the feature again, so the engine sends no `ProjectionAudioOpen` on it; one that
+    /// still carries it announces the feature after the replacement and the stream reopens.
+    #[test]
+    fn a_refresh_without_audio1_never_reopens_the_projection_stream_and_one_with_it_does() {
+        let opens = |outputs: &[Output]| {
+            outputs
+                .iter()
+                .filter(|o| {
+                    matches!(
+                        o,
+                        Output::SendControl {
+                            msg: ControlMessage::ProjectionAudioOpen { .. },
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        for carries_audio1 in [false, true] {
+            let mut h = bare_scenario();
+            let calls: SourceCalls = Arc::new(Mutex::new(Vec::new()));
+            h.rig.agent.audio = Some(Box::new(SourceRecorder(calls.clone())));
+            let peer = h.rig.peer;
+            // A negotiated connection: both ends advertise projection audio, and the loop has
+            // told the engine so (as `on_hello` does).
+            let owned = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+            h.rig
+                .agent
+                .features
+                .extend(owned(&["audio", PROJECTION_AUDIO_FEATURE]));
+            let info = h.rig.agent.peers.get_mut(&peer).unwrap();
+            info.features = owned(&["e1", "audio", PROJECTION_AUDIO_FEATURE]);
+            info.audio = true;
+            info.projection_audio = true;
+            step(&mut h, Input::AudioProjectionCapture { available: true });
+            step(
+                &mut h,
+                Input::AudioPeer {
+                    peer,
+                    name: "peer-name".into(),
+                    available: true,
+                },
+            );
+            step(
+                &mut h,
+                Input::ProjectionAudioPeer {
+                    peer,
+                    available: true,
+                },
+            );
+            project(&mut h, 1);
+            // The host reports the capture of the window's process (42) active: the stream opens.
+            step(
+                &mut h,
+                Input::Audio(crosspane_platform::AudioEvent::VirtualActive {
+                    peer,
+                    kind: AudioKind::Speaker,
+                    active: true,
+                }),
+            );
+            assert_eq!(opens(&h.rig.agent.emitted), 1, "{carries_audio1}");
+            assert_eq!(*calls.lock().unwrap(), [(peer, vec![42])]);
+
+            // The connection is replaced. Its `Hello` has the same displays, so only audio moves.
+            let (fed_mark, emitted_mark) = (h.rig.agent.fed.len(), h.rig.agent.emitted.len());
+            let displays = h.rig.agent.peers[&peer].displays.clone();
+            let features = if carries_audio1 {
+                owned(&["e1", "audio", PROJECTION_AUDIO_FEATURE])
+            } else {
+                owned(&["e1", "audio"])
+            };
+            h.rig.agent.on_link(LinkEvent::HelloRefresh {
+                peer,
+                hello: Hello {
+                    minor: crosspane_protocol::PROTOCOL_MINOR,
+                    name: "peer-announced".into(),
+                    features,
+                    displays,
+                },
+            });
+            process_events(&mut h);
+
+            // The feed order: the replacement first, then `available: true` only if the new
+            // `Hello` carries `audio/1`; the engine is never told `available: false`.
+            let fed = &h.rig.agent.fed[fed_mark..];
+            let replaced = fed
+                .iter()
+                .position(|i| matches!(i, Input::AudioConnectionReplaced { .. }))
+                .expect("the engine heard of the replacement");
+            let announced = fed.iter().position(|i| {
+                matches!(
+                    i,
+                    Input::ProjectionAudioPeer {
+                        available: true,
+                        ..
+                    }
+                )
+            });
+            assert_eq!(announced.is_some(), carries_audio1, "{fed:?}");
+            if let Some(announced) = announced {
+                assert!(replaced < announced);
+            }
+            assert!(!fed.iter().any(|i| matches!(
+                i,
+                Input::ProjectionAudioPeer {
+                    available: false,
+                    ..
+                }
+            )));
+            assert_eq!(h.rig.agent.peers[&peer].projection_audio, carries_audio1);
+
+            // The engine opens a stream on the replacement connection only in the second case.
+            assert_eq!(
+                opens(&h.rig.agent.emitted[emitted_mark..]),
+                usize::from(carries_audio1),
+                "{carries_audio1}"
+            );
+            let mut expected = vec![(peer, vec![42]), (peer, vec![])];
+            if carries_audio1 {
+                expected.push((peer, vec![42]));
+            }
+            assert_eq!(*calls.lock().unwrap(), expected, "{carries_audio1}");
+        }
     }
 
     fn cross_scenario(h: &mut Home) {

@@ -317,10 +317,13 @@ sound along. Speakers only: microphones are not shared yet.
   speakers", once the owner has installed it). Pick it in the system's sound settings or in an app.
   Sound reaches the peer only while an app plays into it, and comes out of the peer's default
   output.
-- **Projected apps bring their sound.** When a machine accepts a projected window (it allowed the
-  source to present windows here: `crosspanectl allow <source> present`), that window's app plays
-  its sound on that machine. No `speaker` grant is needed for it, and there is no app list to set
-  up. A pulled window needs the same `present` grant and brings its sound the same way.
+- **Projected apps bring their sound** when the window comes from a Windows machine. When a machine
+  accepts such a window (it allowed the source to present windows here:
+  `crosspanectl allow <source> present`), that window's app plays its sound on that machine. No
+  `speaker` grant is needed for it, and there is no app list to set up. A pulled window needs the
+  same `present` grant and brings its sound the same way. Every machine can play this sound; only
+  Windows captures it per app so far. Windows projected from a Mac or Linux machine bring no sound
+  of their own: their sound goes through that machine's whole-machine `speaker` route.
 - **`speaker` is for whole-machine audio:** what a Mac or Linux machine plays into its virtual
   "⟨peer⟩ speakers" output (see Use it). Windows has no such output yet, so a Windows machine does
   not send whole-machine sound.
