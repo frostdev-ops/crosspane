@@ -766,9 +766,99 @@ fn capture_failure_rolls_back_and_capture_ids_do_not_repeat() {
                 Output::HideOverlay(HUD)
             ]
         );
+        if failure == Failure::SecureInput {
+            // A SecureInput refusal backs the portal off until the pointer leaves the edge.
+            f.send(edge_released(f.portal, f.now));
+        }
         let (session, capture) = f.begin();
         assert_eq!(session, SessionId(2));
         assert_eq!(capture, CaptureId(2));
+    }
+}
+
+fn refuse_capture(f: &mut Fixture, failure: Failure) -> Vec<Output> {
+    let (_, capture) = f.begin();
+    f.send(Input::CaptureBegun {
+        id: capture,
+        result: Err(failure),
+    })
+}
+
+fn starts_crossing(out: &[Output]) -> bool {
+    shows_hud(out)
+        || out
+            .iter()
+            .any(|o| matches!(o, Output::BeginCapture { .. } | Output::SendControl { .. }))
+}
+
+#[test]
+fn secure_input_refusal_suppresses_repeated_edge_presses() {
+    let mut f = Fixture::new(config(), 2);
+    refuse_capture(&mut f, Failure::SecureInput);
+    // The pointer stays against the edge: every outward move reports a press.
+    for ms in [10, 100, 400, 1000, 1499] {
+        let out = f.feed(ms, edge_pressed(f.portal, time(ms)));
+        assert!(out.is_empty(), "press at {ms} ms: {out:?}");
+    }
+}
+
+#[test]
+fn secure_input_backoff_ends_when_the_pointer_leaves_the_edge() {
+    let mut f = Fixture::new(config(), 2);
+    refuse_capture(&mut f, Failure::SecureInput);
+    assert!(f.feed(10, edge_pressed(f.portal, time(10))).is_empty());
+    assert!(f.feed(20, edge_released(f.portal, time(20))).is_empty());
+    let out = f.feed(30, edge_pressed(f.portal, time(30)));
+    assert!(shows_hud(&out), "{out:?}");
+}
+
+#[test]
+fn secure_input_backoff_ends_after_the_timeout() {
+    let mut f = Fixture::new(config(), 2);
+    refuse_capture(&mut f, Failure::SecureInput);
+    assert!(f.feed(1499, edge_pressed(f.portal, time(1499))).is_empty());
+    let out = f.feed(1500, edge_pressed(f.portal, time(1500)));
+    assert!(shows_hud(&out), "{out:?}");
+}
+
+#[test]
+fn a_release_stamped_before_the_refusal_does_not_end_the_backoff() {
+    let mut f = Fixture::new(config(), 2);
+    f.feed(0, Input::PeerUp { peer: B });
+    f.feed(100, edge_pressed(f.portal, time(100)));
+    let session = start(&f.feed(110, Input::Overlay(OverlayEvent::Visible(HUD)))).1;
+    let out = f.feed(120, control(B, ControlMessage::ControlStarted { session }));
+    let capture = out
+        .iter()
+        .find_map(|o| match o {
+            Output::BeginCapture { id, .. } => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    f.feed(
+        130,
+        Input::CaptureBegun {
+            id: capture,
+            result: Err(Failure::SecureInput),
+        },
+    );
+    // Stamped before the refusal: stale, re-arms nothing.
+    f.feed(140, edge_released(f.portal, time(50)));
+    assert!(f.feed(150, edge_pressed(f.portal, time(150))).is_empty());
+}
+
+#[test]
+fn other_refusals_do_not_back_the_portal_off() {
+    for failure in [
+        Failure::Locked,
+        Failure::PointerButtonHeld,
+        Failure::PermissionDenied,
+        Failure::Other,
+    ] {
+        let mut f = Fixture::new(config(), 2);
+        refuse_capture(&mut f, failure);
+        let out = f.feed(10, edge_pressed(f.portal, time(10)));
+        assert!(starts_crossing(&out), "{failure:?}: {out:?}");
     }
 }
 
