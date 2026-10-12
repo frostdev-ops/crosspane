@@ -2266,10 +2266,28 @@ pub fn create(
     });
     let gpu = if std::env::var("CROSSPANE_GPU").as_deref() != Ok("0") {
         frames.as_ref().and_then(|frames| {
-            frames.enable_gpu(wgpu::Features::empty())
-                .map(|windows| GpuDevice { device: windows.device.clone(), queue: windows.queue.clone(), windows })
-                .map_err(|error| tracing::info!(%error, "Windows source GPU unavailable: CPU frame path"))
-                .ok()
+            // The GPU is created once per process. A busy machine at logon can exceed its bounded
+            // start, so a timeout is retried twice before the CPU frame path is chosen for good.
+            let mut attempt = 1;
+            loop {
+                match frames.enable_gpu(wgpu::Features::empty()) {
+                    Ok(windows) => {
+                        break Some(GpuDevice {
+                            device: windows.device.clone(),
+                            queue: windows.queue.clone(),
+                            windows,
+                        });
+                    }
+                    Err(PlatformError::Timeout) if attempt < 3 => {
+                        tracing::info!(attempt, "Windows source GPU start timed out: retrying");
+                        attempt += 1;
+                    }
+                    Err(error) => {
+                        tracing::info!(%error, "Windows source GPU unavailable: CPU frame path");
+                        break None;
+                    }
+                }
+            }
         })
     } else {
         None
