@@ -1490,12 +1490,13 @@ fn retirement_waits_for_an_outstanding_callback_while_forwarding_continues_corre
         "the state is kept while a callback is outstanding"
     );
     drop(held);
-    rig.sync();
-    assert_eq!(
-        rig.hal.dropped_total(),
-        1,
-        "released once the callback left"
-    );
+    // The hammer keeps calling in, so on a loaded machine one of its callbacks can still be inside
+    // when this thread syncs; the state goes as soon as no callback is outstanding.
+    wait_until("the state released once the callback left", || {
+        rig.sync();
+        rig.hal.dropped_total() >= 1
+    });
+    assert_eq!(rig.hal.dropped_total(), 1, "released exactly once");
     assert_eq!(rig.hal.active_sessions(), 0);
     stop.store(true, Ordering::SeqCst);
     hammer.join().unwrap();
