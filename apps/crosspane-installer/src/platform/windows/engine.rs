@@ -325,6 +325,30 @@ fn touches_driver(verb: &Verb) -> bool {
         .any(|part| matches!(part, Verb::InstallDriver | Verb::RemoveDriver))
 }
 
+/// What a converge does with the sign-in task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskAction {
+    /// Register (or re-register) it.
+    Register,
+    /// Leave it as it is.
+    Keep,
+    /// Delete it: the task would run a program that failed its integrity check.
+    Remove,
+}
+
+/// The task runs the supervisor (the installer), which runs the agent, and neither is checked at
+/// start, so the task stays only while both programs match their approved files. Otherwise it is
+/// re-registered whenever it is unhealthy, and on every route except a plain install.
+pub(crate) fn task_action(programs_ok: bool, health: TaskHealth, route: Route) -> TaskAction {
+    if !programs_ok {
+        TaskAction::Remove
+    } else if health != TaskHealth::Healthy || route != Route::Install {
+        TaskAction::Register
+    } else {
+        TaskAction::Keep
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ConvergeReport {
     pub files_ok: bool,
@@ -473,21 +497,44 @@ pub(crate) fn converge(
         lines.push("Some of Crosspane's files are still missing or different.".to_owned());
     }
 
+    // The sign-in task runs the supervisor (this installer), and the supervisor runs the agent;
+    // neither checks a digest when it starts. A task may only stay registered while both programs
+    // match their approved files, so a repair that can't restore either removes it (fail closed).
+    let programs_ok = file_ok(PayloadFile::Agent) && file_ok(PayloadFile::Installer);
     let mut task_reported = false;
-    if task::inspect(paths) != TaskHealth::Healthy || route != Route::Install {
-        progress.step("Registering the sign-in task…");
-        if let Err(error) = task::register(paths) {
-            setup_note!("converge: task register failed: {}", error.text);
-            task_reported = true;
-            lines.push(format!(
-                "Crosspane couldn't be set to start when you sign in. {}",
-                error.text
-            ));
+    match task_action(programs_ok, task::inspect(paths), route) {
+        TaskAction::Remove => {
+            progress.step("Removing the sign-in task until Crosspane's files are restored…");
+            setup_note!("converge: agent or installer failed validation, removing the task");
+            if let Err(error) = task::delete() {
+                setup_note!("converge: task delete failed: {}", error.text);
+                task_reported = true;
+                lines.push(format!(
+                    "Crosspane's sign-in task couldn't be removed. {}",
+                    error.text
+                ));
+            }
         }
+        TaskAction::Register => {
+            progress.step("Registering the sign-in task…");
+            if let Err(error) = task::register(paths) {
+                setup_note!("converge: task register failed: {}", error.text);
+                task_reported = true;
+                lines.push(format!(
+                    "Crosspane couldn't be set to start when you sign in. {}",
+                    error.text
+                ));
+            }
+        }
+        TaskAction::Keep => {}
     }
-    let task_ok = task::inspect(paths) == TaskHealth::Healthy;
+    let task_ok = programs_ok && task::inspect(paths) == TaskHealth::Healthy;
     if !task_ok && !task_reported {
-        lines.push("Crosspane isn't set to start when you sign in yet.".to_owned());
+        lines.push(if programs_ok {
+            "Crosspane isn't set to start when you sign in yet.".to_owned()
+        } else {
+            "Crosspane won't start when you sign in until its files are restored.".to_owned()
+        });
     }
 
     progress.step("Adding Crosspane to the Start menu…");
@@ -1338,6 +1385,39 @@ mod tests {
         kit::{KitDocument, KitDocumentFile, KitFile},
         step::{INSTALL_WITHOUT_SETUP, PREVIEW_HEADER},
     };
+
+    #[test]
+    fn a_task_never_stays_registered_for_programs_that_failed_validation() {
+        let healths = [
+            TaskHealth::Healthy,
+            TaskHealth::Missing,
+            TaskHealth::Disabled,
+            TaskHealth::Different,
+            TaskHealth::Unavailable,
+        ];
+        let routes = [Route::Install, Route::Repair, Route::CompleteReinstall];
+        for health in healths {
+            for route in routes {
+                assert_eq!(
+                    task_action(false, health, route),
+                    TaskAction::Remove,
+                    "{health:?} {route:?}"
+                );
+            }
+        }
+        assert_eq!(
+            task_action(true, TaskHealth::Healthy, Route::Install),
+            TaskAction::Keep
+        );
+        assert_eq!(
+            task_action(true, TaskHealth::Healthy, Route::Repair),
+            TaskAction::Register
+        );
+        assert_eq!(
+            task_action(true, TaskHealth::Disabled, Route::Install),
+            TaskAction::Register
+        );
+    }
 
     const BANNED: [&str; 7] = [
         "foreign",
