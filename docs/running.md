@@ -149,14 +149,30 @@ is kept in Windows Credential Manager, and the key-file fallback is off on Windo
   `--features private-vdisplay,video`, for the D7 window hiding) builds, signs and installs `~/Applications/Crosspane.app` (with the settings app
   inside), starts it at login (LaunchAgent `io.frostdev.crosspane.agent`) and puts `crosspanectl`
   in `~/.cargo/bin`. Logs: `~/Library/Logs/Crosspane/agent.log`. Re-run it to upgrade.
-- **Windows:** run the per-user installer, `crosspane-installer.exe`. It installs
-  `crosspane-agent.exe`, `crosspane-ui.exe` and `crosspanectl.exe` in
-  `%LOCALAPPDATA%\Programs\Crosspane`, keeps its own state in `%LOCALAPPDATA%\Crosspane\Installer`,
-  asks once for administrator approval (see One-time setup), and creates the logon task
-  `\Crosspane\Agent` (Task Scheduler, Crosspane folder, Agent) for your account. At each sign-in that
-  task starts the agent under a supervisor. The supervisor starts the agent again after a crash (a
-  nonzero exit), five seconds later, and stops restarting it after three restarts within ten
-  minutes. The agent refuses to run elevated. Its logs are `%LOCALAPPDATA%\Crosspane\logs\agent.log`.
+- **Windows:** run the per-user installer, `crosspane-installer.exe`, from the folder you unpacked it
+  in: it installs from the `payload` folder beside it. It puts `crosspane-agent.exe`,
+  `crosspane-ui.exe`, `crosspanectl.exe`, a copy of itself and the elevated setup helper in
+  `%LOCALAPPDATA%\Programs\Crosspane`, adds **Crosspane** and **Crosspane Setup** to the Start menu
+  and an entry to Settings › Apps, asks for administrator approval only when the firewall rule or the
+  display driver is missing (see One-time setup), and creates the logon task `\Crosspane\Agent`
+  (Task Scheduler, Crosspane folder, Agent) for your account. At each sign-in that task starts the
+  agent under a supervisor, which starts the agent again after a crash (a nonzero exit) after 1, 2,
+  4 and 8 seconds and gives up after five failed starts within two minutes. The agent refuses to run
+  elevated.
+
+  Running the installer again installs, upgrades or repairs in place and can always be repeated:
+  whatever it finds in its program folder that doesn't belong there is moved to a timestamped
+  folder in `%LOCALAPPDATA%\Crosspane\backups` (the five newest are kept), and your identity,
+  pairings and settings stay. Its first screen offers **Install or reinstall**, **Repair**,
+  **Uninstall** and **Complete reinstall** (all files replaced); **Crosspane Setup** in the Start
+  menu opens Repair and Uninstall. Uninstall keeps your settings and pairings unless you choose to
+  remove them, and removes the firewall rule and display driver only if you choose that (one more
+  administrator approval). The same operations run without the window, for scripts:
+  `crosspane-installer.exe --install [--complete] [--skip-admin]`, `--repair`,
+  `--uninstall [--remove-settings] [--teardown]`, and `--status`, which prints one line of JSON.
+  The exit code is 0 on success. The installer's own log is `%TEMP%\Crosspane\setup.log`.
+
+  The agent's logs are `%LOCALAPPDATA%\Crosspane\logs\agent.log`.
   Each run starts a fresh file and moves the previous run's log to `agent.log.1` (and `agent.log.1`
   to `agent.log.2`). Each file is capped at 4 MiB, and the live file rotates the same way when a line
   would pass that cap. `crosspanectl diag` includes the tail of each file.

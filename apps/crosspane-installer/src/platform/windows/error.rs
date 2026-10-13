@@ -1,8 +1,34 @@
-//! `SetupError` (plain text plus "an OS change may have happened") and the native error re-export.
+//! `SetupError` (plain text plus "an OS change may have happened") and the bounded native error.
 
 use super::setup_log::setup_note;
 
-pub(crate) use super::native_io::{NativeError, NativeResult};
+/// A bounded native failure from the identity, support, payload and elevated-helper checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum NativeError {
+    #[error("invalid bounded native value")]
+    Invalid,
+    #[error("native observation unavailable")]
+    Unavailable,
+    #[error("foreign or unsafe resource")]
+    Foreign,
+    #[error("unsupported or unknown target")]
+    Unsupported,
+    #[error("positively missing admitted native leaf")]
+    Missing,
+    #[error("operation timed out before dispatch")]
+    Timeout,
+    #[error("operation cancelled before dispatch")]
+    Cancelled,
+    #[error("bounded native owner or installer lock busy")]
+    Busy,
+    #[error("bounded record exceeded")]
+    Oversize,
+    #[error("native mutation outcome unknown; inspect before retry")]
+    OutcomeUnknown,
+}
+
+/// `Result` over [`NativeError`].
+pub type NativeResult<T> = Result<T, NativeError>;
 
 /// A failed setup step, in plain words for the person using the installer.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

@@ -19,7 +19,9 @@ use crosspane_installer_core::elevated::{
     MAX_INSTALL_ID, RULE_PREFIX, RuleScope, Verb,
     kit::{KitFile, KitManifest, KitPin},
     status::{Consent, ElevatedJournal, JournalEntry, StatusReport},
-    step::{ElevatedPlan, PartResult, StepResult, report_lines, status_summary},
+    step::{
+        ElevatedPlan, INSTALL_WITHOUT_SETUP, PartResult, StepResult, report_lines, status_summary,
+    },
 };
 use std::{
     fs::{self, Metadata, OpenOptions},
@@ -81,6 +83,11 @@ const BAD_LOCATION: &str = "Crosspane can't set up its firewall rule for this in
 const NO_RANDOM: &str =
     "Windows couldn't provide a random number for Crosspane's firewall rule. Try again.";
 const NOT_RUN_MESSAGE: &str = "The administrator step didn't run.";
+/// The halves of core `INSTALL_WITHOUT_SETUP`, for a step that asked for only one of them.
+const WITHOUT_FIREWALL: &str =
+    "Until the firewall rule is added, other computers may not reach this PC.";
+const WITHOUT_DRIVER: &str = "Without the display driver, Crosspane mirrors windows in place.";
+const SET_UP: &str = "Firewall rule and display driver are set up.";
 
 /// What the administrator step did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,27 +141,35 @@ pub(crate) fn observe(
     })
 }
 
-/// firewall ∈ {Missing, Mismatch} || driver ∈ {Absent, PackageOnly, DeviceWithoutDriver}. A state
-/// that couldn't be read is not a reason to ask for administrator approval. A driver `Mismatch`
-/// isn't either: the helper's `setup` refuses it (`plan_install` returns `Mismatch` for every
-/// shape `driver_state` calls `Mismatch`), so asking would only repeat a refused prompt.
-pub(crate) fn setup_needed(report: &StatusReport) -> bool {
+/// The firewall rule is missing or is Crosspane's own rule in a shape setup puts right.
+fn firewall_needs_setup(report: &StatusReport) -> bool {
     matches!(
         report.firewall.state,
         FirewallState::Missing | FirewallState::Mismatch
-    ) || matches!(
+    )
+}
+
+/// The display driver is absent or only partly installed. A driver `Mismatch` is not included: the
+/// helper's `setup` refuses it (`plan_install` returns `Mismatch` for every shape `driver_state`
+/// calls `Mismatch`), so asking would only repeat a refused prompt.
+fn driver_needs_setup(report: &StatusReport) -> bool {
+    matches!(
         report.driver.state,
         DriverState::Absent | DriverState::PackageOnly | DriverState::DeviceWithoutDriver
     )
 }
 
-/// Whether there is a firewall rule or driver left for `teardown` to remove, in any form. A state
-/// that couldn't be read is not a reason to ask for administrator approval.
-pub(crate) fn teardown_needed(report: &StatusReport) -> bool {
+/// A firewall rule is there for `teardown` to remove, in any form.
+fn firewall_to_remove(report: &StatusReport) -> bool {
     matches!(
         report.firewall.state,
         FirewallState::Present | FirewallState::Mismatch
-    ) || matches!(
+    )
+}
+
+/// A display driver is there for `teardown` to remove, in any form.
+fn driver_to_remove(report: &StatusReport) -> bool {
+    matches!(
         report.driver.state,
         DriverState::PackageOnly
             | DriverState::DeviceWithoutDriver
@@ -163,7 +178,82 @@ pub(crate) fn teardown_needed(report: &StatusReport) -> bool {
     )
 }
 
-/// `ElevatedPlan::new` for `Verb::Setup` or `Verb::Teardown`.
+/// firewall ∈ {Missing, Mismatch} || driver ∈ {Absent, PackageOnly, DeviceWithoutDriver}. A state
+/// that couldn't be read is not a reason to ask for administrator approval. A driver `Mismatch`
+/// isn't either (see `driver_needs_setup`).
+pub(crate) fn setup_needed(report: &StatusReport) -> bool {
+    firewall_needs_setup(report) || driver_needs_setup(report)
+}
+
+/// Whether there is a firewall rule or driver left for `teardown` to remove, in any form. A state
+/// that couldn't be read is not a reason to ask for administrator approval.
+pub(crate) fn teardown_needed(report: &StatusReport) -> bool {
+    firewall_to_remove(report) || driver_to_remove(report)
+}
+
+/// The administrator step that sets up only what `report` shows is missing: `AddFirewall` when
+/// only the firewall rule is, `InstallDriver` when only the driver is, `Setup` when both are, and
+/// `None` when neither is (`setup_needed` false). The person is then asked about, and told about,
+/// exactly what will be done.
+pub(crate) fn setup_verb(report: &StatusReport, scope: RuleScope) -> Option<Verb> {
+    match (firewall_needs_setup(report), driver_needs_setup(report)) {
+        (true, true) => Some(Verb::Setup(scope)),
+        (true, false) => Some(Verb::AddFirewall(scope)),
+        (false, true) => Some(Verb::InstallDriver),
+        (false, false) => None,
+    }
+}
+
+/// The administrator step that removes only what `report` shows is there: `RemoveFirewall`,
+/// `RemoveDriver`, `Teardown` for both, and `None` when neither is (`teardown_needed` false).
+pub(crate) fn teardown_verb(report: &StatusReport, scope: RuleScope) -> Option<Verb> {
+    match (firewall_to_remove(report), driver_to_remove(report)) {
+        (true, true) => Some(Verb::Teardown(scope)),
+        (true, false) => Some(Verb::RemoveFirewall(scope)),
+        (false, true) => Some(Verb::RemoveDriver),
+        (false, false) => None,
+    }
+}
+
+/// Whether running `consented` does any part of `wanted`, so the person who agreed to its lines
+/// agreed to something `wanted` still calls for. Parts are compared by kind: the scope is the one
+/// the plan was made with.
+pub(crate) fn shares_a_part(consented: &Verb, wanted: &Verb) -> bool {
+    let wanted = wanted.parts();
+    consented
+        .parts()
+        .iter()
+        .any(|part| wanted.iter().any(|other| other.name() == part.name()))
+}
+
+/// What it means that the person declined `verb`: the core sentence when both the firewall rule
+/// and the driver were asked for, otherwise only the half that was.
+pub(crate) fn without_setup_note(verb: &Verb) -> &'static str {
+    match verb {
+        Verb::AddFirewall(_) => WITHOUT_FIREWALL,
+        Verb::InstallDriver => WITHOUT_DRIVER,
+        _ => INSTALL_WITHOUT_SETUP,
+    }
+}
+
+/// The state of the firewall rule and display driver in plain words, for the line under the step:
+/// what administrator approval is needed for, or that both are set up. A state that is neither
+/// (unreadable, not Crosspane's) is told with the core summary.
+pub(crate) fn plain_status(report: &StatusReport) -> String {
+    let wants = match (firewall_needs_setup(report), driver_needs_setup(report)) {
+        (true, true) => "allow Crosspane through the firewall and add the display driver",
+        (true, false) => "allow Crosspane through the firewall",
+        (false, true) => "add the display driver",
+        (false, false) => {
+            let (configured, text) = status_summary(report, false);
+            return if configured { SET_UP.to_owned() } else { text };
+        }
+    };
+    format!("Needs administrator approval to {wants}.")
+}
+
+/// `ElevatedPlan::new` for any mutating verb: `Setup`, `AddFirewall` and `InstallDriver`, or
+/// `Teardown`, `RemoveFirewall` and `RemoveDriver`.
 pub(crate) fn plan(verb: Verb) -> SetupResult<ElevatedPlan> {
     ElevatedPlan::new(verb).map_err(|error: ElevatedError| {
         setup_note!("elevated plan refused: {error}");
@@ -601,8 +691,12 @@ fn outcome_of(verb: &Verb, launched: LaunchOutcome) -> ElevatedOutcome {
         .iter()
         .any(|(_, part)| *part == PartResult::RebootRequired);
     if done {
+        // A step on the driver alone reads its state without the firewall rule (`not checked`), so
+        // it says what it did instead of a summary with a gap in it.
         let text = match (&after, restart) {
-            (Some(after), false) => summary(after),
+            (Some(after), false) if after.firewall.state != FirewallState::NotRequested => {
+                summary(after)
+            }
             _ => report_lines(&result).join(" "),
         };
         return ElevatedOutcome::Configured(text);
@@ -626,8 +720,9 @@ fn outcome_of(verb: &Verb, launched: LaunchOutcome) -> ElevatedOutcome {
 mod tests {
     use super::*;
     use crosspane_installer_core::elevated::{
-        Outcome,
+        Outcome, VerbName,
         status::{DeviceStatus, DriverStatus, FirewallStatus},
+        step::PREVIEW_HEADER,
     };
 
     fn report(firewall: FirewallState, driver: DriverState) -> StatusReport {
@@ -709,6 +804,352 @@ mod tests {
                 "firewall {firewall:?}, driver {driver:?}"
             );
         }
+    }
+
+    /// The kind of verb a table row expects, without its scope.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Want {
+        Nothing,
+        Firewall,
+        Driver,
+        Both,
+    }
+
+    fn shape(verb: Option<Verb>, both: VerbName, firewall: VerbName, driver: VerbName) -> Want {
+        match verb {
+            None => Want::Nothing,
+            Some(verb) if verb.name() == both => Want::Both,
+            Some(verb) if verb.name() == firewall => Want::Firewall,
+            Some(verb) if verb.name() == driver => Want::Driver,
+            Some(other) => panic!("unexpected verb {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setup_verb_names_only_what_is_missing() {
+        let table = [
+            (F::Present, D::Installed, Want::Nothing),
+            // The live state that prompted this: the rule needs widening, the driver is fine.
+            (F::Mismatch, D::Installed, Want::Firewall),
+            (F::Missing, D::Installed, Want::Firewall),
+            (F::Present, D::Absent, Want::Driver),
+            (F::Present, D::PackageOnly, Want::Driver),
+            (F::Present, D::DeviceWithoutDriver, Want::Driver),
+            (F::Missing, D::Absent, Want::Both),
+            (F::Mismatch, D::PackageOnly, Want::Both),
+            (F::Missing, D::DeviceWithoutDriver, Want::Both),
+            // States that couldn't be read or aren't Crosspane's are not a reason to ask.
+            (F::Present, D::Mismatch, Want::Nothing),
+            (F::Missing, D::Mismatch, Want::Firewall),
+            (F::Present, D::Unavailable, Want::Nothing),
+            (F::Unavailable, D::Installed, Want::Nothing),
+            (F::Unavailable, D::Absent, Want::Driver),
+            (F::Unavailable, D::Unavailable, Want::Nothing),
+            (F::NotRequested, D::Installed, Want::Nothing),
+            (F::NotRequested, D::Absent, Want::Driver),
+        ];
+        for (firewall, driver, want) in table {
+            let report = report(firewall, driver);
+            let verb = setup_verb(&report, scope_for_tests());
+            assert_eq!(
+                verb.is_some(),
+                setup_needed(&report),
+                "firewall {firewall:?}, driver {driver:?}"
+            );
+            assert_eq!(
+                shape(
+                    verb,
+                    VerbName::Setup,
+                    VerbName::AddFirewall,
+                    VerbName::InstallDriver
+                ),
+                want,
+                "firewall {firewall:?}, driver {driver:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn teardown_verb_names_only_what_is_there() {
+        let table = [
+            (F::Present, D::Installed, Want::Both),
+            (F::Mismatch, D::Mismatch, Want::Both),
+            (F::Present, D::PackageOnly, Want::Both),
+            (F::Present, D::Absent, Want::Firewall),
+            (F::Mismatch, D::Absent, Want::Firewall),
+            (F::Present, D::Unavailable, Want::Firewall),
+            (F::Missing, D::Installed, Want::Driver),
+            (F::Missing, D::PackageOnly, Want::Driver),
+            (F::Missing, D::DeviceWithoutDriver, Want::Driver),
+            (F::Missing, D::Mismatch, Want::Driver),
+            (F::Unavailable, D::Installed, Want::Driver),
+            (F::NotRequested, D::Installed, Want::Driver),
+            (F::Missing, D::Absent, Want::Nothing),
+            (F::Missing, D::Unavailable, Want::Nothing),
+            (F::Unavailable, D::Unavailable, Want::Nothing),
+            (F::NotRequested, D::Absent, Want::Nothing),
+        ];
+        for (firewall, driver, want) in table {
+            let report = report(firewall, driver);
+            let verb = teardown_verb(&report, scope_for_tests());
+            assert_eq!(
+                verb.is_some(),
+                teardown_needed(&report),
+                "firewall {firewall:?}, driver {driver:?}"
+            );
+            assert_eq!(
+                shape(
+                    verb,
+                    VerbName::Teardown,
+                    VerbName::RemoveFirewall,
+                    VerbName::RemoveDriver
+                ),
+                want,
+                "firewall {firewall:?}, driver {driver:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_chosen_verbs_carry_the_scope_only_where_the_firewall_is_involved() {
+        let scope = scope_for_tests();
+        let both = report(F::Missing, D::Absent);
+        assert_eq!(
+            setup_verb(&both, scope.clone()),
+            Some(Verb::Setup(scope.clone()))
+        );
+        assert_eq!(
+            setup_verb(&report(F::Missing, D::Installed), scope.clone()),
+            Some(Verb::AddFirewall(scope.clone()))
+        );
+        assert_eq!(
+            setup_verb(&report(F::Present, D::Absent), scope.clone()),
+            Some(Verb::InstallDriver)
+        );
+        let there = report(F::Present, D::Installed);
+        assert_eq!(
+            teardown_verb(&there, scope.clone()),
+            Some(Verb::Teardown(scope.clone()))
+        );
+        assert_eq!(
+            teardown_verb(&report(F::Present, D::Absent), scope.clone()),
+            Some(Verb::RemoveFirewall(scope))
+        );
+        assert_eq!(
+            teardown_verb(&report(F::Missing, D::Installed), scope_for_tests()),
+            Some(Verb::RemoveDriver)
+        );
+    }
+
+    #[test]
+    fn every_chosen_verb_makes_a_plan_that_shows_only_its_own_lines() {
+        let scope = scope_for_tests();
+        let every = [
+            Verb::Setup(scope.clone()),
+            Verb::AddFirewall(scope.clone()),
+            Verb::InstallDriver,
+            Verb::Teardown(scope.clone()),
+            Verb::RemoveFirewall(scope),
+            Verb::RemoveDriver,
+        ];
+        for verb in every {
+            let planned = plan(verb.clone()).unwrap();
+            assert_eq!(planned.verb(), &verb);
+            let block = planned.preview_block();
+            assert!(block.starts_with(PREVIEW_HEADER), "{verb:?}");
+            assert!(block.len() <= 1_800, "{verb:?}: {} bytes", block.len());
+            // The consent is for exactly this verb.
+            assert_eq!(planned.consent().unwrap().action(), &verb);
+            let mentions_driver = block.contains("display driver");
+            let mentions_firewall = block.contains("Firewall rule");
+            let touches_driver = verb
+                .parts()
+                .iter()
+                .any(|part| matches!(part, Verb::InstallDriver | Verb::RemoveDriver));
+            let touches_firewall = verb
+                .parts()
+                .iter()
+                .any(|part| matches!(part, Verb::AddFirewall(_) | Verb::RemoveFirewall(_)));
+            assert_eq!(mentions_driver, touches_driver, "{verb:?}: {block}");
+            assert_eq!(mentions_firewall, touches_firewall, "{verb:?}: {block}");
+        }
+    }
+
+    #[test]
+    fn a_consent_covers_a_wanted_step_only_when_they_share_a_part() {
+        let scope = scope_for_tests();
+        let setup = Verb::Setup(scope.clone());
+        let add_firewall = Verb::AddFirewall(scope.clone());
+        let teardown = Verb::Teardown(scope.clone());
+        assert!(shares_a_part(&setup, &setup));
+        assert!(shares_a_part(&setup, &add_firewall));
+        assert!(shares_a_part(&setup, &Verb::InstallDriver));
+        assert!(shares_a_part(&add_firewall, &setup));
+        assert!(shares_a_part(&Verb::InstallDriver, &setup));
+        assert!(shares_a_part(&teardown, &Verb::RemoveDriver));
+        assert!(shares_a_part(&Verb::RemoveFirewall(scope), &teardown));
+        // The firewall rule was agreed to, but only the driver is wanted now.
+        assert!(!shares_a_part(&add_firewall, &Verb::InstallDriver));
+        assert!(!shares_a_part(&Verb::InstallDriver, &add_firewall));
+        // Setting up and tearing down are different things.
+        assert!(!shares_a_part(&setup, &teardown));
+        assert!(!shares_a_part(&Verb::RemoveDriver, &Verb::InstallDriver));
+    }
+
+    #[test]
+    fn declining_is_explained_for_what_was_asked() {
+        let scope = scope_for_tests();
+        assert_eq!(
+            without_setup_note(&Verb::AddFirewall(scope.clone())),
+            "Until the firewall rule is added, other computers may not reach this PC."
+        );
+        assert_eq!(
+            without_setup_note(&Verb::InstallDriver),
+            "Without the display driver, Crosspane mirrors windows in place."
+        );
+        assert_eq!(
+            without_setup_note(&Verb::Setup(scope)),
+            INSTALL_WITHOUT_SETUP
+        );
+        // The core sentence for both is made of these two halves.
+        for half in [
+            without_setup_note(&Verb::InstallDriver),
+            without_setup_note(&Verb::AddFirewall(scope_for_tests())),
+        ] {
+            let lower = half.trim_end_matches('.').to_lowercase();
+            assert!(
+                INSTALL_WITHOUT_SETUP.to_lowercase().contains(&lower),
+                "{half}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_step_line_says_what_needs_approval_in_plain_words() {
+        let table = [
+            (
+                F::Missing,
+                D::Installed,
+                "Needs administrator approval to allow Crosspane through the firewall.",
+            ),
+            (
+                F::Mismatch,
+                D::Installed,
+                "Needs administrator approval to allow Crosspane through the firewall.",
+            ),
+            (
+                F::Present,
+                D::Absent,
+                "Needs administrator approval to add the display driver.",
+            ),
+            (
+                F::Missing,
+                D::Absent,
+                "Needs administrator approval to allow Crosspane through the firewall and add the display driver.",
+            ),
+            (
+                F::Present,
+                D::Installed,
+                "Firewall rule and display driver are set up.",
+            ),
+            // Nothing to approve, but not set up either: the core words for the state.
+            (
+                F::Present,
+                D::Mismatch,
+                "Firewall rule: present. Display driver: different from Crosspane's driver.",
+            ),
+            (
+                F::Unavailable,
+                D::Unavailable,
+                "Firewall rule: unreadable. Display driver: unreadable.",
+            ),
+        ];
+        for (firewall, driver, want) in table {
+            assert_eq!(
+                plain_status(&report(firewall, driver)),
+                want,
+                "firewall {firewall:?}, driver {driver:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_step_line_is_never_a_bare_checked() {
+        let states = [
+            F::Present,
+            F::Missing,
+            F::Mismatch,
+            F::Unavailable,
+            F::NotRequested,
+        ];
+        let drivers = [
+            D::Absent,
+            D::PackageOnly,
+            D::DeviceWithoutDriver,
+            D::Installed,
+            D::Mismatch,
+            D::Unavailable,
+        ];
+        for firewall in states {
+            for driver in drivers {
+                let line = plain_status(&report(firewall, driver));
+                assert!(line.len() > "Checked.".len(), "{line}");
+                assert_ne!(line, "Checked.");
+                for banned in [
+                    "foreign",
+                    "unsettled",
+                    "admission",
+                    "submission",
+                    "epoch",
+                    "journal",
+                    "outcomeunknown",
+                ] {
+                    assert!(!line.to_lowercase().contains(banned), "{line}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_step_that_worked_says_what_it_did() {
+        let scope = scope_for_tests();
+        // The driver step reads its state without the firewall rule.
+        let driver = outcome_of(
+            &Verb::InstallDriver,
+            LaunchOutcome::Verified {
+                outcome: Outcome::Done,
+                after: report(F::NotRequested, D::Installed),
+            },
+        );
+        assert_eq!(
+            driver,
+            ElevatedOutcome::Configured("Crosspane display driver: installed.".to_owned())
+        );
+        // The firewall step reads both, so the whole state is told.
+        let after = report(F::Present, D::Installed);
+        let firewall = outcome_of(
+            &Verb::AddFirewall(scope),
+            LaunchOutcome::Verified {
+                outcome: Outcome::Done,
+                after: after.clone(),
+            },
+        );
+        assert_eq!(firewall, ElevatedOutcome::Configured(summary(&after)));
+    }
+
+    #[test]
+    fn a_declined_single_step_is_declined() {
+        assert_eq!(
+            outcome_of(&Verb::InstallDriver, LaunchOutcome::Declined),
+            ElevatedOutcome::Declined
+        );
+        assert_eq!(
+            outcome_of(
+                &Verb::AddFirewall(scope_for_tests()),
+                LaunchOutcome::Declined
+            ),
+            ElevatedOutcome::Declined
+        );
     }
 
     #[test]
@@ -870,11 +1311,7 @@ mod tests {
     #[test]
     fn plans_carry_the_consent_lines_for_setup_and_teardown() {
         let setup = plan(Verb::Setup(scope_for_tests())).unwrap();
-        assert!(
-            setup
-                .preview_block()
-                .starts_with(crosspane_installer_core::elevated::step::PREVIEW_HEADER)
-        );
+        assert!(setup.preview_block().starts_with(PREVIEW_HEADER));
         assert!(plan(Verb::Teardown(scope_for_tests())).is_ok());
         assert!(plan(Verb::Status(None)).is_err());
     }

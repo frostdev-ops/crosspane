@@ -35,7 +35,7 @@ use crate::{
 use crosspane_installer_core::elevated::{
     FirewallState, RuleScope, Verb,
     status::StatusReport,
-    step::{ElevatedPlan, INSTALL_WITHOUT_SETUP, PREVIEW_HEADER},
+    step::{ElevatedPlan, PREVIEW_HEADER},
 };
 use crosspane_installer_core::{
     ApplyOutcome, JobIntent, JobStage, ObservationSource, OperationId, StepId, WaitKind,
@@ -79,8 +79,6 @@ const MAX_STORED_PLANS: usize = 8;
 /// The longest detail copied into the setup log; longer text is cut.
 const LOG_DETAIL_CHARS: usize = 300;
 
-/// The detail of a step that was checked and has nothing more to say.
-const STEP_CHECKED: &str = "Checked.";
 /// The answer to a job that hit a bug.
 const UNEXPECTED: &str = "Setup hit an unexpected problem. Try again.";
 /// The refusal when the process is elevated, impersonating or outside the user's own session.
@@ -99,6 +97,18 @@ const NOTHING_TO_CHANGE: &str = "There is nothing to change here.";
 const START_PREVIEW: &str = "Start Crosspane now.";
 const ADMIN_PREVIEW: &str =
     "Add the Windows Defender Firewall rule and the display driver that Crosspane needs.";
+const ADMIN_PREVIEW_FIREWALL: &str = "Add the Windows Defender Firewall rule that Crosspane needs.";
+const ADMIN_PREVIEW_DRIVER: &str = "Add the display driver that Crosspane needs.";
+const NOTHING_TO_APPROVE: &str = "Nothing needs administrator approval right now. Check again.";
+/// The lines under the steps. Each says where its step stands, never just that it was looked at.
+const CAN_RUN: &str = "This computer can run Crosspane.";
+const INSTALLED_RUNNING: &str = "Crosspane is installed and running.";
+const INSTALLED_SILENT: &str = "Crosspane is installed but isn't answering yet.";
+const INSTALL_INCOMPLETE: &str = "Crosspane isn't completely installed yet.";
+const INSTALL_READY: &str = "Ready to install.";
+const AGENT_RUNNING: &str = "Crosspane is running.";
+const AGENT_NOT_RUNNING: &str = "Crosspane isn't running yet.";
+const AGENT_READY: &str = "Ready to start Crosspane.";
 const INSTALL_FALLBACK_PREVIEW: &str = "Install Crosspane for this account.";
 const REPAIR_FALLBACK_PREVIEW: &str = "Repair Crosspane.";
 const REINSTALL_FALLBACK_PREVIEW: &str = "Reinstall all of Crosspane's files.";
@@ -111,9 +121,6 @@ const NOT_ON_WINDOWS: &str = "This option isn't available on Windows.";
 const FILES_FAILED: &str = "Crosspane's files couldn't all be put in place.";
 const TASK_FAILED: &str = "Crosspane couldn't be set to start when you sign in.";
 const INSTALL_DONE: &str = "Crosspane is installed.";
-const REPAIR_DONE: &str = "Crosspane's files, sign-in task and agent were checked and are working.";
-const REINSTALL_DONE: &str = "Crosspane was reinstalled and is running.";
-const UNINSTALL_DONE: &str = "Crosspane was uninstalled.";
 const TRY_AGAIN: &str = "Try again.";
 const SETTINGS_LABEL: &str = "Also remove settings and pairings";
 const TEARDOWN_LABEL: &str =
@@ -360,10 +367,6 @@ impl Answer {
             detail: detail.into(),
         }
     }
-
-    fn checked(outcome: NativeOutcome) -> Self {
-        Self::new(outcome, STEP_CHECKED)
-    }
 }
 
 /// The plan the backend answered last for one step. Apply runs exactly this and nothing else.
@@ -565,12 +568,13 @@ impl Worker {
                 // A pass is published before the report that ends its job.
                 self.checks.publish(found.checks.clone());
                 match verdict(&found) {
-                    Verdict::Supported if job.stage == JobStage::Detect => {
-                        Answer::checked(NativeOutcome::Detected {
+                    Verdict::Supported if job.stage == JobStage::Detect => Answer::new(
+                        NativeOutcome::Detected {
                             needs_action: false,
-                        })
-                    }
-                    Verdict::Supported => Answer::checked(self.verified_now()),
+                        },
+                        CAN_RUN,
+                    ),
+                    Verdict::Supported => Answer::new(self.verified_now(), CAN_RUN),
                     Verdict::No(reason) => {
                         Answer::new(NativeOutcome::Waiting(WaitKind::User), reason)
                     }
@@ -616,9 +620,7 @@ impl Worker {
                         (self.clock)(),
                     )
                 } else {
-                    Answer::checked(NativeOutcome::Detected {
-                        needs_action: !(snapshot.converged() && snapshot.agent.answering),
-                    })
+                    install_detected(snapshot.converged(), snapshot.agent.answering)
                 }
             }
             JobStage::Plan => {
@@ -632,7 +634,7 @@ impl Worker {
                     Ok((preview, plan)) => {
                         self.step_plans
                             .insert(INSTALL, (job.operation, StepPlan::Install(plan)));
-                        Answer::checked(NativeOutcome::Planned { preview })
+                        Answer::new(NativeOutcome::Planned { preview }, INSTALL_READY)
                     }
                     Err(refusal) => refusal,
                 }
@@ -659,15 +661,28 @@ impl Worker {
         status: Option<&StatusEvidence>,
     ) -> Answer {
         match job.stage {
-            JobStage::Detect => Answer::checked(NativeOutcome::Detected {
-                needs_action: status_answered(status).is_none(),
-            }),
+            JobStage::Detect => {
+                let running = status_answered(status).is_some();
+                Answer::new(
+                    NativeOutcome::Detected {
+                        needs_action: !running,
+                    },
+                    if running {
+                        AGENT_RUNNING
+                    } else {
+                        AGENT_NOT_RUNNING
+                    },
+                )
+            }
             JobStage::Plan => {
                 self.step_plans
                     .insert(AGENT, (job.operation, StepPlan::Start));
-                Answer::checked(NativeOutcome::Planned {
-                    preview: START_PREVIEW.into(),
-                })
+                Answer::new(
+                    NativeOutcome::Planned {
+                        preview: START_PREVIEW.into(),
+                    },
+                    AGENT_READY,
+                )
             }
             JobStage::Apply => {
                 let Some(StepPlan::Start) = self.consented(job, consent) else {
@@ -681,10 +696,13 @@ impl Worker {
                 start_answer(engine::start(&paths, &beat))
             }
             JobStage::Verify => match status_answered(status) {
-                Some((source, observed_at_ms)) => Answer::checked(NativeOutcome::Verified {
-                    source,
-                    observed_at_ms,
-                }),
+                Some((source, observed_at_ms)) => Answer::new(
+                    NativeOutcome::Verified {
+                        source,
+                        observed_at_ms,
+                    },
+                    AGENT_RUNNING,
+                ),
                 None => Answer::new(NativeOutcome::Waiting(WaitKind::Contract), AGENT_STARTING),
             },
         }
@@ -702,7 +720,7 @@ impl Worker {
                         NativeOutcome::Detected {
                             needs_action: elevated::setup_needed(&report),
                         },
-                        elevated::summary(&report),
+                        elevated::plain_status(&report),
                     ),
                     Ok(report) => admin_verify(&report, (self.clock)()),
                     Err(why) => {
@@ -713,18 +731,26 @@ impl Worker {
             }
             JobStage::Plan => {
                 self.step_plans.remove(&ADMIN);
-                let (_, scope) = match admin_scope() {
+                let (paths, scope) = match admin_scope() {
                     Ok(found) => found,
                     Err(why) => return unavailable(job.stage, why),
                 };
-                match elevated::plan(Verb::Setup(scope)) {
-                    Ok(plan) => {
-                        let preview = format!("{ADMIN_PREVIEW}\n\n{}", plan.preview_block());
+                // The plan names what is missing now, so the prompt never offers the driver when
+                // only the firewall rule is.
+                let report = match elevated::observe(&paths, self.payload.as_deref(), &scope) {
+                    Ok(report) => report,
+                    Err(why) => {
+                        setup_note!("administrator step not checked: {why}");
+                        return Answer::new(NativeOutcome::Waiting(WaitKind::Contract), why);
+                    }
+                };
+                match admin_plan(&report, scope) {
+                    Ok((plan, preview, detail)) => {
                         self.step_plans
                             .insert(ADMIN, (job.operation, StepPlan::Admin(plan)));
-                        Answer::checked(NativeOutcome::Planned { preview })
+                        Answer::new(NativeOutcome::Planned { preview }, detail)
                     }
-                    Err(error) => Answer::new(NativeOutcome::Failed, error.text),
+                    Err(answer) => answer,
                 }
             }
             JobStage::Apply => {
@@ -739,7 +765,7 @@ impl Worker {
                     return Answer::new(NativeOutcome::NotSubmitted, text::NO_INVENTORY);
                 };
                 let beat = self.step_heartbeat(job);
-                admin_answer(elevated::run(&paths, kit, &plan, &beat))
+                admin_answer(elevated::run(&paths, kit, &plan, &beat), plan.verb())
             }
         }
     }
@@ -1179,6 +1205,22 @@ fn status_answered(evidence: Option<&StatusEvidence>) -> Option<(ObservationSour
     .then_some((reply.source, reply.observed_at_ms))
 }
 
+/// INSTALL Detect: nothing to do once everything is in place and Crosspane answers; the line says
+/// which of the two it is that's missing.
+fn install_detected(converged: bool, agent_answering: bool) -> Answer {
+    let line = match (converged, agent_answering) {
+        (true, true) => INSTALLED_RUNNING,
+        (true, false) => INSTALLED_SILENT,
+        (false, _) => INSTALL_INCOMPLETE,
+    };
+    Answer::new(
+        NativeOutcome::Detected {
+            needs_action: !(converged && agent_answering),
+        },
+        line,
+    )
+}
+
 /// INSTALL Verify: files, task and agent must all be good; an agent that is only slow to answer
 /// is "installed but not started yet", never a permanent failure.
 fn install_verify(files_ok: bool, task_healthy: bool, agent_answering: bool, now: u64) -> Answer {
@@ -1188,10 +1230,13 @@ fn install_verify(files_ok: bool, task_healthy: bool, agent_answering: bool, now
     } else if !agent_answering {
         Answer::new(waiting, text::NOT_STARTED_YET)
     } else {
-        Answer::checked(NativeOutcome::Verified {
-            source: ObservationSource::Live,
-            observed_at_ms: now,
-        })
+        Answer::new(
+            NativeOutcome::Verified {
+                source: ObservationSource::Live,
+                observed_at_ms: now,
+            },
+            INSTALLED_RUNNING,
+        )
     }
 }
 
@@ -1231,10 +1276,7 @@ fn install_answer(result: SetupResult<ConvergeReport>) -> Answer {
 /// AGENT Apply: the agent answers within the engine's wait, or the start failed.
 fn start_answer(result: SetupResult<bool>) -> Answer {
     match result {
-        Ok(true) => Answer::new(
-            NativeOutcome::Applied(ApplyOutcome::Applied),
-            "Crosspane is running.",
-        ),
+        Ok(true) => Answer::new(NativeOutcome::Applied(ApplyOutcome::Applied), AGENT_RUNNING),
         Ok(false) => Answer::new(
             NativeOutcome::Applied(ApplyOutcome::Failed),
             text::NOT_STARTED_YET,
@@ -1253,9 +1295,38 @@ fn error_answer(error: SetupError) -> Answer {
     }
 }
 
-/// ADMIN Apply: a declined prompt leaves Crosspane installed without the rule, which is not a
-/// failure of the install.
-fn admin_answer(outcome: ElevatedOutcome) -> Answer {
+/// ADMIN Plan: the plan for what `report` shows is missing (and only that), its preview, and the
+/// line under the step. When nothing needs approval any more, or the plan can't be made, the
+/// answer to give instead.
+fn admin_plan(
+    report: &StatusReport,
+    scope: RuleScope,
+) -> Result<(ElevatedPlan, String, String), Answer> {
+    let detail = elevated::plain_status(report);
+    let Some(verb) = elevated::setup_verb(report, scope) else {
+        return Err(Answer::new(
+            NativeOutcome::Waiting(WaitKind::Contract),
+            NOTHING_TO_APPROVE,
+        ));
+    };
+    let plan =
+        elevated::plan(verb).map_err(|error| Answer::new(NativeOutcome::Failed, error.text))?;
+    let preview = format!("{}\n\n{}", admin_preview(plan.verb()), plan.preview_block());
+    Ok((plan, preview, detail))
+}
+
+/// The sentence above the approval lines, naming what `verb` adds.
+fn admin_preview(verb: &Verb) -> &'static str {
+    match verb {
+        Verb::AddFirewall(_) => ADMIN_PREVIEW_FIREWALL,
+        Verb::InstallDriver => ADMIN_PREVIEW_DRIVER,
+        _ => ADMIN_PREVIEW,
+    }
+}
+
+/// ADMIN Apply: a declined prompt leaves Crosspane installed without what was asked for, which is
+/// not a failure of the install. `verb` is the step that was shown.
+fn admin_answer(outcome: ElevatedOutcome, verb: &Verb) -> Answer {
     match outcome {
         ElevatedOutcome::NotNeeded => Answer::new(
             NativeOutcome::Applied(ApplyOutcome::Applied),
@@ -1266,7 +1337,7 @@ fn admin_answer(outcome: ElevatedOutcome) -> Answer {
         }
         ElevatedOutcome::Declined => Answer::new(
             NativeOutcome::Applied(ApplyOutcome::Refused),
-            INSTALL_WITHOUT_SETUP,
+            elevated::without_setup_note(verb),
         ),
         ElevatedOutcome::Failed(why) => {
             Answer::new(NativeOutcome::Applied(ApplyOutcome::Failed), why)
@@ -1276,17 +1347,17 @@ fn admin_answer(outcome: ElevatedOutcome) -> Answer {
 
 /// ADMIN Verify: the firewall rule is there, or the person is told what is missing.
 fn admin_verify(report: &StatusReport, now: u64) -> Answer {
-    let summary = elevated::summary(report);
+    let line = elevated::plain_status(report);
     if report.firewall.state == FirewallState::Present {
         Answer::new(
             NativeOutcome::Verified {
                 source: ObservationSource::Live,
                 observed_at_ms: now,
             },
-            summary,
+            line,
         )
     } else {
-        Answer::new(NativeOutcome::Waiting(WaitKind::User), summary)
+        Answer::new(NativeOutcome::Waiting(WaitKind::User), line)
     }
 }
 
@@ -1321,6 +1392,18 @@ fn joined(lines: &[String]) -> String {
     lines.join(" ")
 }
 
+/// `lines` without the summary the engine starts a finished report with ("Crosspane is repaired
+/// and running.", "Crosspane was uninstalled."). The screens that show a finished repair,
+/// reinstall or removal print their own headline above these lines, so the summary would only
+/// say it twice. The headless command prints the engine's lines as they are. Every other line
+/// stays.
+fn without_summary(lines: Vec<String>) -> Vec<String> {
+    lines
+        .into_iter()
+        .filter(|line| !engine::is_summary_line(line))
+        .collect()
+}
+
 fn refused(id: MaintenanceId, reason: impl Into<String>) -> MaintenanceReport {
     MaintenanceReport::Refused {
         id,
@@ -1339,7 +1422,7 @@ fn repair_report(
         Ok(report) if report.ok() => MaintenanceReport::RepairFinished {
             id,
             outcome: RepairOutcome::Verified,
-            lines: success_lines(report.lines, REPAIR_DONE),
+            lines: without_summary(report.lines),
             resumable: false,
         },
         Ok(report) => {
@@ -1362,10 +1445,9 @@ fn repair_report(
 fn reinstall_report(id: MaintenanceId, result: SetupResult<ConvergeReport>) -> MaintenanceReport {
     let finished = |outcome, lines| MaintenanceReport::ReinstallFinished { id, outcome, lines };
     match result {
-        Ok(report) if report.ok() => finished(
-            ReinstallOutcome::Verified,
-            success_lines(report.lines, REINSTALL_DONE),
-        ),
+        Ok(report) if report.ok() => {
+            finished(ReinstallOutcome::Verified, without_summary(report.lines))
+        }
         Ok(report) => finished(ReinstallOutcome::Incomplete, failure_lines(&report)),
         Err(error) if error.changed => finished(ReinstallOutcome::Incomplete, vec![error.text]),
         Err(error) => finished(ReinstallOutcome::NotSubmitted, vec![error.text]),
@@ -1377,10 +1459,9 @@ fn reinstall_report(id: MaintenanceId, result: SetupResult<ConvergeReport>) -> M
 fn uninstall_report(id: MaintenanceId, result: SetupResult<UninstallReport>) -> MaintenanceReport {
     let finished = |outcome, lines| MaintenanceReport::Finished { id, outcome, lines };
     match result {
-        Ok(report) if report.left.is_empty() => finished(
-            MaintenanceOutcome::Removed,
-            success_lines(report.lines, UNINSTALL_DONE),
-        ),
+        Ok(report) if report.left.is_empty() => {
+            finished(MaintenanceOutcome::Removed, without_summary(report.lines))
+        }
         Ok(report) => {
             let lines = if report.lines.is_empty() {
                 vec![
@@ -1558,6 +1639,7 @@ mod tests {
     use crosspane_installer_core::elevated::{
         AgentProgram, DriverState, InstallId,
         status::{DriverStatus, FirewallStatus},
+        step::INSTALL_WITHOUT_SETUP,
     };
     use std::sync::atomic::AtomicU64;
 
@@ -1617,14 +1699,17 @@ mod tests {
     }
 
     fn setup_plan() -> ElevatedPlan {
-        let scope = RuleScope {
+        ElevatedPlan::new(Verb::Setup(rule_scope())).unwrap()
+    }
+
+    fn rule_scope() -> RuleScope {
+        RuleScope {
             id: InstallId::parse("0123456789abcdef").unwrap(),
             program: AgentProgram::parse(
                 r"C:\Users\someone\AppData\Local\Programs\Crosspane\crosspane-agent.exe",
             )
             .unwrap(),
-        };
-        ElevatedPlan::new(Verb::Setup(scope)).unwrap()
+        }
     }
 
     fn status_report(firewall: FirewallState, driver: DriverState) -> StatusReport {
@@ -1934,10 +2019,13 @@ mod tests {
         let waiting = NativeOutcome::Waiting(WaitKind::Contract);
         assert_eq!(
             install_verify(true, true, true, 40),
-            Answer::checked(NativeOutcome::Verified {
-                source: ObservationSource::Live,
-                observed_at_ms: 40
-            })
+            Answer::new(
+                NativeOutcome::Verified {
+                    source: ObservationSource::Live,
+                    observed_at_ms: 40
+                },
+                INSTALLED_RUNNING
+            )
         );
         assert_eq!(
             install_verify(true, true, false, 40),
@@ -2026,25 +2114,188 @@ mod tests {
 
     #[test]
     fn a_declined_administrator_prompt_is_refused_not_failed() {
+        let both = Verb::Setup(rule_scope());
         assert_eq!(
-            admin_answer(ElevatedOutcome::Declined),
+            admin_answer(ElevatedOutcome::Declined, &both),
             Answer::new(
                 NativeOutcome::Applied(ApplyOutcome::Refused),
                 INSTALL_WITHOUT_SETUP
             )
         );
         assert_eq!(
-            admin_answer(ElevatedOutcome::Configured("Done.".to_owned())),
+            admin_answer(ElevatedOutcome::Configured("Done.".to_owned()), &both),
             Answer::new(NativeOutcome::Applied(ApplyOutcome::Applied), "Done.")
         );
         assert_eq!(
-            admin_answer(ElevatedOutcome::NotNeeded).outcome,
+            admin_answer(ElevatedOutcome::NotNeeded, &both).outcome,
             NativeOutcome::Applied(ApplyOutcome::Applied)
         );
         assert_eq!(
-            admin_answer(ElevatedOutcome::Failed("No.".to_owned())),
+            admin_answer(ElevatedOutcome::Failed("No.".to_owned()), &both),
             Answer::new(NativeOutcome::Applied(ApplyOutcome::Failed), "No.")
         );
+    }
+
+    #[test]
+    fn a_declined_prompt_says_what_that_leaves_undone_for_what_was_asked() {
+        let declined = |verb: &Verb| admin_answer(ElevatedOutcome::Declined, verb);
+        let firewall = declined(&Verb::AddFirewall(rule_scope()));
+        assert_eq!(
+            firewall,
+            Answer::new(
+                NativeOutcome::Applied(ApplyOutcome::Refused),
+                "Until the firewall rule is added, other computers may not reach this PC."
+            )
+        );
+        assert!(!firewall.detail.contains("display driver"));
+        let driver = declined(&Verb::InstallDriver);
+        assert_eq!(
+            driver,
+            Answer::new(
+                NativeOutcome::Applied(ApplyOutcome::Refused),
+                "Without the display driver, Crosspane mirrors windows in place."
+            )
+        );
+        assert!(!driver.detail.contains("firewall"));
+    }
+
+    #[test]
+    fn the_administrator_plan_names_only_what_is_missing() {
+        // The live state that prompted this: the firewall rule needs widening, the driver is fine.
+        let (plan, preview, detail) = admin_plan(
+            &status_report(FirewallState::Mismatch, DriverState::Installed),
+            rule_scope(),
+        )
+        .unwrap();
+        assert!(matches!(plan.verb(), Verb::AddFirewall(_)));
+        assert!(preview.starts_with(ADMIN_PREVIEW_FIREWALL));
+        assert!(preview.lines().any(|line| line.starts_with(PREVIEW_HEADER)));
+        assert!(
+            !preview.to_lowercase().contains("display driver"),
+            "{preview}"
+        );
+        assert_eq!(
+            detail,
+            "Needs administrator approval to allow Crosspane through the firewall."
+        );
+
+        let (plan, preview, detail) = admin_plan(
+            &status_report(FirewallState::Present, DriverState::Absent),
+            rule_scope(),
+        )
+        .unwrap();
+        assert_eq!(plan.verb(), &Verb::InstallDriver);
+        assert!(preview.starts_with(ADMIN_PREVIEW_DRIVER));
+        assert!(!preview.contains("Firewall rule"), "{preview}");
+        assert_eq!(
+            detail,
+            "Needs administrator approval to add the display driver."
+        );
+
+        let (plan, preview, _) = admin_plan(
+            &status_report(FirewallState::Missing, DriverState::Absent),
+            rule_scope(),
+        )
+        .unwrap();
+        assert!(matches!(plan.verb(), Verb::Setup(_)));
+        assert!(preview.starts_with(ADMIN_PREVIEW));
+        // The consent for the stored plan is for exactly the lines shown.
+        assert_eq!(plan.consent().unwrap().action(), plan.verb());
+    }
+
+    #[test]
+    fn nothing_to_approve_is_a_wait_not_a_prompt() {
+        for (firewall, driver) in [
+            (FirewallState::Present, DriverState::Installed),
+            (FirewallState::Unavailable, DriverState::Unavailable),
+        ] {
+            let answer = admin_plan(&status_report(firewall, driver), rule_scope()).unwrap_err();
+            assert_eq!(
+                answer,
+                Answer::new(
+                    NativeOutcome::Waiting(WaitKind::Contract),
+                    NOTHING_TO_APPROVE
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn the_administrator_step_always_says_where_it_stands() {
+        for firewall in [
+            FirewallState::Present,
+            FirewallState::Missing,
+            FirewallState::Mismatch,
+            FirewallState::Unavailable,
+        ] {
+            for driver in [
+                DriverState::Installed,
+                DriverState::Absent,
+                DriverState::PackageOnly,
+                DriverState::Mismatch,
+                DriverState::Unavailable,
+            ] {
+                let verified = admin_verify(&status_report(firewall, driver), 9);
+                assert!(!verified.detail.is_empty());
+                assert_ne!(verified.detail, "Checked.");
+                if let Ok((_, _, detail)) =
+                    admin_plan(&status_report(firewall, driver), rule_scope())
+                {
+                    assert_ne!(detail, "Checked.");
+                    assert!(
+                        detail.starts_with("Needs administrator approval"),
+                        "{detail}"
+                    );
+                }
+            }
+        }
+        // Needing approval is said as such, not as a check that passed.
+        let missing = admin_verify(
+            &status_report(FirewallState::Missing, DriverState::Installed),
+            9,
+        );
+        assert_eq!(missing.outcome, NativeOutcome::Waiting(WaitKind::User));
+        assert_eq!(
+            missing.detail,
+            "Needs administrator approval to allow Crosspane through the firewall."
+        );
+        let set_up = admin_verify(
+            &status_report(FirewallState::Present, DriverState::Installed),
+            9,
+        );
+        assert_eq!(
+            set_up.detail,
+            "Firewall rule and display driver are set up."
+        );
+    }
+
+    #[test]
+    fn the_install_and_agent_lines_say_where_each_stands() {
+        assert_eq!(
+            install_detected(true, true),
+            Answer::new(
+                NativeOutcome::Detected {
+                    needs_action: false
+                },
+                INSTALLED_RUNNING
+            )
+        );
+        assert_eq!(
+            install_detected(true, false),
+            Answer::new(
+                NativeOutcome::Detected { needs_action: true },
+                INSTALLED_SILENT
+            )
+        );
+        for converged_agent in [false, true] {
+            assert_eq!(
+                install_detected(false, converged_agent),
+                Answer::new(
+                    NativeOutcome::Detected { needs_action: true },
+                    INSTALL_INCOMPLETE
+                )
+            );
+        }
     }
 
     #[test]
@@ -2093,6 +2344,7 @@ mod tests {
     #[test]
     fn a_repair_that_ends_running_is_verified_and_never_resumable() {
         let id = MaintenanceId(3);
+        // The screen's own headline says it; the engine's summary line is not repeated.
         let done = repair_report(
             id,
             Ok(report(
@@ -2108,10 +2360,68 @@ mod tests {
             MaintenanceReport::RepairFinished {
                 id,
                 outcome: RepairOutcome::Verified,
-                lines: vec!["Crosspane is repaired and running.".to_owned()],
+                lines: Vec::new(),
                 resumable: false
             }
         );
+        // Every other line stays.
+        let done = repair_report(
+            id,
+            Ok(report(
+                true,
+                true,
+                true,
+                &[
+                    "Crosspane is repaired and running.",
+                    "Firewall rule: present. Display driver: installed.",
+                ],
+            )),
+            &plan(Vec::new()),
+        );
+        assert_eq!(
+            done,
+            MaintenanceReport::RepairFinished {
+                id,
+                outcome: RepairOutcome::Verified,
+                lines: vec!["Firewall rule: present. Display driver: installed.".to_owned()],
+                resumable: false
+            }
+        );
+    }
+
+    #[test]
+    fn the_engines_summary_line_is_left_out_but_nothing_else() {
+        // Every summary the engine can start a finished report with.
+        for summary in [
+            "Crosspane is installed and running.",
+            "Crosspane is repaired and running.",
+            "Crosspane was reinstalled and is running.",
+            "Crosspane was uninstalled.",
+        ] {
+            assert!(engine::is_summary_line(summary), "{summary}");
+            assert_eq!(
+                without_summary(vec![summary.to_owned(), "Next.".to_owned()]),
+                vec!["Next.".to_owned()]
+            );
+        }
+        // Wherever it stands, and only when it is the whole line.
+        let lines = vec![
+            "First.".to_owned(),
+            "Crosspane was uninstalled.".to_owned(),
+            "Crosspane was uninstalled. But not really.".to_owned(),
+            "Crosspane is repaired.".to_owned(),
+            "Administrator approval was declined. Until the firewall rule is added, other computers may not reach this PC.".to_owned(),
+        ];
+        assert_eq!(
+            without_summary(lines.clone()),
+            [&lines[0], &lines[2], &lines[3], &lines[4]]
+                .map(|line| line.to_owned())
+                .to_vec()
+        );
+        assert!(without_summary(Vec::new()).is_empty());
+        // The engine's real texts are what the filter matches: a change there must show up here.
+        assert!(!engine::is_summary_line(text::NOT_STARTED_YET));
+        assert!(!engine::is_summary_line(TASK_FAILED));
     }
 
     #[test]
@@ -2178,7 +2488,20 @@ mod tests {
         };
         assert_eq!(
             reinstall_report(id, Ok(report(true, true, true, &[]))),
-            finished(ReinstallOutcome::Verified, &[REINSTALL_DONE])
+            finished(ReinstallOutcome::Verified, &[])
+        );
+        // The engine's summary repeats the screen's headline, so it is left out.
+        assert_eq!(
+            reinstall_report(
+                id,
+                Ok(report(
+                    true,
+                    true,
+                    true,
+                    &["Crosspane was reinstalled and is running.", "Kept."]
+                ))
+            ),
+            finished(ReinstallOutcome::Verified, &["Kept."])
         );
         // Files and task in place but the agent silent: incomplete, never unknown.
         assert_eq!(
@@ -2214,7 +2537,28 @@ mod tests {
             MaintenanceReport::Finished {
                 id,
                 outcome: MaintenanceOutcome::Removed,
-                lines: vec!["Crosspane was uninstalled.".to_owned()]
+                lines: Vec::new()
+            }
+        );
+        // A note after the summary stays.
+        let noted = uninstall_report(
+            id,
+            Ok(UninstallReport {
+                left: Vec::new(),
+                lines: vec![
+                    "Crosspane was uninstalled.".to_owned(),
+                    "Your settings were removed but the sign-in key couldn't be erased.".to_owned(),
+                ],
+            }),
+        );
+        assert_eq!(
+            noted,
+            MaintenanceReport::Finished {
+                id,
+                outcome: MaintenanceOutcome::Removed,
+                lines: vec![
+                    "Your settings were removed but the sign-in key couldn't be erased.".to_owned()
+                ]
             }
         );
         let partial = uninstall_report(
@@ -2385,6 +2729,17 @@ mod tests {
             NOTHING_TO_CHANGE,
             START_PREVIEW,
             ADMIN_PREVIEW,
+            ADMIN_PREVIEW_FIREWALL,
+            ADMIN_PREVIEW_DRIVER,
+            NOTHING_TO_APPROVE,
+            CAN_RUN,
+            INSTALLED_RUNNING,
+            INSTALLED_SILENT,
+            INSTALL_INCOMPLETE,
+            INSTALL_READY,
+            AGENT_RUNNING,
+            AGENT_NOT_RUNNING,
+            AGENT_READY,
             INSTALL_FALLBACK_PREVIEW,
             REPAIR_FALLBACK_PREVIEW,
             REINSTALL_FALLBACK_PREVIEW,
@@ -2397,9 +2752,6 @@ mod tests {
             FILES_FAILED,
             TASK_FAILED,
             INSTALL_DONE,
-            REPAIR_DONE,
-            REINSTALL_DONE,
-            UNINSTALL_DONE,
             SETTINGS_LABEL,
             TEARDOWN_LABEL,
             TEARDOWN_NONE_LABEL,

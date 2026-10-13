@@ -20,8 +20,9 @@ use super::{
 };
 use crosspane_installer_core::elevated::{
     RuleScope, Verb,
+    kit::KitManifest,
     status::StatusReport,
-    step::{ElevatedPlan, INSTALL_DECLINE_NOTE, INSTALL_WITHOUT_SETUP},
+    step::{ElevatedPlan, INSTALL_DECLINE_NOTE},
 };
 use std::{
     fs,
@@ -60,14 +61,6 @@ const BUSY_CODES: [i32; 2] = [5, 32];
 /// Receives plain progress lines from long operations.
 pub(crate) trait Progress {
     fn step(&self, text: &str);
-}
-
-/// A `Progress` that drops every line.
-#[derive(Debug)]
-pub(crate) struct NoProgress;
-
-impl Progress for NoProgress {
-    fn step(&self, _: &str) {}
 }
 
 /// Whether, and with what consent, the administrator step may run.
@@ -232,12 +225,12 @@ fn plan_with(
 
     let (elevated, elevated_note) = match &options.elevated {
         ElevatedPolicy::Consented(plan) => (Some(plan.clone()), None),
-        policy => match observe_scope(paths, payload, None, elevated::setup_needed) {
+        policy => match observe_verb(paths, payload, None, elevated::setup_verb) {
             Err(reason) => (None, Some(reason)),
-            Ok((_, false)) => (None, None),
-            Ok((scope, true)) => match policy {
-                ElevatedPolicy::IfNeeded => (Some(elevated::plan(Verb::Setup(scope))?), None),
-                _ => (None, Some(APPROVAL_PENDING.to_owned())),
+            Ok(None) => (None, None),
+            Ok(Some(verb)) => match policy {
+                ElevatedPolicy::IfNeeded => (Some(elevated::plan(verb)?), None),
+                _ => (None, Some(approval_pending(&verb).to_owned())),
             },
         },
     };
@@ -257,22 +250,43 @@ fn plan_with(
 
 /// Shown when the administrator step is skipped but would be needed.
 const APPROVAL_PENDING: &str = "The firewall rule and display driver still need administrator approval. Choose Repair to approve.";
+const APPROVAL_PENDING_FIREWALL: &str =
+    "The firewall rule still needs administrator approval. Choose Repair to approve.";
+const APPROVAL_PENDING_DRIVER: &str =
+    "The display driver still needs administrator approval. Choose Repair to approve.";
 
-/// Reads the helper's status for `scope` (found when `None`). `needed` says whether that status
-/// calls for the administrator step. The error is plain text for the person using setup.
-fn observe_scope(
+/// The note for a skipped administrator step `verb`, naming only what it would have done.
+fn approval_pending(verb: &Verb) -> &'static str {
+    match verb {
+        Verb::AddFirewall(_) => APPROVAL_PENDING_FIREWALL,
+        Verb::InstallDriver => APPROVAL_PENDING_DRIVER,
+        _ => APPROVAL_PENDING,
+    }
+}
+
+/// Reads the helper's status for `scope` (found when `None`) and returns the administrator step it
+/// calls for, as `pick` chooses it, or `None` when nothing is called for. The error is plain text
+/// for the person using setup.
+fn observe_verb(
     paths: &Paths,
     payload: Option<&Path>,
     scope: Option<RuleScope>,
-    needed: fn(&StatusReport) -> bool,
-) -> Result<(RuleScope, bool), String> {
+    pick: fn(&StatusReport, RuleScope) -> Option<Verb>,
+) -> Result<Option<Verb>, String> {
     let scope = match scope {
         Some(scope) => scope,
         None => elevated::scope(paths).map_err(|error| error.text)?,
     };
     let report = elevated::observe(paths, payload, &scope)?;
-    let needed = needed(&report);
-    Ok((scope, needed))
+    Ok(pick(&report, scope))
+}
+
+/// Whether `verb` changes the display driver. The driver has to be in place before the agent
+/// starts, so only a step that leaves it alone can wait until Crosspane is running.
+fn touches_driver(verb: &Verb) -> bool {
+    verb.parts()
+        .iter()
+        .any(|part| matches!(part, Verb::InstallDriver | Verb::RemoveDriver))
 }
 
 #[derive(Clone, Debug)]
@@ -330,9 +344,11 @@ fn exit_candidates(paths: &Paths, system_root: Option<PathBuf>, temp: PathBuf) -
 }
 
 /// leave the install folder → lock → sources → plan → [stop] → `legacy::clean` → `files::place` →
-/// task (if !Healthy || route != Install) → `shell::ensure` → elevated per policy →
-/// `state::write` (only if `files_ok && task_ok`) → `legacy::prune(5)` → unlock → start
-/// (`task::run`, fallback direct spawn) → wait ≤45 s.
+/// task (if !Healthy || route != Install) → `shell::ensure` → elevated per policy (when it
+/// installs or removes the driver) → `state::write` (only if `files_ok && task_ok`) →
+/// `legacy::prune(5)` → unlock → start (`task::run`, fallback direct spawn) → wait ≤45 s →
+/// elevated per policy (when it leaves the driver alone, so Crosspane isn't down while the
+/// approval prompt waits).
 /// Idempotent; reads no prior state. The lock is released before the start: starting changes no
 /// files, and the supervisor gives up on an agent that fails while the lock exists.
 pub(crate) fn converge(
@@ -438,15 +454,27 @@ pub(crate) fn converge(
     }
 
     // Only now: the helper, the driver files and the agent path must be the installed ones.
-    let elevated = run_elevated(
+    let work = prepare_elevated(
         paths,
         inventory,
         options,
         payload.as_deref(),
         &plan,
-        progress,
         &mut lines,
     );
+    // Windows can leave its approval prompt unanswered for minutes, and Crosspane is stopped until
+    // it is. A step that leaves the display driver alone (the firewall rule) doesn't have to hold
+    // Crosspane up, so it runs once Crosspane is back. One that installs or removes the driver
+    // stays ahead of the start, because the agent must not start under a driver that is changing.
+    let (now, later) = if defers_until_started(&work) {
+        (None, Some(work))
+    } else {
+        (Some(work), None)
+    };
+    let mut elevated = match now {
+        Some(work) => run_elevated(paths, work, progress, &mut lines),
+        None => ElevatedOutcome::NotNeeded,
+    };
 
     // Crosspane is started whenever the sign-in task is right and the two programs that run (the
     // agent and the supervisor, which is this installer) match their approved files. A damaged
@@ -457,9 +485,9 @@ pub(crate) fn converge(
     }
     legacy::prune(paths, BACKUPS_KEPT);
 
-    // Everything that changes files is done. Starting changes none, so the lock is released here:
-    // the supervisor sees the lock as a setup replacing files and would give up on an agent whose
-    // first start fails, while this waits for it.
+    // Everything that changes files is done. Starting changes none, so the lock is released here
+    // (on the thread that took it): the supervisor sees the lock as a setup replacing files and
+    // would give up on an agent whose first start fails, while this waits for it.
     drop(lock);
     let mut agent_answering = false;
     if start_wanted {
@@ -467,6 +495,11 @@ pub(crate) fn converge(
         if !agent_answering {
             lines.push(text::NOT_STARTED_YET.to_owned());
         }
+    }
+    // The firewall step changes no installed file, and the kit it runs from is held while it
+    // runs, so it needs no lock either.
+    if let Some(work) = later {
+        elevated = run_elevated(paths, work, progress, &mut lines);
     }
 
     let mut report = ConvergeReport {
@@ -480,10 +513,11 @@ pub(crate) fn converge(
         report.lines.insert(0, success_line(route).to_owned());
     }
     setup_note!(
-        "converge: done files_ok={} task_ok={} agent_answering={}",
+        "converge: done files_ok={} task_ok={} agent_answering={} administrator_step={}",
         report.files_ok,
         report.task_ok,
-        report.agent_answering
+        report.agent_answering,
+        outcome_name(&report.elevated)
     );
     Ok(report)
 }
@@ -549,67 +583,107 @@ fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The administrator step, per policy. Never fatal: its outcome goes in the report.
-fn run_elevated(
+/// What the administrator step is to do, decided from the helper's status but not yet run.
+#[derive(Debug)]
+enum ElevatedWork<'a> {
+    /// Nothing to run: this is the step's outcome (not needed, not allowed, or not checkable).
+    Done(ElevatedOutcome),
+    /// Run `plan` from the helper files `kit` pins.
+    Run {
+        plan: ElevatedPlan,
+        kit: &'a KitManifest,
+    },
+}
+
+/// Whether the step waits until Crosspane has started: it has something to run, and that leaves
+/// the display driver alone.
+fn defers_until_started(work: &ElevatedWork<'_>) -> bool {
+    matches!(work, ElevatedWork::Run { plan, .. } if !touches_driver(plan.verb()))
+}
+
+/// The administrator step, per policy: reads the helper's status and settles what to run. Nothing
+/// elevated runs here. Never fatal: a step that can't go ahead is an outcome for the report.
+fn prepare_elevated<'a>(
     paths: &Paths,
-    inventory: &Inventory,
+    inventory: &'a Inventory,
     options: &ConvergeOptions,
     payload: Option<&Path>,
     plan: &ConvergePlan,
-    progress: &dyn Progress,
     lines: &mut Vec<String>,
-) -> ElevatedOutcome {
+) -> ElevatedWork<'a> {
     let consented = match &options.elevated {
         ElevatedPolicy::Never => {
             if let Some(note) = &plan.elevated_note {
                 lines.push(note.clone());
             }
-            return ElevatedOutcome::NotNeeded;
+            return ElevatedWork::Done(ElevatedOutcome::NotNeeded);
         }
         ElevatedPolicy::IfNeeded => None,
         ElevatedPolicy::Consented(consented) => Some(consented),
     };
     let known_scope = consented.and_then(|plan| plan.verb().scope().cloned());
-    let (scope, needed) = match observe_scope(paths, payload, known_scope, elevated::setup_needed) {
-        Ok(found) => found,
+    let wanted = match observe_verb(paths, payload, known_scope, elevated::setup_verb) {
+        Ok(Some(wanted)) => wanted,
+        Ok(None) => return ElevatedWork::Done(ElevatedOutcome::NotNeeded),
         Err(reason) => {
             setup_note!("converge: administrator step not checked: {reason}");
             lines.push(reason.clone());
-            return ElevatedOutcome::Failed(reason);
+            return ElevatedWork::Done(ElevatedOutcome::Failed(reason));
         }
     };
-    if !needed {
-        return ElevatedOutcome::NotNeeded;
-    }
     let to_run = match consented {
+        // The person agreed to these lines. If the state moved on so that none of them is called
+        // for any more, there is nothing left to approve.
+        Some(consented) if !elevated::shares_a_part(consented.verb(), &wanted) => {
+            return ElevatedWork::Done(ElevatedOutcome::NotNeeded);
+        }
         Some(consented) => consented.clone(),
-        None => match elevated::plan(Verb::Setup(scope)) {
+        None => match elevated::plan(wanted) {
             Ok(planned) => planned,
             Err(error) => {
                 lines.push(error.text.clone());
-                return ElevatedOutcome::Failed(error.text);
+                return ElevatedWork::Done(ElevatedOutcome::Failed(error.text));
             }
         },
     };
     let Some(kit) = inventory.kit() else {
         let reason = "This installer can't set up the firewall rule and display driver.";
         lines.push(reason.to_owned());
-        return ElevatedOutcome::Failed(reason.to_owned());
+        return ElevatedWork::Done(ElevatedOutcome::Failed(reason.to_owned()));
+    };
+    ElevatedWork::Run { plan: to_run, kit }
+}
+
+/// Runs the prepared administrator step and records what happened. Never fatal: its outcome goes
+/// in the report.
+fn run_elevated(
+    paths: &Paths,
+    work: ElevatedWork<'_>,
+    progress: &dyn Progress,
+    lines: &mut Vec<String>,
+) -> ElevatedOutcome {
+    let (plan, kit) = match work {
+        ElevatedWork::Done(outcome) => return outcome,
+        ElevatedWork::Run { plan, kit } => (plan, kit),
     };
     // `elevated::run` tells the person it is waiting for approval, and keeps saying so.
-    let outcome = elevated::run(paths, kit, &to_run, progress);
+    let outcome = elevated::run(paths, kit, &plan, progress);
     setup_note!("converge: administrator step {}", outcome_name(&outcome));
     match &outcome {
         ElevatedOutcome::NotNeeded => {}
         ElevatedOutcome::Configured(summary) => lines.push(summary.clone()),
-        ElevatedOutcome::Declined => {
-            lines.push(format!(
-                "Administrator approval was declined. {INSTALL_WITHOUT_SETUP}"
-            ));
-        }
+        ElevatedOutcome::Declined => lines.push(declined_line(plan.verb())),
         ElevatedOutcome::Failed(reason) => lines.push(reason.clone()),
     }
     outcome
+}
+
+/// The line for a declined approval prompt: what that leaves undone, for what was asked.
+fn declined_line(verb: &Verb) -> String {
+    format!(
+        "Administrator approval was declined. {}",
+        elevated::without_setup_note(verb)
+    )
 }
 
 /// The outcome's variant name only: the texts inside may be shown to the person, not logged.
@@ -779,13 +853,13 @@ pub(crate) fn plan_uninstall(
     let mut plan = None;
     if teardown {
         // The installed helper, because the files are still in place.
-        match observe_scope(paths, None, None, elevated::teardown_needed) {
-            Ok((scope, true)) => {
-                let planned = elevated::plan(Verb::Teardown(scope))?;
+        match observe_verb(paths, None, None, elevated::teardown_verb) {
+            Ok(Some(verb)) => {
+                let planned = elevated::plan(verb)?;
                 lines.push(planned.preview_block());
                 plan = Some(planned);
             }
-            Ok((_, false)) => {}
+            Ok(None) => {}
             Err(reason) => {
                 setup_note!("uninstall plan: firewall rule and driver not checked: {reason}");
                 lines.push(ADMIN_NOT_CHECKED.to_owned());
@@ -813,7 +887,6 @@ fn uninstall_preview(remove_settings: bool) -> Vec<String> {
 const LEFT_PROGRAMS: &str = "program files";
 const LEFT_SETTINGS: &str = "settings and pairings";
 const LEFT_TASK: &str = "sign-in task";
-const LEFT_ADMIN: &str = "firewall rule and display driver";
 const KEY_NOT_ERASED: &str = "Your settings were removed but the sign-in key couldn't be erased.";
 const ADMIN_NOT_CHECKED: &str =
     "The firewall rule and display driver can't be checked right now, so they stay as they are.";
@@ -898,10 +971,23 @@ pub(crate) fn uninstall(
     Ok(UninstallReport { left, lines })
 }
 
+/// The one line an uninstall that left nothing behind starts its report with.
+const UNINSTALLED: &str = "Crosspane was uninstalled.";
+
+/// Whether `line` is the summary an operation starts its report with, once it fully worked: the
+/// success line of a converge route, or the uninstall's. A screen that prints its own headline
+/// leaves it out. The headless command shows it.
+pub(crate) fn is_summary_line(line: &str) -> bool {
+    line == UNINSTALLED
+        || [Route::Install, Route::Repair, Route::CompleteReinstall]
+            .into_iter()
+            .any(|route| line == success_line(route))
+}
+
 /// The summary lines of an uninstall: done, or what is still there with a retry.
 fn uninstall_lines(left: &[String]) -> Vec<String> {
     if left.is_empty() {
-        vec!["Crosspane was uninstalled.".to_owned()]
+        vec![UNINSTALLED.to_owned()]
     } else {
         vec![
             format!("Some parts are still there: {}.", left.join(", ")),
@@ -926,8 +1012,9 @@ fn teardown(
         ElevatedPolicy::Consented(consented) => Some(consented),
     };
     let known_scope = consented.and_then(|plan| plan.verb().scope().cloned());
-    let (scope, needed) = match observe_scope(paths, None, known_scope, elevated::teardown_needed) {
-        Ok(found) => found,
+    let wanted = match observe_verb(paths, None, known_scope, elevated::teardown_verb) {
+        Ok(Some(wanted)) => wanted,
+        Ok(None) => return,
         Err(reason) => {
             // Not "left": nothing a retry could fix, and it must never keep an uninstall open.
             setup_note!("uninstall: firewall rule and driver not checked: {reason}");
@@ -935,38 +1022,60 @@ fn teardown(
             return;
         }
     };
-    if !needed {
-        return;
-    }
     let to_run = match consented {
+        // The person agreed to these lines. If none of them is called for any more, there is
+        // nothing left to approve.
+        Some(consented) if !elevated::shares_a_part(consented.verb(), &wanted) => return,
         Some(consented) => consented.clone(),
-        None => match elevated::plan(Verb::Teardown(scope)) {
-            Ok(planned) => planned,
-            Err(error) => {
-                setup_note!("uninstall: teardown plan failed: {}", error.text);
-                left.push(LEFT_ADMIN.to_owned());
-                return;
+        None => {
+            let name = admin_parts(&wanted);
+            match elevated::plan(wanted) {
+                Ok(planned) => planned,
+                Err(error) => {
+                    setup_note!("uninstall: teardown plan failed: {}", error.text);
+                    left.push(name.to_owned());
+                    return;
+                }
             }
-        },
+        }
     };
+    let name = admin_parts(to_run.verb());
     let Some(kit) = inventory.kit() else {
-        left.push(LEFT_ADMIN.to_owned());
+        left.push(name.to_owned());
         return;
     };
-    progress.step("Removing the firewall rule and display driver…");
+    progress.step(&format!("Removing the {name}…"));
     let outcome = elevated::run(paths, kit, &to_run, progress);
     setup_note!("uninstall: administrator step {}", outcome_name(&outcome));
     match outcome {
         ElevatedOutcome::NotNeeded | ElevatedOutcome::Configured(_) => {}
         ElevatedOutcome::Declined => {
-            left.push(LEFT_ADMIN.to_owned());
-            notes.push("Administrator approval was declined, so the firewall rule and display driver were kept.".to_owned());
+            left.push(name.to_owned());
+            notes.push(kept_note(to_run.verb()));
         }
         ElevatedOutcome::Failed(reason) => {
-            left.push(LEFT_ADMIN.to_owned());
+            left.push(name.to_owned());
             notes.push(reason);
         }
     }
+}
+
+/// What an administrator step covers, in words: the firewall rule, the display driver, or both.
+fn admin_parts(verb: &Verb) -> &'static str {
+    match verb {
+        Verb::AddFirewall(_) | Verb::RemoveFirewall(_) => "firewall rule",
+        Verb::InstallDriver | Verb::RemoveDriver => "display driver",
+        _ => "firewall rule and display driver",
+    }
+}
+
+/// The note for a declined removal prompt: what was kept, for what was asked.
+fn kept_note(verb: &Verb) -> String {
+    let (name, were) = match verb {
+        Verb::Teardown(_) | Verb::Setup(_) => ("firewall rule and display driver", "were"),
+        other => (admin_parts(other), "was"),
+    };
+    format!("Administrator approval was declined, so the {name} {were} kept.")
 }
 
 /// Runs the installed agent's `erase-identity`, hidden, for up to 30 s. True when the sign-in key
@@ -1162,7 +1271,11 @@ pub(crate) mod text {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crosspane_installer_core::elevated::{AgentProgram, InstallId, step::PREVIEW_HEADER};
+    use crosspane_installer_core::elevated::{
+        AgentProgram, InstallId,
+        kit::{KitDocument, KitDocumentFile, KitFile},
+        step::{INSTALL_WITHOUT_SETUP, PREVIEW_HEADER},
+    };
 
     const BANNED: [&str; 7] = [
         "foreign",
@@ -1174,15 +1287,31 @@ mod tests {
         "outcomeunknown",
     ];
 
-    fn setup_plan() -> ElevatedPlan {
-        let scope = RuleScope {
+    fn rule_scope() -> RuleScope {
+        RuleScope {
             id: InstallId::parse("0123456789abcdef").unwrap(),
             program: AgentProgram::parse(
                 r"C:\Users\someone\AppData\Local\Programs\Crosspane\crosspane-agent.exe",
             )
             .unwrap(),
+        }
+    }
+
+    fn setup_plan() -> ElevatedPlan {
+        ElevatedPlan::new(Verb::Setup(rule_scope())).unwrap()
+    }
+
+    fn test_kit() -> KitManifest {
+        let entry = |file| KitDocumentFile {
+            file,
+            size: 1,
+            sha256: "11".repeat(32),
         };
-        ElevatedPlan::new(Verb::Setup(scope)).unwrap()
+        KitManifest::admit(KitDocument {
+            schema_version: 1,
+            files: KitFile::ALL.into_iter().map(entry).collect(),
+        })
+        .unwrap()
     }
 
     fn plain_plan() -> ConvergePlan {
@@ -1372,6 +1501,122 @@ mod tests {
             success_line(Route::CompleteReinstall),
             "Crosspane was reinstalled and is running."
         );
+    }
+
+    #[test]
+    fn summary_lines_are_the_ones_the_engine_writes() {
+        for route in ROUTES {
+            assert!(is_summary_line(success_line(route)), "{route:?}");
+        }
+        assert!(is_summary_line(UNINSTALLED));
+        assert_eq!(uninstall_lines(&[]), vec![UNINSTALLED.to_owned()]);
+        for line in [
+            "",
+            "Crosspane is installed.",
+            "Crosspane was uninstalled. Try again.",
+            text::NOT_STARTED_YET,
+            "Some parts are still there: sign-in task.",
+        ] {
+            assert!(!is_summary_line(line), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_step_that_leaves_the_driver_alone_waits_for_the_start() {
+        let scope = rule_scope();
+        let kit = test_kit();
+        let run = |verb: Verb| ElevatedWork::Run {
+            plan: ElevatedPlan::new(verb).unwrap(),
+            kit: &kit,
+        };
+        // The firewall rule alone: Crosspane doesn't stay down while the prompt waits.
+        assert!(defers_until_started(&run(Verb::AddFirewall(scope.clone()))));
+        assert!(defers_until_started(&run(Verb::RemoveFirewall(
+            scope.clone()
+        ))));
+        // Anything that changes the driver goes first, so the agent starts under the final driver.
+        assert!(!defers_until_started(&run(Verb::Setup(scope.clone()))));
+        assert!(!defers_until_started(&run(Verb::InstallDriver)));
+        assert!(!defers_until_started(&run(Verb::RemoveDriver)));
+        assert!(!defers_until_started(&run(Verb::Teardown(scope))));
+        // Nothing to run: nothing to wait for.
+        for outcome in [
+            ElevatedOutcome::NotNeeded,
+            ElevatedOutcome::Declined,
+            ElevatedOutcome::Failed("No.".to_owned()),
+        ] {
+            assert!(!defers_until_started(&ElevatedWork::Done(outcome)));
+        }
+    }
+
+    #[test]
+    fn a_skipped_or_declined_step_names_only_what_it_was_for() {
+        let scope = rule_scope();
+        let firewall = Verb::AddFirewall(scope.clone());
+        assert_eq!(
+            declined_line(&firewall),
+            "Administrator approval was declined. Until the firewall rule is added, other computers may not reach this PC."
+        );
+        assert_eq!(
+            declined_line(&Verb::InstallDriver),
+            "Administrator approval was declined. Without the display driver, Crosspane mirrors windows in place."
+        );
+        assert_eq!(
+            declined_line(&Verb::Setup(scope.clone())),
+            format!("Administrator approval was declined. {INSTALL_WITHOUT_SETUP}")
+        );
+        assert_eq!(
+            approval_pending(&firewall),
+            "The firewall rule still needs administrator approval. Choose Repair to approve."
+        );
+        assert_eq!(
+            approval_pending(&Verb::InstallDriver),
+            "The display driver still needs administrator approval. Choose Repair to approve."
+        );
+        assert_eq!(approval_pending(&Verb::Setup(scope)), APPROVAL_PENDING);
+    }
+
+    #[test]
+    fn a_declined_removal_says_what_was_kept() {
+        let scope = rule_scope();
+        assert_eq!(
+            kept_note(&Verb::Teardown(scope.clone())),
+            "Administrator approval was declined, so the firewall rule and display driver were kept."
+        );
+        assert_eq!(
+            kept_note(&Verb::RemoveFirewall(scope)),
+            "Administrator approval was declined, so the firewall rule was kept."
+        );
+        assert_eq!(
+            kept_note(&Verb::RemoveDriver),
+            "Administrator approval was declined, so the display driver was kept."
+        );
+        assert_eq!(admin_parts(&Verb::RemoveDriver), "display driver");
+    }
+
+    #[test]
+    fn the_administrator_texts_stay_in_plain_words() {
+        let scope = rule_scope();
+        let verbs = [
+            Verb::Setup(scope.clone()),
+            Verb::AddFirewall(scope.clone()),
+            Verb::InstallDriver,
+            Verb::Teardown(scope.clone()),
+            Verb::RemoveFirewall(scope),
+            Verb::RemoveDriver,
+        ];
+        for verb in verbs {
+            for text in [
+                declined_line(&verb),
+                approval_pending(&verb).to_owned(),
+                kept_note(&verb),
+            ] {
+                let text = text.to_lowercase();
+                for word in BANNED {
+                    assert!(!text.contains(word), "{verb:?}: {text} mentions {word}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -1065,6 +1065,8 @@ impl LiveController {
         match m.entry {
             MaintenanceEntry::Repair => "Checking the repair…",
             MaintenanceEntry::Uninstall => "Checking what will be uninstalled…",
+            // A review asked for from the menu, or asked again after a choice changed.
+            MaintenanceEntry::Menu if m.planning => "Checking what will be uninstalled…",
             MaintenanceEntry::Menu if m.uninstall.is_none() => "Checking Crosspane…",
             MaintenanceEntry::Menu => "Choose Repair or Uninstall.",
         }
@@ -1441,13 +1443,19 @@ impl LiveController {
         (buttons, fields)
     }
 
+    /// Whether a change is under way that the links starting another one must wait for. Waiting
+    /// in setup's own pairing window is not such a change.
+    fn windows_busy(&self) -> bool {
+        self.mutation_in_flight() && !self.following_auto_window()
+    }
+
     fn windows_reinstall_link(&self, buttons: &mut Vec<ButtonView>) {
         if self.windows_entry() {
             buttons.push(button(
                 ids::COMPLETE_REINSTALL,
                 ButtonRole::Ordinary,
                 "Complete reinstall",
-                true,
+                !self.windows_busy(),
                 ButtonKind::Link,
             ));
         }
@@ -1502,7 +1510,7 @@ impl LiveController {
                     ids::COMPLETE_REINSTALL,
                     ButtonRole::Ordinary,
                     "Complete reinstall",
-                    true,
+                    !self.windows_busy(),
                     ButtonKind::Link,
                 ));
             }
@@ -1764,6 +1772,8 @@ impl LiveController {
                             && !(5100..=5290).contains(&b.id)
                     });
                 }
+                // The review of an uninstall is asked for by itself (on entering, and again when
+                // a choice changes), so no button to ask for it is offered while it is prepared.
                 MaintenanceEntry::Uninstall => buttons.retain(|b| {
                     !matches!(
                         b.id,
@@ -1771,7 +1781,7 @@ impl LiveController {
                             | ids::REPAIR_CONFIRM
                             | ids::REPAIR_RESUME
                             | ids::REPAIR_DISCARD
-                    )
+                    ) && !(m.planning && b.id == ids::REMOVE_REVIEW)
                 }),
                 MaintenanceEntry::Menu => {}
             }
@@ -1797,6 +1807,69 @@ impl LiveController {
                     ButtonKind::Primary,
                 ));
             }
+            // Nothing of Crosspane is left after a finished uninstall, so the way on is the same
+            // install the first screen's "Install or reinstall" starts.
+            if self.windows_uninstalled() {
+                buttons.push(button(
+                    ids::NEXT,
+                    ButtonRole::Next,
+                    "Install again",
+                    !self.windows_busy(),
+                    ButtonKind::Primary,
+                ));
+            }
+        }
+    }
+
+    /// The uninstall this Windows maintenance screen asked for finished and removed Crosspane.
+    fn windows_uninstalled(&self) -> bool {
+        self.windows_entry()
+            && self.screen == ScreenId::RepairRemove
+            && matches!(
+                self.maintenance.finished,
+                Some((MaintenanceOutcome::Removed, _))
+            )
+    }
+
+    /// A finished uninstall leaves none of the install standing. Every step setup had already
+    /// looked at is marked as needing a new look, so the progress beside the card no longer shows
+    /// the install as done and a new install checks what is really there instead of trusting the
+    /// earlier answers. Steps not yet looked at, and steps the person put off, are left alone.
+    fn forget_install(&mut self) {
+        let looked_at: Vec<StepId> = self
+            .graph
+            .metas
+            .iter()
+            .map(|m| m.id)
+            .filter(|step| {
+                !matches!(
+                    self.step_state(*step),
+                    StepState::NotChecked | StepState::Skipped | StepState::Stale
+                )
+            })
+            .collect();
+        for step in looked_at {
+            let _ = self.reduce(crosspane_installer_core::FlowEvent::Invalidate { step });
+            self.details.remove(&step);
+            self.previews.remove(&step);
+            self.consents.remove(&step);
+            self.status_waits.remove(&step);
+            self.auto_begun.remove(&step);
+            self.auto_consented.remove(&step);
+        }
+        self.install_started = false;
+    }
+
+    /// Set up again after an uninstall: back at the first screen, then on from it as its
+    /// "Install or reinstall" does.
+    fn install_again(&mut self) {
+        if !self.windows_uninstalled() || self.windows_busy() {
+            return;
+        }
+        self.go(ScreenId::Welcome);
+        self.install_started = true;
+        if let Some(next) = self.next_screen() {
+            self.go(next);
         }
     }
 
@@ -1984,6 +2057,7 @@ impl LiveController {
             ids::SET_UP_NOW => self.reopen(self.screen),
             ids::REOPEN_CONNECT => self.reopen(ScreenId::Connect),
             ids::REOPEN_ARRANGE => self.reopen(ScreenId::Layout),
+            ids::NEXT if self.screen == ScreenId::RepairRemove => self.install_again(),
             ids::NEXT => {
                 if self.screen == ScreenId::Welcome {
                     // The go-ahead for the install steps that stay inside this account.
@@ -2139,20 +2213,32 @@ impl LiveController {
             self.grant_toggle(i, checked);
             return;
         }
+        let windows = self.windows_entry();
         let m = &mut self.maintenance;
         // While a plan is being prepared the choices are frozen, so the preview that comes back
         // always describes exactly the choices that will be confirmed.
         if m.confirmed || m.planning || m.finished.is_some() || m.repair_state.engaged() {
             return;
         }
-        if let Some(choice) = m
+        let Some(choice) = m
             .choices
             .iter_mut()
             .find(|c| ids::removal_field(c.id) == field && c.enabled)
-        {
-            choice.checked = checked;
-            // A changed selection retires the reviewed plan.
-            m.preview = None;
+        else {
+            return;
+        };
+        if windows && choice.checked == checked {
+            return;
+        }
+        choice.checked = checked;
+        // A changed selection retires the reviewed plan.
+        let reviewed = m.preview.take().is_some();
+        // On Windows the review comes back by itself for the new choices: the person never has to
+        // find a button to ask for it again. Until it does, no plan can be confirmed (the
+        // confirmation needs a preview, and every change of the preview changes the revision a
+        // click must carry).
+        if windows && reviewed && m.refused.is_none() {
+            self.plan_uninstall();
         }
     }
 
@@ -2198,7 +2284,7 @@ impl LiveController {
     }
 
     fn plan_complete_reinstall(&mut self) {
-        if !self.windows_entry() || self.reinstall.running {
+        if !self.windows_entry() || self.reinstall.running || self.windows_busy() {
             return;
         }
         // A distinct new review; earlier main/maintenance consent and outcomes are untouched.
@@ -2603,6 +2689,14 @@ impl LiveController {
             return;
         }
         let inspected = matches!(&report, MaintenanceReport::Inspected { .. });
+        let removed = self.windows_entry()
+            && matches!(
+                &report,
+                MaintenanceReport::Finished {
+                    outcome: MaintenanceOutcome::Removed,
+                    ..
+                }
+            );
         let (now, next_call) = (self.now, self.next_call);
         let m = &mut self.maintenance;
         match report {
@@ -2754,6 +2848,9 @@ impl LiveController {
             MaintenanceReport::RepairFinished { .. } => {}
             MaintenanceReport::ReinstallPlanned { .. }
             | MaintenanceReport::ReinstallFinished { .. } => {}
+        }
+        if removed {
+            self.forget_install();
         }
         if inspected && self.windows_entry() && self.maintenance.entry_pending {
             let entry = self.maintenance.entry;
