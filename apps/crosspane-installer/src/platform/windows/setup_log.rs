@@ -116,7 +116,10 @@ fn rotate_if_over_cap(path: &Path) {
     }
     let mut rotated = path.as_os_str().to_owned();
     rotated.push(".1");
-    // A rename that fails (for example, another process holds the file) leaves the log in place.
+    // On Windows `fs::rename` replaces an existing destination file (MoveFileExW with
+    // MOVEFILE_REPLACE_EXISTING, or the equivalent replace-if-exists rename), so an older
+    // rotation is overwritten. A rename that fails (for example, another process holds either
+    // file without delete sharing) leaves the log in place.
     let _ = fs::rename(path, rotated);
 }
 
