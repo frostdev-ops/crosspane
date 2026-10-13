@@ -410,7 +410,10 @@ fn production_controller(
     }
     #[cfg(windows)]
     {
-        crate::platform::windows::integration::open(payload)
+        crate::platform::windows::wizard::open(
+            payload,
+            crate::platform::windows::maintenance_requested(),
+        )
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
@@ -661,13 +664,6 @@ impl eframe::App for InstallerGui {
         }
         if let Some(deadline) = self.demo_deadline {
             ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
-        }
-        #[cfg(windows)]
-        if crate::platform::windows::integration::take_parent_exit() {
-            // Only the worker's actual committed handoff admits an automatic own-viewport exit.
-            self.controller.close();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
         }
         // A window-manager close during a running change is refused, so the change is never cut
         // short by the process exiting; the view explains why.

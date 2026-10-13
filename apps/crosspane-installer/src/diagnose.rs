@@ -111,7 +111,7 @@ pub fn run(payload: Option<PathBuf>) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     crate::platform::macos::integration::diagnose(payload.as_deref(), &mut report);
     #[cfg(all(windows, not(test)))]
-    crate::platform::windows::integration::diagnose::run(payload.as_deref(), &mut report);
+    crate::platform::windows::status::diagnose(payload.as_deref(), &mut report);
     #[cfg(all(windows, test))]
     {
         let _ = payload;

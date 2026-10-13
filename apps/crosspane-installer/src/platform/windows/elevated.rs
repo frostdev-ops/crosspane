@@ -1,14 +1,86 @@
 //! Elevated setup orchestration (L8): firewall rule + display driver through the helper.
+//!
+//! Nothing here elevates by itself. `observe` runs the helper's read-only `status` unelevated.
+//! `run` asks the shell for one `runas` run through `ElevatedHelper::run`, after the person was
+//! shown exactly the lines of the plan, and never kills the elevated child. A declined prompt is
+//! reported as `Declined`; the install around it still completes.
 
 use super::{
+    elevated_kit::{self, KitHold},
+    elevated_launch::{ELEVATED_WAIT, ElevatedHelper, LaunchOutcome, STATUS_WAIT},
     engine::Progress,
-    error::{SetupError, SetupResult},
-    paths::Paths,
+    error::{NativeError, SetupError, SetupResult},
+    paths::{Paths, PayloadFile},
+    setup_log::setup_note,
 };
+use aws_lc_rs::digest::{SHA256, digest};
 use crosspane_installer_core::elevated::{
-    RuleScope, Verb, kit::KitManifest, status::StatusReport, step::ElevatedPlan,
+    AgentProgram, DriverState, ElevatedError, FirewallState, HELPER_IMAGE, InstallId,
+    MAX_INSTALL_ID, RULE_PREFIX, RuleScope, Verb,
+    kit::{KitFile, KitManifest, KitPin},
+    status::{Consent, ElevatedJournal, JournalEntry, StatusReport},
+    step::{ElevatedPlan, PartResult, StepResult, report_lines, status_summary},
 };
-use std::path::Path;
+use std::{
+    fs::{self, Metadata, OpenOptions},
+    io::Read,
+    marker::PhantomData,
+    os::windows::fs::{MetadataExt, OpenOptionsExt},
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::mpsc::{self, RecvTimeoutError},
+    time::{Duration, Instant},
+};
+use windows::{
+    Win32::{
+        NetworkManagement::WindowsFirewall::{INetFwPolicy2, INetFwRule, NetFwPolicy2},
+        System::{
+            Com::{
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED,
+                CoCreateInstance, CoInitializeEx, CoUninitialize, IDispatch,
+            },
+            Ole::IEnumVARIANT,
+            Variant::VARIANT,
+        },
+    },
+    core::Interface,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+};
+
+/// How often `run` tells the person that Windows is still waiting for approval.
+const HEARTBEAT: Duration = Duration::from_secs(15);
+/// Slack on top of the helper's own waits before `run` stops waiting for it. The elevated child is
+/// never killed; only the wait ends.
+const RUN_SLACK: Duration = Duration::from_secs(60);
+/// Longest the firewall rule scan may work, and how long `scope` waits for its thread.
+const SCAN_BUDGET: Duration = Duration::from_secs(25);
+const SCAN_WAIT: Duration = Duration::from_secs(30);
+/// The most rules one scan looks at, Crosspane's and other products' alike.
+const MAX_SCANNED: usize = 65_536;
+/// A Crosspane rule name is `RULE_PREFIX` plus an id of at most `MAX_INSTALL_ID` characters.
+const MAX_RULE_NAME_UNITS: usize = RULE_PREFIX.len() + MAX_INSTALL_ID;
+
+const WAITING: &str = "Waiting for administrator approval…";
+const NO_KIT: &str = "This installer build doesn't include Crosspane's administrator setup files, so the firewall rule and display driver can't be checked.";
+const NOT_INSTALLED_YET: &str = "Crosspane's administrator setup files aren't installed yet.";
+const PAYLOAD_DAMAGED: &str = "The administrator setup file beside this installer doesn't match it. Download Crosspane again.";
+const HELPER_MISSING: &str = "Crosspane's administrator setup file is missing.";
+const STATUS_UNREADABLE: &str =
+    "Crosspane couldn't read the state of its firewall rule and display driver.";
+const KIT_UNAVAILABLE: &str = "The administrator setup files aren't installed or don't match this installer. Run the Crosspane installer you downloaded to restore Crosspane's files.";
+const CONSENT_MISMATCH: &str =
+    "The administrator step doesn't match what was shown. Close this and try again.";
+const AGENT_MOVED: &str =
+    "Crosspane isn't installed where the administrator step expected. Try again.";
+const COULD_NOT_START: &str = "Windows administrator setup couldn't start. Try again.";
+const STOPPED: &str = "Windows administrator setup stopped unexpectedly. Try again.";
+const TIMED_OUT: &str = "Windows administrator setup didn't finish in time. Check the state of Crosspane and try again.";
+const BAD_LOCATION: &str = "Crosspane can't set up its firewall rule for this install location.";
+const NO_RANDOM: &str =
+    "Windows couldn't provide a random number for Crosspane's firewall rule. Try again.";
+const NOT_RUN_MESSAGE: &str = "The administrator step didn't run.";
 
 /// What the administrator step did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,39 +92,81 @@ pub(crate) enum ElevatedOutcome {
 }
 
 /// Install id: the existing rule (`INetFwPolicy2`, unelevated) named `RULE_PREFIX*` whose
-/// application `same_path(agent)`; else random (`aws_lc_rs::rand`). Program = `paths.file(Agent)`.
+/// application is the agent; else random (`aws_lc_rs::rand`). Program = `paths.file(Agent)`.
+///
+/// The helper counts a rule with another name but the same program as covering the agent, which
+/// would leave the state a permanent mismatch. Reusing the existing rule's id avoids that. A scan
+/// that fails falls back to a fresh id; only a scope that can't be built is an error.
 pub(crate) fn scope(paths: &Paths) -> SetupResult<RuleScope> {
-    let _ = paths;
-    Err(SetupError::before("not built"))
+    let program = agent_program(paths)?;
+    let id = match existing_install_id(&program) {
+        Ok(Some(id)) => id,
+        Ok(None) => fresh_install_id()?,
+        Err(note) => {
+            setup_note!("firewall rule scan failed ({note}); using a new install id");
+            fresh_install_id()?
+        }
+    };
+    Ok(RuleScope { id, program })
 }
 
 /// Unelevated `status` via the installed helper, else `payload\crosspane-elevated-setup.exe`
-/// (verified source).
+/// (verified source). The helper's files are held unreplaceable while it runs.
 pub(crate) fn observe(
     paths: &Paths,
     payload: Option<&Path>,
     scope: &RuleScope,
 ) -> Result<StatusReport, String> {
-    let _ = (paths, payload, scope);
-    Err("not built".to_owned())
+    let Some(kit) = elevated_kit::embedded() else {
+        return Err(NO_KIT.to_owned());
+    };
+    let (image, _held) = status_helper(paths, payload, &kit)?;
+    let helper = ElevatedHelper::locate(image).map_err(|error| match error {
+        NativeError::Missing => HELPER_MISSING.to_owned(),
+        _ => STATUS_UNREADABLE.to_owned(),
+    })?;
+    helper.status(Some(scope)).map_err(|error| {
+        setup_note!("elevated status failed: {error}");
+        match error {
+            NativeError::Missing => HELPER_MISSING.to_owned(),
+            _ => STATUS_UNREADABLE.to_owned(),
+        }
+    })
 }
 
-/// firewall ∈ {Missing, Mismatch} || driver ∈ {Absent, PackageOnly, DeviceWithoutDriver}
+/// firewall ∈ {Missing, Mismatch} || driver ∈ {Absent, PackageOnly, DeviceWithoutDriver}. A state
+/// that couldn't be read is not a reason to ask for administrator approval.
 pub(crate) fn setup_needed(report: &StatusReport) -> bool {
-    let _ = report;
-    false
+    matches!(
+        report.firewall.state,
+        FirewallState::Missing | FirewallState::Mismatch
+    ) || matches!(
+        report.driver.state,
+        DriverState::Absent | DriverState::PackageOnly | DriverState::DeviceWithoutDriver
+    )
 }
 
-/// Whether there is a firewall rule or driver left for `teardown` to remove.
+/// Whether there is a firewall rule or driver left for `teardown` to remove, in any form. A state
+/// that couldn't be read is not a reason to ask for administrator approval.
 pub(crate) fn teardown_needed(report: &StatusReport) -> bool {
-    let _ = report;
-    false
+    matches!(
+        report.firewall.state,
+        FirewallState::Present | FirewallState::Mismatch
+    ) || matches!(
+        report.driver.state,
+        DriverState::PackageOnly
+            | DriverState::DeviceWithoutDriver
+            | DriverState::Installed
+            | DriverState::Mismatch
+    )
 }
 
-/// `ElevatedPlan::new`
+/// `ElevatedPlan::new` for `Verb::Setup` or `Verb::Teardown`.
 pub(crate) fn plan(verb: Verb) -> SetupResult<ElevatedPlan> {
-    let _ = verb;
-    Err(SetupError::before("not built"))
+    ElevatedPlan::new(verb).map_err(|error: ElevatedError| {
+        setup_note!("elevated plan refused: {error}");
+        SetupError::before(CONSENT_MISMATCH)
+    })
 }
 
 /// `hold_placed` for the run; `ElevatedHelper::run` on a dedicated STA thread
@@ -64,12 +178,702 @@ pub(crate) fn run(
     plan: &ElevatedPlan,
     progress: &dyn Progress,
 ) -> ElevatedOutcome {
-    let _ = (paths, kit, plan, progress);
-    ElevatedOutcome::NotNeeded
+    let verb = plan.verb().clone();
+    let Ok(consent) = plan.consent() else {
+        return ElevatedOutcome::Failed(CONSENT_MISMATCH.to_owned());
+    };
+    if matches!(verb, Verb::Setup(_) | Verb::AddFirewall(_)) && !plans_installed_agent(paths, &verb)
+    {
+        return ElevatedOutcome::Failed(AGENT_MOVED.to_owned());
+    }
+    // The hold keeps the four kit files unreplaceable until the helper has run. It moves into the
+    // worker, so it lives as long as the helper does even if this wait gives up.
+    let (image, hold) = match elevated_kit::hold_placed(&paths.install, kit) {
+        Ok(held) => held,
+        Err(error) => {
+            setup_note!("elevated kit not usable: {error}");
+            return ElevatedOutcome::Failed(KIT_UNAVAILABLE.to_owned());
+        }
+    };
+    let helper = match ElevatedHelper::locate(image) {
+        Ok(helper) => helper,
+        Err(error) => {
+            setup_note!("elevated helper not usable: {error}");
+            return ElevatedOutcome::Failed(KIT_UNAVAILABLE.to_owned());
+        }
+    };
+    setup_note!("elevated {} starting", verb.name().as_str());
+
+    let (sender, receiver) = mpsc::channel();
+    let worker_verb = verb.clone();
+    let spawned = std::thread::Builder::new()
+        .name("crosspane-elevated-run".into())
+        .spawn(move || {
+            let result = run_on_sta(&helper, &worker_verb, &consent);
+            drop(hold);
+            let _ = sender.send(result);
+        });
+    if let Err(error) = spawned {
+        setup_note!(
+            "elevated worker did not start: os error {:?}",
+            error.raw_os_error()
+        );
+        return ElevatedOutcome::Failed(COULD_NOT_START.to_owned());
+    }
+
+    let give_up = STATUS_WAIT
+        .saturating_mul(2)
+        .saturating_add(ELEVATED_WAIT)
+        .saturating_add(RUN_SLACK);
+    let started = Instant::now();
+    progress.step(WAITING);
+    let result = loop {
+        let left = give_up.saturating_sub(started.elapsed());
+        match receiver.recv_timeout(HEARTBEAT.min(left)) {
+            Ok(result) => break result,
+            Err(RecvTimeoutError::Timeout) if started.elapsed() >= give_up => {
+                setup_note!("elevated {} wait gave up", verb.name().as_str());
+                return ElevatedOutcome::Failed(TIMED_OUT.to_owned());
+            }
+            Err(RecvTimeoutError::Timeout) => progress.step(WAITING),
+            Err(RecvTimeoutError::Disconnected) => {
+                setup_note!(
+                    "elevated {} worker ended without a result",
+                    verb.name().as_str()
+                );
+                return ElevatedOutcome::Failed(STOPPED.to_owned());
+            }
+        }
+    };
+    let outcome = match result {
+        Ok(launched) => outcome_of(&verb, launched),
+        Err(error) => {
+            setup_note!("elevated {} launch failed: {error}", verb.name().as_str());
+            ElevatedOutcome::Failed(match error {
+                NativeError::Missing => HELPER_MISSING.to_owned(),
+                NativeError::Timeout | NativeError::Cancelled => TIMED_OUT.to_owned(),
+                _ => COULD_NOT_START.to_owned(),
+            })
+        }
+    };
+    setup_note!(
+        "elevated {} finished: {}",
+        verb.name().as_str(),
+        kind(&outcome)
+    );
+    outcome
 }
 
 /// Core `status_summary` text for `report`.
 pub(crate) fn summary(report: &StatusReport) -> String {
-    let _ = report;
-    String::new()
+    status_summary(report, false).1
+}
+
+/// A short label for the setup log. It never carries the outcome's text.
+fn kind(outcome: &ElevatedOutcome) -> &'static str {
+    match outcome {
+        ElevatedOutcome::NotNeeded => "not needed",
+        ElevatedOutcome::Configured(_) => "configured",
+        ElevatedOutcome::Declined => "declined",
+        ElevatedOutcome::Failed(_) => "failed",
+    }
+}
+
+// --- the scope -------------------------------------------------------------------------------
+
+/// The agent's program path as the helper wants it: a plain drive path without `\\?\`.
+fn agent_program(paths: &Paths) -> SetupResult<AgentProgram> {
+    let agent = paths.file(PayloadFile::Agent);
+    let text = agent
+        .to_str()
+        .ok_or_else(|| SetupError::before(BAD_LOCATION))?;
+    let text = text.strip_prefix(r"\\?\").unwrap_or(text);
+    AgentProgram::parse(text).map_err(|_| SetupError::before(BAD_LOCATION))
+}
+
+/// A fresh random install id.
+fn fresh_install_id() -> SetupResult<InstallId> {
+    let mut random = [0_u8; 16];
+    aws_lc_rs::rand::fill(&mut random).map_err(|_| SetupError::before(NO_RANDOM))?;
+    Ok(InstallId::from_random(random))
+}
+
+/// The install id in `name` when it is `RULE_PREFIX` (ASCII case-insensitive, as the rule store
+/// compares names) followed by a valid id. Anything else is `None`.
+fn install_id_from_rule_name(name: &str) -> Option<InstallId> {
+    let head = name.get(..RULE_PREFIX.len())?;
+    if !head.eq_ignore_ascii_case(RULE_PREFIX) {
+        return None;
+    }
+    InstallId::parse(name.get(RULE_PREFIX.len()..)?).ok()
+}
+
+/// True when a rule name, as UTF-16 units, starts with `RULE_PREFIX` (ASCII case-insensitive).
+/// Names of other products' rules are compared in this form only and never converted or logged.
+fn has_rule_prefix(name: &[u16]) -> bool {
+    let prefix = RULE_PREFIX.as_bytes();
+    name.len() >= prefix.len()
+        && name.iter().zip(prefix).all(|(unit, byte)| {
+            u8::try_from(*unit).is_ok_and(|unit| unit.eq_ignore_ascii_case(byte))
+        })
+}
+
+/// Why a rule scan produced nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanError {
+    /// A COM call failed with this HRESULT.
+    Com(i32),
+    /// More rules than `MAX_SCANNED`.
+    TooMany,
+    /// `SCAN_BUDGET` passed.
+    Deadline,
+}
+
+impl ScanError {
+    /// The setup log note. It carries an HRESULT at most, never a rule name.
+    fn note(self) -> String {
+        match self {
+            Self::Com(code) => format!("com error 0x{:08X}", code as u32),
+            Self::TooMany => "too many firewall rules".to_owned(),
+            Self::Deadline => "the scan took too long".to_owned(),
+        }
+    }
+}
+
+fn com(error: windows::core::Error) -> ScanError {
+    ScanError::Com(error.code().0)
+}
+
+/// The id of the first existing Crosspane rule whose application is `program`. The scan runs on
+/// its own short-lived thread so COM never touches the caller's apartment, and the wait for it is
+/// bounded. `Err` is a log note.
+fn existing_install_id(program: &AgentProgram) -> Result<Option<InstallId>, String> {
+    let (sender, receiver) = mpsc::channel();
+    let program = program.clone();
+    std::thread::Builder::new()
+        .name("crosspane-firewall-scan".into())
+        .spawn(move || {
+            let _ = sender.send(scan_rules(&program, Instant::now() + SCAN_BUDGET));
+        })
+        .map_err(|_| "the scan thread couldn't start".to_owned())?;
+    match receiver.recv_timeout(SCAN_WAIT) {
+        Ok(Ok(found)) => Ok(found),
+        Ok(Err(error)) => Err(error.note()),
+        Err(_) => Err("the scan didn't finish".to_owned()),
+    }
+}
+
+/// `CoInitializeEx` on this thread, balanced on drop. The guard is not `Send`.
+#[derive(Debug)]
+struct Apartment(PhantomData<Rc<()>>);
+
+impl Apartment {
+    fn multithreaded() -> Result<Self, ScanError> {
+        // SAFETY: initializes COM only for the calling thread. `Drop` balances a success, and the
+        // guard can't leave this thread.
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
+            .map_err(com)?;
+        Ok(Self(PhantomData))
+    }
+}
+
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        // SAFETY: balances the successful `CoInitializeEx` on this same thread.
+        unsafe { CoUninitialize() };
+    }
+}
+
+/// Read-only: enumerates the firewall rules and returns the install id of the first rule named
+/// `RULE_PREFIX*` whose application is `program`. A rule whose name carries no valid id is not
+/// ours and is skipped.
+fn scan_rules(program: &AgentProgram, deadline: Instant) -> Result<Option<InstallId>, ScanError> {
+    // Declared FIRST, so it is dropped LAST: the COM references below are released before the
+    // apartment is uninitialized.
+    let _apartment = Apartment::multithreaded()?;
+    // SAFETY: creates the in-process `NetFwPolicy2` object on the apartment initialized above.
+    // Only read-only members are called on it and on the objects it returns.
+    let policy: INetFwPolicy2 =
+        unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER) }.map_err(com)?;
+    // SAFETY: a read-only getter on the policy object created above.
+    let rules = unsafe { policy.Rules() }.map_err(com)?;
+    // SAFETY: a read-only enumerator over the live rule collection, converted to `IEnumVARIANT`
+    // before use.
+    let unknown = unsafe { rules._NewEnum() }.map_err(com)?;
+    let enumerator: IEnumVARIANT = unknown.cast().map_err(com)?;
+    let mut scanned = 0_usize;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(ScanError::Deadline);
+        }
+        // A `VARIANT` clears what `Next` fills in when it drops, on every path.
+        let mut slot = [VARIANT::default()];
+        let mut fetched = 0_u32;
+        // SAFETY: one writable VARIANT slot and a valid out-count.
+        unsafe { enumerator.Next(&mut slot, &mut fetched) }
+            .ok()
+            .map_err(com)?;
+        if fetched == 0 {
+            return Ok(None);
+        }
+        scanned += 1;
+        if scanned > MAX_SCANNED {
+            return Err(ScanError::TooMany);
+        }
+        let dispatch = IDispatch::try_from(&slot[0]).map_err(com)?;
+        let rule: INetFwRule = dispatch.cast().map_err(com)?;
+        // SAFETY: a read-only getter on a rule object from the collection read above.
+        let name = unsafe { rule.Name() }.map_err(com)?;
+        if name.len() > MAX_RULE_NAME_UNITS || !has_rule_prefix(&name) {
+            continue;
+        }
+        // Only a rule of the Crosspane family is converted to text.
+        let Some(id) = String::from_utf16(&name)
+            .ok()
+            .and_then(|name| install_id_from_rule_name(&name))
+        else {
+            continue;
+        };
+        // SAFETY: a read-only getter on the same rule object.
+        let application = unsafe { rule.ApplicationName() }.map_err(com)?;
+        // The helper's own comparison: it is what decides whether another name already covers
+        // the agent.
+        if program.same_path(&String::from_utf16_lossy(&application)) {
+            return Ok(Some(id));
+        }
+    }
+}
+
+// --- observing -------------------------------------------------------------------------------
+
+/// The helper files kept unreplaceable while a status is read. Only held, never read.
+#[derive(Debug)]
+#[allow(dead_code)]
+enum Held {
+    Kit(KitHold),
+    File(fs::File),
+}
+
+/// The helper image to ask for the status: the installed one if the whole placed kit matches its
+/// pins, else the helper in the payload folder if it matches its pin.
+fn status_helper(
+    paths: &Paths,
+    payload: Option<&Path>,
+    kit: &KitManifest,
+) -> Result<(PathBuf, Held), String> {
+    if let Ok((image, hold)) = elevated_kit::hold_placed(&paths.install, kit) {
+        return Ok((image, Held::Kit(hold)));
+    }
+    let Some(payload) = payload else {
+        return Err(NOT_INSTALLED_YET.to_owned());
+    };
+    // The launcher accepts an absolute path only, so a relative `--payload` is made absolute.
+    let payload = std::path::absolute(payload).unwrap_or_else(|_| payload.to_path_buf());
+    let image = payload.join(PayloadFile::Helper.relative());
+    let file = hold_pinned_helper(&image, kit.pin(KitFile::Helper))
+        .ok_or_else(|| PAYLOAD_DAMAGED.to_owned())?;
+    Ok((image, Held::File(file)))
+}
+
+/// Opens the helper at `path` for reading only, sharing READ, and checks its size and digest
+/// through that same handle. A reparse point, a directory or a mismatch is `None`. The caller
+/// keeps the handle for as long as the file must not change.
+fn hold_pinned_helper(path: &Path, pin: &KitPin) -> Option<fs::File> {
+    debug_assert_eq!(PayloadFile::Helper.relative(), HELPER_IMAGE);
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !plain_file(&metadata) || metadata.len() != pin.size {
+        return None;
+    }
+    // The link itself is opened, not its target, so a reparse point swapped in after the check
+    // above is seen on the handle below.
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .ok()?;
+    let opened = file.metadata().ok()?;
+    if !plain_file(&opened) || opened.len() != pin.size {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(pin.size).ok()?);
+    (&file)
+        .take(pin.size.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let actual = digest(&SHA256, &bytes);
+    (bytes.len() as u64 == pin.size && actual.as_ref() == pin.sha256.as_slice()).then_some(file)
+}
+
+fn plain_file(metadata: &Metadata) -> bool {
+    metadata.file_type().is_file()
+        && (metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+}
+
+// --- running ---------------------------------------------------------------------------------
+
+/// Whether the plan names the installed agent, so the rule is for the program Crosspane runs.
+fn plans_installed_agent(paths: &Paths, verb: &Verb) -> bool {
+    let agent = paths.file(PayloadFile::Agent);
+    verb.scope()
+        .is_some_and(|scope| scope.program.same_path(&agent.to_string_lossy()))
+}
+
+/// The helper's log-only journal: every call becomes one setup log line, and none can fail.
+#[derive(Debug)]
+struct LogJournal;
+
+impl ElevatedJournal for LogJournal {
+    fn record(&mut self, entry: &JournalEntry) -> Result<(), ElevatedError> {
+        setup_note!(
+            "elevated {:?} {:?} exit={:?}",
+            entry.phase,
+            entry.verb,
+            entry.exit
+        );
+        Ok(())
+    }
+}
+
+/// `CoInitializeEx(STA)` on this thread, balanced on drop. `ShellExecuteExW` needs an STA.
+#[derive(Debug)]
+struct StaApartment(PhantomData<Rc<()>>);
+
+impl StaApartment {
+    fn enter() -> Option<Self> {
+        // SAFETY: initializes COM only for the calling thread. `Drop` balances a success (S_OK or
+        // S_FALSE), and the guard can't leave this thread.
+        let code = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if code.is_err() {
+            setup_note!("com error 0x{:08X} entering an apartment", code.0 as u32);
+            return None;
+        }
+        Some(Self(PhantomData))
+    }
+}
+
+impl Drop for StaApartment {
+    fn drop(&mut self) {
+        // SAFETY: balances the successful `CoInitializeEx` on this same thread.
+        unsafe { CoUninitialize() };
+    }
+}
+
+/// Runs the helper on the calling (worker) thread inside its own STA.
+fn run_on_sta(
+    helper: &ElevatedHelper,
+    verb: &Verb,
+    consent: &Consent,
+) -> Result<LaunchOutcome, NativeError> {
+    let Some(_apartment) = StaApartment::enter() else {
+        return Err(NativeError::Unavailable);
+    };
+    helper.run(verb, consent, &mut LogJournal)
+}
+
+/// Maps what the launcher established to the outcome of the administrator step. Every part must be
+/// verified (or need only a restart) for `Configured`.
+fn outcome_of(verb: &Verb, launched: LaunchOutcome) -> ElevatedOutcome {
+    let (result, after) = match launched {
+        LaunchOutcome::Declined => return ElevatedOutcome::Declined,
+        LaunchOutcome::Verified { outcome, after } => (
+            StepResult::launched(verb, &[(verb.clone(), Some(outcome))], Some(&after)),
+            Some(after),
+        ),
+        LaunchOutcome::Unverified { outcome, after } => (
+            StepResult::launched(verb, &[(verb.clone(), outcome)], after.as_ref()),
+            after,
+        ),
+        LaunchOutcome::Parts { outcomes, after } => {
+            (StepResult::launched(verb, &outcomes, after.as_ref()), after)
+        }
+    };
+    let done = !result.parts.is_empty()
+        && result
+            .parts
+            .iter()
+            .all(|(_, part)| matches!(part, PartResult::Verified | PartResult::RebootRequired));
+    let restart = result
+        .parts
+        .iter()
+        .any(|(_, part)| *part == PartResult::RebootRequired);
+    if done {
+        let text = match (&after, restart) {
+            (Some(after), false) => summary(after),
+            _ => report_lines(&result).join(" "),
+        };
+        return ElevatedOutcome::Configured(text);
+    }
+    let mut lines = report_lines(&result);
+    if lines.is_empty() {
+        lines.push(NOT_RUN_MESSAGE.to_owned());
+    }
+    let unknown = result
+        .parts
+        .iter()
+        .any(|(_, part)| *part == PartResult::Unknown);
+    if let (true, Some(after)) = (unknown, &after) {
+        lines.push(summary(after));
+    }
+    ElevatedOutcome::Failed(lines.join(" "))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crosspane_installer_core::elevated::{
+        Outcome,
+        status::{DeviceStatus, DriverStatus, FirewallStatus},
+    };
+
+    fn report(firewall: FirewallState, driver: DriverState) -> StatusReport {
+        StatusReport {
+            schema: 1,
+            elevated: false,
+            driver: DriverStatus {
+                state: driver,
+                packages: Vec::new(),
+                devices: Vec::<DeviceStatus>::new(),
+            },
+            firewall: FirewallStatus {
+                state: firewall,
+                family_count: 0,
+                local_rules_apply: None,
+            },
+        }
+    }
+
+    fn scope_for_tests() -> RuleScope {
+        RuleScope {
+            id: InstallId::parse("eb281d43dffa02d3e3370970828abfe2").unwrap(),
+            program: AgentProgram::parse(
+                r"C:\Users\someone\AppData\Local\Programs\Crosspane\crosspane-agent.exe",
+            )
+            .unwrap(),
+        }
+    }
+
+    use DriverState as D;
+    use FirewallState as F;
+
+    #[test]
+    fn setup_needed_truth_table() {
+        let table = [
+            (F::Present, D::Installed, false),
+            (F::Missing, D::Installed, true),
+            (F::Mismatch, D::Installed, true),
+            (F::Present, D::Absent, true),
+            (F::Present, D::PackageOnly, true),
+            (F::Present, D::DeviceWithoutDriver, true),
+            (F::Missing, D::Absent, true),
+            (F::Mismatch, D::Mismatch, true),
+            // States that couldn't be read or aren't Crosspane's are not a reason to ask.
+            (F::Present, D::Mismatch, false),
+            (F::Present, D::Unavailable, false),
+            (F::Unavailable, D::Installed, false),
+            (F::Unavailable, D::Unavailable, false),
+            (F::NotRequested, D::Installed, false),
+        ];
+        for (firewall, driver, want) in table {
+            assert_eq!(
+                setup_needed(&report(firewall, driver)),
+                want,
+                "firewall {firewall:?}, driver {driver:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn teardown_needed_truth_table() {
+        let table = [
+            (F::Present, D::Installed, true),
+            (F::Missing, D::Installed, true),
+            (F::Present, D::Absent, true),
+            (F::Mismatch, D::Absent, true),
+            (F::Missing, D::PackageOnly, true),
+            (F::Missing, D::DeviceWithoutDriver, true),
+            (F::Missing, D::Mismatch, true),
+            (F::Missing, D::Absent, false),
+            (F::Missing, D::Unavailable, false),
+            (F::Unavailable, D::Unavailable, false),
+            (F::NotRequested, D::Absent, false),
+        ];
+        for (firewall, driver, want) in table {
+            assert_eq!(
+                teardown_needed(&report(firewall, driver)),
+                want,
+                "firewall {firewall:?}, driver {driver:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_id_comes_from_a_crosspane_rule_name() {
+        let id = install_id_from_rule_name(
+            "Crosspane.Agent.UDP.Private.eb281d43dffa02d3e3370970828abfe2",
+        )
+        .unwrap();
+        assert_eq!(id.as_str(), "eb281d43dffa02d3e3370970828abfe2");
+        // The rule store compares names ASCII case-insensitively; the id keeps its own case.
+        let id = install_id_from_rule_name("crosspane.agent.udp.private.AbC-123").unwrap();
+        assert_eq!(id.as_str(), "AbC-123");
+        assert_eq!(id.rule_name(), "Crosspane.Agent.UDP.Private.AbC-123");
+    }
+
+    #[test]
+    fn install_id_refuses_other_names() {
+        for name in [
+            "",
+            "Crosspane.Agent.UDP.Private.",
+            "Crosspane.Agent.UDP.Public.abc",
+            "Crosspane.Agent.UDP.Privat",
+            "Other.Agent.UDP.Private.abc",
+            // Malformed ids: separator, space, path-like, non-ASCII, over-long.
+            "Crosspane.Agent.UDP.Private.abc.def",
+            "Crosspane.Agent.UDP.Private.abc def",
+            "Crosspane.Agent.UDP.Private.abc\\def",
+            "Crosspane.Agent.UDP.Private.abc\u{e9}",
+            &format!(
+                "Crosspane.Agent.UDP.Private.{}",
+                "a".repeat(MAX_INSTALL_ID + 1)
+            ),
+            // A multi-byte character straddling the end of the prefix must not panic.
+            "Crosspane.Agent.UDP.Priva\u{e9}e.abc",
+        ] {
+            assert!(install_id_from_rule_name(name).is_none(), "{name:?}");
+        }
+        let longest = format!("Crosspane.Agent.UDP.Private.{}", "a".repeat(MAX_INSTALL_ID));
+        assert!(install_id_from_rule_name(&longest).is_some());
+        assert_eq!(longest.len(), MAX_RULE_NAME_UNITS);
+    }
+
+    #[test]
+    fn rule_prefix_is_matched_on_utf16_units() {
+        let units = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+        assert!(has_rule_prefix(&units("Crosspane.Agent.UDP.Private.abc")));
+        assert!(has_rule_prefix(&units("CROSSPANE.AGENT.UDP.PRIVATE.")));
+        assert!(!has_rule_prefix(&units("Crosspane.Agent.UDP.Private")));
+        assert!(!has_rule_prefix(&units("Core Networking - DNS (UDP-Out)")));
+        assert!(!has_rule_prefix(&units("")));
+        // A unit above 0xFF never matches, even if its low byte would.
+        let mut lookalike = units("Crosspane.Agent.UDP.Private.");
+        lookalike[0] = 0x0143;
+        assert!(!has_rule_prefix(&lookalike));
+    }
+
+    #[test]
+    fn declined_prompt_is_declined() {
+        let verb = Verb::Setup(scope_for_tests());
+        assert_eq!(
+            outcome_of(&verb, LaunchOutcome::Declined),
+            ElevatedOutcome::Declined
+        );
+    }
+
+    #[test]
+    fn verified_setup_is_configured_with_the_state_summary() {
+        let scope = scope_for_tests();
+        let verb = Verb::Setup(scope.clone());
+        let after = report(F::Present, D::Installed);
+        let launched = LaunchOutcome::Parts {
+            outcomes: vec![
+                (Verb::AddFirewall(scope), Some(Outcome::Done)),
+                (Verb::InstallDriver, Some(Outcome::AlreadyDone)),
+            ],
+            after: Some(after.clone()),
+        };
+        assert_eq!(
+            outcome_of(&verb, launched),
+            ElevatedOutcome::Configured(summary(&after))
+        );
+        assert_eq!(
+            summary(&after),
+            "Firewall rule: present. Display driver: installed."
+        );
+    }
+
+    #[test]
+    fn a_driver_that_needs_a_restart_still_configures() {
+        let scope = scope_for_tests();
+        let verb = Verb::Setup(scope.clone());
+        let launched = LaunchOutcome::Parts {
+            outcomes: vec![
+                (Verb::AddFirewall(scope), Some(Outcome::Done)),
+                (Verb::InstallDriver, Some(Outcome::RebootRequired)),
+            ],
+            after: Some(report(F::Present, D::PackageOnly)),
+        };
+        let ElevatedOutcome::Configured(text) = outcome_of(&verb, launched) else {
+            panic!("a restart is not a failure");
+        };
+        assert!(text.contains("restart"), "{text}");
+    }
+
+    #[test]
+    fn a_refused_or_failed_part_is_a_failure_with_plain_text() {
+        let scope = scope_for_tests();
+        let verb = Verb::Setup(scope.clone());
+        let launched = LaunchOutcome::Parts {
+            outcomes: vec![
+                (Verb::AddFirewall(scope), Some(Outcome::Done)),
+                (Verb::InstallDriver, Some(Outcome::Failed)),
+            ],
+            after: Some(report(F::Present, D::Absent)),
+        };
+        let ElevatedOutcome::Failed(text) = outcome_of(&verb, launched) else {
+            panic!("a failed driver is a failure");
+        };
+        assert!(
+            text.contains("Windows Defender Firewall rule: added."),
+            "{text}"
+        );
+        assert!(
+            text.contains("Crosspane display driver: could not be changed"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_exit_is_a_failure_that_names_the_current_state() {
+        let scope = scope_for_tests();
+        let verb = Verb::Setup(scope);
+        let launched = LaunchOutcome::Parts {
+            outcomes: vec![(Verb::InstallDriver, None)],
+            after: Some(report(F::Missing, D::Absent)),
+        };
+        let ElevatedOutcome::Failed(text) = outcome_of(&verb, launched) else {
+            panic!("an unknown exit is not success");
+        };
+        assert!(
+            text.contains("Firewall rule: missing. Display driver: not installed."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_result_is_never_configured() {
+        let verb = Verb::Teardown(scope_for_tests());
+        let launched = LaunchOutcome::Parts {
+            outcomes: Vec::new(),
+            after: None,
+        };
+        assert!(matches!(
+            outcome_of(&verb, launched),
+            ElevatedOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn plans_carry_the_consent_lines_for_setup_and_teardown() {
+        let setup = plan(Verb::Setup(scope_for_tests())).unwrap();
+        assert!(
+            setup
+                .preview_block()
+                .starts_with(crosspane_installer_core::elevated::step::PREVIEW_HEADER)
+        );
+        assert!(plan(Verb::Teardown(scope_for_tests())).is_ok());
+        assert!(plan(Verb::Status(None)).is_err());
+    }
 }

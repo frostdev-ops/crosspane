@@ -66,65 +66,28 @@ mod platform {
 }
 
 fn main() {
+    // Windows: the supervisor, the headless lifecycle commands and `--maintenance` are decided
+    // before any GUI work. Everything else (including `--diagnose`) falls through to the GUI path.
     #[cfg(windows)]
-    {
+    let maintenance = {
+        use crosspane_installer::platform::windows::{cli, request_maintenance, supervisor};
         let arguments: Vec<_> = std::env::args_os().skip(1).collect();
-        // A4d keeper has one exact flag and no path/PID/operation argv authority.
-        match crosspane_installer::platform::windows::service::upgrade_keeper_mode(&arguments) {
-            Ok(true) => {
-                if let Err(error) =
-                    crosspane_installer::platform::windows::service::upgrade_keeper_entry()
-                {
-                    eprintln!("Crosspane Installer upgrade keeper: {error}");
-                    platform::windows::setup_log::setup_note!("upgrade keeper failed: {error:?}");
-                    std::process::exit(1);
-                }
-                return;
-            }
-            Err(_) => {
-                eprintln!("Crosspane Installer upgrade keeper: invalid arguments");
-                std::process::exit(2);
-            }
-            Ok(false) => {}
-        }
-        // The fixed helper entry is admitted before any supervisor, diagnose or GUI work.
-        match crosspane_installer::platform::windows::replace_helper_mode(&arguments) {
-            Ok(true) => {
-                if let Err(error) = crosspane_installer::platform::windows::replace_helper_entry() {
-                    eprintln!("Crosspane Installer replace helper: {error}");
-                    platform::windows::setup_log::setup_note!("replace helper failed: {error:?}");
-                    std::process::exit(1);
-                }
-                return;
-            }
-            Err(_) => {
-                eprintln!("Crosspane Installer replace helper: invalid arguments");
-                std::process::exit(2);
-            }
-            Ok(false) => {}
-        }
-        match crosspane_installer::platform::windows::service::supervisor_mode(&arguments) {
-            Ok(true) => {
+        match cli::parse(&arguments) {
+            Ok(cli::Launch::Supervisor) => {
                 platform::windows::setup_log::setup_note!("supervisor start");
-                match crosspane_installer::platform::windows::service::supervisor_entry() {
-                    Ok(exit) => {
-                        platform::windows::setup_log::setup_note!("supervisor exit: {exit:?}");
-                    }
-                    Err(error) => {
-                        eprintln!("Crosspane Installer supervisor: {error}");
-                        platform::windows::setup_log::setup_note!("supervisor failed: {error:?}");
-                        std::process::exit(1);
-                    }
-                }
-                return;
+                let code = supervisor::run();
+                platform::windows::setup_log::setup_note!("supervisor exit: {code}");
+                std::process::exit(code);
             }
-            Err(_) => {
-                eprintln!("Crosspane Installer supervisor: invalid arguments");
-                std::process::exit(2);
+            Ok(cli::Launch::Cli(command)) => std::process::exit(cli::run(command)),
+            Ok(cli::Launch::Maintenance) => {
+                request_maintenance();
+                true
             }
-            Ok(false) => {}
+            Ok(cli::Launch::Gui) => false,
+            Err(message) => std::process::exit(cli::usage_exit(&message)),
         }
-    }
+    };
     if std::env::args_os().any(|arg| arg == "--diagnose") {
         #[cfg(windows)]
         console::attach_parent();
@@ -135,7 +98,16 @@ fn main() {
         }
         return;
     }
-    let options = match ReviewOptions::try_parse() {
+    // `--maintenance` is only valid alone, so the GUI options are then the defaults.
+    #[cfg(windows)]
+    let parsed = if maintenance {
+        ReviewOptions::try_parse_from(["crosspane-installer"])
+    } else {
+        ReviewOptions::try_parse()
+    };
+    #[cfg(not(windows))]
+    let parsed = ReviewOptions::try_parse();
+    let options = match parsed {
         Ok(options) => options,
         Err(error) => {
             #[cfg(windows)]
