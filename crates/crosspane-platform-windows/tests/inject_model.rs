@@ -90,13 +90,14 @@ fn focus_change_releases_both_ledgers_before_refusing_submission() {
         .into(),
         ..Default::default()
     });
-    d.key(HidUsage::keyboard(0xe1), true, 0).unwrap();
+    // A typing key (not a modifier): a modifier alone would follow the focus change instead.
+    d.key(HidUsage::keyboard(4), true, 0).unwrap();
     d.button(MouseButton::PRIMARY, true).unwrap();
     assert!(d.submit_guarded(Packet::Move { x: 0, y: 0 }).is_err());
     assert_eq!(
         &d.port().sends[2..],
         &[
-            key_packet(HidUsage::keyboard(0xe1), false).unwrap(),
+            key_packet(HidUsage::keyboard(4), false).unwrap(),
             Packet::Button {
                 button: MouseButton::PRIMARY,
                 down: false
@@ -104,6 +105,524 @@ fn focus_change_releases_both_ledgers_before_refusing_submission() {
         ]
     );
     assert!(d.held_keys().is_empty() && d.held_buttons().is_empty());
+    assert!(!d.repeating());
+}
+
+/// A fake whose every foreground observation is scripted, so a click that activates another
+/// window can be replayed without the default `focus(1, ..)` refilling the queue.
+fn scripted(observations: impl IntoIterator<Item = Result<Foreground, PlatformError>>) -> Fake {
+    Fake {
+        foreground: observations.into_iter().collect(),
+        ..Default::default()
+    }
+}
+fn down(button: MouseButton) -> Packet {
+    Packet::Button { button, down: true }
+}
+fn up(button: MouseButton) -> Packet {
+    Packet::Button {
+        button,
+        down: false,
+    }
+}
+fn ups(sends: &[Packet], button: MouseButton) -> usize {
+    sends.iter().filter(|p| **p == up(button)).count()
+}
+
+#[test]
+fn inject_drag_follows_the_click_into_a_newly_activated_window() {
+    // Move onto an unfocused window, press (this makes window 2 foreground), then drag.
+    let mut d = driver(scripted([
+        Ok(focus(1, 0x2000)),
+        Ok(focus(1, 0x2000)),
+        Ok(focus(2, 0x2000)),
+        Ok(focus(2, 0x2000)),
+    ]));
+    d.submit_guarded(Packet::Move { x: 1, y: 1 }).unwrap();
+    d.button(MouseButton::PRIMARY, true).unwrap();
+    d.submit_guarded(Packet::Move { x: 2, y: 2 }).unwrap();
+    d.submit_guarded(Packet::Move { x: 3, y: 3 }).unwrap();
+    assert_eq!(
+        d.port().sends,
+        [
+            Packet::Move { x: 1, y: 1 },
+            down(MouseButton::PRIMARY),
+            Packet::Move { x: 2, y: 2 },
+            Packet::Move { x: 3, y: 3 },
+        ]
+    );
+    assert!(d.held_buttons().contains(&MouseButton::PRIMARY));
+    // The one up still goes out, exactly once, whatever the foreground is by then.
+    d.button(MouseButton::PRIMARY, false).unwrap();
+    assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 1);
+    assert!(d.held_buttons().is_empty());
+}
+
+#[test]
+fn inject_drag_is_followed_through_several_foreground_changes_and_a_lower_integrity_window() {
+    let mut d = driver(scripted([
+        Ok(focus(1, 0x2000)),
+        Ok(focus(2, 0x1000)), // lower integrity than ours
+        Ok(Foreground {
+            generation: 1,
+            ..focus(2, 0x1000)
+        }),
+        Ok(focus(3, 0x2000)),
+    ]));
+    d.button(MouseButton::PRIMARY, true).unwrap();
+    for n in 0..3 {
+        d.submit_guarded(Packet::Move { x: n, y: n }).unwrap();
+    }
+    assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 0);
+    assert_eq!(d.port().sends.len(), 4);
+    d.release_buttons().unwrap();
+    assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 1);
+}
+
+#[test]
+fn inject_drag_into_a_higher_unknown_or_null_foreground_releases_exactly_once() {
+    let null = Foreground {
+        window: 0,
+        ..focus(1, 0x2000)
+    };
+    for next in [
+        Ok(focus(2, 0x3000)),
+        Ok(null),
+        Ok(Foreground {
+            process: 0,
+            ..focus(2, 0x2000)
+        }),
+        Ok(Foreground {
+            thread: 0,
+            ..focus(2, 0x2000)
+        }),
+        Ok(Foreground {
+            born: 0,
+            ..focus(2, 0x2000)
+        }),
+        Err(PlatformError::SecureInput),
+    ] {
+        let label = format!("{next:?}");
+        let mut d = driver(scripted([Ok(focus(1, 0x2000)), next]));
+        d.button(MouseButton::PRIMARY, true).unwrap();
+        assert!(
+            matches!(
+                d.submit_guarded(Packet::Move { x: 1, y: 1 }),
+                Err(PlatformError::SecureInput)
+            ),
+            "{label}"
+        );
+        // The held button was released exactly once, and the move never went out.
+        assert_eq!(
+            d.port().sends,
+            [down(MouseButton::PRIMARY), up(MouseButton::PRIMARY)],
+            "{label}"
+        );
+        assert!(d.held_buttons().is_empty(), "{label}");
+        // A later release of the already-drained button adds no ledger state and no second up
+        // from the driver itself; only the explicit release the caller asked for goes out.
+        d.release_buttons().unwrap();
+        assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 1, "{label}");
+    }
+}
+
+#[test]
+fn inject_drag_failed_release_stays_owed_until_it_succeeds_once() {
+    let mut d = driver(scripted([Ok(focus(1, 0x2000)), Ok(focus(2, 0x3000))]));
+    d.button(MouseButton::PRIMARY, true).unwrap();
+    d.port_mut().failed = true;
+    assert!(d.submit_guarded(Packet::Move { x: 1, y: 1 }).is_err());
+    // The up was attempted once and failed, so it is still owed.
+    assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 1);
+    assert!(d.held_buttons().contains(&MouseButton::PRIMARY));
+    d.port_mut().failed = false;
+    d.release_buttons().unwrap();
+    assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 2); // retry of the failed one
+    assert!(d.held_buttons().is_empty());
+    d.release_buttons().unwrap();
+    assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 2); // settled: nothing more owed
+}
+
+#[test]
+fn inject_foreground_change_with_a_key_held_still_drains_both_ledgers() {
+    // Only a pointer drag, with or without held modifiers, follows the click: a held typing key
+    // keeps the original fail-safe.
+    let mut d = driver(scripted([
+        Ok(focus(1, 0x2000)),
+        Ok(focus(1, 0x2000)),
+        Ok(focus(2, 0x1000)),
+    ]));
+    d.key(HidUsage::keyboard(4), true, 0).unwrap();
+    d.button(MouseButton::PRIMARY, true).unwrap();
+    assert!(matches!(
+        d.submit_guarded(Packet::Move { x: 1, y: 1 }),
+        Err(PlatformError::SecureInput)
+    ));
+    assert!(d.held_keys().is_empty() && d.held_buttons().is_empty());
+    assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 1);
+}
+
+#[test]
+fn inject_foreground_change_with_nothing_held_is_normal_admission() {
+    let mut d = driver(scripted([
+        Ok(focus(1, 0x2000)),
+        Ok(focus(2, 0x1000)),
+        Ok(focus(3, 0x2000)),
+    ]));
+    d.submit_guarded(Packet::Move { x: 1, y: 1 }).unwrap();
+    d.submit_guarded(Packet::Move { x: 2, y: 2 }).unwrap();
+    d.button(MouseButton::PRIMARY, true).unwrap();
+    assert_eq!(d.port().sends.len(), 3);
+}
+
+fn shift() -> HidUsage {
+    HidUsage::keyboard(0xe1)
+}
+fn ctrl() -> HidUsage {
+    HidUsage::keyboard(0xe0)
+}
+fn letter() -> HidUsage {
+    HidUsage::keyboard(4)
+}
+fn key_down(usage: HidUsage) -> Packet {
+    key_packet(usage, true).unwrap()
+}
+fn key_up(usage: HidUsage) -> Packet {
+    key_packet(usage, false).unwrap()
+}
+fn key_ups(sends: &[Packet], usage: HidUsage) -> usize {
+    sends.iter().filter(|p| **p == key_up(usage)).count()
+}
+/// `downs` observations of window 1 (one per admitted down), then `after`.
+fn change_after(downs: usize, after: Result<Foreground, PlatformError>) -> Fake {
+    scripted(
+        std::iter::repeat_with(|| Ok(focus(1, 0x2000)))
+            .take(downs)
+            .chain([after]),
+    )
+}
+
+#[test]
+fn inject_shift_click_drag_follows_the_click_into_a_newly_activated_window() {
+    // Shift is held, the button goes down against window 1, and the click activates window 2.
+    let mut d = driver(scripted([
+        Ok(focus(1, 0x2000)), // Shift down
+        Ok(focus(1, 0x2000)), // button down, admitted against the old foreground
+        Ok(focus(2, 0x2000)), // first drag move: window 2 is foreground now
+        Ok(focus(2, 0x2000)),
+    ]));
+    d.key(shift(), true, 0).unwrap();
+    assert!(!d.repeating(), "a modifier never arms the typematic repeat");
+    d.button(MouseButton::PRIMARY, true).unwrap();
+    d.submit_guarded(Packet::Move { x: 2, y: 2 }).unwrap();
+    d.submit_guarded(Packet::Move { x: 3, y: 3 }).unwrap();
+    assert_eq!(
+        d.port().sends,
+        [
+            key_down(shift()),
+            down(MouseButton::PRIMARY),
+            Packet::Move { x: 2, y: 2 },
+            Packet::Move { x: 3, y: 3 },
+        ]
+    );
+    // Only ownership moved: both owed ups are still in the ledger, and nothing repeats.
+    assert!(d.held_keys().contains(&shift()));
+    assert!(d.held_buttons().contains(&MouseButton::PRIMARY));
+    assert!(!d.repeating());
+    d.repeat(1_000_000).unwrap();
+    assert_eq!(d.port().sends.len(), 4);
+    d.button(MouseButton::PRIMARY, false).unwrap();
+    d.key(shift(), false, 1).unwrap();
+    assert_eq!(ups(&d.port().sends, MouseButton::PRIMARY), 1);
+    assert_eq!(key_ups(&d.port().sends, shift()), 1);
+    assert!(d.held_keys().is_empty() && d.held_buttons().is_empty());
+    // Settled: a later cleanup sends nothing more.
+    d.release_everything().unwrap();
+    assert_eq!(d.port().sends.len(), 6);
+}
+
+#[test]
+fn inject_ctrl_alone_follows_foreground_changes_for_moves_and_wheel() {
+    let mut d = driver(scripted([
+        Ok(focus(1, 0x2000)), // Ctrl down
+        Ok(focus(2, 0x2000)), // move: another window took the foreground
+        Ok(focus(2, 0x2000)), // wheel, same window
+        Ok(focus(3, 0x1000)), // move: a lower-integrity window
+    ]));
+    d.key(ctrl(), true, 0).unwrap();
+    let zoom = Packet::Wheel {
+        horizontal: false,
+        v120: 120,
+    };
+    d.submit_guarded(Packet::Move { x: 1, y: 1 }).unwrap();
+    d.submit_guarded(zoom).unwrap();
+    d.submit_guarded(Packet::Move { x: 2, y: 2 }).unwrap();
+    assert_eq!(
+        d.port().sends,
+        [
+            key_down(ctrl()),
+            Packet::Move { x: 1, y: 1 },
+            zoom,
+            Packet::Move { x: 2, y: 2 },
+        ]
+    );
+    assert_eq!(d.held_keys().len(), 1);
+    d.key(ctrl(), false, 1).unwrap();
+    assert_eq!(key_ups(&d.port().sends, ctrl()), 1);
+    d.release_everything().unwrap();
+    assert_eq!(key_ups(&d.port().sends, ctrl()), 1);
+}
+
+#[test]
+fn inject_ctrl_wheel_through_scroll_follows_a_foreground_change() {
+    // `scroll` guards once up front and once per packet; the first sees the new window and adopts
+    // it, so the per-packet guard and the scroll context agree.
+    let mut d = driver(scripted([
+        Ok(focus(1, 0x2000)), // Ctrl down
+        Ok(focus(2, 0x2000)), // scroll guard
+        Ok(focus(2, 0x2000)), // per-packet guard
+    ]));
+    d.key(ctrl(), true, 0).unwrap();
+    d.scroll(ScrollDelta {
+        v120_y: 120,
+        ..pixels(0.0, 0.0)
+    })
+    .unwrap();
+    assert_eq!(
+        d.port().sends,
+        [key_down(ctrl()), wheel(false, 120)],
+        "the wheel reached the new window"
+    );
+    d.release_keys().unwrap();
+    assert_eq!(key_ups(&d.port().sends, ctrl()), 1);
+}
+
+#[test]
+fn inject_each_of_the_eight_modifiers_follows_a_foreground_change() {
+    // Left/Right Ctrl, Shift, Alt and Win.
+    for id in 0xe0..=0xe7 {
+        let usage = HidUsage::keyboard(id);
+        let mut d = driver(scripted([Ok(focus(1, 0x2000)), Ok(focus(2, 0x2000))]));
+        d.key(usage, true, 0).unwrap();
+        d.submit_guarded(Packet::Move { x: 1, y: 1 }).unwrap();
+        assert_eq!(
+            d.port().sends,
+            [key_down(usage), Packet::Move { x: 1, y: 1 }],
+            "{id:#x}"
+        );
+        assert!(!d.repeating(), "{id:#x}");
+        d.key(usage, false, 1).unwrap();
+        assert_eq!(key_ups(&d.port().sends, usage), 1, "{id:#x}");
+        assert!(d.held_keys().is_empty(), "{id:#x}");
+    }
+}
+
+#[test]
+fn inject_modifier_with_a_typing_key_held_releases_everything_once_on_a_foreground_change() {
+    for button in [false, true] {
+        for shift_first in [false, true] {
+            let mut d = driver(change_after(2 + usize::from(button), Ok(focus(2, 0x2000))));
+            if shift_first {
+                d.key(shift(), true, 0).unwrap();
+                d.key(letter(), true, 1).unwrap();
+            } else {
+                d.key(letter(), true, 0).unwrap();
+                d.key(shift(), true, 1).unwrap();
+            }
+            if button {
+                d.button(MouseButton::PRIMARY, true).unwrap();
+            }
+            let owed = 2 + usize::from(button);
+            assert_eq!(d.port().sends.len(), owed);
+            assert!(matches!(
+                d.submit_guarded(Packet::Move { x: 1, y: 1 }),
+                Err(PlatformError::SecureInput)
+            ));
+            // The move never went out; each down got exactly one up; the repeat is gone.
+            assert_eq!(d.port().sends.len(), owed * 2, "{button} {shift_first}");
+            assert_eq!(key_ups(&d.port().sends, shift()), 1);
+            assert_eq!(key_ups(&d.port().sends, letter()), 1);
+            assert_eq!(
+                ups(&d.port().sends, MouseButton::PRIMARY),
+                usize::from(button)
+            );
+            assert!(d.held_keys().is_empty() && d.held_buttons().is_empty());
+            assert!(!d.repeating());
+            d.repeat(1_000_000).unwrap();
+            d.release_everything().unwrap();
+            assert_eq!(
+                d.port().sends.len(),
+                owed * 2,
+                "settled: nothing more is sent"
+            );
+        }
+    }
+}
+
+#[test]
+fn inject_typing_key_after_a_modifier_follow_is_admitted_and_a_further_change_releases_once() {
+    let mut d = driver(scripted([
+        Ok(focus(1, 0x2000)), // Shift down
+        Ok(focus(2, 0x2000)), // move: adopt window 2
+        Ok(focus(2, 0x2000)), // letter down: window 2 owns now, nothing changed
+        Ok(focus(3, 0x2000)), // move: the letter is held, so this releases
+    ]));
+    d.key(shift(), true, 0).unwrap();
+    d.submit_guarded(Packet::Move { x: 1, y: 1 }).unwrap();
+    d.key(letter(), true, 1).unwrap();
+    assert!(d.repeating());
+    assert!(matches!(
+        d.submit_guarded(Packet::Move { x: 2, y: 2 }),
+        Err(PlatformError::SecureInput)
+    ));
+    assert!(!d.repeating());
+    assert_eq!(key_ups(&d.port().sends, shift()), 1);
+    assert_eq!(key_ups(&d.port().sends, letter()), 1);
+    assert!(d.held_keys().is_empty());
+    d.repeat(1_000_000).unwrap();
+    // Shift down, move, letter down, then one up each; the second move never went out.
+    assert_eq!(d.port().sends.len(), 5);
+}
+
+#[test]
+fn inject_owed_lock_toggle_up_releases_once_even_with_only_a_modifier_or_nothing_else_held() {
+    for with_shift in [false, true] {
+        let guards = 1 + usize::from(with_shift); // set_locks guards once, a held Shift once
+        let mut d = driver(change_after(guards, Ok(focus(2, 0x2000))));
+        if with_shift {
+            d.key(shift(), true, 0).unwrap();
+        }
+        // The Caps down and up both fail, so the toggle's up stays owed.
+        d.port_mut().failed = true;
+        assert!(
+            d.set_locks(LockKeys {
+                caps_lock: Some(true),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        d.port_mut().failed = false;
+        let caps = HidUsage::keyboard(0x39);
+        let before = d.port().sends.len();
+        assert!(matches!(
+            d.submit_guarded(Packet::Move { x: 1, y: 1 }),
+            Err(PlatformError::SecureInput)
+        ));
+        // The owed Caps up (the first, failed attempt plus the retry) and the one Shift up.
+        assert_eq!(key_ups(&d.port().sends, caps), 2, "{with_shift}");
+        assert_eq!(
+            key_ups(&d.port().sends, shift()),
+            usize::from(with_shift),
+            "{with_shift}"
+        );
+        assert_eq!(
+            d.port().sends.len(),
+            before + 1 + usize::from(with_shift),
+            "the move never went out"
+        );
+        assert!(d.held_keys().is_empty());
+        d.release_everything().unwrap();
+        assert_eq!(key_ups(&d.port().sends, caps), 2, "settled");
+    }
+}
+
+#[test]
+fn inject_modifiers_into_a_higher_unknown_or_null_foreground_release_exactly_once() {
+    let null = Foreground {
+        window: 0,
+        ..focus(1, 0x2000)
+    };
+    // `None` is an unreadable foreground (a secure desktop, an unstable read).
+    for next in [
+        Some(focus(2, 0x3000)),
+        Some(null),
+        Some(Foreground {
+            process: 0,
+            ..focus(2, 0x2000)
+        }),
+        Some(Foreground {
+            thread: 0,
+            ..focus(2, 0x2000)
+        }),
+        // An incomplete identity (no process creation time) never inherits held modifiers.
+        Some(Foreground {
+            born: 0,
+            ..focus(2, 0x2000)
+        }),
+        None,
+    ] {
+        for (modifiers, button) in [
+            (vec![shift()], false),
+            (vec![ctrl()], false),
+            (vec![ctrl(), shift()], false),
+            (vec![shift()], true),
+        ] {
+            let label = format!("{next:?} {modifiers:?} {button}");
+            let downs = modifiers.len() + usize::from(button);
+            let mut d = driver(change_after(downs, next.ok_or(PlatformError::SecureInput)));
+            for usage in &modifiers {
+                d.key(*usage, true, 0).unwrap();
+            }
+            if button {
+                d.button(MouseButton::PRIMARY, true).unwrap();
+            }
+            assert!(
+                matches!(
+                    d.submit_guarded(Packet::Move { x: 1, y: 1 }),
+                    Err(PlatformError::SecureInput)
+                ),
+                "{label}"
+            );
+            // Nothing but the downs and one up each: the move never went out.
+            assert_eq!(d.port().sends.len(), downs * 2, "{label}");
+            for usage in &modifiers {
+                assert_eq!(key_ups(&d.port().sends, *usage), 1, "{label}");
+            }
+            assert_eq!(
+                ups(&d.port().sends, MouseButton::PRIMARY),
+                usize::from(button),
+                "{label}"
+            );
+            assert!(
+                d.held_keys().is_empty() && d.held_buttons().is_empty(),
+                "{label}"
+            );
+            d.release_everything().unwrap();
+            assert_eq!(d.port().sends.len(), downs * 2, "{label}: settled");
+        }
+    }
+}
+
+#[test]
+fn inject_held_modifier_with_a_closed_gate_releases_once_and_never_follows() {
+    let mut d = driver(scripted([Ok(focus(1, 0x2000)), Ok(focus(2, 0x2000))]));
+    d.key(shift(), true, 0).unwrap();
+    d.gate().set_engine_permits(false);
+    assert!(matches!(
+        d.submit_guarded(Packet::Move { x: 1, y: 1 }),
+        Err(PlatformError::Locked)
+    ));
+    assert_eq!(d.port().sends, [key_down(shift()), key_up(shift())]);
+    assert!(d.held_keys().is_empty());
+}
+
+#[test]
+fn inject_failed_modifier_release_stays_owed_until_it_succeeds_once() {
+    let mut d = driver(change_after(1, Ok(focus(2, 0x3000))));
+    d.key(shift(), true, 0).unwrap();
+    d.port_mut().failed = true;
+    assert!(d.submit_guarded(Packet::Move { x: 1, y: 1 }).is_err());
+    assert_eq!(key_ups(&d.port().sends, shift()), 1);
+    assert!(
+        d.held_keys().contains(&shift()),
+        "the failed up is still owed"
+    );
+    d.port_mut().failed = false;
+    d.release_keys().unwrap();
+    assert_eq!(key_ups(&d.port().sends, shift()), 2); // the retry of the failed one
+    assert!(d.held_keys().is_empty());
+    d.release_keys().unwrap();
+    assert_eq!(key_ups(&d.port().sends, shift()), 2); // settled
 }
 
 #[test]

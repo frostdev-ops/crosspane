@@ -1445,10 +1445,11 @@ fn a_notification_still_queued_when_the_binding_is_removed_is_flushed_boundedly_
 fn retirement_waits_for_an_outstanding_callback_while_forwarding_continues_correctly() {
     let (rig, mut ports, callback) = Rig::forwarding();
     let stop = Arc::new(AtomicBool::new(false));
+    let hammer_stop = Arc::new(AtomicBool::new(false));
     let flowed = Arc::new(AtomicUsize::new(0));
     let hammer = {
         let callback = callback.clone();
-        let stop = stop.clone();
+        let stop = hammer_stop.clone();
         std::thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
                 forward(&*callback, &stereo_pattern(0, 64));
@@ -1479,26 +1480,39 @@ fn retirement_waits_for_an_outstanding_callback_while_forwarding_continues_corre
         }
         std::thread::yield_now();
     };
+    // While `held` is inside, every hammer cycle finds a callback inside and does nothing, so the
+    // hammer ends now rather than competing for the CPU during the retirement below.
+    hammer_stop.store(true, Ordering::SeqCst);
+    hammer.join().unwrap();
     rig.hal.app_stop(SPEAKERS_APP);
-    wait_until("the owner to stop the IOProc", || {
-        rig.hal.stopped_total() == 1
-    });
-    std::thread::sleep(Duration::from_millis(10));
-    assert_eq!(
-        rig.hal.dropped_total(),
-        0,
-        "the state is kept while a callback is outstanding"
-    );
+    // The owner waits at most `RETIRE_WAIT` (100 ms) for the callback to leave, then keeps the
+    // state forever. So `held` must leave well inside that window: this thread spins instead of
+    // sleeping, because a sleep can overshoot by tens of milliseconds on a loaded CI machine.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rig.hal.stopped_total() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the owner to stop the IOProc"
+        );
+        std::thread::yield_now();
+    }
+    let outstanding = Instant::now() + Duration::from_millis(5);
+    while Instant::now() < outstanding {
+        assert_eq!(
+            rig.hal.dropped_total(),
+            0,
+            "the state is kept while a callback is outstanding"
+        );
+        std::thread::yield_now();
+    }
     drop(held);
-    rig.sync();
-    assert_eq!(
-        rig.hal.dropped_total(),
-        1,
-        "released once the callback left"
-    );
+    wait_until("the state released once the callback left", || {
+        rig.sync();
+        rig.hal.dropped_total() >= 1
+    });
+    assert_eq!(rig.hal.dropped_total(), 1, "released exactly once");
     assert_eq!(rig.hal.active_sessions(), 0);
     stop.store(true, Ordering::SeqCst);
-    hammer.join().unwrap();
     let samples = drainer.join().unwrap();
     assert!(
         !samples.is_empty(),

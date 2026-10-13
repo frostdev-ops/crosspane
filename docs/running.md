@@ -83,8 +83,9 @@ agent connects.
 **Windows** has no per-app permissions to grant. The installer asks once for administrator approval
 (one UAC prompt) for two things:
 
-- a Windows Defender Firewall rule, `Crosspane.Agent.UDP.Private.<install id>`, that lets the
-  installed agent receive UDP from the local subnet on private networks;
+- a Windows Defender Firewall rule, `Crosspane.Agent.UDP.Private.<install id>` (name kept from
+  earlier setups), that lets the installed agent receive UDP from the local subnet on private and
+  public networks (not domain networks);
 - the Crosspane display driver (preview): one virtual display adapter that shows no display until
   Crosspane needs one. The driver is optional. Without it, projected Windows windows stay visible in
   place (mirror).
@@ -148,14 +149,33 @@ is kept in Windows Credential Manager, and the key-file fallback is off on Windo
   `--features private-vdisplay,video`, for the D7 window hiding) builds, signs and installs `~/Applications/Crosspane.app` (with the settings app
   inside), starts it at login (LaunchAgent `io.frostdev.crosspane.agent`) and puts `crosspanectl`
   in `~/.cargo/bin`. Logs: `~/Library/Logs/Crosspane/agent.log`. Re-run it to upgrade.
-- **Windows:** run the per-user installer, `crosspane-installer.exe`. It installs
-  `crosspane-agent.exe`, `crosspane-ui.exe` and `crosspanectl.exe` in
-  `%LOCALAPPDATA%\Programs\Crosspane`, keeps its own state in `%LOCALAPPDATA%\Crosspane\Installer`,
-  asks once for administrator approval (see One-time setup), and creates the logon task
-  `\Crosspane\Agent` (Task Scheduler, Crosspane folder, Agent) for your account. At each sign-in that
-  task starts the agent under a supervisor. The supervisor starts the agent again after a crash (a
-  nonzero exit), five seconds later, and stops restarting it after three restarts within ten
-  minutes. The agent refuses to run elevated. Its logs are `%LOCALAPPDATA%\Crosspane\logs\agent.log`.
+- **Windows:** run the per-user installer, `crosspane-installer.exe`, from the folder you unpacked it
+  in: it installs from the `payload` folder beside it. It puts `crosspane-agent.exe`,
+  `crosspane-ui.exe`, `crosspanectl.exe`, a copy of itself and the elevated setup helper in
+  `%LOCALAPPDATA%\Programs\Crosspane`, adds **Crosspane** and **Crosspane Setup** to the Start menu
+  and an entry to Settings › Apps, asks for administrator approval only when the firewall rule or the
+  display driver is missing (see One-time setup), and creates the logon task `\Crosspane\Agent`
+  (Task Scheduler, Crosspane folder, Agent) for your account. At each sign-in that task starts the
+  agent under a supervisor, which starts the agent again after a crash (a nonzero exit) after 1, 2,
+  4 and 8 seconds and gives up after five failed starts within two minutes. The agent refuses to run
+  elevated.
+
+  Running the installer again installs, upgrades or repairs in place and can always be repeated:
+  whatever it finds in its program folder that doesn't belong there is moved to a timestamped
+  folder in `%LOCALAPPDATA%\Crosspane\backups` (the five newest are kept), and your identity,
+  pairings and settings stay. Its first screen offers **Install or reinstall**, **Repair**,
+  **Uninstall** and **Complete reinstall** (all files replaced); **Crosspane Setup** in the Start
+  menu opens Repair and Uninstall. Uninstall keeps your settings and pairings unless you choose to
+  remove them, and removes the firewall rule and display driver only if you choose that (one more
+  administrator approval). The same operations run without the window, for scripts:
+  `crosspane-installer.exe --install [--payload DIR] [--complete] [--skip-admin]`, `--repair`,
+  `--uninstall [--remove-settings] [--teardown]`, and `--status`, which prints one line of JSON.
+  `--skip-admin` installs without asking for administrator approval. The exit code is 0 on
+  success. The installer is a windowed program, so run it with `Start-Process -Wait` (PowerShell)
+  or from a batch file to wait for it and read the exit code. Its own log is
+  `%TEMP%\Crosspane\setup.log`.
+
+  The agent's logs are `%LOCALAPPDATA%\Crosspane\logs\agent.log`.
   Each run starts a fresh file and moves the previous run's log to `agent.log.1` (and `agent.log.1`
   to `agent.log.2`). Each file is capped at 4 MiB, and the live file rotates the same way when a line
   would pass that cap. `crosspanectl diag` includes the tail of each file.
@@ -306,30 +326,54 @@ whose monitor list contains only `WAYLAND-*` outputs. See the
 `crosspanectl status` shows peers, layout, projections (with received frames), missing
 permissions and recent notices.
 
-## Audio (speakers, v0)
+## Audio (speakers and projected apps, v0)
 
-A machine can play its sound on a paired machine's speakers.
-Speakers only: microphones are not shared yet.
+A machine can play its sound on a paired machine's speakers, and a projected window brings its app's
+sound along. Speakers only: microphones are not shared yet.
 
 - **Use it:** each paired machine that has an audio backend shows a virtual output called
   "⟨peer⟩ speakers" (on Linux, a PipeWire sink; on the Mac, the Crosspane audio driver's "Crosspane
   speakers", once the owner has installed it). Pick it in the system's sound settings or in an app.
   Sound reaches the peer only while an app plays into it, and comes out of the peer's default
   output.
+- **Projected apps bring their sound** when the window comes from a Windows machine. When a machine
+  accepts such a window (it allowed the source to present windows here:
+  `crosspanectl allow <source> present`), that window's app plays its sound on that machine. No
+  `speaker` grant is needed for it, and there is no app list to set up. A pulled window needs the
+  same `present` grant and brings its sound the same way. Every machine can play this sound; only
+  Windows captures it per app so far. Windows projected from a Mac or Linux machine bring no sound
+  of their own: their sound goes through that machine's whole-machine `speaker` route.
+- **`speaker` is for whole-machine audio:** what a Mac or Linux machine plays into its virtual
+  "⟨peer⟩ speakers" output (see Use it). Windows has no such output yet, so a Windows machine does
+  not send whole-machine sound.
 - **On Windows** there is no virtual output yet, so the peer's speakers don't appear in the sound
-  settings. A Windows machine plays a peer's sound on its default output (shared playback). As a
-  source, it sends the sound of the app behind a window projected to that peer, captured from that
-  app's process tree. Capturing doesn't mute the app: its sound still plays on this machine too.
-- **The speakers' owner decides.** Both sides are off by default: on the machine whose speakers
-  should play, run `crosspanectl allow <peer> speaker` (`--off` to withdraw). Withdrawing it,
-  locking the screen, `crosspanectl panic`, a lost connection or revoking the peer stops the sound
-  within a second. After an unlock, an app has to start playing again.
+  settings. A Windows machine plays a peer's sound on its default output (shared playback).
+- **Windows sources** send only projected apps' sound, taken from the window's process and the
+  processes it started, so browsers and Electron apps work. Projecting one window sends its whole
+  app's sound. The app stays audible on the source too: the sound is copied, not moved. These get
+  no projected sound: packaged (UWP) apps whose window belongs to `ApplicationFrameHost.exe`, apps
+  that play through a separate service or broker process, exclusive-mode audio, and Windows builds
+  older than 20348 (every Windows 10 build; all Windows 11 builds qualify).
+- **Versions.** Both machines must run an agent with projected-app sound (`audio/1` in its Hello).
+  With an older peer, a Windows source falls back to the old rule: its sound goes only if the
+  machine playing it has granted `speaker` to that Windows machine. Mac and Linux sources are
+  unchanged.
+- **The speakers' owner decides.** Whole-machine speaker audio is off by default on both sides: on
+  the machine whose speakers should play, run `crosspanectl allow <peer> speaker` (`--off` to
+  withdraw). Withdrawing it, locking the screen, `crosspanectl panic`, a lost connection or revoking
+  the peer stops that sound within a second. After an unlock, an app has to start playing again.
+- **Projected sound follows the projection.** It stops as soon as the window is returned or closed,
+  `present` is revoked, the screen locks, `crosspanectl panic` ends the projection, or the 20 s
+  reconnect grace runs out. A dropped connection stops it too, and it returns if the projection
+  resumes within the grace. Revoking `speaker` does not stop it; ending the projection does. After
+  an unlock, project the window again to hear it.
 - **`crosspanectl allow <peer> mic`** is accepted and stored, and answers that microphones are not
   supported yet: no microphone is ever opened. An app recording from "⟨peer⟩ microphone" hears
   silence, and the agent shows a refusal notice.
 - **See it:** `crosspanectl status` shows, per peer, what it may do here (`speaker`, `mic`, ...) and
-  whether it is playing on this machine's speakers; the tray / menu-bar menu lists the peers
-  playing now, and its icon shows the active state.
+  whether it is playing on this machine's speakers. The tray / menu-bar menu lists a peer whose
+  projected app is playing the same way as speaker audio ("⟨peer⟩ is playing sound on these
+  speakers"), and its icon shows the active state.
 - **Needs** an audio backend at agent start: PipeWire (Linux), CoreAudio (Mac) or the Windows audio
   stack (process-tree capture needs Windows build 20348 or later). The agent logs "audio sharing on"
   (or why not) and then advertises the `audio` feature. `CROSSPANE_AUDIO=0` in the agent's
@@ -339,8 +383,12 @@ Speakers only: microphones are not shared yet.
 - **Limits (v0):** the Mac resamples the 48 kHz stream to its default output's rate (44.1, 48,
   88.2, 96, 176.4 or 192 kHz); the Mac's driver serves one peer at a time;
   an agent whose audio worker died keeps audio refused until it restarts.
-- **Windows limits (v0):** a change of the default output or audio device ends the stream, and sound
-  resumes only once an app starts playing again.
+- **Windows default-device changes:** the stream follows the default output. When the default
+  playback device changes, or the one in use is unplugged or disabled, the agent reopens playback on
+  the new default with the same format negotiation (a short gap, then sound continues). Reopening
+  is limited to 5 attempts per stream per minute, with backoff; if it fails or the limit is hit
+  (a flapping device), the stream ends as before and sound resumes only once an app starts playing
+  again. Sound captured from a projected app does not depend on the output device.
 - **Check it without touching your audio:** `scripts/test-env.sh scripts/e2e/audio-private.sh`
   runs two agents, each on its own private PipeWire server, plays a 1 kHz tone into one's "speakers"
   and records what comes out of the other's output.

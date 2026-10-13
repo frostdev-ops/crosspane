@@ -22,6 +22,12 @@ use crate::lifecycle::Parking;
 pub(crate) const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const QUEUE_CAP: usize = 64;
 
+/// Gives a window the keyboard focus (`WindowSource::activate`). It runs on the worker's thread, in
+/// the same FIFO as the parking calls: the Windows source waits up to two seconds when the OS
+/// denies the foreground request, which must not stall the agent loop, and a later park or return
+/// of the same window must not overtake the activation.
+pub(crate) type Activator = Box<dyn FnMut(WindowId) -> Result<(), PlatformError> + Send>;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Command {
     Park {
@@ -39,6 +45,9 @@ pub(crate) enum Command {
         window: WindowId,
         place: Option<(DisplayId, PointDevice)>,
     },
+    Activate {
+        window: WindowId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +55,7 @@ pub(crate) enum Kind {
     Park,
     Resize,
     Restore,
+    Activate,
 }
 
 impl Command {
@@ -53,7 +63,8 @@ impl Command {
         match self {
             Self::Park { window, .. }
             | Self::Resize { window, .. }
-            | Self::Restore { window, .. } => window,
+            | Self::Restore { window, .. }
+            | Self::Activate { window } => window,
         }
     }
     fn kind(self) -> Kind {
@@ -61,7 +72,19 @@ impl Command {
             Self::Park { .. } => Kind::Park,
             Self::Resize { .. } => Kind::Resize,
             Self::Restore { .. } => Kind::Restore,
+            Self::Activate { .. } => Kind::Activate,
         }
+    }
+}
+
+/// What the engine is told about a failed platform call.
+fn failure_of(error: &PlatformError) -> Failure {
+    match error {
+        PlatformError::Locked => Failure::Locked,
+        PlatformError::SecureInput => Failure::SecureInput,
+        PlatformError::PointerButtonHeld => Failure::PointerButtonHeld,
+        PlatformError::PermissionDenied(_) => Failure::PermissionDenied,
+        _ => Failure::Other,
     }
 }
 
@@ -86,7 +109,15 @@ impl Completion {
             #[cfg(windows)]
             notice: None,
             outcome: match command {
-                Command::Restore { window, .. } => Outcome::Restored { window, ok: false },
+                Command::Restore { window, .. } => Outcome::Restored {
+                    window,
+                    ok: false,
+                    failure: Some(Failure::Other),
+                },
+                Command::Activate { window } => Outcome::Activated {
+                    window,
+                    result: Err(Failure::Other),
+                },
                 _ => Outcome::Parked {
                     window: command.window(),
                     result: Err(Failure::Other),
@@ -112,6 +143,17 @@ pub(crate) enum Outcome {
     Restored {
         window: WindowId,
         ok: bool,
+        /// Why a return failed (`None` when it succeeded). `Locked` and `SecureInput` mean the
+        /// session was closed or the OS could not prove it open: the agent retries those when the
+        /// session opens again (no window is lost), and leaves every other failure to the
+        /// journal's startup recovery.
+        failure: Option<Failure>,
+    },
+    /// The focus request ran (or was refused) on the worker; the focus change itself arrives as a
+    /// window event.
+    Activated {
+        window: WindowId,
+        result: Result<(), Failure>,
     },
     Panicked,
 }
@@ -178,28 +220,49 @@ pub(crate) struct Worker {
     stopped: mpsc::Receiver<Parking>,
     abandoned: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    can_activate: bool,
     #[cfg(test)]
     next_test_id: u64,
 }
 
 impl Worker {
+    /// A worker that parks and restores only (the agent starts its own with an activator).
+    #[cfg(test)]
     pub(crate) fn start(
         backend: Box<dyn WindowParking>,
         events: mpsc::Sender<Event>,
     ) -> std::io::Result<Self> {
+        Self::start_with_activator(backend, None, events)
+    }
+
+    /// As `start`, and the worker also carries out `Command::Activate` through `activator`.
+    pub(crate) fn start_with_activator(
+        backend: Box<dyn WindowParking>,
+        activator: Option<Activator>,
+        events: mpsc::Sender<Event>,
+    ) -> std::io::Result<Self> {
         Self::start_inner(
             backend,
+            activator,
             events,
             #[cfg(test)]
             None,
         )
     }
 
+    /// Whether `Command::Activate` can run here. Without an activator the agent focuses windows
+    /// itself.
+    pub(crate) fn can_activate(&self) -> bool {
+        self.can_activate
+    }
+
     fn start_inner(
         backend: Box<dyn WindowParking>,
+        activator: Option<Activator>,
         events: mpsc::Sender<Event>,
         #[cfg(test)] before_claim: Option<BeforeClaim>,
     ) -> std::io::Result<Self> {
+        let can_activate = activator.is_some();
         let (wake, rx) = mpsc::sync_channel(1);
         let (stopped_tx, stopped) = mpsc::sync_channel(1);
         let state = Arc::new(Mutex::new(State::default()));
@@ -211,9 +274,11 @@ impl Worker {
             .name("crosspane-parking".into())
             .spawn(move || {
                 let mut backend = backend;
+                let mut activator = activator;
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     run(
                         backend.as_mut(),
+                        &mut activator,
                         rx,
                         &sink,
                         &shared,
@@ -265,6 +330,7 @@ impl Worker {
             stopped,
             abandoned,
             thread: Some(thread),
+            can_activate,
             #[cfg(test)]
             next_test_id: 1,
         })
@@ -291,6 +357,12 @@ impl Worker {
             // Superseded geometry never runs, even if a Park/Restore separates the two
             // resize requests. The replacement enters at its own arrival position.
             state.ready.retain(|queued| !matches!(queued.command, Command::Resize { window, .. } if window == command.window()));
+        }
+        if matches!(command, Command::Activate { .. } | Command::Restore { .. }) {
+            // A newer focus request replaces a queued one, and a window that is being returned
+            // is not focused after the fact. A claimed activation is never cancelled: it is the
+            // call in flight, and the return queues behind it.
+            state.ready.retain(|queued| !matches!(queued.command, Command::Activate { window } if window == command.window()));
         }
         if matches!(command, Command::Restore { .. }) {
             if state.waiting_restores.is_empty() && state.ready.len() < QUEUE_CAP {
@@ -427,7 +499,11 @@ fn claim(shared: &Shared, events: &mpsc::Sender<Event>, abandoned: &AtomicBool) 
     }
 }
 
-fn operation(backend: &mut dyn WindowParking, job: Job) -> Completion {
+fn operation(
+    backend: &mut dyn WindowParking,
+    activator: &mut Option<Activator>,
+    job: Job,
+) -> Completion {
     #[cfg(windows)]
     let mut notice = None;
     let outcome = match job.command {
@@ -474,6 +550,7 @@ fn operation(backend: &mut dyn WindowParking, job: Job) -> Completion {
                         Command::Park { .. } => "park",
                         Command::Resize { .. } => "move",
                         Command::Restore { .. } => "restore",
+                        Command::Activate { .. } => "activate",
                     },
                     "parking operation failed"
                 );
@@ -483,15 +560,30 @@ fn operation(backend: &mut dyn WindowParking, job: Job) -> Completion {
                 {
                     notice = Some(crosspane_platform_windows::model::parking::PENDING_REPARK_REASON);
                 }
-                match error {
-                    PlatformError::Locked => Failure::Locked,
-                    PlatformError::SecureInput => Failure::SecureInput,
-                    PlatformError::PointerButtonHeld => Failure::PointerButtonHeld,
-                    PlatformError::PermissionDenied(_) => Failure::PermissionDenied,
-                    _ => Failure::Other,
-                }
+                failure_of(&error)
             });
             Outcome::Parked { window, result }
+        }
+        Command::Activate { window } => {
+            // A panic here is the focus call's, not the parking backend's: the worker, and the
+            // journal recovery it owns, carry on.
+            let result = match activator.as_mut() {
+                Some(activate) => catch_unwind(AssertUnwindSafe(|| activate(window)))
+                    .unwrap_or_else(|_| {
+                        Err(PlatformError::Backend("window activation panicked".into()))
+                    }),
+                None => Err(PlatformError::Unsupported("no window activator")),
+            }
+            .map_err(|error| {
+                tracing::warn!(
+                    %error,
+                    operation = job.id,
+                    window = window.0,
+                    "could not focus a projected window: its keys are held back"
+                );
+                failure_of(&error)
+            });
+            Outcome::Activated { window, result }
         }
         Command::Restore { window, place } => {
             let result = match place {
@@ -510,6 +602,7 @@ fn operation(backend: &mut dyn WindowParking, job: Job) -> Completion {
             Outcome::Restored {
                 window,
                 ok: result.is_ok(),
+                failure: result.as_ref().err().map(failure_of),
             }
         }
     };
@@ -523,6 +616,7 @@ fn operation(backend: &mut dyn WindowParking, job: Job) -> Completion {
 
 fn run(
     backend: &mut dyn WindowParking,
+    activator: &mut Option<Activator>,
     rx: mpsc::Receiver<()>,
     events: &mpsc::Sender<Event>,
     shared: &Shared,
@@ -538,7 +632,7 @@ fn run(
         loop {
             match claim(shared, events, abandoned) {
                 Claim::Job(job) => {
-                    let completion = operation(backend, job);
+                    let completion = operation(backend, activator, job);
                     let Ok(mut state) = shared.lock() else {
                         return Parking::Failed;
                     };
@@ -775,6 +869,7 @@ pub(crate) mod tests {
         let (release, gate) = mpsc::channel();
         let worker = Worker::start_inner(
             Box::new(backend),
+            None,
             events,
             Some(BeforeClaim {
                 entered,
@@ -1102,6 +1197,169 @@ pub(crate) mod tests {
         assert!(controls.journal.load(Ordering::SeqCst));
         assert!(controls.observed.try_recv().is_err());
     }
+
+    type ActivationLog = Arc<Mutex<Vec<WindowId>>>;
+
+    /// An activator that records the window, announces it, and then waits for one token on `gate`.
+    fn activator(
+        log: &ActivationLog,
+        entered: mpsc::Sender<WindowId>,
+        gate: mpsc::Receiver<()>,
+    ) -> Activator {
+        let log = log.clone();
+        Box::new(move |window| {
+            log.lock().unwrap().push(window);
+            let _ = entered.send(window);
+            gate.recv().unwrap();
+            Ok(())
+        })
+    }
+
+    fn activate(window: u64) -> Command {
+        Command::Activate {
+            window: WindowId(window),
+        }
+    }
+
+    #[test]
+    fn activation_runs_on_the_worker_in_order_with_a_return_of_the_same_window() {
+        let (backend, controls) = fake(None);
+        let (events, rx) = mpsc::channel();
+        let log = ActivationLog::default();
+        let (entered_tx, entered) = mpsc::channel();
+        let (open, gate) = mpsc::channel();
+        let mut worker = Worker::start_with_activator(
+            Box::new(backend),
+            Some(activator(&log, entered_tx, gate)),
+            events,
+        )
+        .unwrap();
+        assert!(worker.can_activate());
+        // `submit` returns while the first activation is blocked: the caller never waits for it.
+        worker.submit(activate(1));
+        assert_eq!(
+            entered.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WindowId(1)
+        );
+        worker.submit(activate(1));
+        worker.submit(activate(2));
+        worker.submit(Command::Restore {
+            window: WindowId(1),
+            place: None,
+        });
+        // The return of window 1 dropped its queued (not yet claimed) activation, kept window 2's,
+        // and waits behind the call in flight: the worker is serial.
+        assert_eq!(
+            worker
+                .state
+                .lock()
+                .unwrap()
+                .ready
+                .iter()
+                .map(|job| job.command)
+                .collect::<Vec<_>>(),
+            vec![
+                activate(2),
+                Command::Restore {
+                    window: WindowId(1),
+                    place: None
+                }
+            ]
+        );
+        assert!(controls.observed.try_recv().is_err());
+        open.send(()).unwrap();
+        open.send(()).unwrap();
+        assert!(matches!(
+            next(&mut worker, &rx),
+            Outcome::Activated {
+                window: WindowId(1),
+                result: Ok(())
+            }
+        ));
+        assert!(matches!(
+            next(&mut worker, &rx),
+            Outcome::Activated {
+                window: WindowId(2),
+                result: Ok(())
+            }
+        ));
+        assert_eq!(call(&controls), (Kind::Restore, WindowId(1), 0));
+        assert!(matches!(
+            next(&mut worker, &rx),
+            Outcome::Restored { ok: true, .. }
+        ));
+        assert_eq!(*log.lock().unwrap(), [WindowId(1), WindowId(2)]);
+        worker.shutdown(SHUTDOWN_WAIT);
+    }
+
+    #[test]
+    fn a_refused_or_panicking_activation_reports_failure_and_leaves_parking_running() {
+        let (backend, _controls) = fake(None);
+        let (events, rx) = mpsc::channel();
+        let mut worker = Worker::start(Box::new(backend), events).unwrap();
+        assert!(!worker.can_activate());
+        worker.submit(activate(1));
+        assert!(matches!(
+            next(&mut worker, &rx),
+            Outcome::Activated {
+                result: Err(Failure::Other),
+                ..
+            }
+        ));
+        worker.shutdown(SHUTDOWN_WAIT);
+
+        let (backend, controls_after) = fake(None);
+        let (events, rx) = mpsc::channel();
+        let mut worker = Worker::start_with_activator(
+            Box::new(backend),
+            Some(Box::new(|_| panic!("fixture: activation panic"))),
+            events,
+        )
+        .unwrap();
+        worker.submit(activate(1));
+        assert!(matches!(
+            next(&mut worker, &rx),
+            Outcome::Activated {
+                result: Err(Failure::Other),
+                ..
+            }
+        ));
+        worker.submit(park(2));
+        assert_eq!(call(&controls_after).0, Kind::Park);
+        assert!(matches!(
+            next(&mut worker, &rx),
+            Outcome::Parked { result: Ok(_), .. }
+        ));
+        assert_eq!(worker.shutdown(SHUTDOWN_WAIT).0, Parking::Restored);
+    }
+
+    #[test]
+    fn shutdown_discards_a_queued_activation() {
+        let (backend, controls) = fake(Some(Kind::Resize));
+        let (events, _rx) = mpsc::channel();
+        let log = ActivationLog::default();
+        let (entered_tx, _entered) = mpsc::channel();
+        let (_open, gate) = mpsc::channel();
+        let mut worker = Worker::start_with_activator(
+            Box::new(backend),
+            Some(activator(&log, entered_tx, gate)),
+            events,
+        )
+        .unwrap();
+        worker.submit(resize(1, 100));
+        call(&controls);
+        worker.submit(activate(3));
+        let scheduler = worker.state.clone();
+        let shutdown = std::thread::spawn(move || worker.shutdown(SHUTDOWN_WAIT));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !scheduler.lock().unwrap().stopping {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        controls.release.send(()).unwrap();
+        shutdown.join().unwrap();
+        assert!(log.lock().unwrap().is_empty());
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -1138,6 +1396,7 @@ mod windows_pending_notice_tests {
         };
         let done = operation(
             &mut Refused(reason),
+            &mut None,
             Job {
                 id: 1,
                 command: park,
@@ -1154,6 +1413,7 @@ mod windows_pending_notice_tests {
         assert_eq!(
             operation(
                 &mut Refused("different unsupported reason"),
+                &mut None,
                 Job {
                     id: 2,
                     command: park
@@ -1171,6 +1431,7 @@ mod windows_pending_notice_tests {
         assert_eq!(
             operation(
                 &mut Refused(reason),
+                &mut None,
                 Job {
                     id: 3,
                     command: resize

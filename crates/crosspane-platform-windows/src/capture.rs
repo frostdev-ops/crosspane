@@ -5,8 +5,11 @@
 //! acknowledgment ends capture within approximately 500 ms plus scheduling/native-call delay.
 //! After hook loss at most one pair can reach the foreground. F24 is not universally unused.
 //! Partial insertion owes only its matching up, retried three times; a failed up remains \[U\],
-//! possibly held locally. It is never reported as verified cleanup. Native calls have no public
-//! hard real-time guarantee. Mouse Raw Input mismatch conservatively ends both hooks without
+//! possibly held locally. It is never reported as verified cleanup. A probe is never sent to a
+//! foreground that UIPI would silently drop it for (a higher-integrity or secure-desktop window,
+//! or one whose integrity cannot be read): that ends an active capture as `Lost` ("elevated
+//! foreground") and refuses an activation with `SecureInput`, and is never a fault. Native calls
+//! have no public hard real-time guarantee. Mouse Raw Input mismatch conservatively ends both hooks without
 //! claiming that Windows removes them together. This backend exclusively owns mouse Raw Input.
 
 #![allow(unsafe_code)]
@@ -25,6 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::inject::{own_integrity, process_integrity};
 use crosspane_platform::{
     CaptureAbort, CaptureEvent, CaptureId, CapturePortal, CaptureStart, Edge, EndReason, EventSink,
     InputCapture, IoGate, MotionKind, PlatformError, PortalId,
@@ -43,7 +47,8 @@ use windows_sys::Win32::{
     System::{
         LibraryLoader::GetModuleHandleW,
         Threading::{
-            GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+            GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, SetThreadPriority,
+            THREAD_PRIORITY_HIGHEST,
         },
     },
     UI::{
@@ -62,7 +67,10 @@ use windows_sys::Win32::{
 };
 
 use crate::model::{
-    capture::{self as model, Probe, ProbeAction, Resource, Watchdog},
+    capture::{
+        self as model, ForegroundClass, Probe, ProbeAction, ProbeDecision, ProbePhase, ProbeStage,
+        Resource, Watchdog,
+    },
     geometry::{DisplayIds, MonitorProbe, displays},
     hook::{
         DragSettlementResult, HookState, KeyIn, KeySnapshot, MouseIn, MouseKind, drag_up_transition,
@@ -77,6 +85,52 @@ thread_local! { static CALLBACK: Cell<*const Shared> = const { Cell::new(null())
 
 fn error(message: &'static str) -> PlatformError {
     PlatformError::Backend(message.into())
+}
+/// Fault sites, indexed by `Shared::fault_cause`. Fixed labels only: no key, button or position.
+const FAULT_CAUSES: [&str; 17] = [
+    "unrecorded",
+    "event queue full",
+    "callback ring full",
+    "owner wake failed",
+    "pointer release failed",
+    "event delivery panicked",
+    "unmapped key",
+    "raw input read failed",
+    "absolute raw mouse input",
+    "owner panicked",
+    "probe thread unavailable",
+    "watchdog unavailable",
+    "drag observer lost",
+    "mouse raw input registration changed",
+    "pointer clip lost",
+    "probe submission lost",
+    "probe unacknowledged",
+];
+/// Why the latest capture ended as `Lost`, as an index into `LOSS_CAUSES`. One backend per process.
+static LAST_LOSS: AtomicU8 = AtomicU8::new(0);
+const LOSS_CAUSES: [&str; 10] = [
+    "unrecorded",
+    "fault",
+    "keyboard probe unacknowledged",
+    "session gate closed or epoch changed",
+    "owner thread stalled",
+    "mouse hook silent while raw input moved",
+    "activation raced a gate or generation change",
+    "probe due while the gate was closed",
+    "owner thread ended",
+    "elevated foreground: input cannot be verified",
+];
+/// `LOSS_CAUSES` index: the foreground is elevated or secure, so UIPI would drop the probe.
+const LOSS_ELEVATED: u8 = 9;
+/// The cause of the latest `Lost` capture end in this process (fixed text, never input data).
+pub fn last_loss() -> &'static str {
+    LOSS_CAUSES
+        .get(usize::from(LAST_LOSS.load(Ordering::Acquire)))
+        .copied()
+        .unwrap_or("unrecorded")
+}
+fn note_loss(cause: u8) {
+    LAST_LOSS.store(cause, Ordering::Release);
 }
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -167,6 +221,8 @@ struct Shared {
     reason: AtomicU8,
     shutdown: AtomicBool,
     fault: AtomicBool,
+    /// The first fault's site (`FAULT_CAUSES` index), for the error text. Never input data.
+    fault_cause: AtomicU8,
     thread: AtomicU32,
     pump: AtomicU64,
     mouse_hook_count: AtomicU64,
@@ -181,6 +237,9 @@ struct Shared {
     ack: AtomicU8,
     probe_at: AtomicU64,
     probe_owed: AtomicBool,
+    /// Set by the probe thread when, during warm-up, the foreground turned out to be elevated or
+    /// secure and no probe was sent. The owner then refuses the activation; reset by each warm-up.
+    foreground_refused: AtomicBool,
     keys: [AtomicU8; 768],
     key_tokens: [AtomicU64; 768],
     buttons: [AtomicU8; 5],
@@ -219,6 +278,7 @@ impl Shared {
             reason: AtomicU8::new(0),
             shutdown: AtomicBool::new(false),
             fault: AtomicBool::new(false),
+            fault_cause: AtomicU8::new(0),
             thread: AtomicU32::new(0),
             pump: AtomicU64::new(0),
             mouse_hook_count: AtomicU64::new(0),
@@ -233,6 +293,7 @@ impl Shared {
             ack: AtomicU8::new(0),
             probe_at: AtomicU64::new(0),
             probe_owed: AtomicBool::new(false),
+            foreground_refused: AtomicBool::new(false),
             keys: std::array::from_fn(|_| AtomicU8::new(0)),
             key_tokens: std::array::from_fn(|_| AtomicU64::new(0)),
             buttons: std::array::from_fn(|_| AtomicU8::new(0)),
@@ -270,10 +331,25 @@ impl Shared {
     fn active_token(&self) -> Option<u64> {
         self.active_snapshot().map(|s| s.1)
     }
+    /// Faults are terminal; the first site is kept for `lost`.
+    fn fail(&self, cause: u8) {
+        let _ = self
+            .fault_cause
+            .compare_exchange(0, cause, Ordering::AcqRel, Ordering::Acquire);
+        self.fault.store(true, Ordering::Release);
+    }
+    /// `what` observation lost, with the first fault's site.
+    fn lost(&self, what: &str) -> PlatformError {
+        let cause = usize::from(self.fault_cause.load(Ordering::Acquire));
+        PlatformError::Backend(format!(
+            "{what} observation lost ({})",
+            FAULT_CAUSES.get(cause).copied().unwrap_or("unrecorded")
+        ))
+    }
     fn enqueue(&self, id: Option<u64>, event: CaptureEvent) {
         let mut events = lock(&self.events);
         if events.len() >= 4096 && !matches!(event, CaptureEvent::Started { .. }) {
-            self.fault.store(true, Ordering::Release);
+            self.fail(1);
             return;
         }
         events.push_back((id, event));
@@ -286,11 +362,11 @@ impl Shared {
             captured: capture.is_some(),
             token: capture.map_or(0, |s| s.1),
         }) {
-            self.fault.store(true, Ordering::Release);
+            self.fail(2);
         }
         // SAFETY: posts a scalar wakeup to our live owner thread; no pointers or allocations.
         if unsafe { PostThreadMessageW(self.thread.load(Ordering::Acquire), WAKE, 0, 0) } == 0 {
-            self.fault.store(true, Ordering::Release);
+            self.fail(3);
         }
     }
     /// Independent of owner/model locks. The delivery thread serializes the terminal event.
@@ -334,7 +410,7 @@ impl Shared {
             if unsafe { ClipCursor(null()) } == 0 {
                 // Preserve the release obligation for subsequent owned cleanup attempts.
                 self.clipped.store(true, Ordering::Release);
-                self.fault.store(true, Ordering::Release);
+                self.fail(4);
                 self.cleanup_verified.store(false, Ordering::Release);
                 eprintln!("crosspane capture pointer release unverified");
             }
@@ -461,7 +537,8 @@ impl CaptureAbort for Abort {
 fn deliver(shared: Arc<Shared>) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| deliver_events(&shared)));
     if result.is_err() {
-        shared.fault.store(true, Ordering::Release);
+        shared.fail(5);
+        note_loss(1);
         shared.terminate(EndReason::Lost);
         eprintln!("crosspane capture delivery failed");
     }
@@ -546,7 +623,7 @@ unsafe extern "system" fn keyboard_callback(
             let Some(index) =
                 model::key_slot(key.scanCode, key.flags & LLKHF_EXTENDED != 0, key.vkCode)
             else {
-                shared.fault.store(true, Ordering::Release);
+                shared.fail(6);
                 return;
             };
             let id = shared.active_snapshot();
@@ -690,7 +767,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                     size_of::<RAWINPUTHEADER>() as u32,
                 ) == u32::MAX
                 {
-                    shared.fault.store(true, Ordering::Release);
+                    shared.fail(7);
                     return;
                 }
                 if input.header.dwType != RIM_TYPEMOUSE || input.header.hDevice.is_null() {
@@ -702,7 +779,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                     shared.raw_count.fetch_add(1, Ordering::AcqRel);
                 }
                 if mouse.usFlags & 1 != 0 {
-                    shared.fault.store(true, Ordering::Release);
+                    shared.fail(8);
                     return;
                 }
                 shared
@@ -897,6 +974,9 @@ impl WindowsCapture {
                 return Err(e);
             }
         };
+        // The owner slot is ours, so this backend starts with no recorded loss: a rebuilt backend
+        // must never report the cause of the one before it.
+        LAST_LOSS.store(0, Ordering::Release);
         let shared = Arc::new(Shared::new(gate));
         let (commands, receive) = mpsc::sync_channel(16);
         let (ready, wait) = mpsc::sync_channel(1);
@@ -947,6 +1027,20 @@ impl WindowsCapture {
         self
     }
 
+    /// Whether this backend can never serve another request: its owner thread has ended, or a
+    /// fault is recorded (faults are terminal; every later request answers "observation lost").
+    /// Two atomic loads, safe from any thread.
+    pub fn is_dead(&self) -> bool {
+        is_dead(&self.shared)
+    }
+
+    /// A handle for asking `is_dead` after this backend has been boxed as a `dyn InputCapture`.
+    /// It holds no strong reference, so it never keeps a dropped backend (or the process-wide
+    /// owner slot) alive.
+    pub fn health(&self) -> CaptureHealth {
+        CaptureHealth(Arc::downgrade(&self.shared))
+    }
+
     fn request<T>(
         &self,
         command: impl FnOnce(mpsc::SyncSender<Result<T, PlatformError>>) -> Command,
@@ -954,7 +1048,7 @@ impl WindowsCapture {
         if self.shared.owner_done.load(Ordering::Acquire)
             || self.shared.fault.load(Ordering::Acquire)
         {
-            return Err(error("capture observation lost"));
+            return Err(self.shared.lost("capture"));
         }
         let (reply, wait) = mpsc::sync_channel(1);
         self.commands
@@ -1115,7 +1209,57 @@ impl Drop for WindowsCapture {
         self.shared.terminate(EndReason::Aborted);
         self.shared.shutdown.store(true, Ordering::Release);
         // No join on the native thread: its retained Arc owns all callback resources until exit.
+        // A dead backend's owner has already torn the hooks, the raw registration and the clip
+        // down (before `owner_done`), and its helper threads leave on `owner_done`; the owner slot
+        // is released when the last of them drops its `Arc<Shared>`. `wait_owner_released` is how
+        // a caller that wants to build a replacement waits for exactly that.
     }
+}
+
+fn is_dead(shared: &Shared) -> bool {
+    shared.owner_done.load(Ordering::Acquire) || shared.fault.load(Ordering::Acquire)
+}
+
+/// Asks whether a backend can never serve another request (`WindowsCapture::is_dead`) without
+/// owning it. Weak: it neither keeps the backend's state alive nor delays the release of the
+/// process-wide owner slot.
+#[derive(Clone, Debug)]
+pub struct CaptureHealth(std::sync::Weak<Shared>);
+
+impl CaptureHealth {
+    /// `Some(cause)` once the backend can never serve another request. The cause is a fixed label
+    /// (the first fault's site, or that the owner thread ended): never key, button or pointer
+    /// data. `None` while the backend is serving.
+    pub fn lost(&self) -> Option<&'static str> {
+        let Some(shared) = self.0.upgrade() else {
+            return Some("backend released");
+        };
+        if shared.fault.load(Ordering::Acquire) {
+            let cause = usize::from(shared.fault_cause.load(Ordering::Acquire));
+            return Some(FAULT_CAUSES.get(cause).copied().unwrap_or("unrecorded"));
+        }
+        shared
+            .owner_done
+            .load(Ordering::Acquire)
+            .then_some("owner thread ended")
+    }
+}
+
+/// Waits until no capture owner exists in this process, so a new `WindowsCapture` can be built.
+/// The slot is released when the last thread of a dropped backend lets go of its state; for a dead
+/// backend that is the owner (after it removed its hooks, raw registration and clip), the
+/// watchdog, the probe and the delivery thread, each of which ends on `owner_done` within tens of
+/// milliseconds. `false` when the slot is still held after `timeout` (for example an owner still
+/// containing the tail of a physical drag): the caller may try again later.
+pub fn wait_owner_released(timeout: Duration) -> bool {
+    let deadline = Instant::now().checked_add(timeout);
+    while OWNER.load(Ordering::Acquire) {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    true
 }
 
 fn mouse_target() -> Result<Option<HWND>, PlatformError> {
@@ -1467,6 +1611,72 @@ fn nonce() -> Result<usize, PlatformError> {
     }
 }
 
+/// Classifies the current foreground window against this process's integrity (see
+/// `ForegroundClass`). Mirrors the injector's foreground read (`inject.rs` `foreground`): window,
+/// pid and thread, the pid's token integrity, then the window and pid again. A foreground that
+/// changes while it is read is read again (three attempts) and otherwise reads as unknown. Our own
+/// process is at our own integrity without a query. A null foreground, which is what the secure
+/// desktop and another input desktop look like to this process, is `Absent`. Reads identity only:
+/// no titles, content or input.
+fn foreground_class() -> ForegroundClass {
+    let own = own_integrity();
+    for _ in 0..3 {
+        // SAFETY: read-only foreground identity queries; no titles or content are acquired.
+        let (window, pid) = unsafe {
+            let window = GetForegroundWindow();
+            let mut pid = 0;
+            if !window.is_null() && GetWindowThreadProcessId(window, &mut pid) == 0 {
+                pid = 0;
+            }
+            (window, pid)
+        };
+        if window.is_null() {
+            return ForegroundClass::Absent;
+        }
+        if pid == 0 {
+            continue;
+        }
+        // SAFETY: reads only this process's id.
+        let foreground = if pid == unsafe { GetCurrentProcessId() } {
+            own
+        } else {
+            process_integrity(pid)
+        };
+        // SAFETY: read-only recheck that the same window still belongs to the same process.
+        let unchanged = unsafe {
+            let mut again = 0;
+            GetForegroundWindow() == window
+                && GetWindowThreadProcessId(window, &mut again) != 0
+                && again == pid
+        };
+        if unchanged {
+            return model::classify_foreground(true, foreground, own);
+        }
+    }
+    ForegroundClass::Unknown
+}
+
+fn probe_phase(shared: &Shared) -> ProbePhase {
+    if shared.warming.load(Ordering::Acquire) {
+        ProbePhase::Warming
+    } else {
+        ProbePhase::Active
+    }
+}
+
+/// Ends the capture as `Lost` because its foreground is elevated or secure and input cannot be
+/// verified. Deliberately not a fault: nothing is wrong with the backend, so it stays usable and
+/// the user simply gets control back on this machine. Does nothing when no capture is live (a
+/// stale decision for a capture that already ended must not mislabel it or cancel a new one).
+fn end_for_elevated_foreground(shared: &Shared) {
+    let live = shared.warming.load(Ordering::Acquire)
+        || shared.generation.load(Ordering::Acquire) & 3 == model::ACTIVE;
+    if live {
+        note_loss(LOSS_ELEVATED);
+        shared.terminate(EndReason::Lost);
+    }
+}
+
 fn submit_probe(_shared: &Shared, nonce: usize, up_only: bool) -> u32 {
     #[cfg(test)]
     {
@@ -1527,6 +1737,18 @@ fn prepare_capture(
     point: POINT,
     nonce: usize,
 ) -> Result<(), PlatformError> {
+    // UIPI would silently drop the warm-up probe aimed at an elevated or secure foreground, so
+    // the capture could never be verified: refuse now, before any hook, clip or cursor is taken.
+    // A refusal, not a fault; the caller rolls back and the backend stays usable.
+    if model::probe_decision(
+        foreground_class(),
+        ProbePhase::Warming,
+        ProbeStage::BeforeSubmit,
+    ) == ProbeDecision::Refuse
+    {
+        return Err(PlatformError::SecureInput);
+    }
+    shared.foreground_refused.store(false, Ordering::Release);
     shared.probe_at.store(0, Ordering::Release);
     shared.ack.store(0, Ordering::Release);
     shared.active_epoch.store(epoch, Ordering::Release);
@@ -1584,7 +1806,8 @@ fn owner_thread(
         run_owner(&shared, monitors, commands, &ready, drag)
     }));
     if result.is_err() {
-        shared.fault.store(true, Ordering::Release);
+        shared.fail(9);
+        note_loss(1);
         shared.terminate(EndReason::Lost);
         eprintln!("crosspane capture owner failed");
     }
@@ -1662,7 +1885,7 @@ fn run_owner(
         .spawn(move || probe_thread(health, probe_rx))
         .is_err()
     {
-        shared.fault.store(true, Ordering::Release);
+        shared.fail(10);
         return;
     }
     let health = shared.clone();
@@ -1681,17 +1904,33 @@ fn run_owner(
                     let probe_lost = probe_at != 0
                         && health.ack.load(Ordering::Acquire) != 3
                         && time.saturating_sub(probe_at - 1) >= model::PROBE_TIMEOUT_MS;
-                    if health.fault.load(Ordering::Acquire)
-                        || probe_lost
-                        || watch.lost(
-                            time,
-                            health.gate.is_open(),
-                            health.gate.epoch(),
-                            health.pump.load(Ordering::Acquire),
-                            health.mouse_hook_count.load(Ordering::Acquire),
-                            health.raw_count.load(Ordering::Acquire),
-                        )
-                    {
+                    let gate = health.gate.is_open();
+                    let epoch = health.gate.epoch();
+                    let pump = health.pump.load(Ordering::Acquire);
+                    let cause = if health.fault.load(Ordering::Acquire) {
+                        1
+                    } else if probe_lost {
+                        2
+                    } else if watch.lost(
+                        time,
+                        gate,
+                        epoch,
+                        pump,
+                        health.mouse_hook_count.load(Ordering::Acquire),
+                        health.raw_count.load(Ordering::Acquire),
+                    ) {
+                        if !gate || epoch != watch.epoch() {
+                            3
+                        } else if time.saturating_sub(pump) >= model::PUMP_TIMEOUT_MS {
+                            4
+                        } else {
+                            5
+                        }
+                    } else {
+                        0
+                    };
+                    if cause != 0 {
+                        note_loss(cause);
                         health.terminate(EndReason::Lost);
                     }
                 } else {
@@ -1702,7 +1941,7 @@ fn run_owner(
         })
         .is_err()
     {
-        shared.fault.store(true, Ordering::Release);
+        shared.fail(11);
         return;
     }
     let _ = ready.send(Ok(()));
@@ -1769,7 +2008,7 @@ fn run_owner(
                             shared.enqueue(None, event);
                         }
                     }
-                    Err(_) => shared.fault.store(true, Ordering::Release),
+                    Err(_) => shared.fail(12),
                 }
             }
         }
@@ -1786,12 +2025,13 @@ fn run_owner(
         }
         old_active = active;
         if shared.fault.load(Ordering::Acquire) {
+            note_loss(1);
             shared.terminate(EndReason::Lost);
             hook.end(EndReason::Lost, event_time());
             native.release_capture();
             let _ = probe_tx.try_send(None);
             if let Some(p) = pending.take() {
-                let _ = p.reply.send(Err(error("drag observation lost")));
+                let _ = p.reply.send(Err(shared.lost("drag")));
             }
             // Narrow fault exception: only the ONE reserved primary's counterpart remains
             // contained. No activation/input delivery/probes occur after terminal failure.
@@ -1856,6 +2096,19 @@ fn run_owner(
                     }
                 } else {
                     pending = Some(p);
+                }
+            } else if shared.foreground_refused.load(Ordering::Acquire) {
+                // The foreground turned elevated or secure during warm-up and the probe thread
+                // sent no probe: refuse now rather than time out. Nothing is owed (nothing was
+                // submitted) and nothing is faulted.
+                shared.warming.store(false, Ordering::Release);
+                native.release_capture();
+                let _ = probe_tx.try_send(None);
+                let _ = p.reply.send(Err(PlatformError::SecureInput));
+                if let Some(drag) = &mut drag {
+                    for event in drag.retire(event_time()) {
+                        shared.enqueue(None, event);
+                    }
                 }
             } else if shared.ack.load(Ordering::Acquire) == 3 {
                 let (held, mut buttons) = snapshot(shared);
@@ -1954,6 +2207,7 @@ fn run_owner(
                             || !shared.gate.is_open()
                             || shared.gate.epoch() != p.epoch
                         {
+                            note_loss(6);
                             shared.terminate(EndReason::Lost);
                             let _ = p.reply.send(Err(PlatformError::Locked));
                             if let Some(drag) = &mut drag {
@@ -2250,23 +2504,28 @@ fn run_owner(
         if now(shared.start).saturating_sub(raw_check) >= 100 {
             raw_check = now(shared.start);
             if mouse_target().map_or(true, |target| target != Some(native.hwnd)) {
-                shared.fault.store(true, Ordering::Release);
+                shared.fail(13);
+                note_loss(1);
                 shared.terminate(EndReason::Lost);
             }
             if shared.active_id().is_some()
                 && clip_point.is_none_or(|point| !native.capture_healthy(point))
             {
-                shared.fault.store(true, Ordering::Release);
+                shared.fail(14);
+                note_loss(1);
                 shared.terminate(EndReason::Lost);
             }
         }
         thread::sleep(Duration::from_millis(1));
     }
+    if LAST_LOSS.load(Ordering::Acquire) == 0 {
+        note_loss(8);
+    }
     shared.terminate(EndReason::Lost);
     native.cleanup();
     let _ = probe_tx.try_send(None);
     if let Some(p) = pending {
-        let _ = p.reply.send(Err(error("capture observation lost")));
+        let _ = p.reply.send(Err(shared.lost("capture")));
     }
     CALLBACK.with(|slot| slot.set(null()));
 }
@@ -2305,31 +2564,71 @@ fn probe_thread(shared: Arc<Shared>, commands: mpsc::Receiver<Option<(usize, u64
             }
             match p.poll(now(shared.start)) {
                 ProbeAction::Pair => {
-                    shared.probe_owed.store(true, Ordering::Release);
-                    shared.ack.store(0, Ordering::Release);
-                    shared
-                        .probe_at
-                        .store(now(shared.start).saturating_add(1), Ordering::Release);
-                    if !shared.gate.is_open() || shared.gate.epoch() != epoch {
-                        p.submitted(0);
-                        shared.probe_owed.store(false, Ordering::Release);
-                        p.stop(now(shared.start));
-                        shared.terminate(EndReason::Lost);
-                    } else {
-                        let lost = p.submitted(submit_probe(&shared, identity, false))
-                            == ProbeAction::Lost;
-                        shared
-                            .probe_owed
-                            .store(p.cleanup_pending(), Ordering::Release);
-                        if lost {
-                            shared.fault.store(true, Ordering::Release);
-                            shared.terminate(EndReason::Lost);
+                    // Decided before anything is recorded or submitted: UIPI drops an injected
+                    // probe aimed at an elevated or secure foreground while SendInput still
+                    // reports success, so it could never be acknowledged.
+                    match model::probe_decision(
+                        foreground_class(),
+                        probe_phase(&shared),
+                        ProbeStage::BeforeSubmit,
+                    ) {
+                        ProbeDecision::Refuse => {
+                            // Warm-up: no probe is sent and the owner refuses the activation.
+                            // The probe stays armed (a fresh one is due at once), so if the
+                            // capture activated meanwhile its next decision ends it as a loss.
+                            shared.foreground_refused.store(true, Ordering::Release);
+                            probe = Probe::new(identity, now(shared.start));
+                        }
+                        ProbeDecision::EndLostElevated => {
+                            // Nothing was submitted, so nothing is owed and nothing is faulted.
+                            p.submitted(0);
+                            p.stop(now(shared.start));
+                            end_for_elevated_foreground(&shared);
+                        }
+                        // A fault needs a submitted probe, so `Fault` cannot occur here.
+                        ProbeDecision::Probe | ProbeDecision::Fault => {
+                            shared.probe_owed.store(true, Ordering::Release);
+                            shared.ack.store(0, Ordering::Release);
+                            shared
+                                .probe_at
+                                .store(now(shared.start).saturating_add(1), Ordering::Release);
+                            if !shared.gate.is_open() || shared.gate.epoch() != epoch {
+                                p.submitted(0);
+                                shared.probe_owed.store(false, Ordering::Release);
+                                p.stop(now(shared.start));
+                                note_loss(7);
+                                shared.terminate(EndReason::Lost);
+                            } else {
+                                let lost = p.submitted(submit_probe(&shared, identity, false))
+                                    == ProbeAction::Lost;
+                                shared
+                                    .probe_owed
+                                    .store(p.cleanup_pending(), Ordering::Release);
+                                if lost {
+                                    shared.fail(15);
+                                    note_loss(1);
+                                    shared.terminate(EndReason::Lost);
+                                }
+                            }
                         }
                     }
                 }
                 ProbeAction::Lost => {
-                    shared.fault.store(true, Ordering::Release);
-                    shared.terminate(EndReason::Lost);
+                    // A submitted probe went unacknowledged. If the foreground has since turned
+                    // elevated or secure (it changed between the check and SendInput), UIPI
+                    // dropped it: a loss. Otherwise the keyboard hook is gone: a fault.
+                    match model::probe_decision(
+                        foreground_class(),
+                        probe_phase(&shared),
+                        ProbeStage::Unacknowledged,
+                    ) {
+                        ProbeDecision::EndLostElevated => end_for_elevated_foreground(&shared),
+                        ProbeDecision::Fault | ProbeDecision::Probe | ProbeDecision::Refuse => {
+                            shared.fail(16);
+                            note_loss(1);
+                            shared.terminate(EndReason::Lost);
+                        }
+                    }
                 }
                 ProbeAction::Up => {
                     p.up_submitted(submit_probe(&shared, identity, true));
@@ -2627,6 +2926,71 @@ mod tests {
             assert_eq!(shared.drag_order.load(Ordering::Acquire), 0);
             assert!(lock(&shared.events).is_empty());
         }
+    }
+
+    #[test]
+    fn own_token_integrity_reads_and_agrees_with_a_process_query() {
+        let own = own_integrity().expect("this process's own token integrity is readable");
+        // SAFETY: reads only this process's id.
+        let pid = unsafe { GetCurrentProcessId() };
+        assert!((0x1000..=0x5000).contains(&own), "implausible RID {own:#x}");
+        assert_eq!(process_integrity(pid), Some(own));
+        // Our own windows never read as a higher integrity than ours.
+        assert_ne!(
+            model::classify_foreground(true, process_integrity(pid), Some(own)),
+            ForegroundClass::Higher
+        );
+    }
+    #[test]
+    fn a_process_that_cannot_be_opened_reads_as_unknown_not_as_admitted() {
+        // Pid 0 is the idle process and cannot be opened; an unreadable foreground fails closed.
+        assert_eq!(process_integrity(0), None);
+        assert_eq!(
+            model::classify_foreground(true, process_integrity(0), own_integrity()),
+            ForegroundClass::Unknown
+        );
+    }
+    #[test]
+    fn the_foreground_read_is_total_and_reads_no_content() {
+        // Whatever is in front on this machine, the read completes with one of the four classes.
+        assert!(matches!(
+            foreground_class(),
+            ForegroundClass::Absent
+                | ForegroundClass::Unknown
+                | ForegroundClass::Higher
+                | ForegroundClass::LowerOrEqual
+        ));
+    }
+    #[test]
+    fn an_elevated_foreground_ends_a_live_capture_as_lost_and_never_as_a_fault() {
+        let shared = Shared::new(IoGate::new());
+        assert_eq!(probe_phase(&shared), ProbePhase::Active);
+        // No capture is live: a stale decision changes and records nothing.
+        let idle = shared.generation.load(Ordering::Acquire);
+        end_for_elevated_foreground(&shared);
+        assert_eq!(shared.generation.load(Ordering::Acquire), idle);
+        assert!(!shared.end_pending.load(Ordering::Acquire));
+        assert!(!shared.fault.load(Ordering::Acquire));
+        // A warm-up is cancelled, not faulted.
+        shared.warming.store(true, Ordering::Release);
+        assert_eq!(probe_phase(&shared), ProbePhase::Warming);
+        let pending = model::reserve(&shared.generation).unwrap();
+        end_for_elevated_foreground(&shared);
+        assert_ne!(shared.generation.load(Ordering::Acquire), pending);
+        assert_eq!(shared.generation.load(Ordering::Acquire) & 3, model::IDLE);
+        assert!(!shared.warming.load(Ordering::Acquire));
+        assert!(!shared.fault.load(Ordering::Acquire));
+        // An active capture ends as Lost with the elevated label, and the backend stays usable.
+        activate(&shared, 3);
+        end_for_elevated_foreground(&shared);
+        assert!(shared.active_id().is_none());
+        assert!(shared.end_pending.load(Ordering::Acquire));
+        assert_eq!(shared.terminal.load(Ordering::Acquire), 3);
+        assert_eq!(shared.reason.load(Ordering::Acquire), 2);
+        assert!(!shared.fault.load(Ordering::Acquire));
+        assert!(!is_dead(&shared));
+        assert_eq!(last_loss(), LOSS_CAUSES[usize::from(LOSS_ELEVATED)]);
+        assert_eq!(last_loss(), "elevated foreground: input cannot be verified");
     }
 
     fn limited() -> bool {
@@ -3185,5 +3549,45 @@ mod tests {
         );
         // Without a fresh pump read nothing is known; this path calls no native API.
         assert_eq!(lock_keys(false), LockKeys::default());
+    }
+
+    #[test]
+    fn capture_health_reports_a_fault_or_an_ended_owner_and_never_keeps_the_state_alive() {
+        let serving = Arc::new(Shared::new(IoGate::new()));
+        let health = CaptureHealth(Arc::downgrade(&serving));
+        assert!(!is_dead(&serving));
+        assert_eq!(health.lost(), None);
+        // A fault is terminal and names its first site.
+        serving.fail(13);
+        serving.fail(2);
+        assert!(is_dead(&serving));
+        assert_eq!(health.lost(), Some("mouse raw input registration changed"));
+        // An owner that ended without a fault says so.
+        let ended = Arc::new(Shared::new(IoGate::new()));
+        let ended_health = CaptureHealth(Arc::downgrade(&ended));
+        ended.owner_done.store(true, Ordering::Release);
+        assert!(is_dead(&ended));
+        assert_eq!(ended_health.lost(), Some("owner thread ended"));
+        // The handle is weak: once the state is gone the backend counts as released.
+        assert_eq!(Arc::strong_count(&serving), 1);
+        drop(serving);
+        assert_eq!(health.lost(), Some("backend released"));
+    }
+
+    #[test]
+    fn waiting_for_the_owner_slot_returns_once_the_last_holder_drops() {
+        // Dropping the state releases the process-wide slot, as the last thread of a dead backend
+        // does. Another test dropping a `Shared` can only release it earlier, never hold it.
+        OWNER.store(true, Ordering::Release);
+        let shared = Arc::new(Shared::new(IoGate::new()));
+        let holder = shared.clone();
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            drop(holder);
+        });
+        drop(shared);
+        assert!(wait_owner_released(Duration::from_secs(5)));
+        releaser.join().unwrap();
+        assert!(!OWNER.load(Ordering::Acquire));
     }
 }

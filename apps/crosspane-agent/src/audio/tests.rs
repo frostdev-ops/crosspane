@@ -37,140 +37,6 @@ impl Drop for ReleaseSourceGate {
     }
 }
 
-fn receive_speaker_grant(sources: &mut SourceCatalogue, peer: NodeId, enabled: bool) {
-    sources.observe(&crosspane_engine::Input::Link(
-        crosspane_protocol::link::LinkEvent::Control {
-            peer,
-            msg: crosspane_protocol::msg::ControlMessage::Grants(if enabled {
-                vec![crosspane_protocol::msg::Capability::AudioSpeaker]
-            } else {
-                vec![]
-            }),
-        },
-    ));
-}
-
-fn source_notice(node: NodeId, projection: u64, peer: NodeId) -> Output {
-    Output::Notice(crosspane_engine::Notice::ProjectionStarted {
-        key: crosspane_engine::io::ProjectionKey {
-            source: node,
-            projection: crosspane_types::id::ProjectionId(projection),
-        },
-        peer,
-        parking: crosspane_protocol::projection::ParkingKind::Twin,
-    })
-}
-
-#[test]
-fn source_projection_start_sends_current_pids_and_second_window_same_pid_is_unchanged() {
-    let peer = node(46);
-    let node = node(45);
-    let mut sources = SourceCatalogue::default();
-    receive_speaker_grant(&mut sources, peer, true);
-    let first = crosspane_types::id::WindowId(1);
-    sources.outputs(node, Some(first), &[source_notice(node, 1, peer)]);
-    assert_eq!(sources.changes(node, |_| Some(10)), vec![(peer, vec![10])]);
-    sources.outputs(
-        node,
-        Some(crosspane_types::id::WindowId(2)),
-        &[source_notice(node, 2, peer)],
-    );
-    assert!(sources.changes(node, |_| Some(10)).is_empty());
-    assert_eq!(
-        sources.changes(node, |window| Some(if window == first { 20 } else { 10 })),
-        vec![(peer, vec![10, 20])]
-    );
-}
-
-#[test]
-fn source_projection_end_sends_empty_and_destination_or_pidless_window_never_adds_a_source() {
-    let peer = node(48);
-    let node = node(47);
-    let mut sources = SourceCatalogue::default();
-    receive_speaker_grant(&mut sources, peer, true);
-    sources.outputs(
-        node,
-        Some(crosspane_types::id::WindowId(1)),
-        &[source_notice(peer, 1, node)],
-    );
-    assert!(sources.changes(node, |_| Some(99)).is_empty());
-    sources.outputs(
-        node,
-        Some(crosspane_types::id::WindowId(2)),
-        &[source_notice(node, 1, peer)],
-    );
-    assert!(sources.changes(node, |_| None).is_empty());
-    assert_eq!(sources.changes(node, |_| Some(10)), vec![(peer, vec![10])]);
-    sources.outputs(
-        node,
-        None,
-        &[Output::Notice(crosspane_engine::Notice::ProjectionEnded {
-            key: crosspane_engine::io::ProjectionKey {
-                source: node,
-                projection: crosspane_types::id::ProjectionId(1),
-            },
-            reason: crosspane_protocol::projection::ProjectionEndReason::Returned,
-        })],
-    );
-    assert_eq!(sources.changes(node, |_| Some(10)), vec![(peer, vec![])]);
-    assert!(sources.changes(node, |_| Some(10)).is_empty());
-}
-
-#[test]
-fn source_projection_uses_received_grant_only_and_revoke_sends_empty() {
-    let peer = node(50);
-    let node = node(49);
-    let mut sources = SourceCatalogue::default();
-    sources.outputs(
-        node,
-        Some(crosspane_types::id::WindowId(1)),
-        &[source_notice(node, 1, peer)],
-    );
-    sources.observe(&crosspane_engine::Input::Grants(
-        [(
-            peer,
-            [crosspane_protocol::msg::Capability::AudioSpeaker].into(),
-        )]
-        .into(),
-    ));
-    assert!(sources.changes(node, |_| Some(10)).is_empty());
-    receive_speaker_grant(&mut sources, peer, true);
-    assert_eq!(sources.changes(node, |_| Some(10)), vec![(peer, vec![10])]);
-    sources.observe(&crosspane_engine::Input::Grants(Default::default()));
-    assert!(sources.changes(node, |_| Some(10)).is_empty());
-    receive_speaker_grant(&mut sources, peer, false);
-    assert_eq!(sources.changes(node, |_| Some(10)), vec![(peer, vec![])]);
-}
-
-#[test]
-fn source_projection_connection_replacement_and_closed_window_clear_without_cached_pid_rebind() {
-    let peer = node(52);
-    let node = node(51);
-    let mut sources = SourceCatalogue::default();
-    receive_speaker_grant(&mut sources, peer, true);
-    sources.outputs(
-        node,
-        Some(crosspane_types::id::WindowId(1)),
-        &[source_notice(node, 1, peer)],
-    );
-    assert_eq!(sources.changes(node, |_| Some(10)), vec![(peer, vec![10])]);
-    sources.observe(&crosspane_engine::Input::AudioConnectionReplaced { peer });
-    assert_eq!(sources.changes(node, |_| Some(10)), vec![(peer, vec![])]);
-    assert!(sources.changes(node, |_| Some(10)).is_empty());
-    receive_speaker_grant(&mut sources, peer, true);
-    assert_eq!(sources.changes(node, |_| Some(20)), vec![(peer, vec![20])]);
-    sources.observe(&crosspane_engine::Input::Link(
-        crosspane_protocol::link::LinkEvent::Closed {
-            peer,
-            error: LinkError::Closed,
-        },
-    ));
-    assert_eq!(sources.changes(node, |_| Some(20)), vec![(peer, vec![])]);
-    receive_speaker_grant(&mut sources, peer, true);
-    assert_eq!(sources.changes(node, |_| Some(20)), vec![(peer, vec![20])]);
-    assert_eq!(sources.changes(node, |_| None), vec![(peer, vec![])]);
-}
-
 #[test]
 fn source_sets_wait_for_successful_add_and_coalesce_to_latest_before_dispatch() {
     let h = Harness::new();
@@ -530,13 +396,28 @@ impl HostProbe {
             .expect("peer has virtual devices")
     }
 
-    /// Everything the worker has written to playback number `index` so far.
+    /// Everything waiting in playback number `index`'s ring, taken in one step (as a device that
+    /// consumed it all at once), so the data thread never sees the ring half drained.
     fn played(&self, index: usize) -> Vec<f32> {
         let mut playbacks = lock(&self.playbacks);
-        let mut out = Vec::new();
-        while let Ok(sample) = playbacks[index].pcm.pop() {
-            out.push(sample);
-        }
+        let pcm = &mut playbacks[index].pcm;
+        let queued = pcm.slots();
+        Self::take(pcm, queued)
+    }
+
+    /// What a device playing 10 ms would take: at most `samples` from playback `index`'s ring.
+    fn consume(&self, index: usize, samples: usize) -> Vec<f32> {
+        let mut playbacks = lock(&self.playbacks);
+        let pcm = &mut playbacks[index].pcm;
+        let n = samples.min(pcm.slots());
+        Self::take(pcm, n)
+    }
+
+    fn take(pcm: &mut Consumer<f32>, n: usize) -> Vec<f32> {
+        let chunk = pcm.read_chunk(n).expect("queued samples");
+        let (first, second) = chunk.as_slices();
+        let out = first.iter().chain(second).copied().collect();
+        chunk.commit_all();
         out
     }
 
@@ -1127,8 +1008,9 @@ fn tone_round_trips_through_send_and_playout() {
     assert_eq!(h.stats().sent, 50);
 
     // Receive side: the same packets, re-addressed to a playback stream, one per 10 ms of fake
-    // time. Nothing is played before the initial 40 ms jitter delay has run out on the clock;
-    // after it, exactly one whole frame arrives per 10 ms step.
+    // time, and a device that plays one 10 ms frame per step. Nothing is played before the initial
+    // 40 ms jitter delay has run out on the clock; after it, the ring is kept two frames deep and
+    // exactly one whole frame is played per 10 ms step.
     let receiver = key(peer, 2, 2);
     h.open_playback(receiver);
     assert_eq!(*lock(&h.probe.formats), vec![STEREO]);
@@ -1143,7 +1025,7 @@ fn tone_round_trips_through_send_and_playout() {
             },
         );
         h.step();
-        played.extend(h.probe.played(0));
+        played.extend(h.probe.consume(0, 960));
         // The first packet arrived at step 0; the deadline is 40 ms later, which is reached by
         // the clock at the end of step 3.
         let due_frames = i.saturating_sub(2);
@@ -1192,6 +1074,7 @@ fn slow_open_does_not_stall_playout_stop_or_callers() {
     // Playout of A carries on, and no caller waits for the host.
     let packets = tone_packets(1, 12);
     let mut slowest = Duration::ZERO;
+    let mut played = 0;
     for packet in packets.iter().take(8) {
         let started = Instant::now();
         h.w().packet(peer, packet.clone());
@@ -1202,19 +1085,19 @@ fn slow_open_does_not_stall_playout_stop_or_callers() {
         h.clock.advance(Duration::from_millis(10));
         h.wait_applied();
         h.run_passes(2);
+        played += h.probe.consume(0, 960).len();
     }
     assert!(
         slowest < Duration::from_millis(300),
         "a caller waited {slowest:?} behind a host call"
     );
-    assert!(
-        h.probe.played(0).len() >= 3 * 960,
-        "A's playout was delayed"
-    );
+    assert!(played >= 3 * 960, "A's playout was delayed");
 
-    // A stop takes effect while the host is still blocked: nothing more reaches A.
+    // A stop takes effect while the host is still blocked: nothing more reaches A (what it wrote
+    // before the stop is taken out of the ring first).
     h.submit(Output::StopAudioStream { key: a });
     h.wait_applied();
+    h.probe.played(0);
     for packet in packets.iter().skip(8) {
         h.w().packet(peer, packet.clone());
         h.clock.advance(Duration::from_millis(10));
@@ -1926,7 +1809,9 @@ fn removing_a_peer_stops_working_streams_before_its_devices_go() {
     // Only the send that was already inside the link completed; the two queued frames never went.
     assert_eq!(at_removal.packets_sent, sent_before + 1);
     assert_eq!(h.sent_count(), sent_before + 1);
-    // Delivery stays stopped: received packets are dropped and nothing plays.
+    // Delivery stays stopped: received packets are dropped and nothing plays (what the playback
+    // ring held from before the removal is taken out first).
+    h.probe.played(0);
     let unknown = h.stats().rx_unknown;
     h.w().packet(peer, tone_packets(2, 1).remove(0));
     h.clock.advance(Duration::from_millis(50));
@@ -2329,11 +2214,10 @@ fn a_virtual_speaker_that_goes_away_fails_its_sender() {
 
 #[test]
 fn a_full_playback_ring_loses_whole_frames_and_never_writes_half_of_one() {
-    // Room for three whole frames and half of a fourth.
+    // Room for one whole frame and half of a second. Playout tops the ring up toward two frames,
+    // so the second frame of every top-up does not fit.
     let probe = HostProbe::new();
-    probe
-        .playback_samples
-        .store(3 * 960 + 480, Ordering::SeqCst);
+    probe.playback_samples.store(960 + 480, Ordering::SeqCst);
     let h = Harness::with_probe(probe);
     let peer = node(1);
     let k = key(peer, 1, 1);
@@ -2342,10 +2226,10 @@ fn a_full_playback_ring_loses_whole_frames_and_never_writes_half_of_one() {
     play_in(&h, peer, &tone_packets(1, 16));
     assert!(h.stats().playback_overflow > 0);
     assert_eq!(h.failed(k), 0);
-    // The ring holds exactly its three whole frames; the half frame of room stayed unused.
+    // The ring holds exactly its one whole frame; the half frame of room stayed unused.
     let (queued, capacity) = h.probe.ring_fill(0);
-    assert_eq!((queued, capacity), (3 * 960, 3 * 960 + 480));
-    assert_eq!(h.probe.played(0).len(), 3 * 960);
+    assert_eq!((queued, capacity), (960, 960 + 480));
+    assert_eq!(h.probe.played(0).len(), 960);
 }
 
 #[test]
@@ -2496,11 +2380,12 @@ fn a_cancel_during_a_multi_frame_playout_pass_writes_nothing_more() {
     for packet in &packets[8..] {
         h.w().packet(peer, packet.clone());
     }
+    // The playback ring is topped up (two frames): nothing more is pulled until the device takes.
     h.settle();
-    h.probe.played(0);
     let played_before = h.stats().played;
 
-    // Four frames come due in one pass. The cancel arrives as the second is pulled.
+    // The device takes the whole ring, so two frames are wanted in one pass. The cancel arrives as
+    // the second is pulled.
     let pulled = Arc::new(AtomicUsize::new(0));
     h.on_stage({
         let (shared, pulled) = (h.shared().clone(), pulled.clone());
@@ -2510,7 +2395,7 @@ fn a_cancel_during_a_multi_frame_playout_pass_writes_nothing_more() {
             }
         }
     });
-    h.clock.advance(Duration::from_millis(40));
+    assert_eq!(h.probe.played(0).len(), 2 * 960);
     wait_until("the second pull", Duration::from_secs(5), || {
         pulled.load(Ordering::SeqCst) >= 2
     });
@@ -2536,12 +2421,12 @@ fn a_cancel_after_a_frame_is_written_pulls_no_further_frame() {
     for packet in &packets[8..] {
         h.w().packet(peer, packet.clone());
     }
+    // The playback ring is topped up (two frames): nothing more is pulled until the device takes.
     h.settle();
-    h.probe.played(0);
     let played_before = h.stats().played;
 
-    // Four frames come due in one pass. The cancel arrives right after the first is written, so
-    // the next pull must not happen at all.
+    // The device takes the whole ring, so two frames are wanted in one pass. The cancel arrives
+    // right after the first is written, so the next pull must not happen at all.
     let pulled = Arc::new(AtomicUsize::new(0));
     h.on_stage({
         let (shared, pulled) = (h.shared().clone(), pulled.clone());
@@ -2553,7 +2438,7 @@ fn a_cancel_after_a_frame_is_written_pulls_no_further_frame() {
             Stage::Encoded | Stage::Admitting => {}
         }
     });
-    h.clock.advance(Duration::from_millis(40));
+    assert_eq!(h.probe.played(0).len(), 2 * 960);
     wait_until("the first pull", Duration::from_secs(5), || {
         pulled.load(Ordering::SeqCst) >= 1
     });

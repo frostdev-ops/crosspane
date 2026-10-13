@@ -1,4 +1,15 @@
 //! M1 parking leaves windows on their screen and journals their original frame before resizing.
+//!
+//! The journal's life cycle (04 §8 invariant 4, no window is lost). The decisions behind each rule
+//! are in the private `decide` module, which has no native calls:
+//! - A window's original frame is durable before the first native write to that window.
+//! - A park that fails before it attempted any native write withdraws the entry it created: the
+//!   window was never moved. Once a write was attempted (even one that errored or timed out, since
+//!   AX may still have applied it) the entry stays, and so does any entry an earlier park made.
+//! - Restore retires an entry only when its window is back at its original frame, provably already
+//!   there, or gone. It never retires one it could not prove.
+//! - `recover` tries every entry. One that cannot be settled stays journaled and never blocks the
+//!   rest; the call then fails, naming how many remain.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -21,6 +32,10 @@ use crate::windows::{
     AxLookup, AxWindow, FULLSCREEN_WAIT, RawWindow, WindowQuery, bounds_equal, display_for_frame,
     ensure_fullscreen_with, fullscreen_pause, fullscreen_press_needed, quartz_fullscreen,
     require_accessibility, valid_frame,
+};
+use decide::{
+    AxSight, RESTORE_SLACK, ResizeFailure, RestorePlan, frame_close, leave_fullscreen_first,
+    plan_restore, recover_each, withdraw_after_failed_park,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -224,19 +239,24 @@ impl ParkingState {
             .ok_or(PlatformError::NotFound)
     }
 
+    /// Resize `raw`'s window. A failure says whether a native write may have reached the window:
+    /// everything before the first AX write only reads, so `park` can then take its entry back.
     fn resize_window(
         &self,
         raw: &RawWindow,
         size: PixelSize,
         deadline: Instant,
-    ) -> Result<Parked, PlatformError> {
+    ) -> Result<Parked, ResizeFailure> {
         if quartz_fullscreen(raw) {
-            return parked(raw.id, raw.frame);
+            return parked(raw.id, raw.frame).map_err(ResizeFailure::before_write);
         }
-        let ax = AxWindow::find(raw, deadline)?;
-        let frame = ax.frame()?;
-        let display = display_for_frame(frame)?;
-        let (_, scale) = display_metrics(display)?;
+        let ax = AxWindow::find(raw, deadline).map_err(ResizeFailure::before_write)?;
+        let frame = ax.frame().map_err(ResizeFailure::before_write)?;
+        let display = display_for_frame(frame).map_err(ResizeFailure::before_write)?;
+        let (_, scale) = display_metrics(display).map_err(ResizeFailure::before_write)?;
+        // From here on a write is attempted. Every failure counts as one that may have moved the
+        // window, even an error or timeout from the write itself: AX can apply a write and still
+        // report failure, and the journal entry is all that brings the window back.
         // AXSize can move a constrained window. Explicitly retain its current top-left.
         ax.restore(RectLogical::new(
             frame.origin,
@@ -244,8 +264,10 @@ impl ParkingState {
                 f64::from(size.width) / scale,
                 f64::from(size.height) / scale,
             ),
-        ))?;
-        parked(raw.id, ax.frame()?)
+        ))
+        .map_err(ResizeFailure::from_write)?;
+        let frame = ax.frame().map_err(ResizeFailure::from_write)?;
+        parked(raw.id, frame).map_err(ResizeFailure::from_write)
     }
 
     fn remove_entry(&mut self, window: WindowId) -> Result<(), PlatformError> {
@@ -256,6 +278,43 @@ impl ParkingState {
         Ok(())
     }
 
+    /// Take back the entry a failed park made for a window that was never touched. Best effort:
+    /// `remove_entry` changes memory only after the journal is rewritten, so if that fails the
+    /// entry stays in both places, and recovery retires it (the window is still at its original
+    /// frame) instead of blocking anything.
+    fn withdraw_unmoved(&mut self, window: WindowId) {
+        if let Err(error) = self.remove_entry(window) {
+            tracing::warn!(
+                window = window.0,
+                %error,
+                "could not withdraw the journal entry of a window that was never moved; \
+                 recovery retires it"
+            );
+        }
+    }
+
+    /// The Quartz window of a journal entry. `None` after retiring the entry because the window
+    /// is gone (closed, or its id now belongs to another process): nothing is left to restore.
+    fn window_or_retire(
+        &mut self,
+        window: WindowId,
+        pid: i32,
+        deadline: Instant,
+    ) -> Result<Option<RawWindow>, PlatformError> {
+        match self.window(window, Some(pid), deadline) {
+            Ok(raw) => Ok(Some(raw)),
+            Err(PlatformError::NotFound) => {
+                self.remove_entry(window)?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Put the window of a journal entry back and retire the entry. `Ok(true)`: the window was
+    /// moved back. `Ok(false)`: the entry was retired with nothing to move, because the window is
+    /// gone or is already at its original frame ([`plan_restore`]). Any error leaves the entry
+    /// journaled, and it is never removed before the window is known to be where it belongs.
     fn restore_entry(
         &mut self,
         window: WindowId,
@@ -264,36 +323,69 @@ impl ParkingState {
         let Some(entry) = self.entries.get(&window).copied() else {
             return Ok(false);
         };
-        let raw = match self.window(window, Some(entry.pid), deadline) {
-            Ok(raw) => raw,
-            Err(PlatformError::NotFound) => {
-                self.remove_entry(window)?;
-                return Ok(false);
-            }
-            Err(error) => return Err(error),
+        let Some(mut raw) = self.window_or_retire(window, entry.pid, deadline)? else {
+            return Ok(false);
         };
         require_accessibility()?;
-        // A prior park may have failed while persisting its in-memory entry. Ensure that entry
-        // is durable even when restore is the very next call after that failure.
+        // A park that failed while persisting its entry and then could not withdraw it leaves the
+        // entry in memory only. Make it durable before any native write below, so a crash during
+        // the restore still finds it.
         write_journal(&self.journal, &self.entries)?;
-        if quartz_fullscreen(&raw) {
+        if leave_fullscreen_first(
+            quartz_fullscreen(&raw),
+            bounds_equal(raw.frame, entry.frame),
+        ) {
             self.set_fullscreen(window, false, deadline)?;
+            let Some(fresh) = self.window_or_retire(window, entry.pid, deadline)? else {
+                return Ok(false);
+            };
+            raw = fresh;
         }
-        let raw = self.window(window, Some(entry.pid), deadline)?;
-        let ax = AxWindow::find(&raw, deadline)?;
-        ax.restore(entry.frame)?;
-        let actual = ax.frame()?;
-        if (actual.origin.x - entry.frame.origin.x).abs() > 2.0
-            || (actual.origin.y - entry.frame.origin.y).abs() > 2.0
-            || (actual.size.width - entry.frame.size.width).abs() > 2.0
-            || (actual.size.height - entry.frame.size.height).abs() > 2.0
-        {
-            return Err(PlatformError::Backend(
-                "window refused its original frame; journal retained".into(),
-            ));
+        let quartz_at_original = bounds_equal(raw.frame, entry.frame);
+        let ax = match AxWindow::find(&raw, deadline) {
+            Ok(ax) => Some(ax),
+            // AX has no element for this window (another Space, a window the app does not
+            // expose). Whether that blocks the restore is `plan_restore`'s decision.
+            Err(PlatformError::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+        let sight = match &ax {
+            None => AxSight::Missing,
+            Some(ax) => match ax.frame() {
+                Ok(frame) if frame_close(frame, entry.frame, RESTORE_SLACK) => AxSight::AtOriginal,
+                Ok(_) => AxSight::Elsewhere,
+                // The element went away while we looked: the same as never having found it.
+                Err(PlatformError::NotFound) => AxSight::Missing,
+                Err(error) => return Err(error),
+            },
+        };
+        match (plan_restore(quartz_at_original, sight), ax) {
+            (RestorePlan::NothingToRestore, _) => {
+                tracing::info!(
+                    window = window.0,
+                    "parked window is already at its original frame; journal entry retired"
+                );
+                self.remove_entry(window)?;
+                Ok(false)
+            }
+            (RestorePlan::Move, Some(ax)) => {
+                ax.restore(entry.frame)?;
+                if !frame_close(ax.frame()?, entry.frame, RESTORE_SLACK) {
+                    return Err(PlatformError::Backend(
+                        "window refused its original frame; journal retained".into(),
+                    ));
+                }
+                self.remove_entry(window)?;
+                Ok(true)
+            }
+            // `Move` without an AX element cannot happen (the plan moves only what AX showed);
+            // like `Keep` it leaves the entry alone.
+            (RestorePlan::Move, None) | (RestorePlan::Keep, _) => Err(PlatformError::Backend(
+                "window is not at its original frame and has no accessible AX element; \
+                 journal retained"
+                    .into(),
+            )),
         }
-        self.remove_entry(window)?;
-        Ok(true)
     }
 
     fn park(
@@ -309,14 +401,30 @@ impl ParkingState {
             self.entries.get(&window).map(|entry| entry.pid),
             deadline,
         )?;
+        // Only an entry this call creates may be withdrawn again. An older one belongs to a window
+        // an earlier park may have moved, and a retry must never replace its original frame.
+        let created = !self.entries.contains_key(&window);
         self.entries.entry(window).or_insert(Entry {
             pid: raw.pid,
             frame: raw.frame,
         });
         // Even a repeated park persists the original entry before another native change.
-        // Retain it in memory on a write failure: a retry must never replace the original frame.
-        write_journal(&self.journal, &self.entries)?;
-        self.resize_window(&raw, size, deadline)
+        if let Err(error) = write_journal(&self.journal, &self.entries) {
+            // Nothing has been written to the window yet.
+            if withdraw_after_failed_park(created, false) {
+                self.withdraw_unmoved(window);
+            }
+            return Err(error);
+        }
+        match self.resize_window(&raw, size, deadline) {
+            Ok(parked) => Ok(parked),
+            Err(failure) => {
+                if withdraw_after_failed_park(created, failure.may_have_moved) {
+                    self.withdraw_unmoved(window);
+                }
+                Err(failure.error)
+            }
+        }
     }
 
     fn resize(
@@ -330,7 +438,9 @@ impl ParkingState {
         let entry = self.entries.get(&window).ok_or(PlatformError::NotFound)?;
         let raw = self.window(window, Some(entry.pid), deadline)?;
         write_journal(&self.journal, &self.entries)?;
+        // The entry of a parked window stays whatever the outcome.
         self.resize_window(&raw, size, deadline)
+            .map_err(|failure| failure.error)
     }
 
     fn geometry(&self, window: WindowId, deadline: Instant) -> Result<Parked, PlatformError> {
@@ -344,14 +454,34 @@ impl ParkingState {
         parked(window, ax.frame()?)
     }
 
+    /// Try every journal entry, in window-id order. An entry that cannot be settled stays
+    /// journaled and the rest are still tried (04 §8 invariant 4: one stuck window never keeps
+    /// another from being returned, at shutdown or at the next start). When any entry remains the
+    /// result is an error naming how many, so the caller reports an incomplete recovery; the next
+    /// start tries those again. The deadline is the command's: past it the entries not yet
+    /// reached stay journaled too.
     fn recover(&mut self, deadline: Instant) -> Result<Vec<WindowId>, PlatformError> {
-        let mut restored = Vec::new();
-        for window in self.entries.keys().copied().collect::<Vec<_>>() {
-            if self.restore_entry(window, deadline)? {
-                restored.push(window);
-            }
-        }
-        Ok(restored)
+        let windows: Vec<WindowId> = self.entries.keys().copied().collect();
+        let report = recover_each(
+            windows,
+            |window| {
+                self.restore_entry(window, deadline).inspect_err(|error| {
+                    tracing::warn!(
+                        window = window.0,
+                        %error,
+                        "parked window not restored; its journal entry is kept"
+                    );
+                })
+            },
+            || Instant::now() >= deadline,
+        );
+        tracing::info!(
+            restored = report.restored.len(),
+            retired = report.retired,
+            kept = report.kept,
+            "parking journal recovery"
+        );
+        report.into_result()
     }
 }
 
@@ -752,6 +882,357 @@ fn write_journal(path: &Path, entries: &BTreeMap<WindowId, Entry>) -> Result<(),
     result
 }
 
+/// What parking and recovery decide, with no native calls and no I/O, so each rule is tested
+/// without WindowServer or AX. `ParkingState` makes the observations and carries the decisions
+/// out.
+///
+/// What restore does with a journal entry (`E` is its original frame):
+///
+/// | Quartz window | at `E` (Quartz) | AX window | AX frame vs `E` | Decision |
+/// |---|---|---|---|---|
+/// | gone | | | | retire: nothing left to restore |
+/// | present, native fullscreen | no | | | leave fullscreen first, then continue |
+/// | present, native fullscreen | yes | | | stay fullscreen (leaving would move it off `E`), continue |
+/// | present | any | found | within 2 pt | retire: already home, nothing to write |
+/// | present | any | found | elsewhere | write `E`, verify within 2 pt, then retire; else keep |
+/// | present | yes | missing | | retire: never moved, or already back, and AX has nothing to say |
+/// | present | no | missing | | keep: cannot prove it home, cannot move it |
+///
+/// Reads that fail (Quartz, AX, journal) keep the entry. Only an entry whose window is proven
+/// home, or gone, is ever removed.
+mod decide {
+    use crosspane_platform::PlatformError;
+    use crosspane_types::geom::RectLogical;
+    use crosspane_types::id::WindowId;
+
+    /// How far an AX frame may be from the journaled original and still count as there, in
+    /// points. It is the tolerance restore always verified its own write with.
+    pub(super) const RESTORE_SLACK: f64 = 2.0;
+
+    /// `a` and `b` agree on every edge to within `slack` points.
+    pub(super) fn frame_close(a: RectLogical, b: RectLogical, slack: f64) -> bool {
+        (a.origin.x - b.origin.x).abs() <= slack
+            && (a.origin.y - b.origin.y).abs() <= slack
+            && (a.size.width - b.size.width).abs() <= slack
+            && (a.size.height - b.size.height).abs() <= slack
+    }
+
+    /// A failed resize and whether a native write may have reached the window.
+    #[derive(Debug)]
+    pub(super) struct ResizeFailure {
+        pub(super) error: PlatformError,
+        pub(super) may_have_moved: bool,
+    }
+
+    impl ResizeFailure {
+        /// The failure came from a lookup or a read: the window cannot have been touched.
+        pub(super) fn before_write(error: PlatformError) -> Self {
+            Self {
+                error,
+                may_have_moved: false,
+            }
+        }
+
+        /// The failure came from, or after, the first AX write. A write that errored or timed out
+        /// may still have been applied, so the window may have moved.
+        pub(super) fn from_write(error: PlatformError) -> Self {
+            Self {
+                error,
+                may_have_moved: true,
+            }
+        }
+    }
+
+    /// Whether a failed park takes its journal entry back out: only an entry this very park
+    /// created, and only when no native write may have reached the window. Otherwise the entry
+    /// is what lets recovery put a moved window back, or belongs to an earlier park.
+    pub(super) fn withdraw_after_failed_park(
+        created_by_this_park: bool,
+        may_have_moved: bool,
+    ) -> bool {
+        created_by_this_park && !may_have_moved
+    }
+
+    /// Restore leaves native fullscreen first, but not for a window already at its original
+    /// frame: leaving fullscreen would move it away from where it belongs.
+    pub(super) fn leave_fullscreen_first(fullscreen: bool, quartz_at_original: bool) -> bool {
+        fullscreen && !quartz_at_original
+    }
+
+    /// What AX showed of the window being restored.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum AxSight {
+        /// AX has no element for the window.
+        Missing,
+        /// An element whose frame is within [`RESTORE_SLACK`] of the original.
+        AtOriginal,
+        /// An element somewhere else.
+        Elsewhere,
+    }
+
+    /// What restore does with the entry.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum RestorePlan {
+        /// The window is home: retire the entry without writing to the window.
+        NothingToRestore,
+        /// Write the original frame through AX, verify, then retire the entry.
+        Move,
+        /// Neither provably home nor movable: keep the entry.
+        Keep,
+    }
+
+    /// The restore decision for a window Quartz still lists. `quartz_at_original`: WindowServer's
+    /// frame equals the journaled one (whole points, so a point of slack at most).
+    pub(super) fn plan_restore(quartz_at_original: bool, ax: AxSight) -> RestorePlan {
+        match ax {
+            AxSight::AtOriginal => RestorePlan::NothingToRestore,
+            AxSight::Elsewhere => RestorePlan::Move,
+            AxSight::Missing if quartz_at_original => RestorePlan::NothingToRestore,
+            AxSight::Missing => RestorePlan::Keep,
+        }
+    }
+
+    /// What one recovery pass over the journal came to.
+    #[derive(Debug, Default)]
+    pub(super) struct Recovery {
+        /// Windows moved back, in the order tried.
+        pub(super) restored: Vec<WindowId>,
+        /// Entries retired with nothing to move: window gone, or already home.
+        pub(super) retired: usize,
+        /// Entries still journaled: they failed, or the deadline came before they were tried.
+        pub(super) kept: usize,
+        first_error: Option<PlatformError>,
+    }
+
+    impl Recovery {
+        fn keep(&mut self, error: PlatformError) {
+            self.kept += 1;
+            self.first_error.get_or_insert(error);
+        }
+
+        /// `Ok` with the windows moved back when nothing is left journaled. Otherwise an error
+        /// that says how many entries remain and why the first one did.
+        pub(super) fn into_result(self) -> Result<Vec<WindowId>, PlatformError> {
+            match self.first_error {
+                None => Ok(self.restored),
+                Some(error) => Err(PlatformError::Backend(format!(
+                    "{} parked window(s) not restored and still journaled \
+                     ({} restored, {} retired); first error: {error}",
+                    self.kept,
+                    self.restored.len(),
+                    self.retired
+                ))),
+            }
+        }
+    }
+
+    /// Run `restore` over every window, whatever happens to the ones before it. `restore` returns
+    /// `Ok(true)` for a window moved back, `Ok(false)` for an entry retired without a move, and
+    /// an error for one that stays journaled. Once `expired` says so, the windows not yet tried
+    /// stay journaled with a timeout.
+    pub(super) fn recover_each(
+        windows: impl IntoIterator<Item = WindowId>,
+        mut restore: impl FnMut(WindowId) -> Result<bool, PlatformError>,
+        mut expired: impl FnMut() -> bool,
+    ) -> Recovery {
+        let mut report = Recovery::default();
+        for window in windows {
+            if expired() {
+                report.keep(PlatformError::Timeout);
+                continue;
+            }
+            match restore(window) {
+                Ok(true) => report.restored.push(window),
+                Ok(false) => report.retired += 1,
+                Err(error) => report.keep(error),
+            }
+        }
+        report
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crosspane_types::geom::{PointLogical, SizeLogical};
+
+        fn rect(x: f64, y: f64, width: f64, height: f64) -> RectLogical {
+            RectLogical::new(PointLogical::new(x, y), SizeLogical::new(width, height))
+        }
+
+        fn backend(text: &str) -> PlatformError {
+            PlatformError::Backend(text.into())
+        }
+
+        #[test]
+        fn frame_close_checks_every_edge_against_the_slack() {
+            let original = rect(100.0, 80.0, 800.0, 600.0);
+            assert!(frame_close(original, original, 0.0));
+            assert!(frame_close(
+                rect(102.0, 78.0, 802.0, 598.0),
+                original,
+                RESTORE_SLACK
+            ));
+            for off in [
+                rect(102.5, 80.0, 800.0, 600.0),
+                rect(100.0, 77.5, 800.0, 600.0),
+                rect(100.0, 80.0, 802.5, 600.0),
+                rect(100.0, 80.0, 800.0, 597.5),
+            ] {
+                assert!(!frame_close(off, original, RESTORE_SLACK), "{off:?}");
+            }
+            assert!(!frame_close(
+                rect(f64::NAN, 80.0, 800.0, 600.0),
+                original,
+                RESTORE_SLACK
+            ));
+        }
+
+        #[test]
+        fn a_failed_park_withdraws_only_an_entry_it_created_before_any_write() {
+            // (created by this park, a write may have reached the window) -> withdraw.
+            assert!(withdraw_after_failed_park(true, false));
+            // A write may have moved it: the entry is what brings the window back.
+            assert!(!withdraw_after_failed_park(true, true));
+            // An older entry belongs to a window an earlier park may have moved.
+            assert!(!withdraw_after_failed_park(false, false));
+            assert!(!withdraw_after_failed_park(false, true));
+        }
+
+        #[test]
+        fn resize_failures_say_whether_a_write_may_have_happened() {
+            let read = ResizeFailure::before_write(PlatformError::NotFound);
+            assert!(!read.may_have_moved);
+            assert!(matches!(read.error, PlatformError::NotFound));
+            let write = ResizeFailure::from_write(PlatformError::Timeout);
+            assert!(write.may_have_moved);
+            assert!(matches!(write.error, PlatformError::Timeout));
+            // The two combine as park uses them: an AX lookup failure leaves the window alone, a
+            // timed-out write does not.
+            assert!(withdraw_after_failed_park(true, read.may_have_moved));
+            assert!(!withdraw_after_failed_park(true, write.may_have_moved));
+        }
+
+        #[test]
+        fn fullscreen_is_left_only_when_the_window_is_away_from_its_original_frame() {
+            assert!(leave_fullscreen_first(true, false));
+            assert!(!leave_fullscreen_first(true, true));
+            assert!(!leave_fullscreen_first(false, false));
+            assert!(!leave_fullscreen_first(false, true));
+        }
+
+        #[test]
+        fn restore_plan_follows_the_rule_table() {
+            use AxSight::{AtOriginal, Elsewhere, Missing};
+            use RestorePlan::{Keep, Move, NothingToRestore};
+            for (quartz_at_original, ax, plan) in [
+                // AX found the window and it is home: nothing to write, whatever Quartz says.
+                (true, AtOriginal, NothingToRestore),
+                (false, AtOriginal, NothingToRestore),
+                // AX found it elsewhere: put it back through AX.
+                (true, Elsewhere, Move),
+                (false, Elsewhere, Move),
+                // AX cannot find it: Quartz at the original frame retires the entry, anything
+                // else keeps it.
+                (true, Missing, NothingToRestore),
+                (false, Missing, Keep),
+            ] {
+                assert_eq!(
+                    plan_restore(quartz_at_original, ax),
+                    plan,
+                    "quartz_at_original={quartz_at_original} ax={ax:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn recovery_goes_on_past_an_entry_that_fails() {
+            let mut script = vec![
+                (
+                    WindowId(1),
+                    Err(backend("window refused its original frame")),
+                ),
+                (WindowId(2), Ok(true)),
+                (WindowId(3), Ok(false)),
+                (WindowId(4), Err(PlatformError::Timeout)),
+                (WindowId(5), Ok(true)),
+            ];
+            let mut tried = Vec::new();
+            let report = recover_each(
+                script.iter().map(|(window, _)| *window).collect::<Vec<_>>(),
+                |window| {
+                    tried.push(window);
+                    script.remove(0).1
+                },
+                || false,
+            );
+            assert_eq!(tried, (1..=5).map(WindowId).collect::<Vec<_>>());
+            assert_eq!(report.restored, vec![WindowId(2), WindowId(5)]);
+            assert_eq!((report.retired, report.kept), (1, 2));
+            let Err(PlatformError::Backend(text)) = report.into_result() else {
+                panic!("two entries are still journaled");
+            };
+            assert!(
+                text.starts_with("2 parked window(s) not restored"),
+                "{text}"
+            );
+            assert!(text.contains("2 restored, 1 retired"), "{text}");
+            // The first failure is the one reported.
+            assert!(
+                text.ends_with("window refused its original frame"),
+                "{text}"
+            );
+        }
+
+        #[test]
+        fn recovery_that_settles_every_entry_returns_the_restored_windows() {
+            let report = recover_each(
+                [WindowId(7), WindowId(8), WindowId(9)],
+                |window| Ok(window != WindowId(8)),
+                || false,
+            );
+            assert_eq!((report.retired, report.kept), (1, 0));
+            assert!(matches!(
+                report.into_result().as_deref(),
+                Ok([WindowId(7), WindowId(9)])
+            ));
+        }
+
+        #[test]
+        fn recovery_with_nothing_journaled_is_ok_and_empty() {
+            let report = recover_each(Vec::new(), |_| Err(PlatformError::NotFound), || false);
+            assert!(matches!(report.into_result().as_deref(), Ok([])));
+        }
+
+        #[test]
+        fn recovery_past_the_deadline_keeps_what_it_did_not_reach() {
+            let mut tried = Vec::new();
+            let mut polls = 0;
+            let report = recover_each(
+                [WindowId(1), WindowId(2), WindowId(3)],
+                |window| {
+                    tried.push(window);
+                    Ok(true)
+                },
+                || {
+                    polls += 1;
+                    polls > 1
+                },
+            );
+            assert_eq!(tried, vec![WindowId(1)]);
+            assert_eq!(report.restored, vec![WindowId(1)]);
+            assert_eq!(report.kept, 2);
+            let Err(PlatformError::Backend(text)) = report.into_result() else {
+                panic!("two entries were never tried");
+            };
+            assert!(
+                text.starts_with("2 parked window(s) not restored"),
+                "{text}"
+            );
+            assert!(text.ends_with("timed out"), "{text}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,6 +1325,102 @@ mod tests {
         drop(parking);
         fs::write(&path, "crosspane-mirror-v1\n42 123 NaN 0 400 300\n").unwrap();
         assert!(read_journal(&path).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[allow(clippy::unwrap_used)]
+    fn temp_journal(name: &str) -> (PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "crosspane-parking-{name}-{}-{}",
+            std::process::id(),
+            crate::clock::now().as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("journal");
+        (directory, path)
+    }
+
+    fn journaled_entry() -> Entry {
+        Entry {
+            pid: 500,
+            frame: RectLogical::new(
+                PointLogical::new(40.0, 60.0),
+                SizeLogical::new(800.0, 600.0),
+            ),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn withdrawing_an_unmoved_entry_is_durable_and_best_effort() {
+        let (directory, path) = temp_journal("withdraw");
+        let entries = BTreeMap::from([
+            (WindowId(1), journaled_entry()),
+            (WindowId(2), journaled_entry()),
+        ]);
+        write_journal(&path, &entries).unwrap();
+        let mut state = ParkingState {
+            journal: path.clone(),
+            entries,
+            query: WindowQuery::new().unwrap(),
+        };
+        state.withdraw_unmoved(WindowId(2));
+        assert_eq!(
+            state.entries.keys().copied().collect::<Vec<_>>(),
+            vec![WindowId(1)]
+        );
+        assert_eq!(read_journal(&path).unwrap(), state.entries);
+        // A journal that cannot be rewritten: the entry stays, in memory and on disk alike, and
+        // recovery retires it later. Nothing fails.
+        fs::remove_dir_all(&directory).unwrap();
+        state.withdraw_unmoved(WindowId(1));
+        assert!(state.entries.contains_key(&WindowId(1)));
+    }
+
+    #[test]
+    #[cfg(feature = "private-vdisplay")]
+    #[allow(clippy::unwrap_used)]
+    fn recovery_retires_gone_windows_and_goes_on_past_one_it_cannot_read() {
+        let (directory, path) = temp_journal("recover");
+        let entries = BTreeMap::from([
+            (WindowId(10), journaled_entry()),
+            (WindowId(20), journaled_entry()),
+            (WindowId(30), journaled_entry()),
+        ]);
+        write_journal(&path, &entries).unwrap();
+        let mut state = ParkingState {
+            journal: path.clone(),
+            entries,
+            // One Quartz answer per entry, in window-id order: 10 is gone, the read for 20 times
+            // out, 30 is gone. A gone window needs no AX, so none of this touches Accessibility.
+            query: WindowQuery::scripted(vec![
+                Ok(Vec::new()),
+                Err(PlatformError::Timeout),
+                Ok(Vec::new()),
+            ]),
+        };
+        let result = state.recover(Instant::now() + Duration::from_secs(5));
+        assert!(
+            matches!(
+                &result,
+                Err(PlatformError::Backend(text))
+                    if text.starts_with("1 parked window(s) not restored")
+            ),
+            "{result:?}"
+        );
+        let still_journaled = vec![WindowId(20)];
+        assert_eq!(
+            state.entries.keys().copied().collect::<Vec<_>>(),
+            still_journaled
+        );
+        assert_eq!(
+            read_journal(&path)
+                .unwrap()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            still_journaled
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -10,7 +10,7 @@ use std::{
     future::Future,
     pin::pin,
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll, Wake, Waker},
@@ -28,13 +28,64 @@ use windows::{
     },
     core::Interface,
 };
+use windows_sys::Win32::System::LibraryLoader::{
+    GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleHandleExW,
+};
 
 pub(crate) const BOUND: Duration = Duration::from_secs(2);
+
+/// Keeps `d3d12.dll` loaded for the rest of the process.
+///
+/// wgpu-hal loads `d3d12.dll` with `LoadLibrary` and calls `FreeLibrary` when the last of its
+/// instance, adapter and device handles goes. Every D3D12 interface this module clones out of
+/// wgpu or creates itself is released through that DLL: `ID3D12Device::Release` reads
+/// `d3d12.dll` data, so a release after the unload faults with STATUS_ACCESS_VIOLATION inside
+/// `D3D12Core.dll` (reproduced by `tests/gpu_drop.rs`: the faulting read was inside the unloaded
+/// `d3d12.dll` image). `WindowsGpu` orders its own fields so that cannot happen, but resources
+/// it hands out (`SharedTexture`, `Fence`, encoder input slots, a `Lease`) may be released by
+/// code that does not control that order, so the library is pinned: it is a system DLL this
+/// process keeps using until it exits anyway. Pinning never loads anything; it only marks the
+/// already loaded module as unremovable, so it must run after wgpu created its DX12 instance.
+fn pin_d3d12_runtime() -> Result<(), PlatformError> {
+    static PINNED: AtomicBool = AtomicBool::new(false);
+    if PINNED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let name: Vec<u16> = "d3d12.dll".encode_utf16().chain(Some(0)).collect();
+    let mut module = std::ptr::null_mut();
+    // SAFETY: NUL-terminated wide module name and a valid output slot. FLAG_PIN only marks an
+    // already loaded module as unremovable; it neither loads one nor takes another call's pin.
+    let pinned =
+        unsafe { GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, name.as_ptr(), &mut module) };
+    if pinned == 0 {
+        // No DX12 runtime in this process: there is nothing for a GPU context to share with.
+        return Err(error(Reason::Adapter));
+    }
+    PINNED.store(true, Ordering::Release);
+    Ok(())
+}
 pub(crate) fn error(reason: Reason) -> PlatformError {
-    PlatformError::Backend(reason.name().into())
+    // The node locking, unlocking or retiring this capture is a lifecycle event, not a GPU
+    // failure. Callers already treat `Locked` as "stop quietly, keep the device".
+    if reason.lifecycle() {
+        PlatformError::Locked
+    } else {
+        PlatformError::Backend(reason.name().into())
+    }
+}
+/// Milliseconds on a process-local monotonic clock, for the retirement/rebuild bookkeeping.
+pub(crate) fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 pub(crate) fn api<T>(value: windows::core::Result<T>) -> Result<T, PlatformError> {
     value.map_err(|e| PlatformError::Backend(format!("GPU HRESULT {:08x}", e.code().0 as u32)))
+}
+/// As `api`, naming the call that failed so a refusal can be traced to one step.
+fn step<T>(call: &str, value: windows::core::Result<T>) -> Result<T, PlatformError> {
+    value.map_err(|e| {
+        PlatformError::Backend(format!("GPU {call} HRESULT {:08x}", e.code().0 as u32))
+    })
 }
 fn luid(value: LUID) -> u64 {
     (value.HighPart as u32 as u64) << 32 | u64::from(value.LowPart)
@@ -62,19 +113,70 @@ fn wait_future<T>(future: impl Future<Output = T>, until: Instant) -> Result<T, 
 }
 
 /// Source-only context. The proxy host owns a different device and queue.
+///
+/// Fields drop in declaration order, after `Drop::drop` has run, and that order is load-bearing:
+/// 1. `retained` holds D3D12 objects whose GPU work may still be running. `Drop::drop` empties it
+///    first (waiting for the work, or abandoning it on a retired instance), and it is declared
+///    first so that nothing it owned can outlive the rest.
+/// 2. `raw_queue` and `d12` are our own references to the DX12 queue and device that live inside
+///    wgpu. They are released while the wgpu device, and the `d3d12.dll` handle that device
+///    carries, are still alive: releasing them after wgpu-hal's `FreeLibrary` is the access
+///    violation this order exists to prevent. (The library is also pinned, see
+///    `pin_d3d12_runtime`, for native objects that outlive this struct.)
+/// 3. `queue` then `device` are wgpu's handles; dropping the last of them tears down the hal
+///    device.
+/// 4. `context` and `d11` are the capture backend's D3D11 device, shared with it, last.
+///
+/// Holders of this context must likewise declare their `Arc<WindowsGpu>` *after* every native
+/// D3D12/D3D11 object they own (see `Surface`).
 pub struct WindowsGpu {
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    pub(crate) d11: ID3D11Device,
-    pub(crate) context: Arc<Mutex<ID3D11DeviceContext>>,
-    pub(crate) d12: ID3D12Device,
+    retained: Mutex<Vec<Retained>>,
     pub(crate) raw_queue: ID3D12CommandQueue,
+    pub(crate) d12: ID3D12Device,
+    pub queue: wgpu::Queue,
+    pub device: wgpu::Device,
+    pub(crate) context: Arc<Mutex<ID3D11DeviceContext>>,
+    pub(crate) d11: ID3D11Device,
     pub(crate) luid: u64,
     pub(crate) video_supported: bool,
+    wanted: wgpu::Features,
     serial: Mutex<()>,
     next: AtomicU64,
-    failed: AtomicBool,
-    retained: Mutex<Vec<Retained>>,
+    latch: Mutex<model::Latch>,
+    refusal: Mutex<Option<String>>,
+}
+impl Drop for WindowsGpu {
+    fn drop(&mut self) {
+        // Nobody can submit work any more (no `Arc` is left), so what remains is the deferred
+        // release of resources a finished surface left behind. A healthy instance waits for the
+        // GPU to finish with them. A retired one (an unconfirmed handoff) has a fence that may
+        // never pass, so it gets one look and then abandons what is left: a leaked resource is
+        // harmless, a resource released under running GPU work is not. A removed device reports
+        // `u64::MAX` and is released at once.
+        let patient = self.retired().is_none();
+        let until = Instant::now() + if patient { BOUND } else { Duration::ZERO };
+        let retained = self
+            .retained
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for held in std::mem::take(retained) {
+            loop {
+                // SAFETY: read-only completion query on a fence this entry still owns.
+                let completed = unsafe { held.fence.GetCompletedValue() };
+                // `u64::MAX` is a removed device: nothing is running, release is safe.
+                if completed == u64::MAX || completed >= held.value {
+                    drop(held);
+                    break;
+                }
+                if Instant::now() >= until {
+                    // Unclean ownership is never a safe early free.
+                    std::mem::forget(held);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
 }
 impl fmt::Debug for WindowsGpu {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -96,6 +198,8 @@ impl WindowsGpu {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::DX12;
         let instance = wgpu::Instance::new(desc);
+        // After the instance (which loads d3d12.dll) and before any D3D12 object of ours exists.
+        pin_d3d12_runtime()?;
         let adapters = wait_future(instance.enumerate_adapters(wgpu::Backends::DX12), until)?;
         let adapter = adapters
             .into_iter()
@@ -147,18 +251,20 @@ impl WindowsGpu {
             }
         }
         let result = Arc::new(Self {
-            device,
-            queue,
-            d11,
-            context,
-            d12,
+            retained: Mutex::new(Vec::new()),
             raw_queue,
+            d12,
+            queue,
+            device,
+            context,
+            d11,
             luid: luid(capture.AdapterLuid),
             video_supported,
+            wanted,
             serial: Mutex::new(()),
             next: AtomicU64::new(1),
-            failed: AtomicBool::new(false),
-            retained: Mutex::new(Vec::new()),
+            latch: Mutex::new(model::Latch::default()),
+            refusal: Mutex::new(None),
         });
         result.healthy()?;
         Ok(result)
@@ -171,27 +277,126 @@ impl WindowsGpu {
                 value != u64::MAX && value < held.value
             });
         }
-        if self.failed.load(Ordering::Acquire) {
-            return Err(error(Reason::Submitted));
+        if let Err(reason) = self.latch().healthy() {
+            return Err(error(reason));
         }
         // SAFETY: read-only removal status of our retained devices, not an owner session query.
-        unsafe {
-            api(self.d11.GetDeviceRemovedReason())?;
-            api(self.d12.GetDeviceRemovedReason())?;
+        let removed = unsafe {
+            api(self.d11.GetDeviceRemovedReason())
+                .and_then(|()| api(self.d12.GetDeviceRemovedReason()))
+        };
+        if removed.is_err() {
+            // A removed or reset device never comes back; a rebuild makes a new one.
+            self.retire_for(model::Fault::Device, Reason::Removed);
         }
-        Ok(())
+        removed
     }
+    fn latch(&self) -> MutexGuard<'_, model::Latch> {
+        // Plain data with no invariant spanning a panic: a poisoned guard is still correct.
+        self.latch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// Retires this instance after an unconfirmed handoff. The instance never serves again;
+    /// the capture side may build a fresh one later.
     pub(crate) fn retire(&self) {
-        self.failed.store(true, Ordering::Release);
+        self.retire_for(model::Fault::Handoff, Reason::Submitted);
     }
-    pub(crate) fn hold<T: Send + 'static>(
-        self: &Arc<Self>,
-        fence: ID3D12Fence,
-        value: u64,
-        payload: T,
-    ) {
+    pub(crate) fn retire_for(&self, fault: model::Fault, reason: Reason) {
+        self.latch().retire(fault, reason, now_ms());
+    }
+    /// Why this instance is retired, if it is.
+    pub(crate) fn retired(&self) -> Option<model::Retired> {
+        self.latch().retired()
+    }
+    /// The features this instance was created with, for building its replacement.
+    pub(crate) fn wanted(&self) -> wgpu::Features {
+        self.wanted
+    }
+    /// One handoff of a surface timed out. Isolated timeouts cost only that surface; several in
+    /// a row mean the queue is stalled and retire the instance.
+    pub(crate) fn strike(&self) {
+        let mut latch = self.latch();
+        let _ = latch.strike(now_ms());
+    }
+    pub(crate) fn settled(&self) {
+        self.latch().settled();
+    }
+    /// A slot could not be created. Remembers why; persistent failure latches `Unsupported`.
+    pub(crate) fn surface_failed(&self, cause: &PlatformError) {
+        self.note_refusal(cause);
+        // A size this adapter cannot hold says nothing about sharing; a retired instance
+        // already has its cause.
+        let size_only =
+            matches!(cause, PlatformError::Backend(name) if name == Reason::Layout.name());
+        if !size_only && self.latch().retired().is_none() {
+            let _ = self.latch().surface_failed(now_ms());
+        }
+    }
+    /// Remembers the last refusal for `off_reason` without counting it against the instance.
+    pub(crate) fn note_refusal(&self, cause: &PlatformError) {
+        if let Ok(mut refusal) = self.refusal.lock() {
+            *refusal = Some(format!("{cause:?}"));
+        }
+    }
+    pub(crate) fn surface_created(&self) {
+        self.latch().surface_created();
+        if let Ok(mut refusal) = self.refusal.lock() {
+            *refusal = None;
+        }
+    }
+    /// Why the GPU path is not serving frames, for the agent to report: the retirement cause
+    /// when this instance is retired, else the last slot-creation failure, else None.
+    pub fn off_reason(&self) -> Option<String> {
+        if let Some(retired) = self.retired() {
+            return Some(format!("{} ({:?})", retired.reason.name(), retired.fault));
+        }
+        self.refusal.lock().ok().and_then(|refusal| refusal.clone())
+    }
+    /// Runs the slot-creation and handoff steps once on synthetic data and names each outcome.
+    /// Diagnostic only: it creates one shared texture, two shared fences and one lease, and
+    /// never touches a captured window.
+    pub fn diagnose(self: &Arc<Self>, size: PixelSize) -> Vec<(&'static str, Result<(), String>)> {
+        fn text(error: PlatformError) -> String {
+            format!("{error:?}")
+        }
+        let mut steps = vec![("healthy", self.healthy().map_err(text))];
+        steps.push((
+            "shared_texture",
+            self.shared(size, DXGI_FORMAT_B8G8R8A8_UNORM)
+                .map(drop)
+                .map_err(text),
+        ));
+        steps.push(("shared_fence", self.fence().map(drop).map_err(text)));
+        let surface = match Surface::new(self.clone(), size) {
+            Ok(surface) => {
+                steps.push(("surface", Ok(())));
+                surface
+            }
+            Err(error) => {
+                steps.push(("surface", Err(text(error))));
+                return steps;
+            }
+        };
+        let gate = IoGate::new();
+        gate.set_session_permits(true);
+        gate.set_engine_permits(true);
+        let epoch = gate.epoch();
+        match surface.begin(self, gate, epoch) {
+            Ok(mut lease) => {
+                steps.push(("begin", Ok(())));
+                steps.push(("finish", lease.finish().map_err(text)));
+            }
+            Err(error) => steps.push(("begin", Err(text(error)))),
+        }
+        steps
+    }
+    /// Defers the release of `payload` until `fence` reaches `value` (checked by `healthy`, and
+    /// waited for in `Drop`). The list is owned by this context, which is what ties the lifetime
+    /// of the payload to it; the entries deliberately hold no `Arc<WindowsGpu>` of their own,
+    /// because that made a cycle that kept a retired context alive for the whole process.
+    pub(crate) fn hold<T: Send + 'static>(&self, fence: ID3D12Fence, value: u64, payload: T) {
         let held = Retained {
-            _gpu: self.clone(),
             _payload: Box::new(payload),
             fence,
             value,
@@ -213,7 +418,11 @@ impl WindowsGpu {
             self.healthy()?;
             match self.serial.try_lock() {
                 Ok(lock) => return Ok(lock),
-                Err(std::sync::TryLockError::Poisoned(_)) => return Err(error(Reason::Submitted)),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    // A panic inside a lease leaves the queue state unknown.
+                    self.retire();
+                    return Err(error(Reason::Submitted));
+                }
                 Err(std::sync::TryLockError::WouldBlock) => (),
             }
             if Instant::now() >= until {
@@ -222,11 +431,24 @@ impl WindowsGpu {
             thread::sleep(Duration::from_millis(1));
         }
     }
+    /// Waits for `fence`; a timeout retires the whole instance (the NV12 path relies on this).
     pub(crate) fn wait(
         &self,
         fence: &ID3D12Fence,
         value: u64,
         permitted: impl Fn() -> bool,
+    ) -> Result<(), PlatformError> {
+        self.wait_with(fence, value, permitted, true)
+    }
+    /// As `wait`, but with `retire_on_timeout` false a timeout is only reported: the caller
+    /// quarantines its own surface and counts a strike, so one slow frame cannot cost the
+    /// process its GPU path. A removed device retires the instance either way.
+    pub(crate) fn wait_with(
+        &self,
+        fence: &ID3D12Fence,
+        value: u64,
+        permitted: impl Fn() -> bool,
+        retire_on_timeout: bool,
     ) -> Result<(), PlatformError> {
         let until = Instant::now() + BOUND;
         loop {
@@ -237,14 +459,16 @@ impl WindowsGpu {
             // SAFETY: live owned fence, polled without events or an unbounded native wait.
             let done = unsafe { fence.GetCompletedValue() };
             if done == u64::MAX {
-                self.retire();
+                self.retire_for(model::Fault::Device, Reason::Removed);
                 return Err(error(Reason::Removed));
             }
             if done >= value {
                 return Ok(());
             }
             if Instant::now() >= until {
-                self.retire();
+                if retire_on_timeout {
+                    self.retire();
+                }
                 return Err(PlatformError::Timeout);
             }
             thread::sleep(Duration::from_millis(1));
@@ -269,37 +493,52 @@ impl WindowsGpu {
                 Quality: 0,
             },
             Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
+            // ALLOW_RENDER_TARGET is what lets D3D11 open the texture: without it
+            // OpenSharedResource1 answers E_INVALIDARG on the NVIDIA driver here (measured with
+            // examples/gpu_share_variants.rs), which left every capture slot on the CPU path.
+            // The D3D11 side only ever copies into it; the flag is not used for rendering.
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS
+                | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             ..Default::default()
         };
         let mut resource = None;
         // SAFETY: a same-adapter, single-sample, DEFAULT shared committed resource in COMMON.
         unsafe {
-            api(self.d12.CreateCommittedResource(
-                &D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_DEFAULT,
-                    ..Default::default()
-                },
-                D3D12_HEAP_FLAG_SHARED,
-                &desc,
-                D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut resource,
-            ))?;
+            step(
+                "CreateCommittedResource",
+                self.d12.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_SHARED,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut resource,
+                ),
+            )?;
         }
         let resource = resource.ok_or_else(|| error(Reason::Sharing))?;
         // SAFETY: unnamed, non-inheritable own handle, opened only on the verified capture device.
         let handle = model::SharedHandle::new(
             unsafe {
-                api(self
-                    .d12
-                    .CreateSharedHandle(&resource, None, GENERIC_ALL.0, None))?
+                step(
+                    "CreateSharedHandle(texture)",
+                    self.d12
+                        .CreateSharedHandle(&resource, None, GENERIC_ALL.0, None),
+                )?
             },
             close_handle,
         );
         let device: ID3D11Device1 = api(self.d11.cast())?;
         // SAFETY: matching LUID and the exact handle owned above. Handle closes on every path.
-        let texture: ID3D11Texture2D = unsafe { api(device.OpenSharedResource1(handle.get()))? };
+        let texture: ID3D11Texture2D = unsafe {
+            step(
+                "OpenSharedResource1",
+                device.OpenSharedResource1(handle.get()),
+            )?
+        };
         let mut actual = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: verifies the opened resource, without querying any window or other process.
         unsafe {
@@ -355,21 +594,25 @@ pub(crate) struct Fence {
     pub d12: ID3D12Fence,
     pub d11: ID3D11Fence,
 }
+/// Resources of a finished surface that the GPU may still be reading. `_payload` is declared
+/// before `fence` so the resources are released first; the entry lives in `WindowsGpu::retained`.
 struct Retained {
-    _gpu: Arc<WindowsGpu>,
     _payload: Box<dyn Send>,
     fence: ID3D12Fence,
     value: u64,
 }
 
+/// One shared capture slot. Fields drop in declaration order: every native D3D12/D3D11 object
+/// and the wgpu texture wrapping one are released before `gpu`, so a surface holding the last
+/// reference to its context never tears the context down underneath its own resources.
 pub(crate) struct Surface {
     pub shared: SharedTexture,
-    gpu: Arc<WindowsGpu>,
     producer: Fence,
     consumer: Fence,
     produced: AtomicU64,
     state: Mutex<Slot>,
     wrapped: Mutex<Option<wgpu::Texture>>,
+    gpu: Arc<WindowsGpu>,
 }
 impl Surface {
     pub(crate) fn new(gpu: Arc<WindowsGpu>, size: PixelSize) -> Result<Arc<Self>, PlatformError> {
@@ -397,7 +640,16 @@ impl Surface {
         self.free(true)
     }
     pub(crate) fn healthy(&self) -> bool {
-        self.gpu.healthy().is_ok()
+        self.gpu.healthy().is_ok() && self.state.lock().is_ok_and(|state| !state.retired)
+    }
+    /// An unconfirmed handoff makes this surface unusable for good, whatever happens to the
+    /// device. Its owner replaces it; its resources stay held until the consumer fence passes.
+    pub(crate) fn quarantine(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.retire();
     }
     pub(crate) fn belongs(&self, gpu: &WindowsGpu) -> bool {
         std::ptr::eq(self.gpu.as_ref(), gpu)
@@ -428,9 +680,20 @@ impl Surface {
         model::permitted(gate.is_open(), gate.epoch(), epoch).map_err(error)?;
         let serial = gpu.lock()?;
         let produced = self.produced.load(Ordering::Acquire);
-        gpu.wait(&self.producer.d12, produced, || {
-            gate.is_open() && gate.epoch() == epoch
-        })?;
+        if let Err(cause) = gpu.wait_with(
+            &self.producer.d12,
+            produced,
+            || gate.is_open() && gate.epoch() == epoch,
+            false,
+        ) {
+            if matches!(cause, PlatformError::Timeout) {
+                // The capture device never signalled: this surface is suspect, and enough of
+                // these in a row mean the queue is stalled.
+                self.quarantine();
+                gpu.strike();
+            }
+            return Err(cause);
+        }
         let mut wrapped = self.wrapped.lock().map_err(|_| error(Reason::Sharing))?;
         if wrapped.is_none() {
             let size = wgpu::Extent3d {
@@ -485,8 +748,11 @@ impl Surface {
         let mut handoff = Handoff::default();
         handoff.stage().map_err(error)?;
         // SAFETY: scoped guard; staged wait is removed or consumed before the serial lock is released.
-        let queue = unsafe { gpu.queue.as_hal::<wgpu::hal::api::Dx12>() }
-            .ok_or_else(|| error(Reason::Adapter))?;
+        let Some(queue) = (unsafe { gpu.queue.as_hal::<wgpu::hal::api::Dx12>() }) else {
+            // `done` was already advanced for a signal that will never come.
+            self.quarantine();
+            return Err(error(Reason::Adapter));
+        };
         queue.add_wait_fence(self.producer.d12.clone(), produced);
         drop(queue);
         Ok(Lease {
@@ -497,6 +763,7 @@ impl Surface {
             done,
             gate,
             epoch,
+            failed: false,
         })
     }
 }
@@ -536,6 +803,7 @@ pub struct Lease<'a> {
     done: u64,
     gate: Arc<IoGate>,
     epoch: u64,
+    failed: bool,
 }
 impl fmt::Debug for Lease<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -562,6 +830,25 @@ impl Lease<'_> {
         if self.handoff.complete {
             return Ok(());
         }
+        if self.failed {
+            // The first failure already quarantined the surface; a second attempt would only
+            // submit and wait again on a handoff nobody can confirm.
+            return Err(error(Reason::Submitted));
+        }
+        if let Err(cause) = self.release() {
+            self.failed = true;
+            self.surface.quarantine();
+            if matches!(cause, PlatformError::Timeout) {
+                self.surface.gpu.strike();
+            }
+            return Err(cause);
+        }
+        self.surface.gpu.settled();
+        self.handoff.finish();
+        model::permitted(self.gate.is_open(), self.gate.epoch(), self.epoch).map_err(error)
+    }
+    /// Returns the queue ownership taken in `begin`. Ok means the consumer fence passed.
+    fn release(&mut self) -> Result<(), PlatformError> {
         let gpu = &self.surface.gpu;
         // SAFETY: staged entries belong to this serialized image handoff only.
         let queue = unsafe { gpu.queue.as_hal::<wgpu::hal::api::Dx12>() }
@@ -584,19 +871,14 @@ impl Lease<'_> {
             }),
         );
         gpu.queue.submit([commands.finish()]);
-        // Ownership cleanup proceeds even after gate closure; output publication does not.
-        gpu.wait(&self.surface.consumer.d12, self.done, || true)?;
-        self.handoff.finish();
-        model::permitted(self.gate.is_open(), self.gate.epoch(), self.epoch).map_err(error)
+        // Ownership cleanup proceeds even after gate closure; output publication does not. A
+        // timeout here costs this surface (and a strike), not the whole device.
+        gpu.wait_with(&self.surface.consumer.d12, self.done, || true, false)
     }
 }
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
-        if self.finish().is_err() && !self.handoff.complete {
-            self.surface.gpu.retire();
-            if let Ok(mut state) = self.surface.state.lock() {
-                state.retire();
-            }
-        }
+        // `finish` quarantines the surface and counts the strike itself when it fails.
+        let _ = self.finish();
     }
 }

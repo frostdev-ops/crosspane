@@ -9,10 +9,44 @@ const SLOT: Duration = Duration::from_millis(10);
 const WINDOW: u32 = 32;
 const RING_FRAMES: usize = 3 * AUDIO_FRAME_SAMPLES;
 const STARVATION: u32 = 20; // At most 200 ms of PLC; then reset once and emit silence.
+/// Largest accepted `JitterConfig::max`. The packet window holds 32 slots (320 ms); a target
+/// at or below 200 ms keeps the `pull_next` trim threshold (target slots + 8) inside it.
+const MAX_TARGET: Duration = Duration::from_millis(200);
+/// Packets queued beyond the target that `pull_next` tolerates before trimming.
+const TRIM_SLACK: usize = 8;
+
+/// Target-delay policy: `base + 4·jitter + loss`, clamped to `[min, max]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JitterConfig {
+    pub base: Duration,
+    pub min: Duration,
+    pub max: Duration,
+}
+
+impl Default for JitterConfig {
+    /// Base 40 ms, clamped to 20..80 ms: the behaviour of `JitterBuffer::new`.
+    fn default() -> Self {
+        Self {
+            base: Duration::from_millis(40),
+            min: Duration::from_millis(20),
+            max: Duration::from_millis(80),
+        }
+    }
+}
+
+impl JitterConfig {
+    fn valid(&self) -> bool {
+        !self.min.is_zero()
+            && self.min <= self.base
+            && self.base <= self.max
+            && self.max <= MAX_TARGET
+    }
+}
 
 /// Arrival jitter uses a 1/16 EWMA of the absolute local interarrival error against sequence
-/// distance (never sender wall time). Target is 40 ms + four jitter deviations, plus a loss
-/// margin decaying by 1/256 per received packet, clamped to 20..80 ms. Occupancy uses a 1/64
+/// distance (never sender wall time). Target is the configured base (default 40 ms) + four
+/// jitter deviations, plus a loss margin decaying by 1/256 per received packet, clamped to the
+/// configured bounds (default 20..80 ms). Occupancy uses a 1/64
 /// EWMA, a one-packet deadband, and a slow PI servo (20 ppm/frame proportional, 0.1 ppm/frame/slot integral).
 /// Positive correction consumes more source samples. The fixed three-frame interpolation ring
 /// retains fractional position and channel continuity across packets. Late pulls advance all
@@ -23,10 +57,16 @@ const STARVATION: u32 = 20; // At most 200 ms of PLC; then reset once and emit s
 /// normal window without letting active-playout jumps reset admission. The first such packet
 /// starts a new target-delay wait; delayed forward packets cannot be distinguished from fresh
 /// packets without a wire freshness signal. No catch-up decoding or stored latency.
-/// All queues and scratch are allocated by `new`.
+/// `pull_next` is the device-paced alternative to `pull`: it never rebases on lateness and
+/// instead trims an overfull queue. After 200 ms of concealment with nothing queued it arms the
+/// same one-time reanchor, so a sender resuming after a pause restarts playout instead of being
+/// dropped as late. All queues and scratch are allocated by `new`.
 pub struct JitterBuffer {
     kind: AudioKind,
     stream: AudioStreamId,
+    config: JitterConfig,
+    playing: bool,
+    playout: Option<u64>,
     decoder: Decoder,
     packets: Vec<AudioPacket>,
     anchor: Option<(u32, u64)>,
@@ -61,12 +101,28 @@ impl fmt::Debug for JitterBuffer {
 
 impl JitterBuffer {
     pub fn new(kind: AudioKind, stream: AudioStreamId) -> Result<Self, AudioError> {
+        Self::with_config(kind, stream, JitterConfig::default())
+    }
+
+    /// Like `new`, with an explicit target-delay policy. A config outside
+    /// `0 < min <= base <= max <= 200 ms` is `AudioError::InvalidFormat`.
+    pub fn with_config(
+        kind: AudioKind,
+        stream: AudioStreamId,
+        c: JitterConfig,
+    ) -> Result<Self, AudioError> {
         if stream.0 == 0 {
             return Err(AudioError::WrongStream);
+        }
+        if !c.valid() {
+            return Err(AudioError::InvalidFormat);
         }
         Ok(Self {
             kind,
             stream,
+            config: c,
+            playing: false,
+            playout: None,
             decoder: Decoder::new(kind)?,
             packets: Vec::with_capacity(WINDOW as usize),
             anchor: None,
@@ -79,7 +135,7 @@ impl JitterBuffer {
             rate_ppm: 0.0,
             loss_ns: 0.0,
             stats: AudioStats {
-                target_delay: Duration::from_millis(40),
+                target_delay: c.base,
                 buffered_packets: 0,
                 received: 0,
                 lost: 0,
@@ -148,6 +204,9 @@ impl JitterBuffer {
             self.anchor = Some((packet.seq, packet.sample_time));
             self.due = Some(now.saturating_add(self.stats.target_delay));
             self.recovery_anchor = None;
+            // A fresh source boundary: start-up waits for the target again.
+            self.playing = false;
+            self.playout = None;
         }
         if let Some((anchor_seq, anchor_time)) = self.anchor {
             let offset =
@@ -210,9 +269,17 @@ impl JitterBuffer {
     }
 
     fn target(&mut self) {
-        let ns =
-            (40_000_000.0 + 4.0 * self.jitter_ns + self.loss_ns).clamp(20_000_000.0, 80_000_000.0);
+        let JitterConfig { base, min, max } = self.config;
+        let ns = (base.as_nanos() as f64 + 4.0 * self.jitter_ns + self.loss_ns)
+            .clamp(min.as_nanos() as f64, max.as_nanos() as f64);
         self.stats.target_delay = Duration::from_nanos(ns as u64);
+    }
+
+    // Audio/video sync work prompted by Thiago Goncalves (2026-10).
+    /// The sender `sample_time` (48 kHz frames) of the first frame of the PCM the latest
+    /// non-`Waiting` pull returned; `None` before one, and after a rebase until the next pull.
+    pub fn playout_sample_time(&self) -> Option<u64> {
+        self.playout
     }
 
     pub fn stats(&self) -> AudioStats {
@@ -271,6 +338,8 @@ impl JitterBuffer {
             self.rate_ppm = 0.0;
             self.stats.drift_ppm = 0;
             self.starving = STARVATION + 1;
+            self.playing = false;
+            self.playout = None;
             let sample_time = sample_time.ok_or(AudioError::InvalidPacket)?;
             self.seq = current.wrapping_add(advance as u32);
             // Rebase the sender anchor too: advances may exceed half or multiple seq wraps.
@@ -282,6 +351,77 @@ impl JitterBuffer {
             return Ok(AudioPull::Concealed);
         }
         self.due = Some(due.saturating_add(SLOT));
+        self.render(pcm)
+    }
+
+    // Audio/video sync work prompted by Thiago Goncalves (2026-10).
+    /// Device-paced: the consumer needs the next 10 ms now. `Waiting` only until the first
+    /// packet + target; afterwards always a frame (packet/FEC/concealed), never a lateness
+    /// rebase; if more than target/10 + 8 packets are queued, the oldest are dropped down to
+    /// the target first. The occupancy servo is unchanged.
+    pub fn pull_next(&mut self, now: MonoTime, pcm: &mut [f32]) -> Result<AudioPull, AudioError> {
+        pcm.fill(0.0);
+        if pcm.len() != self.kind.format().frame_samples() {
+            return Err(AudioError::InvalidFormat);
+        }
+        let Some(due) = self.due else {
+            return Ok(AudioPull::Waiting);
+        };
+        if !self.playing && now < due {
+            return Ok(AudioPull::Waiting);
+        }
+        self.trim();
+        // Keep `pull` coherent if a caller mixes the two: the next slot is due in 10 ms.
+        self.due = Some(now.saturating_add(SLOT));
+        let result = self.render(pcm)?;
+        // Audio/video sync work prompted by Thiago Goncalves (2026-10).
+        // A device-paced pull is never late, so the recovery reanchor that a late `pull` arms
+        // never arms here. A sender that paused (it sends nothing while its source is silent)
+        // resumes with seq and sample_time continuing from before the pause: behind the playout
+        // cursor, so `push` would drop it forever. Once `STARVATION` frames (200 ms) were
+        // concealed with nothing queued, arm the same one-time reanchor: the next forward packet
+        // consistent with the last one restarts playout after the target, as at stream start.
+        if self.starving >= STARVATION && self.packets.is_empty() && self.recovery_anchor.is_none()
+        {
+            self.recovery_anchor = self.anchor;
+        }
+        Ok(result)
+    }
+
+    /// Drops the oldest queued packets when more than target + `TRIM_SLACK` slots are queued,
+    /// so that the newest `target` slots of sender time remain. Skipped slots are not decoded.
+    fn trim(&mut self) {
+        let target = (self.stats.target_delay.as_nanos() / SLOT.as_nanos()) as usize;
+        if self.packets.len() <= target + TRIM_SLACK {
+            return;
+        }
+        // Every queued packet is within WINDOW slots ahead of `seq` (enforced by `push`).
+        let newest = self
+            .packets
+            .iter()
+            .map(|p| p.seq.wrapping_sub(self.seq))
+            .max()
+            .unwrap_or(0);
+        // newest + 1 > len > target, so `start` is positive.
+        let start = newest.saturating_add(1).saturating_sub(target as u32);
+        let before = self.packets.len();
+        let seq = self.seq;
+        self.packets.retain(|p| p.seq.wrapping_sub(seq) >= start);
+        self.stats.dropped = self
+            .stats
+            .dropped
+            .saturating_add((before - self.packets.len()) as u64);
+        self.seq = self.seq.wrapping_add(start);
+        // Decoded frames still in the ring precede the skip; discard them so the ring stays
+        // contiguous with `seq` and `playout_sample_time` stays exact.
+        self.len = 0;
+        self.phase = 0.0;
+        // The trim is a deliberate step in occupancy: restart its EWMA from the new level so
+        // the servo does not chase the stale average. The integral (clock drift) is kept.
+        self.occupancy = None;
+    }
+
+    fn render(&mut self, pcm: &mut [f32]) -> Result<AudioPull, AudioError> {
         let occupancy =
             self.packets.len() as f64 + (self.len as f64 - self.phase) / AUDIO_FRAME_SAMPLES as f64;
         let smoothed = self.occupancy.unwrap_or(occupancy)
@@ -315,6 +455,17 @@ impl JitterBuffer {
             }
             self.len += AUDIO_FRAME_SAMPLES;
         }
+        // Audio/video sync work prompted by Thiago Goncalves (2026-10).
+        // The ring is contiguous and ends where source frame `seq` starts, so the first output
+        // frame (ring position `phase`) is `len - floor(phase)` frames before that boundary.
+        self.playout = self.anchor.and_then(|(anchor_seq, anchor_time)| {
+            let back = i64::try_from(self.len).ok()? - self.phase.floor() as i64;
+            let offset = i64::from(self.seq.wrapping_sub(anchor_seq) as i32)
+                .checked_mul(AUDIO_FRAME_SAMPLES as i64)?
+                .checked_sub(back)?;
+            anchor_time.checked_add_signed(offset)
+        });
+        self.playing = true;
         let channels = self.kind.format().channels as usize;
         for frame in 0..AUDIO_FRAME_SAMPLES {
             let position = self.phase + frame as f64 * step;

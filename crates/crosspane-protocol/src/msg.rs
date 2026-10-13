@@ -205,6 +205,12 @@ pub enum ControlMessage {
     AudioClose {
         stream: AudioStreamId,
     },
+    /// Source → destination: stereo 48 kHz mix of the sender's windows projected to the receiver.
+    /// Sent only when PROJECTION_AUDIO_FEATURE is negotiated. Admitted under a live projection from
+    /// the sender, never under AudioSpeaker. AudioOpened/AudioRefused/AudioClose/datagrams as AudioOpen.
+    ProjectionAudioOpen {
+        stream: AudioStreamId,
+    },
     ClipOffer(ClipOffer),
     ClipWithdraw(ClipWithdraw),
     ClipFetch(ClipFetch),

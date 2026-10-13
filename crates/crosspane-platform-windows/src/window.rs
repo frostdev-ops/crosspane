@@ -44,7 +44,7 @@ use windows_sys::Win32::{
 
 use crate::model::{
     geometry::{DisplayIds, MonitorProbe},
-    popup,
+    popup, process_claims,
     window::{self, Identity, Observation, Windows},
     winevent::{self, RawWinEvent},
 };
@@ -1024,12 +1024,42 @@ struct Enumeration<'a> {
     windows: Vec<u64>,
 }
 
+/// Mirrors admissions and removals into the process-claims registry that binds projected-app
+/// audio PIDs to their window's process identity. Called with the table lock held, right after
+/// the mutation and before the events reach the sink, so a window the engine learns about is
+/// already claimed. Only `Added` carries a newly verified identity; a changed identity is
+/// reported as `Removed` then `Added`.
+fn publish_claims(table: &Windows, events: &[WindowEvent]) {
+    for event in events {
+        match event {
+            WindowEvent::Added(info) => {
+                if let Some(identity) = table.identity(info.id) {
+                    process_claims::record_claim(info.id.0, identity.pid, identity.process_created);
+                }
+            }
+            WindowEvent::Removed(id) => process_claims::remove_claim(id.0),
+            _ => {}
+        }
+    }
+}
+
 fn emit(events: Vec<WindowEvent>, sink: &Option<Arc<dyn EventSink<WindowEvent>>>) {
     if let Some(sink) = sink {
         for event in events {
             sink.send(event);
         }
     }
+}
+
+/// Crosspane's own windows are never sources (model/winevent.rs excludes them). Their fields
+/// are not read either: GetWindowTextW on a same-process window sends WM_GETTEXT to its owner
+/// thread, and that thread may be the one waiting for this source to start.
+fn own_process(window: HWND) -> bool {
+    let mut pid = 0;
+    // SAFETY: PID metadata only; this never sends a message to the window.
+    unsafe { GetWindowThreadProcessId(window, &mut pid) };
+    // SAFETY: identifier of this process only.
+    pid == unsafe { GetCurrentProcessId() }
 }
 
 fn observe(
@@ -1042,6 +1072,7 @@ fn observe(
 ) -> Result<(), PlatformError> {
     if !context.allows(id)
         || id == number(native.window)
+        || own_process(hwnd(id))
         || !context.state.fields_open.load(Ordering::Acquire)
     {
         return Ok(());
@@ -1063,21 +1094,27 @@ fn observe(
     });
     let events = match result {
         Ok(_) if !context.allows(id) => Vec::new(),
-        Ok(observation) => context
-            .state
-            .windows
-            .lock()
-            .map_err(|_| backend("window observer state"))?
-            .observe(observation),
+        Ok(observation) => {
+            let mut table = context
+                .state
+                .windows
+                .lock()
+                .map_err(|_| backend("window observer state"))?;
+            let events = table.observe(observation);
+            publish_claims(&table, &events);
+            events
+        }
         Err(_) => {
             // SAFETY: this is an admitted HWND; absence is checked without reading content.
             if context.allows(id) && unsafe { IsWindow(hwnd(id)) } == 0 {
-                context
+                let mut table = context
                     .state
                     .windows
                     .lock()
-                    .map_err(|_| backend("window observer state"))?
-                    .close(id, None)
+                    .map_err(|_| backend("window observer state"))?;
+                let events = table.close(id, None);
+                publish_claims(&table, &events);
+                events
             } else {
                 Vec::new()
             }
@@ -1307,11 +1344,13 @@ fn run(
                 .drain(..)
                 .collect();
             for event in raw {
-                let (events, refresh) = state
+                let mut table = state
                     .windows
                     .lock()
-                    .map_err(|_| backend("window observer state"))?
-                    .event(event);
+                    .map_err(|_| backend("window observer state"))?;
+                let (events, refresh) = table.event(event);
+                publish_claims(&table, &events);
+                drop(table);
                 emit(events, &sink);
                 if refresh {
                     observe(event.hwnd, &context, &native, &probes, &ids, &sink)?;
@@ -1379,6 +1418,13 @@ fn run(
             }
         }
         thread::sleep(Duration::from_millis(10));
+    }
+    // A stopped or faulted source no longer vouches for any window: its claims go with it, so
+    // projected-app capture fails closed until a live source admits the window again.
+    if let Ok(table) = state.windows.lock() {
+        for window in table.list() {
+            process_claims::remove_claim(window.id.0);
+        }
     }
     drop(native);
     CONTEXT.with(|slot| slot.borrow_mut().take());

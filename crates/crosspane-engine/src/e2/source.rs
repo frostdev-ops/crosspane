@@ -1,6 +1,6 @@
 //! Lifecycle, focus guard and content-to-display input mapping on the window owner.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crosspane_input::Held;
@@ -13,7 +13,7 @@ use crosspane_protocol::projection::{
     BrowsableWindow, MAX_BROWSE_WINDOWS, ParkingKind, ProjInput, ProjectionEndReason as Reason,
     ProjectionMessage as Message, ProxyPlacement, WindowSummary,
 };
-use crosspane_types::geom::{PixelRect, PixelSize, PointDevice, RectLogical};
+use crosspane_types::geom::{DisplayGeometry, PixelRect, PixelSize, PointDevice, RectLogical};
 use crosspane_types::id::{DisplayId, NodeId, ProjectionId, WindowId};
 use crosspane_types::time::MonoTime;
 
@@ -149,6 +149,12 @@ pub(super) struct Source {
     /// when it is.
     focus_wanted: bool,
     pub(super) clipboard_focused: bool,
+    /// The initial park failed with a window-specific failure, so the projection continues as a
+    /// mirror (M1) of the window where it stands. The engine never moves it afterwards: it is not
+    /// resized or re-parked (a destination's `Resize` is answered with the window's actual
+    /// geometry), `parked` follows the window's own frame, and ending the projection returns
+    /// nothing (no `Output::Restore`: the failed park's own was issued when it failed).
+    in_place: bool,
 }
 
 impl E2 {
@@ -412,6 +418,7 @@ impl E2 {
                 last_activation: None,
                 focus_wanted: false,
                 clipboard_focused: false,
+                in_place: false,
             },
         );
         Ok(())
@@ -704,6 +711,8 @@ impl E2 {
             });
             return;
         }
+        // Read before `source` borrows `self.sources`.
+        let permits_io = self.permits_io();
         let Some((&projection, source)) = self.sources.iter_mut().find(|(_, s)| {
             s.window == window && (matches!(s.stage, Stage::Parking(_)) || s.resizing)
         }) else {
@@ -721,9 +730,41 @@ impl E2 {
         if initial {
             source.stage = Stage::Capturing(now.saturating_add(START_TIMEOUT));
         }
-        let Ok(parked) = result else {
-            self.end_source(projection, Reason::Failed, false, now, out);
-            return;
+        let parked = match result {
+            Ok(parked) => parked,
+            // The window itself refused to be parked (it is gone from the platform's view, or
+            // will not move: the agent reports every failure that is not the session's or a
+            // permission's as `Other`). The first park of a projection then falls back to M1
+            // instead of ending it: the window stays where it is and is captured as a window
+            // (the reported fallback, 03 "Placement models"). `Locked` and `SecureInput` (the
+            // session), `PermissionDenied` and `PointerButtonHeld` (retryable, nothing to do with
+            // the window) still end it, and so does an `Other` when the session does not permit
+            // I/O (fail closed) or when the window's place on a known display is unknown (its
+            // input could not be mapped). A later failure (a resize) ends it as before.
+            Err(Failure::Other) if initial && permits_io => {
+                let Some(parked) = self
+                    .windows
+                    .get(&window)
+                    .and_then(|info| in_place_parked(info, &self.display_bounds))
+                else {
+                    self.end_source(projection, Reason::Failed, false, now, out);
+                    return;
+                };
+                source.in_place = true;
+                // The failed park may have left a journal entry (and a partial change): this is
+                // the one return that balances it, exactly the one the failed-park end issued
+                // before. It is queued behind the park, so it settles the platform's state
+                // before anything else touches the window; ending the projection issues none.
+                out.push(Output::Restore {
+                    window,
+                    place: None,
+                });
+                parked
+            }
+            Err(_) => {
+                self.end_source(projection, Reason::Failed, false, now, out);
+                return;
+            }
         };
         let Some((size, parking)) = geometry(parked).filter(|_| parked.window == window) else {
             self.end_source(projection, Reason::Failed, false, now, out);
@@ -750,6 +791,19 @@ impl E2 {
                 peer: source.peer,
                 parking,
             }));
+            if source.in_place {
+                out.push(Output::Notice(Notice::ProjectionShownInPlace {
+                    key: ProjectionKey {
+                        source: self.node,
+                        projection,
+                    },
+                    title: self
+                        .windows
+                        .get(&window)
+                        .map(|info| wire_text(&info.title))
+                        .unwrap_or_default(),
+                }));
+            }
         } else if matches!(source.stage, Stage::Restarting(_)) {
             if !source.restart(projection, now, out) {
                 self.end_source(projection, Reason::Failed, false, now, out);
@@ -1229,7 +1283,12 @@ impl E2 {
         if let Some(stream) = source.stream {
             out.push(Output::StopCapture { stream });
         }
-        if !matches!(source.stage, Stage::Offered(_)) || source.restore_place.is_some() {
+        // An in-place window was never moved by this projection: it has nothing to return (the
+        // return that balanced its failed park went out when that park failed), and a placement
+        // requested by a drag-return would be a move of its own.
+        if !source.in_place
+            && (!matches!(source.stage, Stage::Offered(_)) || source.restore_place.is_some())
+        {
             out.push(Output::Restore {
                 window: source.window,
                 place: source.restore_place,
@@ -1359,6 +1418,14 @@ impl E2 {
                     source.stand_in = None;
                 }
                 source.window_state = original.state;
+                // An in-place window is the user's to move and resize: its frame is followed,
+                // never undone. (Off-Space its frame says nothing.)
+                if source.in_place
+                    && original.state != WindowState::Hidden
+                    && let Some(parked) = in_place_parked(original, &self.display_bounds)
+                {
+                    source.follow_in_place(projection, parked, out);
+                }
             }
             let changed_stand_in = source.reconcile_stand_in(&self.windows, now);
             if window.id == source.window || source.stand_in == Some(window.id) || changed_stand_in
@@ -1395,9 +1462,41 @@ impl E2 {
             source.stop_capture(out);
         }
     }
+
+    /// AUD-PROJ: the process ids whose audio follows this node's projections, per destination
+    /// peer. A projection counts only while its destination has accepted it on the current
+    /// connection and the window is parked: `Capturing`, `Live` or `Restarting` (the stages of
+    /// `Notice::ProjectionStarted` and its resumption). `Offered` and `Parking` (not accepted or
+    /// not parked yet), `Suspended` (link lost) and `Resuming` (re-offered, not yet accepted
+    /// again) contribute nothing, and a projection that has ended is no longer in `sources`.
+    /// The pid is the projected window's own process as the platform reported it; a window
+    /// without one, or with pid 0, contributes nothing. A peer without any pid has no entry.
+    pub(super) fn audio_sources(&self) -> BTreeMap<NodeId, BTreeSet<u32>> {
+        let mut sources: BTreeMap<NodeId, BTreeSet<u32>> = BTreeMap::new();
+        for source in self.sources.values().filter(|s| s.accepted_here()) {
+            if let Some(pid) = self
+                .windows
+                .get(&source.window)
+                .and_then(|info| info.pid)
+                .filter(|&pid| pid != 0)
+            {
+                sources.entry(source.peer).or_default().insert(pid);
+            }
+        }
+        sources
+    }
 }
 
 impl Source {
+    /// The destination accepted this projection on the current connection and the window is
+    /// parked (or being parked again after a resume): the stages from which it is shown.
+    fn accepted_here(&self) -> bool {
+        matches!(
+            self.stage,
+            Stage::Capturing(_) | Stage::Live | Stage::Restarting(_)
+        )
+    }
+
     fn reconcile_stand_in(
         &mut self,
         windows: &BTreeMap<WindowId, WindowInfo>,
@@ -1593,6 +1692,11 @@ impl Source {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
+        // An in-place window is followed (`follow_in_place`), never parked again.
+        if self.in_place {
+            self.repark_due = false;
+            return;
+        }
         if self.stage != Stage::Live {
             return;
         }
@@ -1666,7 +1770,9 @@ impl Source {
         let Some((size, parking)) = geometry(parked) else {
             return false;
         };
+        // An in-place window is not resized to the destination's geometry (nothing can move it).
         if let Some((wanted, scale)) = self.resume_geometry.take()
+            && !self.in_place
             && (size != wanted || self.parked_scale != scale)
         {
             self.resizing = true;
@@ -1775,11 +1881,13 @@ impl Source {
             return;
         }
         // Satisfied means the window really is this size at this scale. What was asked before
-        // doesn't count: an app's minimum size makes the two differ.
-        let satisfied = self.fullscreen_current()
-            && self.fullscreen == fullscreen
-            && self.parked_scale == scale
-            && self.parked.and_then(geometry).map(|(actual, _)| actual) == Some(size);
+        // doesn't count: an app's minimum size makes the two differ. An in-place window is never
+        // resized: every request is answered with the geometry it has.
+        let satisfied = self.in_place
+            || (self.fullscreen_current()
+                && self.fullscreen == fullscreen
+                && self.parked_scale == scale
+                && self.parked.and_then(geometry).map(|(actual, _)| actual) == Some(size));
         if satisfied {
             self.answer(projection, request, out);
         } else {
@@ -1826,12 +1934,44 @@ impl Source {
         }
     }
 
+    /// An in-place window now has geometry `parked` (it moved, was resized, or went fullscreen
+    /// by itself). Input is mapped from it from now on, and the destination is told when the
+    /// size or the fullscreen state changed: there is no park to wait for, and nothing here
+    /// pushes the window back. Not while suspended or resuming (no peer to tell): the restart's
+    /// `Geometry` carries it.
+    fn follow_in_place(&mut self, projection: ProjectionId, parked: Parked, out: &mut Vec<Output>) {
+        if self.parked == Some(parked) {
+            return;
+        }
+        let Some((size, parking)) = geometry(parked) else {
+            return;
+        };
+        let unchanged = self.parked.and_then(geometry).map(|(size, _)| size) == Some(size)
+            && self.fullscreen == parked.fullscreen;
+        self.parked = Some(parked);
+        self.fullscreen = parked.fullscreen;
+        if !unchanged && matches!(self.stage, Stage::Capturing(_) | Stage::Live) {
+            send(
+                self.peer,
+                Message::Geometry {
+                    fullscreen: Some(self.fullscreen),
+                    projection,
+                    size,
+                    parking,
+                    answers: self.answered,
+                },
+                out,
+            );
+        }
+    }
+
     fn resize_latest(&mut self, projection: ProjectionId, out: &mut Vec<Output>) {
         let Some((size, scale, request, fullscreen)) = self.latest_resize.take() else {
             return;
         };
         let actual = self.parked.and_then(geometry).map(|(actual, _)| actual);
         if !sane_size(size)
+            || self.in_place
             || (self.fullscreen_current()
                 && actual == Some(size)
                 && self.parked_scale == scale
@@ -1910,6 +2050,41 @@ fn geometry(parked: Parked) -> Option<(PixelSize, ParkingKind)> {
         _ => return None,
     };
     Some((PixelSize::new(width as u32, height as u32), parking))
+}
+
+/// The geometry of `window` where it stands, as an M1 mirror's: its frame in device pixels
+/// relative to the origin of the display it is on (the rounding of `crosspane-platform-macos`:
+/// edges outward, so every touched pixel is kept). `None` when the window has no display, the
+/// display's geometry is not known, or the frame is empty or out of range. Input mapping needs a
+/// display and an origin, so nothing is guessed.
+fn in_place_parked(
+    window: &WindowInfo,
+    displays: &BTreeMap<DisplayId, DisplayGeometry>,
+) -> Option<Parked> {
+    let display = window.display?;
+    let geometry = displays.get(&display)?;
+    let (scale, origin, frame) = (geometry.scale, geometry.logical_origin, window.frame);
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let edges = [
+        ((frame.min_x() - origin.x) * scale).floor(),
+        ((frame.min_y() - origin.y) * scale).floor(),
+        ((frame.max_x() - origin.x) * scale).ceil(),
+        ((frame.max_y() - origin.y) * scale).ceil(),
+    ];
+    let in_range = |v: f64| v.is_finite() && v >= f64::from(i32::MIN) && v <= f64::from(i32::MAX);
+    if !edges.into_iter().all(in_range) || edges[2] <= edges[0] || edges[3] <= edges[1] {
+        return None;
+    }
+    let corner = |x: f64, y: f64| crosspane_types::geom::euclid::Point2D::new(x as i32, y as i32);
+    Some(Parked {
+        window: window.id,
+        kind: PlatformParking::Mirror,
+        display,
+        content: PixelRect::new(corner(edges[0], edges[1]), corner(edges[2], edges[3])),
+        fullscreen: window.state == WindowState::Fullscreen,
+    })
 }
 
 fn move_to(parked: Parked, p: PointDevice) -> InjectCmd {

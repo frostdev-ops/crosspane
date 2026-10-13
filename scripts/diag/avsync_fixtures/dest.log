@@ -1,0 +1,522 @@
+2026-10-12T00:16:45.000123Z  INFO crosspane_agent::audio: playback opened stream=3
+2026-10-12T00:16:45.063123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=240 at_ns=1005063123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:45.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=0 captured_ns=1000003000000 decoded_ns=1005028123456 sent_ns=1005029123456
+2026-10-12T00:16:45.309123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=12000 at_ns=1005309123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:45.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=1 captured_ns=1000253000000 decoded_ns=1005278123456 sent_ns=1005279123456
+2026-10-12T00:16:45.560123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=24000 at_ns=1005560123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:45.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=2 captured_ns=1000503000000 decoded_ns=1005528123456 sent_ns=1005529123456
+2026-10-12T00:16:45.811123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=36000 at_ns=1005811123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:45.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=3 captured_ns=1000753000000 decoded_ns=1005778123456 sent_ns=1005779123456
+2026-10-12T00:16:46.067123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=48240 at_ns=1006067123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:46.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=4 captured_ns=1001003000000 decoded_ns=1006028123456 sent_ns=1006029123456
+2026-10-12T00:16:46.308123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=60000 at_ns=1006308123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:46.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=5 captured_ns=1001253000000 decoded_ns=1006278123456 sent_ns=1006279123456
+2026-10-12T00:16:46.559123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=72000 at_ns=1006559123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:46.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=6 captured_ns=1001503000000 decoded_ns=1006528123456 sent_ns=1006529123456
+2026-10-12T00:16:46.810123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=84000 at_ns=1006810123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:46.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=7 captured_ns=1001753000000 decoded_ns=1006778123456 sent_ns=1006779123456
+2026-10-12T00:16:47.066123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=96240 at_ns=1007066123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:47.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=8 captured_ns=1002003000000 decoded_ns=1007028123456 sent_ns=1007029123456
+2026-10-12T00:16:47.312123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=108000 at_ns=1007312123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:47.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=9 captured_ns=1002253000000 decoded_ns=1007278123456 sent_ns=1007279123456
+2026-10-12T00:16:47.558123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=120000 at_ns=1007558123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:47.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=10 captured_ns=1002503000000 decoded_ns=1007528123456 sent_ns=1007529123456
+2026-10-12T00:16:47.809123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=132000 at_ns=1007809123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:47.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=11 captured_ns=1002753000000 decoded_ns=1007778123456 sent_ns=1007779123456
+2026-10-12T00:16:48.065123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=144240 at_ns=1008065123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:48.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=12 captured_ns=1003003000000 decoded_ns=1008028123456 sent_ns=1008029123456
+2026-10-12T00:16:48.311123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=156000 at_ns=1008311123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:48.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=13 captured_ns=1003253000000 decoded_ns=1008278123456 sent_ns=1008279123456
+2026-10-12T00:16:48.562123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=168000 at_ns=1008562123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:48.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=14 captured_ns=1003503000000 decoded_ns=1008528123456 sent_ns=1008529123456
+2026-10-12T00:16:48.808123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=180000 at_ns=1008808123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:48.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=15 captured_ns=1003753000000 decoded_ns=1008778123456 sent_ns=1008779123456
+2026-10-12T00:16:49.064123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=192240 at_ns=1009064123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:49.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=16 captured_ns=1004003000000 decoded_ns=1009028123456 sent_ns=1009029123456
+2026-10-12T00:16:49.310123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=204000 at_ns=1009310123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:49.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=17 captured_ns=1004253000000 decoded_ns=1009278123456 sent_ns=1009279123456
+2026-10-12T00:16:49.561123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=216000 at_ns=1009561123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:49.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=18 captured_ns=1004503000000 decoded_ns=1009528123456 sent_ns=1009529123456
+2026-10-12T00:16:49.812123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=228000 at_ns=1009812123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:49.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=19 captured_ns=1004753000000 decoded_ns=1009778123456 sent_ns=1009779123456
+2026-10-12T00:16:50.063123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=240240 at_ns=1010063123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:50.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=20 captured_ns=1005003000000 decoded_ns=1010028123456 sent_ns=1010029123456
+2026-10-12T00:16:50.309123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=252000 at_ns=1010309123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:50.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=21 captured_ns=1005253000000 decoded_ns=1010278123456 sent_ns=1010279123456
+2026-10-12T00:16:50.560123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=264000 at_ns=1010560123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:50.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=22 captured_ns=1005503000000 decoded_ns=1010528123456 sent_ns=1010529123456
+2026-10-12T00:16:50.811123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=276000 at_ns=1010811123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:50.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=23 captured_ns=1005753000000 decoded_ns=1010778123456 sent_ns=1010779123456
+2026-10-12T00:16:51.067123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=288240 at_ns=1011067123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:51.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=24 captured_ns=1006003000000 decoded_ns=1011028123456 sent_ns=1011029123456
+2026-10-12T00:16:51.308123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=300000 at_ns=1011308123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:51.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=25 captured_ns=1006253000000 decoded_ns=1011278123456 sent_ns=1011279123456
+2026-10-12T00:16:51.559123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=312000 at_ns=1011559123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:51.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=26 captured_ns=1006503000000 decoded_ns=1011528123456 sent_ns=1011529123456
+2026-10-12T00:16:51.810123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=324000 at_ns=1011810123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:51.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=27 captured_ns=1006753000000 decoded_ns=1011778123456 sent_ns=1011779123456
+2026-10-12T00:16:52.066123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=336240 at_ns=1012066123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:52.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=28 captured_ns=1007003000000 decoded_ns=1012028123456 sent_ns=1012029123456
+2026-10-12T00:16:52.312123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=348000 at_ns=1012312123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:52.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=29 captured_ns=1007253000000 decoded_ns=1012278123456 sent_ns=1012279123456
+2026-10-12T00:16:52.558123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=360000 at_ns=1012558123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:52.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=30 captured_ns=1007503000000 decoded_ns=1012528123456 sent_ns=1012529123456
+2026-10-12T00:16:52.809123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=372000 at_ns=1012809123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:52.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=31 captured_ns=1007753000000 decoded_ns=1012778123456 sent_ns=1012779123456
+2026-10-12T00:16:53.065123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=384240 at_ns=1013065123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:53.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=32 captured_ns=1008003000000 decoded_ns=1013028123456 sent_ns=1013029123456
+2026-10-12T00:16:53.311123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=396000 at_ns=1013311123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:53.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=33 captured_ns=1008253000000 decoded_ns=1013278123456 sent_ns=1013279123456
+2026-10-12T00:16:53.562123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=408000 at_ns=1013562123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:53.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=34 captured_ns=1008503000000 decoded_ns=1013528123456 sent_ns=1013529123456
+2026-10-12T00:16:53.808123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=420000 at_ns=1013808123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:53.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=35 captured_ns=1008753000000 decoded_ns=1013778123456 sent_ns=1013779123456
+2026-10-12T00:16:54.064123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=432240 at_ns=1014064123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:54.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=36 captured_ns=1009003000000 decoded_ns=1014028123456 sent_ns=1014029123456
+2026-10-12T00:16:54.310123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=444000 at_ns=1014310123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:54.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=37 captured_ns=1009253000000 decoded_ns=1014278123456 sent_ns=1014279123456
+2026-10-12T00:16:54.561123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=456000 at_ns=1014561123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:54.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=38 captured_ns=1009503000000 decoded_ns=1014528123456 sent_ns=1014529123456
+2026-10-12T00:16:54.812123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=468000 at_ns=1014812123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:54.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=39 captured_ns=1009753000000 decoded_ns=1014778123456 sent_ns=1014779123456
+2026-10-12T00:16:55.063123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=480240 at_ns=1015063123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:55.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=40 captured_ns=1010003000000 decoded_ns=1015028123456 sent_ns=1015029123456
+2026-10-12T00:16:55.309123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=492000 at_ns=1015309123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:55.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=41 captured_ns=1010253000000 decoded_ns=1015278123456 sent_ns=1015279123456
+2026-10-12T00:16:55.560123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=504000 at_ns=1015560123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:55.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=42 captured_ns=1010503000000 decoded_ns=1015528123456 sent_ns=1015529123456
+2026-10-12T00:16:55.811123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=516000 at_ns=1015811123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:55.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=43 captured_ns=1010753000000 decoded_ns=1015778123456 sent_ns=1015779123456
+2026-10-12T00:16:56.067123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=528240 at_ns=1016067123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:56.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=44 captured_ns=1011003000000 decoded_ns=1016028123456 sent_ns=1016029123456
+2026-10-12T00:16:56.308123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=540000 at_ns=1016308123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:56.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=45 captured_ns=1011253000000 decoded_ns=1016278123456 sent_ns=1016279123456
+2026-10-12T00:16:56.559123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=552000 at_ns=1016559123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:56.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=46 captured_ns=1011503000000 decoded_ns=1016528123456 sent_ns=1016529123456
+2026-10-12T00:16:56.810123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=564000 at_ns=1016810123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:56.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=47 captured_ns=1011753000000 decoded_ns=1016778123456 sent_ns=1016779123456
+2026-10-12T00:16:57.066123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=576240 at_ns=1017066123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:57.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=48 captured_ns=1012003000000 decoded_ns=1017028123456 sent_ns=1017029123456
+2026-10-12T00:16:57.312123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=588000 at_ns=1017312123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:57.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=49 captured_ns=1012253000000 decoded_ns=1017278123456 sent_ns=1017279123456
+2026-10-12T00:16:57.558123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=600000 at_ns=1017558123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:57.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=50 captured_ns=1012503000000 decoded_ns=1017528123456 sent_ns=1017529123456
+2026-10-12T00:16:57.809123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=612000 at_ns=1017809123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:57.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=51 captured_ns=1012753000000 decoded_ns=1017778123456 sent_ns=1017779123456
+2026-10-12T00:16:58.065123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=624240 at_ns=1018065123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:58.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=52 captured_ns=1013003000000 decoded_ns=1018028123456 sent_ns=1018029123456
+2026-10-12T00:16:58.311123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=636000 at_ns=1018311123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:58.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=53 captured_ns=1013253000000 decoded_ns=1018278123456 sent_ns=1018279123456
+2026-10-12T00:16:58.562123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=648000 at_ns=1018562123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:58.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=54 captured_ns=1013503000000 decoded_ns=1018528123456 sent_ns=1018529123456
+2026-10-12T00:16:58.808123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=660000 at_ns=1018808123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:58.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=55 captured_ns=1013753000000 decoded_ns=1018778123456 sent_ns=1018779123456
+2026-10-12T00:16:59.064123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=672240 at_ns=1019064123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:59.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=56 captured_ns=1014003000000 decoded_ns=1019028123456 sent_ns=1019029123456
+2026-10-12T00:16:59.310123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=684000 at_ns=1019310123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:59.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=57 captured_ns=1014253000000 decoded_ns=1019278123456 sent_ns=1019279123456
+2026-10-12T00:16:59.561123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=696000 at_ns=1019561123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:59.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=58 captured_ns=1014503000000 decoded_ns=1019528123456 sent_ns=1019529123456
+2026-10-12T00:16:59.812123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=708000 at_ns=1019812123456 ring_frames=960 target_ms=40
+2026-10-12T00:16:59.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=59 captured_ns=1014753000000 decoded_ns=1019778123456 sent_ns=1019779123456
+2026-10-12T00:17:00.063123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=720240 at_ns=1020063123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:00.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=60 captured_ns=1015003000000 decoded_ns=1020028123456 sent_ns=1020029123456
+2026-10-12T00:17:00.309123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=732000 at_ns=1020309123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:00.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=61 captured_ns=1015253000000 decoded_ns=1020278123456 sent_ns=1020279123456
+2026-10-12T00:17:00.560123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=744000 at_ns=1020560123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:00.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=62 captured_ns=1015503000000 decoded_ns=1020528123456 sent_ns=1020529123456
+2026-10-12T00:17:00.811123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=756000 at_ns=1020811123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:00.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=63 captured_ns=1015753000000 decoded_ns=1020778123456 sent_ns=1020779123456
+2026-10-12T00:17:01.067123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=768240 at_ns=1021067123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:01.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=64 captured_ns=1016003000000 decoded_ns=1021028123456 sent_ns=1021029123456
+2026-10-12T00:17:01.308123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=780000 at_ns=1021308123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:01.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=65 captured_ns=1016253000000 decoded_ns=1021278123456 sent_ns=1021279123456
+2026-10-12T00:17:01.559123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=792000 at_ns=1021559123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:01.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=66 captured_ns=1016503000000 decoded_ns=1021528123456 sent_ns=1021529123456
+2026-10-12T00:17:01.810123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=804000 at_ns=1021810123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:01.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=67 captured_ns=1016753000000 decoded_ns=1021778123456 sent_ns=1021779123456
+2026-10-12T00:17:02.066123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=816240 at_ns=1022066123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:02.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=68 captured_ns=1017003000000 decoded_ns=1022028123456 sent_ns=1022029123456
+2026-10-12T00:17:02.312123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=828000 at_ns=1022312123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:02.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=69 captured_ns=1017253000000 decoded_ns=1022278123456 sent_ns=1022279123456
+2026-10-12T00:17:02.558123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=840000 at_ns=1022558123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:02.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=70 captured_ns=1017503000000 decoded_ns=1022528123456 sent_ns=1022529123456
+2026-10-12T00:17:02.809123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=852000 at_ns=1022809123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:02.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=71 captured_ns=1017753000000 decoded_ns=1022778123456 sent_ns=1022779123456
+2026-10-12T00:17:03.065123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=864240 at_ns=1023065123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:03.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=72 captured_ns=1018003000000 decoded_ns=1023028123456 sent_ns=1023029123456
+2026-10-12T00:17:03.311123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=876000 at_ns=1023311123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:03.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=73 captured_ns=1018253000000 decoded_ns=1023278123456 sent_ns=1023279123456
+2026-10-12T00:17:03.562123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=888000 at_ns=1023562123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:03.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=74 captured_ns=1018503000000 decoded_ns=1023528123456 sent_ns=1023529123456
+2026-10-12T00:17:03.808123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=900000 at_ns=1023808123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:03.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=75 captured_ns=1018753000000 decoded_ns=1023778123456 sent_ns=1023779123456
+2026-10-12T00:17:04.064123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=912240 at_ns=1024064123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:04.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=76 captured_ns=1019003000000 decoded_ns=1024028123456 sent_ns=1024029123456
+2026-10-12T00:17:04.310123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=924000 at_ns=1024310123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:04.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=77 captured_ns=1019253000000 decoded_ns=1024278123456 sent_ns=1024279123456
+2026-10-12T00:17:04.561123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=936000 at_ns=1024561123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:04.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=78 captured_ns=1019503000000 decoded_ns=1024528123456 sent_ns=1024529123456
+2026-10-12T00:17:04.812123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=948000 at_ns=1024812123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:04.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=79 captured_ns=1019753000000 decoded_ns=1024778123456 sent_ns=1024779123456
+2026-10-12T00:17:05.063123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=960240 at_ns=1025063123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:05.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=80 captured_ns=1020003000000 decoded_ns=1025028123456 sent_ns=1025029123456
+2026-10-12T00:17:05.309123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=972000 at_ns=1025309123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:05.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=81 captured_ns=1020253000000 decoded_ns=1025278123456 sent_ns=1025279123456
+2026-10-12T00:17:05.560123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=984000 at_ns=1025560123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:05.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=82 captured_ns=1020503000000 decoded_ns=1025528123456 sent_ns=1025529123456
+2026-10-12T00:17:05.811123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=996000 at_ns=1025811123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:05.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=83 captured_ns=1020753000000 decoded_ns=1025778123456 sent_ns=1025779123456
+2026-10-12T00:17:06.067123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1008240 at_ns=1026067123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:06.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=84 captured_ns=1021003000000 decoded_ns=1026028123456 sent_ns=1026029123456
+2026-10-12T00:17:06.308123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1020000 at_ns=1026308123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:06.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=85 captured_ns=1021253000000 decoded_ns=1026278123456 sent_ns=1026279123456
+2026-10-12T00:17:06.559123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1032000 at_ns=1026559123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:06.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=86 captured_ns=1021503000000 decoded_ns=1026528123456 sent_ns=1026529123456
+2026-10-12T00:17:06.810123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1044000 at_ns=1026810123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:06.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=87 captured_ns=1021753000000 decoded_ns=1026778123456 sent_ns=1026779123456
+2026-10-12T00:17:07.066123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1056240 at_ns=1027066123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:07.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=88 captured_ns=1022003000000 decoded_ns=1027028123456 sent_ns=1027029123456
+2026-10-12T00:17:07.312123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1068000 at_ns=1027312123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:07.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=89 captured_ns=1022253000000 decoded_ns=1027278123456 sent_ns=1027279123456
+2026-10-12T00:17:07.558123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1080000 at_ns=1027558123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:07.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=90 captured_ns=1022503000000 decoded_ns=1027528123456 sent_ns=1027529123456
+2026-10-12T00:17:07.809123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1092000 at_ns=1027809123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:07.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=91 captured_ns=1022753000000 decoded_ns=1027778123456 sent_ns=1027779123456
+2026-10-12T00:17:08.065123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1104240 at_ns=1028065123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:08.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=92 captured_ns=1023003000000 decoded_ns=1028028123456 sent_ns=1028029123456
+2026-10-12T00:17:08.311123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1116000 at_ns=1028311123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:08.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=93 captured_ns=1023253000000 decoded_ns=1028278123456 sent_ns=1028279123456
+2026-10-12T00:17:08.562123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1128000 at_ns=1028562123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:08.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=94 captured_ns=1023503000000 decoded_ns=1028528123456 sent_ns=1028529123456
+2026-10-12T00:17:08.808123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1140000 at_ns=1028808123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:08.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=95 captured_ns=1023753000000 decoded_ns=1028778123456 sent_ns=1028779123456
+2026-10-12T00:17:09.064123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1152240 at_ns=1029064123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:09.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=96 captured_ns=1024003000000 decoded_ns=1029028123456 sent_ns=1029029123456
+2026-10-12T00:17:09.310123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1164000 at_ns=1029310123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:09.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=97 captured_ns=1024253000000 decoded_ns=1029278123456 sent_ns=1029279123456
+2026-10-12T00:17:09.561123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1176000 at_ns=1029561123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:09.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=98 captured_ns=1024503000000 decoded_ns=1029528123456 sent_ns=1029529123456
+2026-10-12T00:17:09.812123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1188000 at_ns=1029812123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:09.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=99 captured_ns=1024753000000 decoded_ns=1029778123456 sent_ns=1029779123456
+2026-10-12T00:17:10.063123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1200240 at_ns=1030063123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:10.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=100 captured_ns=1025003000000 decoded_ns=1030028123456 sent_ns=1030029123456
+2026-10-12T00:17:10.309123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1212000 at_ns=1030309123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:10.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=101 captured_ns=1025253000000 decoded_ns=1030278123456 sent_ns=1030279123456
+2026-10-12T00:17:10.560123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1224000 at_ns=1030560123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:10.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=102 captured_ns=1025503000000 decoded_ns=1030528123456 sent_ns=1030529123456
+2026-10-12T00:17:10.811123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1236000 at_ns=1030811123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:10.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=103 captured_ns=1025753000000 decoded_ns=1030778123456 sent_ns=1030779123456
+2026-10-12T00:17:11.067123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1248240 at_ns=1031067123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:11.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=104 captured_ns=1026003000000 decoded_ns=1031028123456 sent_ns=1031029123456
+2026-10-12T00:17:11.308123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1260000 at_ns=1031308123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:11.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=105 captured_ns=1026253000000 decoded_ns=1031278123456 sent_ns=1031279123456
+2026-10-12T00:17:11.559123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1272000 at_ns=1031559123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:11.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=106 captured_ns=1026503000000 decoded_ns=1031528123456 sent_ns=1031529123456
+2026-10-12T00:17:11.810123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1284000 at_ns=1031810123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:11.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=107 captured_ns=1026753000000 decoded_ns=1031778123456 sent_ns=1031779123456
+2026-10-12T00:17:12.066123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1296240 at_ns=1032066123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:12.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=108 captured_ns=1027003000000 decoded_ns=1032028123456 sent_ns=1032029123456
+2026-10-12T00:17:12.312123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1308000 at_ns=1032312123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:12.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=109 captured_ns=1027253000000 decoded_ns=1032278123456 sent_ns=1032279123456
+2026-10-12T00:17:12.558123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1320000 at_ns=1032558123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:12.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=110 captured_ns=1027503000000 decoded_ns=1032528123456 sent_ns=1032529123456
+2026-10-12T00:17:12.809123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1332000 at_ns=1032809123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:12.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=111 captured_ns=1027753000000 decoded_ns=1032778123456 sent_ns=1032779123456
+2026-10-12T00:17:13.065123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1344240 at_ns=1033065123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:13.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=112 captured_ns=1028003000000 decoded_ns=1033028123456 sent_ns=1033029123456
+2026-10-12T00:17:13.311123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1356000 at_ns=1033311123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:13.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=113 captured_ns=1028253000000 decoded_ns=1033278123456 sent_ns=1033279123456
+2026-10-12T00:17:13.562123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1368000 at_ns=1033562123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:13.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=114 captured_ns=1028503000000 decoded_ns=1033528123456 sent_ns=1033529123456
+2026-10-12T00:17:13.808123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1380000 at_ns=1033808123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:13.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=115 captured_ns=1028753000000 decoded_ns=1033778123456 sent_ns=1033779123456
+2026-10-12T00:17:14.064123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1392240 at_ns=1034064123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:14.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=116 captured_ns=1029003000000 decoded_ns=1034028123456 sent_ns=1034029123456
+2026-10-12T00:17:14.310123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1404000 at_ns=1034310123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:14.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=117 captured_ns=1029253000000 decoded_ns=1034278123456 sent_ns=1034279123456
+2026-10-12T00:17:14.561123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1416000 at_ns=1034561123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:14.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=118 captured_ns=1029503000000 decoded_ns=1034528123456 sent_ns=1034529123456
+2026-10-12T00:17:14.812123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1428000 at_ns=1034812123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:14.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=119 captured_ns=1029753000000 decoded_ns=1034778123456 sent_ns=1034779123456
+2026-10-12T00:17:15.063123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1440240 at_ns=1035063123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:15.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=120 captured_ns=1030003000000 decoded_ns=1035028123456 sent_ns=1035029123456
+2026-10-12T00:17:15.309123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1452000 at_ns=1035309123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:15.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=121 captured_ns=1030253000000 decoded_ns=1035278123456 sent_ns=1035279123456
+2026-10-12T00:17:15.560123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1464000 at_ns=1035560123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:15.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=122 captured_ns=1030503000000 decoded_ns=1035528123456 sent_ns=1035529123456
+2026-10-12T00:17:15.811123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1476000 at_ns=1035811123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:15.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=123 captured_ns=1030753000000 decoded_ns=1035778123456 sent_ns=1035779123456
+2026-10-12T00:17:16.067123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1488240 at_ns=1036067123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:16.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=124 captured_ns=1031003000000 decoded_ns=1036028123456 sent_ns=1036029123456
+2026-10-12T00:17:16.308123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1500000 at_ns=1036308123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:16.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=125 captured_ns=1031253000000 decoded_ns=1036278123456 sent_ns=1036279123456
+2026-10-12T00:17:16.559123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1512000 at_ns=1036559123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:16.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=126 captured_ns=1031503000000 decoded_ns=1036528123456 sent_ns=1036529123456
+2026-10-12T00:17:16.810123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1524000 at_ns=1036810123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:16.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=127 captured_ns=1031753000000 decoded_ns=1036778123456 sent_ns=1036779123456
+2026-10-12T00:17:17.066123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1536240 at_ns=1037066123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:17.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=128 captured_ns=1032003000000 decoded_ns=1037028123456 sent_ns=1037029123456
+2026-10-12T00:17:17.312123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1548000 at_ns=1037312123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:17.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=129 captured_ns=1032253000000 decoded_ns=1037278123456 sent_ns=1037279123456
+2026-10-12T00:17:17.558123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1560000 at_ns=1037558123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:17.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=130 captured_ns=1032503000000 decoded_ns=1037528123456 sent_ns=1037529123456
+2026-10-12T00:17:17.809123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1572000 at_ns=1037809123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:17.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=131 captured_ns=1032753000000 decoded_ns=1037778123456 sent_ns=1037779123456
+2026-10-12T00:17:18.065123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1584240 at_ns=1038065123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:18.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=132 captured_ns=1033003000000 decoded_ns=1038028123456 sent_ns=1038029123456
+2026-10-12T00:17:18.311123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1596000 at_ns=1038311123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:18.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=133 captured_ns=1033253000000 decoded_ns=1038278123456 sent_ns=1038279123456
+2026-10-12T00:17:18.562123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1608000 at_ns=1038562123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:18.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=134 captured_ns=1033503000000 decoded_ns=1038528123456 sent_ns=1038529123456
+2026-10-12T00:17:18.808123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1620000 at_ns=1038808123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:18.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=135 captured_ns=1033753000000 decoded_ns=1038778123456 sent_ns=1038779123456
+2026-10-12T00:17:19.064123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1632240 at_ns=1039064123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:19.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=136 captured_ns=1034003000000 decoded_ns=1039028123456 sent_ns=1039029123456
+2026-10-12T00:17:19.310123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1644000 at_ns=1039310123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:19.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=137 captured_ns=1034253000000 decoded_ns=1039278123456 sent_ns=1039279123456
+2026-10-12T00:17:19.561123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1656000 at_ns=1039561123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:19.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=138 captured_ns=1034503000000 decoded_ns=1039528123456 sent_ns=1039529123456
+2026-10-12T00:17:19.812123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1668000 at_ns=1039812123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:19.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=139 captured_ns=1034753000000 decoded_ns=1039778123456 sent_ns=1039779123456
+2026-10-12T00:17:20.063123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1680240 at_ns=1040063123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:20.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=140 captured_ns=1035003000000 decoded_ns=1040028123456 sent_ns=1040029123456
+2026-10-12T00:17:20.309123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1692000 at_ns=1040309123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:20.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=141 captured_ns=1035253000000 decoded_ns=1040278123456 sent_ns=1040279123456
+2026-10-12T00:17:20.560123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1704000 at_ns=1040560123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:20.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=142 captured_ns=1035503000000 decoded_ns=1040528123456 sent_ns=1040529123456
+2026-10-12T00:17:20.811123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1716000 at_ns=1040811123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:20.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=143 captured_ns=1035753000000 decoded_ns=1040778123456 sent_ns=1040779123456
+2026-10-12T00:17:21.067123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1728240 at_ns=1041067123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:21.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=144 captured_ns=1036003000000 decoded_ns=1041028123456 sent_ns=1041029123456
+2026-10-12T00:17:21.308123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1740000 at_ns=1041308123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:21.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=145 captured_ns=1036253000000 decoded_ns=1041278123456 sent_ns=1041279123456
+2026-10-12T00:17:21.559123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1752000 at_ns=1041559123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:21.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=146 captured_ns=1036503000000 decoded_ns=1041528123456 sent_ns=1041529123456
+2026-10-12T00:17:21.810123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1764000 at_ns=1041810123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:21.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=147 captured_ns=1036753000000 decoded_ns=1041778123456 sent_ns=1041779123456
+2026-10-12T00:17:22.066123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1776240 at_ns=1042066123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:22.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=148 captured_ns=1037003000000 decoded_ns=1042028123456 sent_ns=1042029123456
+2026-10-12T00:17:22.312123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1788000 at_ns=1042312123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:22.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=149 captured_ns=1037253000000 decoded_ns=1042278123456 sent_ns=1042279123456
+2026-10-12T00:17:22.558123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1800000 at_ns=1042558123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:22.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=150 captured_ns=1037503000000 decoded_ns=1042528123456 sent_ns=1042529123456
+2026-10-12T00:17:22.809123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1812000 at_ns=1042809123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:22.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=151 captured_ns=1037753000000 decoded_ns=1042778123456 sent_ns=1042779123456
+2026-10-12T00:17:23.065123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1824240 at_ns=1043065123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:23.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=152 captured_ns=1038003000000 decoded_ns=1043028123456 sent_ns=1043029123456
+2026-10-12T00:17:23.311123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1836000 at_ns=1043311123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:23.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=153 captured_ns=1038253000000 decoded_ns=1043278123456 sent_ns=1043279123456
+2026-10-12T00:17:23.562123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1848000 at_ns=1043562123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:23.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=154 captured_ns=1038503000000 decoded_ns=1043528123456 sent_ns=1043529123456
+2026-10-12T00:17:23.808123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1860000 at_ns=1043808123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:23.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=155 captured_ns=1038753000000 decoded_ns=1043778123456 sent_ns=1043779123456
+2026-10-12T00:17:24.064123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1872240 at_ns=1044064123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:24.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=156 captured_ns=1039003000000 decoded_ns=1044028123456 sent_ns=1044029123456
+2026-10-12T00:17:24.310123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1884000 at_ns=1044310123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:24.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=157 captured_ns=1039253000000 decoded_ns=1044278123456 sent_ns=1044279123456
+2026-10-12T00:17:24.561123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1896000 at_ns=1044561123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:24.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=158 captured_ns=1039503000000 decoded_ns=1044528123456 sent_ns=1044529123456
+2026-10-12T00:17:24.812123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1908000 at_ns=1044812123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:24.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=159 captured_ns=1039753000000 decoded_ns=1044778123456 sent_ns=1044779123456
+2026-10-12T00:17:25.063123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1920240 at_ns=1045063123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:25.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=160 captured_ns=1040003000000 decoded_ns=1045028123456 sent_ns=1045029123456
+2026-10-12T00:17:25.309123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1932000 at_ns=1045309123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:25.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=161 captured_ns=1040253000000 decoded_ns=1045278123456 sent_ns=1045279123456
+2026-10-12T00:17:25.560123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1944000 at_ns=1045560123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:25.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=162 captured_ns=1040503000000 decoded_ns=1045528123456 sent_ns=1045529123456
+2026-10-12T00:17:25.811123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1956000 at_ns=1045811123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:25.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=163 captured_ns=1040753000000 decoded_ns=1045778123456 sent_ns=1045779123456
+2026-10-12T00:17:26.067123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1968240 at_ns=1046067123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:26.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=164 captured_ns=1041003000000 decoded_ns=1046028123456 sent_ns=1046029123456
+2026-10-12T00:17:26.308123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=1980000 at_ns=1046308123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:26.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=165 captured_ns=1041253000000 decoded_ns=1046278123456 sent_ns=1046279123456
+2026-10-12T00:17:26.559123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=1992000 at_ns=1046559123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:26.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=166 captured_ns=1041503000000 decoded_ns=1046528123456 sent_ns=1046529123456
+2026-10-12T00:17:26.810123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2004000 at_ns=1046810123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:26.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=167 captured_ns=1041753000000 decoded_ns=1046778123456 sent_ns=1046779123456
+2026-10-12T00:17:27.066123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2016240 at_ns=1047066123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:27.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=168 captured_ns=1042003000000 decoded_ns=1047028123456 sent_ns=1047029123456
+2026-10-12T00:17:27.312123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2028000 at_ns=1047312123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:27.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=169 captured_ns=1042253000000 decoded_ns=1047278123456 sent_ns=1047279123456
+2026-10-12T00:17:27.558123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2040000 at_ns=1047558123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:27.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=170 captured_ns=1042503000000 decoded_ns=1047528123456 sent_ns=1047529123456
+2026-10-12T00:17:27.809123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2052000 at_ns=1047809123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:27.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=171 captured_ns=1042753000000 decoded_ns=1047778123456 sent_ns=1047779123456
+2026-10-12T00:17:28.065123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2064240 at_ns=1048065123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:28.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=172 captured_ns=1043003000000 decoded_ns=1048028123456 sent_ns=1048029123456
+2026-10-12T00:17:28.311123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2076000 at_ns=1048311123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:28.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=173 captured_ns=1043253000000 decoded_ns=1048278123456 sent_ns=1048279123456
+2026-10-12T00:17:28.562123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2088000 at_ns=1048562123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:28.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=174 captured_ns=1043503000000 decoded_ns=1048528123456 sent_ns=1048529123456
+2026-10-12T00:17:28.808123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2100000 at_ns=1048808123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:28.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=175 captured_ns=1043753000000 decoded_ns=1048778123456 sent_ns=1048779123456
+2026-10-12T00:17:29.064123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2112240 at_ns=1049064123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:29.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=176 captured_ns=1044003000000 decoded_ns=1049028123456 sent_ns=1049029123456
+2026-10-12T00:17:29.310123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2124000 at_ns=1049310123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:29.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=177 captured_ns=1044253000000 decoded_ns=1049278123456 sent_ns=1049279123456
+2026-10-12T00:17:29.561123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2136000 at_ns=1049561123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:29.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=178 captured_ns=1044503000000 decoded_ns=1049528123456 sent_ns=1049529123456
+2026-10-12T00:17:29.812123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2148000 at_ns=1049812123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:29.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=179 captured_ns=1044753000000 decoded_ns=1049778123456 sent_ns=1049779123456
+2026-10-12T00:17:30.063123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2160240 at_ns=1050063123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:30.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=180 captured_ns=1045003000000 decoded_ns=1050028123456 sent_ns=1050029123456
+2026-10-12T00:17:30.309123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2172000 at_ns=1050309123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:30.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=181 captured_ns=1045253000000 decoded_ns=1050278123456 sent_ns=1050279123456
+2026-10-12T00:17:30.560123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2184000 at_ns=1050560123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:30.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=182 captured_ns=1045503000000 decoded_ns=1050528123456 sent_ns=1050529123456
+2026-10-12T00:17:30.811123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2196000 at_ns=1050811123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:30.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=183 captured_ns=1045753000000 decoded_ns=1050778123456 sent_ns=1050779123456
+2026-10-12T00:17:31.067123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2208240 at_ns=1051067123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:31.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=184 captured_ns=1046003000000 decoded_ns=1051028123456 sent_ns=1051029123456
+2026-10-12T00:17:31.308123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2220000 at_ns=1051308123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:31.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=185 captured_ns=1046253000000 decoded_ns=1051278123456 sent_ns=1051279123456
+2026-10-12T00:17:31.559123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2232000 at_ns=1051559123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:31.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=186 captured_ns=1046503000000 decoded_ns=1051528123456 sent_ns=1051529123456
+2026-10-12T00:17:31.810123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2244000 at_ns=1051810123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:31.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=187 captured_ns=1046753000000 decoded_ns=1051778123456 sent_ns=1051779123456
+2026-10-12T00:17:32.066123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2256240 at_ns=1052066123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:32.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=188 captured_ns=1047003000000 decoded_ns=1052028123456 sent_ns=1052029123456
+2026-10-12T00:17:32.312123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2268000 at_ns=1052312123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:32.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=189 captured_ns=1047253000000 decoded_ns=1052278123456 sent_ns=1052279123456
+2026-10-12T00:17:32.558123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2280000 at_ns=1052558123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:32.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=190 captured_ns=1047503000000 decoded_ns=1052528123456 sent_ns=1052529123456
+2026-10-12T00:17:32.809123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2292000 at_ns=1052809123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:32.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=191 captured_ns=1047753000000 decoded_ns=1052778123456 sent_ns=1052779123456
+2026-10-12T00:17:33.065123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2304240 at_ns=1053065123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:33.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=192 captured_ns=1048003000000 decoded_ns=1053028123456 sent_ns=1053029123456
+2026-10-12T00:17:33.311123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2316000 at_ns=1053311123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:33.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=193 captured_ns=1048253000000 decoded_ns=1053278123456 sent_ns=1053279123456
+2026-10-12T00:17:33.562123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2328000 at_ns=1053562123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:33.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=194 captured_ns=1048503000000 decoded_ns=1053528123456 sent_ns=1053529123456
+2026-10-12T00:17:33.808123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2340000 at_ns=1053808123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:33.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=195 captured_ns=1048753000000 decoded_ns=1053778123456 sent_ns=1053779123456
+2026-10-12T00:17:34.064123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2352240 at_ns=1054064123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:34.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=196 captured_ns=1049003000000 decoded_ns=1054028123456 sent_ns=1054029123456
+2026-10-12T00:17:34.310123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2364000 at_ns=1054310123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:34.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=197 captured_ns=1049253000000 decoded_ns=1054278123456 sent_ns=1054279123456
+2026-10-12T00:17:34.561123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2376000 at_ns=1054561123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:34.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=198 captured_ns=1049503000000 decoded_ns=1054528123456 sent_ns=1054529123456
+2026-10-12T00:17:34.812123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2388000 at_ns=1054812123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:34.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=199 captured_ns=1049753000000 decoded_ns=1054778123456 sent_ns=1054779123456
+2026-10-12T00:17:35.063123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2400240 at_ns=1055063123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:35.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=200 captured_ns=1050003000000 decoded_ns=1055028123456 sent_ns=1055029123456
+2026-10-12T00:17:35.309123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2412000 at_ns=1055309123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:35.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=201 captured_ns=1050253000000 decoded_ns=1055278123456 sent_ns=1055279123456
+2026-10-12T00:17:35.560123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2424000 at_ns=1055560123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:35.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=202 captured_ns=1050503000000 decoded_ns=1055528123456 sent_ns=1055529123456
+2026-10-12T00:17:35.811123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2436000 at_ns=1055811123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:35.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=203 captured_ns=1050753000000 decoded_ns=1055778123456 sent_ns=1055779123456
+2026-10-12T00:17:36.067123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2448240 at_ns=1056067123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:36.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=204 captured_ns=1051003000000 decoded_ns=1056028123456 sent_ns=1056029123456
+2026-10-12T00:17:36.308123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2460000 at_ns=1056308123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:36.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=205 captured_ns=1051253000000 decoded_ns=1056278123456 sent_ns=1056279123456
+2026-10-12T00:17:36.559123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2472000 at_ns=1056559123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:36.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=206 captured_ns=1051503000000 decoded_ns=1056528123456 sent_ns=1056529123456
+2026-10-12T00:17:36.810123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2484000 at_ns=1056810123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:36.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=207 captured_ns=1051753000000 decoded_ns=1056778123456 sent_ns=1056779123456
+2026-10-12T00:17:37.066123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2496240 at_ns=1057066123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:37.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=208 captured_ns=1052003000000 decoded_ns=1057028123456 sent_ns=1057029123456
+2026-10-12T00:17:37.312123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2508000 at_ns=1057312123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:37.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=209 captured_ns=1052253000000 decoded_ns=1057278123456 sent_ns=1057279123456
+2026-10-12T00:17:37.558123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2520000 at_ns=1057558123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:37.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=210 captured_ns=1052503000000 decoded_ns=1057528123456 sent_ns=1057529123456
+2026-10-12T00:17:37.809123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2532000 at_ns=1057809123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:37.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=211 captured_ns=1052753000000 decoded_ns=1057778123456 sent_ns=1057779123456
+2026-10-12T00:17:38.065123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2544240 at_ns=1058065123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:38.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=212 captured_ns=1053003000000 decoded_ns=1058028123456 sent_ns=1058029123456
+2026-10-12T00:17:38.311123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2556000 at_ns=1058311123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:38.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=213 captured_ns=1053253000000 decoded_ns=1058278123456 sent_ns=1058279123456
+2026-10-12T00:17:38.562123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2568000 at_ns=1058562123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:38.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=214 captured_ns=1053503000000 decoded_ns=1058528123456 sent_ns=1058529123456
+2026-10-12T00:17:38.808123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2580000 at_ns=1058808123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:38.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=215 captured_ns=1053753000000 decoded_ns=1058778123456 sent_ns=1058779123456
+2026-10-12T00:17:39.064123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2592240 at_ns=1059064123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:39.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=216 captured_ns=1054003000000 decoded_ns=1059028123456 sent_ns=1059029123456
+2026-10-12T00:17:39.310123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2604000 at_ns=1059310123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:39.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=217 captured_ns=1054253000000 decoded_ns=1059278123456 sent_ns=1059279123456
+2026-10-12T00:17:39.561123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2616000 at_ns=1059561123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:39.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=218 captured_ns=1054503000000 decoded_ns=1059528123456 sent_ns=1059529123456
+2026-10-12T00:17:39.812123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2628000 at_ns=1059812123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:39.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=219 captured_ns=1054753000000 decoded_ns=1059778123456 sent_ns=1059779123456
+2026-10-12T00:17:40.063123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2640240 at_ns=1060063123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:40.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=220 captured_ns=1055003000000 decoded_ns=1060028123456 sent_ns=1060029123456
+2026-10-12T00:17:40.309123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2652000 at_ns=1060309123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:40.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=221 captured_ns=1055253000000 decoded_ns=1060278123456 sent_ns=1060279123456
+2026-10-12T00:17:40.560123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2664000 at_ns=1060560123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:40.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=222 captured_ns=1055503000000 decoded_ns=1060528123456 sent_ns=1060529123456
+2026-10-12T00:17:40.811123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2676000 at_ns=1060811123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:40.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=223 captured_ns=1055753000000 decoded_ns=1060778123456 sent_ns=1060779123456
+2026-10-12T00:17:41.067123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2688240 at_ns=1061067123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:41.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=224 captured_ns=1056003000000 decoded_ns=1061028123456 sent_ns=1061029123456
+2026-10-12T00:17:41.308123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2700000 at_ns=1061308123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:41.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=225 captured_ns=1056253000000 decoded_ns=1061278123456 sent_ns=1061279123456
+2026-10-12T00:17:41.559123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2712000 at_ns=1061559123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:41.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=226 captured_ns=1056503000000 decoded_ns=1061528123456 sent_ns=1061529123456
+2026-10-12T00:17:41.810123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2724000 at_ns=1061810123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:41.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=227 captured_ns=1056753000000 decoded_ns=1061778123456 sent_ns=1061779123456
+2026-10-12T00:17:42.066123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2736240 at_ns=1062066123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:42.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=228 captured_ns=1057003000000 decoded_ns=1062028123456 sent_ns=1062029123456
+2026-10-12T00:17:42.312123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2748000 at_ns=1062312123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:42.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=229 captured_ns=1057253000000 decoded_ns=1062278123456 sent_ns=1062279123456
+2026-10-12T00:17:42.558123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2760000 at_ns=1062558123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:42.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=230 captured_ns=1057503000000 decoded_ns=1062528123456 sent_ns=1062529123456
+2026-10-12T00:17:42.809123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2772000 at_ns=1062809123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:42.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=231 captured_ns=1057753000000 decoded_ns=1062778123456 sent_ns=1062779123456
+2026-10-12T00:17:43.065123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2784240 at_ns=1063065123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:43.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=232 captured_ns=1058003000000 decoded_ns=1063028123456 sent_ns=1063029123456
+2026-10-12T00:17:43.311123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2796000 at_ns=1063311123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:43.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=233 captured_ns=1058253000000 decoded_ns=1063278123456 sent_ns=1063279123456
+2026-10-12T00:17:43.562123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2808000 at_ns=1063562123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:43.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=234 captured_ns=1058503000000 decoded_ns=1063528123456 sent_ns=1063529123456
+2026-10-12T00:17:43.808123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2820000 at_ns=1063808123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:43.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=235 captured_ns=1058753000000 decoded_ns=1063778123456 sent_ns=1063779123456
+2026-10-12T00:17:44.064123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2832240 at_ns=1064064123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:44.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=236 captured_ns=1059003000000 decoded_ns=1064028123456 sent_ns=1064029123456
+2026-10-12T00:17:44.310123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2844000 at_ns=1064310123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:44.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=237 captured_ns=1059253000000 decoded_ns=1064278123456 sent_ns=1064279123456
+2026-10-12T00:17:44.561123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2856000 at_ns=1064561123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:44.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=238 captured_ns=1059503000000 decoded_ns=1064528123456 sent_ns=1064529123456
+2026-10-12T00:17:44.812123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2868000 at_ns=1064812123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:44.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=239 captured_ns=1059753000000 decoded_ns=1064778123456 sent_ns=1064779123456
+2026-10-12T00:17:45.063123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2880240 at_ns=1065063123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:45.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=240 captured_ns=1060003000000 decoded_ns=1065028123456 sent_ns=1065029123456
+2026-10-12T00:17:45.309123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2892000 at_ns=1065309123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:45.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=241 captured_ns=1060253000000 decoded_ns=1065278123456 sent_ns=1065279123456
+2026-10-12T00:17:45.560123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2904000 at_ns=1065560123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:45.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=242 captured_ns=1060503000000 decoded_ns=1065528123456 sent_ns=1065529123456
+2026-10-12T00:17:45.811123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2916000 at_ns=1065811123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:45.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=243 captured_ns=1060753000000 decoded_ns=1065778123456 sent_ns=1065779123456
+2026-10-12T00:17:46.067123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2928240 at_ns=1066067123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:46.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=244 captured_ns=1061003000000 decoded_ns=1066028123456 sent_ns=1066029123456
+2026-10-12T00:17:46.308123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2940000 at_ns=1066308123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:46.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=245 captured_ns=1061253000000 decoded_ns=1066278123456 sent_ns=1066279123456
+2026-10-12T00:17:46.559123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2952000 at_ns=1066559123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:46.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=246 captured_ns=1061503000000 decoded_ns=1066528123456 sent_ns=1066529123456
+2026-10-12T00:17:46.810123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2964000 at_ns=1066810123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:46.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=247 captured_ns=1061753000000 decoded_ns=1066778123456 sent_ns=1066779123456
+2026-10-12T00:17:47.066123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=2976240 at_ns=1067066123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:47.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=248 captured_ns=1062003000000 decoded_ns=1067028123456 sent_ns=1067029123456
+2026-10-12T00:17:47.312123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=2988000 at_ns=1067312123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:47.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=249 captured_ns=1062253000000 decoded_ns=1067278123456 sent_ns=1067279123456
+2026-10-12T00:17:47.558123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=3000000 at_ns=1067558123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:47.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=250 captured_ns=1062503000000 decoded_ns=1067528123456 sent_ns=1067529123456
+2026-10-12T00:17:47.809123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=3012000 at_ns=1067809123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:47.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=251 captured_ns=1062753000000 decoded_ns=1067778123456 sent_ns=1067779123456
+2026-10-12T00:17:48.065123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=3024240 at_ns=1068065123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:48.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=252 captured_ns=1063003000000 decoded_ns=1068028123456 sent_ns=1068029123456
+2026-10-12T00:17:48.311123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=3036000 at_ns=1068311123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:48.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=253 captured_ns=1063253000000 decoded_ns=1068278123456 sent_ns=1068279123456
+2026-10-12T00:17:48.562123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=3048000 at_ns=1068562123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:48.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=254 captured_ns=1063503000000 decoded_ns=1068528123456 sent_ns=1068529123456
+2026-10-12T00:17:48.808123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=3060000 at_ns=1068808123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:48.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=255 captured_ns=1063753000000 decoded_ns=1068778123456 sent_ns=1068779123456
+2026-10-12T00:17:49.064123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=3072240 at_ns=1069064123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:49.028123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=256 captured_ns=1064003000000 decoded_ns=1069028123456 sent_ns=1069029123456
+2026-10-12T00:17:49.310123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=3084000 at_ns=1069310123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:49.278123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=257 captured_ns=1064253000000 decoded_ns=1069278123456 sent_ns=1069279123456
+2026-10-12T00:17:49.561123Z TRACE crosspane::avsync: peer="mac-01" stream=3 sample_time=3096000 at_ns=1069561123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:49.528123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=258 captured_ns=1064503000000 decoded_ns=1069528123456 sent_ns=1069529123456
+2026-10-12T00:17:49.812123Z TRACE crosspane::avsync: side="rx" peer="mac-01" stream=3 sample_time=3108000 at_ns=1069812123456 ring_frames=960 target_ms=40
+2026-10-12T00:17:49.778123Z TRACE crosspane::avsync: side="video" source="mac-01" projection=7 seq=259 captured_ns=1064753000000 decoded_ns=1069778123456 sent_ns=1069779123456
+2026-10-12T00:17:50.000123Z DEBUG crosspane_media::audio::jitter: stats target_ms=40

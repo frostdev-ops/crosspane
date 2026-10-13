@@ -30,10 +30,45 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThrea
 use windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::model::session::{Reading, SessionModel, Signal, UNKNOWN, missed_sleep};
+use crate::model::session::{
+    ReadRetry, Reading, SessionModel, Signal, UNKNOWN, Verdict, missed_sleep,
+};
 
 const POLL: Duration = Duration::from_millis(500);
 const OBSERVATION_BOUND: Duration = Duration::from_secs(2);
+
+/// What one finished native read does. A complete reading is published. An incomplete one is
+/// published (as UNKNOWN, closing the gate) only once the policy has repeated it enough: until
+/// then the state proven last stays as it is and the delay before the next repeat is returned.
+/// Signals do not pass through here, so a lock, a deactivation or a sleep still closes the gate
+/// at once.
+fn settle(
+    shared: &Shared,
+    retry: &Cell<ReadRetry>,
+    revision: u64,
+    reading: Reading,
+) -> Option<Duration> {
+    let proven = shared.state();
+    let mut policy = retry.get();
+    let verdict = policy.verdict(reading, proven);
+    retry.set(policy);
+    match verdict {
+        Verdict::Retry(delay) => {
+            tracing::debug!(
+                delay_ms = delay.as_millis() as u64,
+                "session query incomplete; repeating before the state is given up"
+            );
+            Some(delay)
+        }
+        Verdict::Publish => {
+            if !reading.is_complete() && proven.permits_io() {
+                tracing::info!("session state could not be read; failing closed (UNKNOWN)");
+            }
+            shared.complete(revision, reading);
+            None
+        }
+    }
+}
 
 struct Data {
     model: SessionModel,
@@ -420,6 +455,10 @@ struct Native {
     window: HWND,
     wts: bool,
     power: HPOWERNOTIFY,
+    /// Repeats of an incomplete read while the state proven last still permits I/O.
+    retry: Cell<ReadRetry>,
+    /// When the next repeat is due, if one is pending.
+    retry_due: Cell<Option<Instant>>,
 }
 
 impl Native {
@@ -452,6 +491,8 @@ impl Native {
             window: null_mut(),
             wts: false,
             power: 0,
+            retry: Cell::new(ReadRetry::default()),
+            retry_due: Cell::new(None),
         };
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
@@ -525,7 +566,9 @@ impl Native {
         } else {
             Reading::UNKNOWN
         };
-        self.context.shared.complete(revision, reading);
+        let delay = settle(&self.context.shared, &self.retry, revision, reading);
+        self.retry_due
+            .set(delay.map(|delay| Instant::now() + delay));
         self.context.shared.touched();
     }
 
@@ -548,16 +591,29 @@ impl Native {
                     }
                 }
             }
+            // A repeat of an incomplete read runs here, on the loop that also takes the
+            // notifications, so waiting for it never delays a lock announcement.
+            let repeat = self
+                .retry_due
+                .get()
+                .is_some_and(|due| Instant::now() >= due);
             if self.context.shared.refresh.swap(false, Ordering::AcqRel)
                 || last_poll.elapsed() >= POLL
+                || repeat
             {
                 self.poll(&mut clock);
                 last_poll = Instant::now();
             }
+            // The wait ends early for a pending repeat; otherwise it is the usual 50 ms.
+            let wait = self.retry_due.get().map_or(50, |due| {
+                due.saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .clamp(1, 50) as u32
+            });
             // SAFETY: zero handles, queue wake only. 50ms bound also observes stop without posting
             // to an HWND/thread ID that might have been recycled after observer failure.
             let result = unsafe {
-                MsgWaitForMultipleObjectsEx(0, null(), 50, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+                MsgWaitForMultipleObjectsEx(0, null(), wait, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
             };
             if result == WAIT_FAILED {
                 return Err(os_error("wait for session messages"));
@@ -621,6 +677,16 @@ impl Clock {
     }
 }
 
+/// Debug evidence for an incomplete read: which query failed and the Win32 error it left. It tells a
+/// transient failure (the input desktop cannot be opened while the display topology changes) from
+/// a persistent one (a secure desktop, a session switch). The error is stale for the steps that
+/// make no failing call (a console sentinel or a console switch).
+fn query_failed(step: &'static str) {
+    // SAFETY: reads only this thread's last-error scalar; never user data.
+    let win32_error = unsafe { GetLastError() };
+    tracing::debug!(step, win32_error, "session query failed");
+}
+
 fn read_state(expected_session: u32) -> Reading {
     let mut session = 0;
     // SAFETY: own process and valid output scalar; console ID is a read-only scalar.
@@ -628,11 +694,13 @@ fn read_state(expected_session: u32) -> Reading {
         if ProcessIdToSessionId(GetCurrentProcessId(), &mut session) == 0
             || session != expected_session
         {
+            query_failed("process session");
             return Reading::UNKNOWN;
         }
         WTSGetActiveConsoleSessionId()
     };
     if console == u32::MAX {
+        query_failed("no console session");
         return Reading::UNKNOWN;
     }
     let connected = match connection_state(session) {
@@ -645,6 +713,7 @@ fn read_state(expected_session: u32) -> Reading {
     };
     // SAFETY: a second read rejects console switches during the multi-call observation.
     if unsafe { WTSGetActiveConsoleSessionId() } != console {
+        query_failed("console switched during the read");
         return Reading::UNKNOWN;
     }
     Reading {
@@ -693,6 +762,9 @@ fn connection_state(session: u32) -> Option<bool> {
         } else {
             None
         };
+    if result.is_none() {
+        query_failed("WTSQuerySessionInformation");
+    }
     if !buffer.is_null() {
         // SAFETY: free only the buffer returned by this WTS call, exactly once.
         unsafe { WTSFreeMemory(buffer.cast()) };
@@ -704,6 +776,7 @@ fn default_input_desktop() -> Option<bool> {
     // SAFETY: read-only, non-inherited input desktop handle; no switching or hooks.
     let desktop = unsafe { OpenInputDesktop(0, 0, DESKTOP_READOBJECTS) };
     if desktop.is_null() {
+        query_failed("OpenInputDesktop");
         return None;
     }
     let mut name = [0u16; 128];
@@ -726,6 +799,7 @@ fn default_input_desktop() -> Option<bool> {
         || needed as usize > size_of_val(&name)
         || needed % 2 != 0
     {
+        query_failed("input desktop name");
         return None;
     }
     let end = name[..needed as usize / 2]
@@ -803,9 +877,91 @@ mod tests {
             window: null_mut(),
             wts: false,
             power: 0,
+            retry: Cell::new(ReadRetry::default()),
+            retry_due: Cell::new(None),
         });
         assert!(!gate.is_open());
         assert_eq!(shared.state(), UNKNOWN);
+    }
+
+    fn captured(shared: &Shared) -> Arc<Mutex<Vec<SessionEvent>>> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        shared
+            .subscribe(Arc::new(move |event| sink.lock().unwrap().push(event)))
+            .unwrap();
+        // The initial state delivered on subscription is not what these tests look at.
+        events.lock().unwrap().clear();
+        events
+    }
+
+    #[test]
+    fn session_retry_a_transient_failure_keeps_state_and_gate_and_publishes_nothing() {
+        let (shared, gate) = opened();
+        let events = captured(&shared);
+        let retry = Cell::new(ReadRetry::default());
+        // The query fails for a moment, twice, then answers: no event, the gate never closes.
+        for _ in 0..2 {
+            assert_eq!(
+                settle(&shared, &retry, shared.begin_read(), Reading::UNKNOWN),
+                Some(crate::model::session::RETRY_INTERVAL)
+            );
+            assert!(gate.is_open());
+            assert!(shared.state().permits_io());
+        }
+        assert_eq!(settle(&shared, &retry, shared.begin_read(), OPEN), None);
+        assert!(gate.is_open());
+        assert!(shared.state().permits_io());
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_retry_a_persistent_failure_closes_and_publishes_unknown_after_the_budget() {
+        let (shared, gate) = opened();
+        let events = captured(&shared);
+        let retry = Cell::new(ReadRetry::default());
+        for _ in 0..crate::model::session::RETRY_LIMIT {
+            assert!(settle(&shared, &retry, shared.begin_read(), Reading::UNKNOWN).is_some());
+            assert!(gate.is_open());
+        }
+        assert_eq!(
+            settle(&shared, &retry, shared.begin_read(), Reading::UNKNOWN),
+            None
+        );
+        assert!(!gate.is_open());
+        assert_eq!(shared.state(), UNKNOWN);
+        assert_eq!(*events.lock().unwrap(), vec![SessionEvent::State(UNKNOWN)]);
+        // Once UNKNOWN is published nothing is held any more: the next failure publishes at once,
+        // and only a complete reading reopens the gate.
+        assert_eq!(
+            settle(&shared, &retry, shared.begin_read(), Reading::UNKNOWN),
+            None
+        );
+        assert!(!gate.is_open());
+        assert_eq!(settle(&shared, &retry, shared.begin_read(), OPEN), None);
+        assert!(gate.is_open());
+    }
+
+    #[test]
+    fn session_retry_never_delays_a_lock_notification_or_reopens_after_one() {
+        let (shared, gate) = opened();
+        let retry = Cell::new(ReadRetry::default());
+        assert!(settle(&shared, &retry, shared.begin_read(), Reading::UNKNOWN).is_some());
+        assert!(gate.is_open());
+        // A lock is announced while a repeat is pending: the signal path closes the gate at
+        // once, without going through the policy.
+        let before = shared.begin_read();
+        shared.signal(Signal::Lock);
+        assert!(!gate.is_open());
+        // The repeat that was in flight read before the lock: it is stale and changes nothing,
+        // whatever it saw, and the state the signal set is not permissive, so nothing is held.
+        assert_eq!(settle(&shared, &retry, before, OPEN), None);
+        assert!(!gate.is_open());
+        assert_eq!(
+            settle(&shared, &retry, shared.begin_read(), Reading::UNKNOWN),
+            None
+        );
+        assert!(!gate.is_open());
     }
 
     #[test]

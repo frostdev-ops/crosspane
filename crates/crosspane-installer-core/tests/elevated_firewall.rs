@@ -1,8 +1,8 @@
 //! WP-W4.1c T12: the firewall rule model (`elevated::firewall`) on synthetic COM rules.
 #![allow(clippy::unwrap_used)] // Test fixtures may assert successful setup.
 use crosspane_installer_core::elevated::firewall::{
-    ComRule, FirewallPlan, MAX_FAMILY, desired_rule, firewall_state, plan_add, plan_remove,
-    rule_matches,
+    ComRule, FirewallPlan, MAX_FAMILY, NET_FW_PROFILE2_PRIVATE, RULE_PROFILES, desired_rule,
+    firewall_state, plan_add, plan_remove, rule_matches,
 };
 use crosspane_installer_core::elevated::{AgentProgram, FirewallState, InstallId, RuleScope};
 use std::slice;
@@ -51,8 +51,10 @@ fn desired_rule_matches_itself() {
     assert_eq!(rule.application_name, PROGRAM);
     assert_eq!(
         (rule.protocol, rule.direction, rule.action, rule.profiles),
-        (17, 1, 1, 2)
+        (17, 1, 1, RULE_PROFILES)
     );
+    // Private and public networks, never the domain profile (1).
+    assert_eq!(RULE_PROFILES, 6);
     assert!(rule.enabled);
     assert_eq!(rule.remote_addresses, "LocalSubnet");
     assert_eq!(rule.local_ports, "*");
@@ -449,4 +451,47 @@ fn firewall_state_table() {
         FirewallState::Missing
     );
     assert_eq!(firewall_state(&over, Some(&scope)), FirewallState::Mismatch);
+}
+
+#[test]
+fn legacy_private_only_rule_is_widened_or_removed() {
+    let scope = scope();
+    let mut legacy = desired_rule(&scope);
+    legacy.profiles = NET_FW_PROFILE2_PRIVATE;
+    let family = slice::from_ref(&legacy);
+    assert_eq!(plan_add(family, &scope), FirewallPlan::Widen);
+    assert_eq!(plan_remove(family, &scope), FirewallPlan::Remove);
+    assert_eq!(
+        firewall_state(family, Some(&scope)),
+        FirewallState::Mismatch
+    );
+}
+
+#[test]
+fn profiles_with_domain_is_a_mismatch() {
+    let scope = scope();
+    let mut rule = desired_rule(&scope);
+    rule.profiles = 7;
+    let family = slice::from_ref(&rule);
+    assert_eq!(plan_add(family, &scope), FirewallPlan::Mismatch(DIFFERS));
+    assert_eq!(plan_remove(family, &scope), FirewallPlan::Mismatch(DIFFERS));
+    assert_eq!(
+        firewall_state(family, Some(&scope)),
+        FirewallState::Mismatch
+    );
+}
+
+#[test]
+fn legacy_rule_with_another_difference_is_a_mismatch() {
+    let scope = scope();
+    let mut rule = desired_rule(&scope);
+    rule.profiles = NET_FW_PROFILE2_PRIVATE;
+    rule.remote_addresses = "*".to_owned();
+    let family = slice::from_ref(&rule);
+    assert_eq!(plan_add(family, &scope), FirewallPlan::Mismatch(DIFFERS));
+    assert_eq!(plan_remove(family, &scope), FirewallPlan::Mismatch(DIFFERS));
+    assert_eq!(
+        firewall_state(family, Some(&scope)),
+        FirewallState::Mismatch
+    );
 }

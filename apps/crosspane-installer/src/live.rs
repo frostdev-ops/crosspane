@@ -154,6 +154,18 @@ pub enum MaintenanceRequest {
         id: MaintenanceId,
         status: Option<StatusEvidence>,
     },
+    /// Independently review a complete Windows reinstall; identity and trust are always kept.
+    PlanReinstall {
+        id: MaintenanceId,
+        status: Option<StatusEvidence>,
+    },
+    /// Explicit confirmation of that exact independent plan and current view revision.
+    ConfirmReinstall {
+        id: MaintenanceId,
+        plan: u64,
+        revision: u64,
+        status: Option<StatusEvidence>,
+    },
 }
 
 /// A complete Status reply, delivered unchanged: its call id, original receipt time and source
@@ -251,6 +263,19 @@ pub enum RepairOutcome {
     CheckedAfterEarlierRepair,
 }
 
+/// How a complete reinstall ended. The person always gets the platform's lines with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReinstallOutcome {
+    /// Crosspane's files, its sign-in task and its agent were checked and are healthy.
+    Verified,
+    /// Something is still missing or not running; the lines say what, and it can be tried again.
+    Incomplete,
+    /// Shown like `Incomplete`. Windows never reports it: every outcome there is known.
+    Unknown,
+    /// Nothing was changed.
+    NotSubmitted,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum MaintenanceReport {
     Inspected {
@@ -320,6 +345,16 @@ pub enum MaintenanceReport {
         outcome: RepairOutcome,
         lines: Vec<String>,
         resumable: bool,
+    },
+    ReinstallPlanned {
+        id: MaintenanceId,
+        plan: u64,
+        preview: String,
+    },
+    ReinstallFinished {
+        id: MaintenanceId,
+        outcome: ReinstallOutcome,
+        lines: Vec<String>,
     },
 }
 
@@ -456,6 +491,13 @@ pub trait Platform {
         std::collections::BTreeSet::new()
     }
     fn save_skipped(&mut self, _steps: &std::collections::BTreeSet<StepId>) {}
+    /// Whether this setup can install Crosspane's files from where it runs. A setup started from
+    /// an installed copy has no downloaded files beside it, so an install or a complete reinstall
+    /// from there can only fail: the controller then doesn't offer them. Linux and macOS keep the
+    /// default.
+    fn can_install_here(&mut self) -> bool {
+        true
+    }
 }
 
 /// The hiding choice (D7) an agent config file proves was made: `mac_virtual_display = true` at
@@ -533,6 +575,8 @@ pub mod ids {
     pub const REPAIR_CONFIRM: u16 = 5006;
     pub const REPAIR_RESUME: u16 = 5007;
     pub const REPAIR_DISCARD: u16 = 5008;
+    pub const COMPLETE_REINSTALL: u16 = 5009;
+    pub const REINSTALL_CONFIRM: u16 = 5010;
 
     pub fn retry(step: StepId) -> u16 {
         100 + step.0

@@ -408,7 +408,9 @@ mod tests {
             }),
             Err(PlatformError::Timeout)
         ));
-        release.send(()).unwrap();
+        // A worker that starts after the deadline refuses before running the call and drops
+        // `wait`, so the release may have no receiver; either way no native step may begin.
+        let _ = release.send(());
         store.wait_quiescent(Duration::from_secs(1)).unwrap();
         assert!(!next_call.load(std::sync::atomic::Ordering::SeqCst));
     }

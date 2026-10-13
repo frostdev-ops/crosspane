@@ -344,6 +344,19 @@ pub enum Input {
     AudioMicrophoneSupport {
         available: bool,
     },
+    /// Once at start: whether this node's audio backend can capture per-projection app audio
+    /// (true on Windows with audio enabled). Defaults to false: a node that never sends this
+    /// never sends `AudioProjectionSources` or opens a projection audio stream.
+    AudioProjectionCapture {
+        available: bool,
+    },
+    /// After `AudioPeer`: whether both `Hello`s carry `PROJECTION_AUDIO_FEATURE` (`"audio/1"`),
+    /// i.e. `peer` understands "sound follows the window". False removes it (link loss, or a
+    /// `HelloRefresh` without the feature).
+    ProjectionAudioPeer {
+        peer: NodeId,
+        available: bool,
+    },
     // ---- E2 ----
     /// This node's windows (from `WindowSource`).
     Windows(WindowEvent),
@@ -471,6 +484,14 @@ pub enum Output {
     AudioIndicators {
         microphones: Vec<AudioKey>,
         speakers: Vec<AudioKey>,
+    },
+    /// The latest set of process ids whose audio this node sends `peer`; empty stops it. The host
+    /// passes it to `AudioHost::set_peer_sources`. Emitted only when the set changes, and again
+    /// after `RemoveAudioPeer` followed by a re-add. A bare pid can be reused by another process,
+    /// so the host must bind each pid to the projected window's process identity before capturing.
+    AudioProjectionSources {
+        peer: NodeId,
+        pids: Vec<u32>,
     },
     SetPortals(Vec<CapturePortal>),
     /// Turn `InputCapture::set_monitor_local_activity` on or off (local override on a target).
@@ -668,6 +689,15 @@ pub enum Notice {
     ProjectionRefused {
         peer: NodeId,
         reason: Refusal,
+    },
+    /// E2 source: the window could not be parked (it refused to move), so its projection
+    /// continues as a mirror of the window where it stands, and it stays visible on this node.
+    /// Emitted once per such projection, right after its `ProjectionStarted`. Nothing was moved:
+    /// the projection's end returns nothing (no `Output::Restore` at the end). `title` is the
+    /// window's, capped as on the wire.
+    ProjectionShownInPlace {
+        key: ProjectionKey,
+        title: String,
     },
     /// WP-2.43: this node's input went home into its own projected window (`entered`), or left it.
     Home {

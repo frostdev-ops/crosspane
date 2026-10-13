@@ -51,6 +51,7 @@ pub(crate) fn is_audio_control(msg: &ControlMessage) -> bool {
             | ControlMessage::AudioOpened { .. }
             | ControlMessage::AudioRefused { .. }
             | ControlMessage::AudioClose { .. }
+            | ControlMessage::ProjectionAudioOpen { .. }
     )
 }
 

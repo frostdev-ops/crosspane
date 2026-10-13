@@ -109,6 +109,13 @@ pub(super) struct Destination {
 }
 
 impl Destination {
+    /// The proxy is open (the projection was accepted) and the link is up: sound from the
+    /// source plays here. A suspended destination keeps its proxy through the reconnect grace
+    /// but shows nothing live.
+    pub(super) fn shown(&self) -> bool {
+        self.open && self.suspended.is_none()
+    }
+
     pub(super) fn drag_geometry(&self) -> Option<(PixelSize, f64)> {
         self.current
             .filter(|_| self.open && self.suspended.is_none())
@@ -1195,6 +1202,19 @@ impl E2 {
             })
             .flatten()
             .min()
+    }
+
+    /// AUD-PROJ: the peers with at least one projection shown here, i.e. whose sound plays on
+    /// this node without the `speaker` grant: a destination whose proxy is open (the projection
+    /// was accepted) and not suspended (the link is up). `present` was granted for every such
+    /// destination to exist; revoking it, a lock, a panic, an end, a return or the reconnect
+    /// grace running out removes the destination in the same `handle`.
+    pub(super) fn audio_destinations(&self) -> BTreeSet<NodeId> {
+        self.destinations
+            .iter()
+            .filter(|(_, destination)| destination.shown())
+            .map(|(key, _)| key.source)
+            .collect()
     }
 }
 

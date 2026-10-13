@@ -776,6 +776,13 @@ impl Worker {
 
     fn maintenance(&mut self, request: MaintenanceRequest) {
         match request {
+            MaintenanceRequest::PlanReinstall { id, .. }
+            | MaintenanceRequest::ConfirmReinstall { id, .. } => {
+                self.maint(MaintenanceReport::Refused {
+                    id,
+                    reason: "Complete reinstall is available on Windows.".into(),
+                });
+            }
             MaintenanceRequest::Inspect { id } => {
                 self.maintenance = Maintenance {
                     id: Some(id),

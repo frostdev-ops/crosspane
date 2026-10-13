@@ -2,7 +2,7 @@
 //! elevation, journals the Intent, asks the shell for one `runas` run, waits a bounded time and
 //! journals the Outcome. It never kills the elevated child.
 
-use super::native_io::{NativeError, NativeResult};
+use super::error::{NativeError, NativeResult};
 use crosspane_installer_core::elevated::{
     HELPER_IMAGE, Outcome, RuleScope, Verb, command_line, is_local_drive_path, render_arguments,
     status::{

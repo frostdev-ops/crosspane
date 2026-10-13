@@ -38,6 +38,12 @@ const REENTRY_GUARD: Duration = Duration::from_millis(150);
 /// How long after a target session ends the restored portals stay disarmed if the platform never
 /// reports an `EdgeReleased` for them (a pointer that was never inside the strip produces none).
 pub const REARM_FALLBACK: Duration = Duration::from_secs(1);
+/// How long after a crossing whose capture was refused with [`Failure::SecureInput`] (an elevated
+/// foreground window, the secure desktop, Secure Event Input) the same portal ignores presses, if
+/// the pointer doesn't leave the edge first (the portal's next `EdgeReleased` re-arms it earlier).
+/// Without it a pointer held against the edge retries the crossing, HUD included, at the HUD
+/// round-trip rate.
+pub const SECURE_INPUT_BACKOFF: Duration = Duration::from_millis(1500);
 const DRAG_SAMPLE_FRESH: Duration = Duration::from_millis(60);
 const HUD_TIMEOUT: Duration = Duration::from_millis(500);
 const START_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1239,7 +1245,16 @@ impl ControllerE1 {
                         }
                     }
                 }
-                Err(_) => self.return_home(EndReason::Released, None, true, true, now, out),
+                Err(failure) => {
+                    // The refusal repeats for as long as the foreground stays elevated: back
+                    // this portal off (as a restored one is) rather than re-run the crossing,
+                    // HUD included, on every outward move. No notice: none is emitted for a
+                    // refusal today, so there is none to repeat.
+                    if *failure == Failure::SecureInput {
+                        self.disarm_refused_portal(now);
+                    }
+                    self.return_home(EndReason::Released, None, true, true, now, out);
+                }
             }
         } else if result.is_ok() {
             // A repeat of the success of the exit capture that committed is not a new capture:
@@ -1574,6 +1589,27 @@ impl ControllerE1 {
                 .iter()
                 .any(|d| d.from == from && d.to == to && d.edge == edge)
         })
+    }
+
+    // The crossing in progress had its capture refused with `SecureInput`: disarm its portal
+    // until the pointer leaves the edge (a release stamped at or after `now`) or
+    // `SECURE_INPUT_BACKOFF` passes, whichever is first.
+    fn disarm_refused_portal(&mut self, now: MonoTime) {
+        let Phase::Crossing(c) = &self.phase else {
+            return;
+        };
+        let Some((from, to, edge)) = self.connection(c.portal) else {
+            return;
+        };
+        self.disarmed
+            .retain(|d| !(d.from == from && d.to == to && d.edge == edge));
+        self.disarmed.push(Disarmed {
+            from,
+            to,
+            edge,
+            valid_from: now,
+            until: now.saturating_add(SECURE_INPUT_BACKOFF),
+        });
     }
 
     // `at` is the release's own timestamp (the platform's monotonic clock, which is also the

@@ -365,6 +365,9 @@ pub enum RestoreOutcome {
     Restored(Observed),
     MonitorGone,
 }
+/// A journaled window whose show state differs from its original (e.g. now maximized).
+const SHOW_STATE_REASON: &str = "Windows mirror show-state restoration";
+
 #[derive(Clone, Copy)]
 enum RestoreDisposition {
     Restored,
@@ -659,9 +662,7 @@ impl<P: NativePort> Controller<P> {
             return Err(PlatformError::Locked);
         }
         if current.show != entry.original.show {
-            return Err(PlatformError::Unsupported(
-                "Windows mirror show-state restoration",
-            ));
+            return Err(PlatformError::Unsupported(SHOW_STATE_REASON));
         }
         if current.outer != entry.original.rect_physical
             || current.visible != entry.visible_original
@@ -720,10 +721,21 @@ impl<P: NativePort> Controller<P> {
         let mut report = MirrorRecovery::default();
         for entry in self.journal.entries.clone() {
             self.port.check()?;
-            match self.restore_entry(entry, None)? {
-                RestoreDisposition::Restored => report.restored += 1,
-                RestoreDisposition::Retired => report.retired += 1,
-                RestoreDisposition::MonitorGone => {}
+            let identity = entry.identity;
+            match self.restore_entry(entry, None) {
+                Ok(RestoreDisposition::Restored) => report.restored += 1,
+                Ok(RestoreDisposition::Retired) => report.retired += 1,
+                Ok(RestoreDisposition::MonitorGone) => {}
+                // A minimized, hidden or cloaked window, or one in another show state, can't be
+                // proven restored now. Its entry stays journaled and pending, so one window's
+                // state never blocks startup. A closed session gate still fails startup.
+                Err(PlatformError::Locked) if self.port.check().is_ok() => {
+                    self.pending.insert(identity);
+                }
+                Err(PlatformError::Unsupported(reason)) if reason == SHOW_STATE_REASON => {
+                    self.pending.insert(identity);
+                }
+                Err(error) => return Err(error),
             }
         }
         report.pending = self.journal.entries.len();

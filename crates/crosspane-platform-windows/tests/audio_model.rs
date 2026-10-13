@@ -692,3 +692,262 @@ fn cancel_and_device_failure_are_terminal_with_distinct_evidence() {
     failed.cancel();
     assert_eq!(failed.reason(), Some(AudioDeviceError::Failed));
 }
+
+/// AVS-1a: the process-loopback mixer is clocked by captured data.
+mod data_clocked_mixing {
+    use crosspane_platform_windows::model::audio::{
+        CAPTURE_IDLE, MAX_CAPTURE_BACKLOG, SPEAKER_FRAME_SAMPLES, SpeakerMixer, capture_excess,
+        frames_to_mix,
+    };
+    use rtrb::{Consumer, Producer, RingBuffer};
+
+    const FRAME: usize = SPEAKER_FRAME_SAMPLES;
+    const MS: u64 = 1_000_000;
+    /// The native per-process capture ring.
+    const RING: usize = 9_600;
+    /// One 480-frame packet at exactly 48 kHz.
+    const PACKET_NS: u64 = 10 * MS;
+
+    #[test]
+    fn frames_to_mix_truth_table() {
+        assert_eq!(frames_to_mix(&[], &[]), 0);
+        // All idle: nothing is mixed, whatever is queued.
+        assert_eq!(frames_to_mix(&[1_920, 9_600], &[true, true]), 0);
+        // The minimum over live captures, in whole frames.
+        assert_eq!(frames_to_mix(&[1_920], &[false]), 2);
+        assert_eq!(frames_to_mix(&[2_880, 1_000], &[false, false]), 1);
+        assert_eq!(frames_to_mix(&[1_920, 959], &[false, false]), 0);
+        // An idle capture with nothing queued does not stall a live one.
+        assert_eq!(frames_to_mix(&[0, 2_880], &[true, false]), 3);
+        assert_eq!(
+            frames_to_mix(&[2_880, 1_000, 5_000], &[false, false, true]),
+            1
+        );
+        // Unpaired entries are ignored.
+        assert_eq!(frames_to_mix(&[1_920, 0], &[false]), 2);
+    }
+
+    #[test]
+    fn capture_excess_truth_table() {
+        let keep = MAX_CAPTURE_BACKLOG * FRAME;
+        assert_eq!(keep, 1_920);
+        for (queued, excess) in [
+            (0, 0),
+            (959, 0),
+            (1_920, 0),
+            // A half frame at the back stays; discarding is always whole stereo pairs.
+            (1_921, 0),
+            (1_922, 2),
+            (2_880, 960),
+            (2_881, 960),
+            (9_600, 7_680),
+        ] {
+            assert_eq!(capture_excess(queued), excess, "queued {queued}");
+            assert_eq!(excess % 2, 0);
+        }
+    }
+
+    struct Source {
+        period_ns: u64,
+        next_ns: u64,
+        value: f32,
+        /// Produces nothing for packets due in `[from, to)`.
+        silent: Option<(u64, u64)>,
+        pcm: Producer<f32>,
+        mix: Consumer<f32>,
+        heard: Option<u64>,
+        /// Packets (10 ms frames) produced.
+        produced: u64,
+        /// Frames mixed that contained this source.
+        mixed: u64,
+        /// Samples lost to a full capture ring.
+        overflow: u64,
+        /// Samples discarded by `capture_excess`.
+        trimmed: u64,
+    }
+
+    impl Source {
+        fn new(period_ns: u64, first_ns: u64, value: f32, silent: Option<(u64, u64)>) -> Self {
+            let (pcm, mix) = RingBuffer::new(RING);
+            Self {
+                period_ns,
+                next_ns: first_ns,
+                value,
+                silent,
+                pcm,
+                mix,
+                heard: None,
+                produced: 0,
+                mixed: 0,
+                overflow: 0,
+                trimmed: 0,
+            }
+        }
+
+        /// What `drain` does on a wake-up at `now`: collect every packet the engine has finished.
+        fn deliver(&mut self, now: u64, end: u64) {
+            while self.next_ns <= now.min(end) {
+                let at = self.next_ns;
+                self.next_ns += self.period_ns;
+                if self
+                    .silent
+                    .is_some_and(|(from, to)| (from..to).contains(&at))
+                {
+                    continue;
+                }
+                self.produced += 1;
+                self.heard = Some(now);
+                if self.pcm.slots() < FRAME {
+                    self.overflow += FRAME as u64;
+                    continue;
+                }
+                for _ in 0..FRAME {
+                    self.pcm.push(self.value).unwrap();
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Run {
+        mixed: u64,
+        /// Largest capture ring, in samples, after a pass that mixed.
+        max_after_mix: usize,
+        /// Largest capture ring, in samples, after any pass.
+        max_any: usize,
+        /// Longest time between two passes that mixed.
+        longest_gap_ns: u64,
+    }
+
+    /// The `source_worker` mix block over a run with wake-ups jittered by 0-16 ms, ending with a
+    /// pass at exactly `end_ns`.
+    fn simulate(sources: &mut [Source], end_ns: u64, seed: u64) -> Run {
+        let idle_ns = u64::try_from(CAPTURE_IDLE.as_nanos()).unwrap();
+        let mut mixer = SpeakerMixer::new();
+        let mut output = [0.0; SPEAKER_FRAME_SAMPLES];
+        let mut rng = seed;
+        let mut now = 0;
+        let mut last_mix: Option<u64> = None;
+        let mut run = Run::default();
+        loop {
+            for source in sources.iter_mut() {
+                source.deliver(now, end_ns);
+            }
+            let queued: Vec<usize> = sources.iter().map(|s| s.mix.slots()).collect();
+            let idle: Vec<bool> = sources
+                .iter()
+                .map(|s| s.heard.is_none_or(|heard| now - heard >= idle_ns))
+                .collect();
+            let frames = frames_to_mix(&queued, &idle);
+            for _ in 0..frames {
+                mixer.begin();
+                let mut expected = 0.0;
+                for (source, idle) in sources.iter_mut().zip(&idle) {
+                    if !idle {
+                        mixer.add(&mut source.mix);
+                        source.mixed += 1;
+                        expected += source.value;
+                    }
+                }
+                mixer.finish(&mut output);
+                assert!(output.iter().all(|sample| *sample == expected));
+            }
+            run.mixed += frames as u64;
+            if frames > 0 {
+                for source in sources.iter_mut() {
+                    let excess = capture_excess(source.mix.slots());
+                    if excess > 0 {
+                        source.mix.read_chunk(excess).unwrap().commit_all();
+                        source.trimmed += excess as u64;
+                    }
+                    run.max_after_mix = run.max_after_mix.max(source.mix.slots());
+                }
+                if let Some(last) = last_mix {
+                    run.longest_gap_ns = run.longest_gap_ns.max(now - last);
+                }
+                last_mix = Some(now);
+            }
+            for source in sources.iter() {
+                run.max_any = run.max_any.max(source.mix.slots());
+            }
+            if now >= end_ns {
+                return run;
+            }
+            rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            now = (now + (rng >> 33) % (16 * MS + 1)).min(end_ns);
+        }
+    }
+
+    #[test]
+    fn sixty_seconds_of_jittered_wakeups_mix_exactly_what_was_captured() {
+        let end = 60_000 * MS;
+        let mut sources = [
+            Source::new(PACKET_NS, PACKET_NS, 0.25, None),
+            // Goes idle for 2 s mid-run.
+            Source::new(
+                PACKET_NS,
+                PACKET_NS + 3 * MS,
+                0.5,
+                Some((30_000 * MS, 32_000 * MS)),
+            ),
+        ];
+        let run = simulate(&mut sources, end, 0x5eed);
+        let [a, b] = &sources;
+        assert_eq!(a.produced, 6_000);
+        // Packets at 13 ms + 10k up to 60 s, less the 200 due while idle.
+        assert_eq!(b.produced, 5_799);
+        // Mixed equals produced (+-1 frame) for both live captures; nothing is lost.
+        assert!(run.mixed.abs_diff(a.produced) <= 1, "{run:?}");
+        assert!(a.mixed.abs_diff(a.produced) <= 1);
+        assert!(b.mixed.abs_diff(b.produced) <= 1);
+        for source in &sources {
+            assert_eq!(source.overflow, 0);
+            assert_eq!(source.trimmed, 0);
+        }
+        // The backlog after mixing stays within three frames.
+        assert!(run.max_after_mix <= 3 * FRAME, "{run:?}");
+        // While a capture is going idle the others wait at most CAPTURE_IDLE plus one wake-up.
+        assert!(run.max_any <= 6 * FRAME, "{run:?}");
+        // The idle capture never stalls the others: mixing continues through its 2 s gap.
+        assert!(run.longest_gap_ns <= 60 * MS, "{run:?}");
+    }
+
+    #[test]
+    fn a_source_half_a_percent_fast_keeps_a_bounded_backlog() {
+        let end = 60_000 * MS;
+        let fast = PACKET_NS * 1_000 / 1_005;
+        let mut sources = [
+            Source::new(fast, fast, 0.25, None),
+            Source::new(PACKET_NS, PACKET_NS + 7 * MS, 0.5, None),
+        ];
+        let run = simulate(&mut sources, end, 0xd21f7);
+        let [a, b] = &sources;
+        assert!(
+            a.produced > b.produced + 25,
+            "{} {}",
+            a.produced,
+            b.produced
+        );
+        // The slower capture sets the pace; the fast one's lead is discarded, never queued.
+        assert!(run.mixed.abs_diff(b.produced) <= 1, "{run:?}");
+        assert_eq!(a.overflow + b.overflow + b.trimmed, 0);
+        let lead = (a.produced - b.produced) * FRAME as u64;
+        assert!(
+            a.trimmed.abs_diff(lead) <= 3 * FRAME as u64,
+            "{} {lead}",
+            a.trimmed
+        );
+        assert!(run.max_after_mix <= 3 * FRAME, "{run:?}");
+        assert!(run.max_any <= 6 * FRAME, "{run:?}");
+
+        // Alone, a fast source is mixed in full at its own rate and never backs up.
+        let mut alone = [Source::new(fast, fast, 0.25, None)];
+        let run = simulate(&mut alone, end, 0xa10e);
+        assert!(run.mixed.abs_diff(alone[0].produced) <= 1, "{run:?}");
+        assert_eq!(alone[0].overflow + alone[0].trimmed, 0);
+        assert!(run.max_after_mix < FRAME, "{run:?}");
+        assert!(run.max_any <= 3 * FRAME, "{run:?}");
+    }
+}

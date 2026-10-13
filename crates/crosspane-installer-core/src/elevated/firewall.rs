@@ -6,6 +6,9 @@ pub const NET_FW_IP_PROTOCOL_UDP: i32 = 17;
 pub const NET_FW_RULE_DIR_IN: i32 = 1;
 pub const NET_FW_ACTION_ALLOW: i32 = 1;
 pub const NET_FW_PROFILE2_PRIVATE: i32 = 2;
+pub const NET_FW_PROFILE2_PUBLIC: i32 = 4;
+/// Private and public networks. The domain profile (1) is not covered.
+pub const RULE_PROFILES: i32 = NET_FW_PROFILE2_PRIVATE | NET_FW_PROFILE2_PUBLIC;
 pub const NET_FW_EDGE_TRAVERSAL_TYPE_DENY: i32 = 0;
 pub const NET_FW_AUTHENTICATE_NONE: i32 = 0;
 pub const REMOTE_ADDRESSES: &str = "LocalSubnet";
@@ -64,7 +67,7 @@ pub fn desired_rule(scope: &RuleScope) -> ComRule {
         interface_types: "All".to_owned(),
         enabled: true,
         grouping: scope.id.rule_group(),
-        profiles: NET_FW_PROFILE2_PRIVATE,
+        profiles: RULE_PROFILES,
         action: NET_FW_ACTION_ALLOW,
         edge_traversal_options: NET_FW_EDGE_TRAVERSAL_TYPE_DENY,
         secure_flags: NET_FW_AUTHENTICATE_NONE,
@@ -114,6 +117,8 @@ fn is_wildcard(text: &str) -> bool {
 pub enum FirewallPlan {
     Add,
     AlreadyPresent,
+    /// The exact rule is a legacy private-only rule; the helper widens its profiles in place.
+    Widen,
     Remove,
     AlreadyAbsent,
     Mismatch(&'static str),
@@ -149,28 +154,44 @@ fn exact_rule<'a>(
     }
 }
 
-/// Adds the rule when the family has none under the exact name.
+/// True when `observed` is a rule from an earlier setup: the exact rule with the private profile
+/// alone. Every other field must match the specification.
+fn is_legacy(observed: &ComRule, scope: &RuleScope) -> bool {
+    if observed.profiles != NET_FW_PROFILE2_PRIVATE {
+        return false;
+    }
+    let mut widened = observed.clone();
+    widened.profiles = RULE_PROFILES;
+    rule_matches(&widened, scope)
+}
+
+/// Adds the rule when the family has none under the exact name. A legacy private-only rule is
+/// widened instead.
 pub fn plan_add(family: &[ComRule], scope: &RuleScope) -> FirewallPlan {
     match exact_rule(family, scope) {
         Err(reason) => FirewallPlan::Mismatch(reason),
         Ok(None) => FirewallPlan::Add,
         Ok(Some(rule)) if rule_matches(rule, scope) => FirewallPlan::AlreadyPresent,
+        Ok(Some(rule)) if is_legacy(rule, scope) => FirewallPlan::Widen,
         Ok(Some(_)) => FirewallPlan::Mismatch(DIFFERS),
     }
 }
 
-/// Removes the rule only when exactly one rule under the exact name matches the specification.
+/// Removes the rule only when exactly one rule under the exact name matches the specification. A
+/// legacy private-only rule from an earlier setup is removed too.
 pub fn plan_remove(family: &[ComRule], scope: &RuleScope) -> FirewallPlan {
     match exact_rule(family, scope) {
         Err(reason) => FirewallPlan::Mismatch(reason),
         Ok(None) => FirewallPlan::AlreadyAbsent,
-        Ok(Some(rule)) if rule_matches(rule, scope) => FirewallPlan::Remove,
+        Ok(Some(rule)) if rule_matches(rule, scope) || is_legacy(rule, scope) => {
+            FirewallPlan::Remove
+        }
         Ok(Some(_)) => FirewallPlan::Mismatch(DIFFERS),
     }
 }
 
 /// `None` means no firewall rule is requested. Otherwise the state follows the same rules as the
-/// plans.
+/// plans. A legacy private-only rule is `Mismatch` until it is widened.
 pub fn firewall_state(family: &[ComRule], scope: Option<&RuleScope>) -> FirewallState {
     let Some(scope) = scope else {
         return FirewallState::NotRequested;

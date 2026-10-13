@@ -143,7 +143,7 @@ fn describe_text_is_frozen_byte_for_byte() {
     assert_eq!(
         describe(&Verb::AddFirewall(scope())),
         vec![
-            r#"Allow C:\Users\user\AppData\Local\Programs\Crosspane\crosspane-agent.exe to receive UDP traffic from your local subnet on private networks (Windows Defender Firewall rule "Crosspane.Agent.UDP.Private.w41c-vm-1")."#,
+            r#"Allow C:\Users\user\AppData\Local\Programs\Crosspane\crosspane-agent.exe to receive UDP traffic from your local subnet on private and public networks, not domain networks (Windows Defender Firewall rule "Crosspane.Agent.UDP.Private.w41c-vm-1")."#,
         ]
     );
     assert_eq!(
@@ -622,7 +622,7 @@ fn combined_describe_is_the_parts_text_in_run_order() {
     assert_eq!(
         setup,
         vec![
-            r#"Allow C:\Users\user\AppData\Local\Programs\Crosspane\crosspane-agent.exe to receive UDP traffic from your local subnet on private networks (Windows Defender Firewall rule "Crosspane.Agent.UDP.Private.w41c-vm-1")."#,
+            r#"Allow C:\Users\user\AppData\Local\Programs\Crosspane\crosspane-agent.exe to receive UDP traffic from your local subnet on private and public networks, not domain networks (Windows Defender Firewall rule "Crosspane.Agent.UDP.Private.w41c-vm-1")."#,
             "Add the Crosspane display driver (CrosspaneIdd.inf, publisher Crosspane) to the Windows driver store.",
             "Create one Crosspane virtual display adapter (hardware ID Crosspane\\IddTwinV1). It shows no display until Crosspane needs one.",
         ]

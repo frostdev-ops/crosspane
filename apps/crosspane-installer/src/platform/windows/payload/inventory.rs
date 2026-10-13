@@ -1,5 +1,5 @@
 //! Approval is supplied by the executing installer's build, never by inspected payload bytes.
-use super::super::native_io::{NativeError, NativeResult};
+use super::super::error::{NativeError, NativeResult};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_INVENTORY_BYTES: usize = 64 * 1024;
@@ -14,7 +14,6 @@ pub(crate) enum PayloadRole {
     Ctl,
 }
 impl PayloadRole {
-    pub(crate) const ALL: [Self; 4] = [Self::Installer, Self::Agent, Self::Ui, Self::Ctl];
     pub(crate) fn leaf(self) -> &'static str {
         match self {
             Self::Installer => "crosspane-installer.exe",
@@ -62,53 +61,14 @@ impl std::fmt::Debug for ApprovedPe {
     }
 }
 impl ApprovedPe {
-    pub(crate) fn role(&self) -> PayloadRole {
-        self.role
-    }
-    pub(crate) fn facts(&self) -> &PeFacts {
-        &self.facts
-    }
     pub(crate) fn size(&self) -> u64 {
         self.facts.size
     }
-    // A4b native consumers use these fixed pin views; current helper comparison uses facts().
-    #[allow(dead_code)]
     pub(crate) fn sha256(&self) -> [u8; 32] {
         self.facts.sha256
     }
-    // A4b native consumers use these fixed pin views; current helper comparison uses facts().
-    #[allow(dead_code)]
-    pub(crate) fn machine(&self) -> u16 {
-        self.facts.machine
-    }
-    // A4b native consumers use these fixed pin views; current helper comparison uses facts().
-    #[allow(dead_code)]
-    pub(crate) fn subsystem(&self) -> u16 {
-        self.facts.subsystem
-    }
     pub(crate) fn version(&self) -> &str {
         &self.facts.version
-    }
-    pub(crate) fn matches(&self, other: &Self) -> bool {
-        self.role == other.role && self.facts == other.facts
-    }
-    /// Only the native own-module opener can create this non-deserializable source token.
-    #[cfg(windows)]
-    pub(crate) fn own_image(image: &super::super::native_io::SelfImagePin) -> NativeResult<Self> {
-        let facts = image.facts().clone();
-        if !facts.valid() {
-            return Err(NativeError::Unsupported);
-        }
-        Ok(Self {
-            role: PayloadRole::Installer,
-            facts,
-        })
-    }
-    #[cfg(test)]
-    // Used by source-included integration tests; the library test root does not call this fixture.
-    #[allow(dead_code)]
-    pub(crate) fn fixture(role: PayloadRole, facts: PeFacts) -> Self {
-        Self { role, facts }
     }
 }
 #[derive(Deserialize)]
@@ -186,57 +146,11 @@ impl ApprovedInventory {
         }
         Ok(inventory)
     }
-    /// Aggregate staged bytes include four fixed roles and the optional installer helper copy.
-    pub(crate) fn check_staging_budget(
-        &self,
-        installer: &ApprovedPe,
-        helper: bool,
-    ) -> NativeResult<()> {
-        if installer.role() != PayloadRole::Installer {
-            return Err(NativeError::Foreign);
-        }
-        let mut total = installer
-            .size()
-            .checked_mul(if helper { 2 } else { 1 })
-            .ok_or(NativeError::Oversize)?;
-        for role in [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl] {
-            total = total
-                .checked_add(self.role(role)?.size())
-                .ok_or(NativeError::Oversize)?;
-        }
-        if total > MAX_STAGING_BYTES {
-            return Err(NativeError::Oversize);
-        }
-        Ok(())
-    }
     pub(crate) fn role(&self, role: PayloadRole) -> NativeResult<&ApprovedPe> {
         self.payloads
             .iter()
             .find(|pin| pin.role == role)
             .ok_or(NativeError::Unsupported)
-    }
-    #[cfg(test)]
-    // Used by source-included integration tests; the library test root does not call this fixture.
-    #[allow(dead_code)]
-    pub(crate) fn fixture(payloads: Vec<ApprovedPe>) -> NativeResult<Self> {
-        if payloads.len() != 4
-            || PayloadRole::ALL.iter().any(|role| {
-                payloads
-                    .iter()
-                    .filter(|pin| pin.role == *role && pin.facts.valid())
-                    .count()
-                    != 1
-            })
-        {
-            return Err(NativeError::Invalid);
-        }
-        Ok(Self { payloads })
-    }
-    #[cfg(test)]
-    // Used by source-included integration tests; the library test root does not call this fixture.
-    #[allow(dead_code)]
-    pub(crate) fn fixture_parse(value: Option<&str>) -> NativeResult<Self> {
-        Self::from_embedded(value)
     }
 }
 fn parse_sha(value: &str) -> NativeResult<[u8; 32]> {
@@ -257,7 +171,7 @@ fn parse_sha(value: &str) -> NativeResult<[u8; 32]> {
     }
     Ok(bytes)
 }
-/// Bounded PE header inspection shared by native opened-handle checks and inert fixtures.
+/// Bounded PE header inspection, shared by the payload source checks and the installed-file checks.
 pub(crate) fn pe_header(bytes: &[u8], size: u64) -> NativeResult<(u16, u16)> {
     fn u16_at(bytes: &[u8], at: usize) -> NativeResult<u16> {
         Ok(u16::from_le_bytes(

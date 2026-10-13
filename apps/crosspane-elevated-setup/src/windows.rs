@@ -18,7 +18,8 @@ use crosspane_installer_core::elevated::driver::{
     driver_state, package_ownership, plan_install, plan_removal,
 };
 use crosspane_installer_core::elevated::firewall::{
-    ComRule, FirewallPlan, desired_rule, firewall_state, plan_add, plan_remove,
+    ComRule, FirewallPlan, NET_FW_PROFILE2_PRIVATE, RULE_PROFILES, desired_rule, firewall_state,
+    plan_add, plan_remove,
 };
 use crosspane_installer_core::elevated::status::{
     DeviceStatus, DriverStatus, FirewallStatus, STATUS_SCHEMA, StatusReport,
@@ -371,6 +372,21 @@ fn add_firewall(scope: &RuleScope) -> HelperResult<Outcome> {
             note(reason);
             return Ok(Outcome::Mismatch);
         }
+        FirewallPlan::Widen => {
+            // An earlier setup's private-only rule: widen its profiles in place, then verify.
+            firewall.set_profiles(&scope.id.rule_name(), RULE_PROFILES)?;
+            if firewall_reads(&firewall, scope, FirewallState::Present) {
+                return Ok(Outcome::Done);
+            }
+            // Verification failed after the widen: put back exactly the profiles this run changed.
+            if firewall
+                .set_profiles(&scope.id.rule_name(), NET_FW_PROFILE2_PRIVATE)
+                .is_err()
+            {
+                note("could not restore the firewall rule's network profiles");
+            }
+            return Ok(Outcome::Failed);
+        }
         FirewallPlan::Add => {}
         FirewallPlan::Remove | FirewallPlan::AlreadyAbsent => return Ok(Outcome::Failed),
     }
@@ -396,7 +412,9 @@ fn remove_firewall(scope: &RuleScope) -> HelperResult<Outcome> {
             return Ok(Outcome::Mismatch);
         }
         FirewallPlan::Remove => {}
-        FirewallPlan::Add | FirewallPlan::AlreadyPresent => return Ok(Outcome::Failed),
+        FirewallPlan::Add | FirewallPlan::AlreadyPresent | FirewallPlan::Widen => {
+            return Ok(Outcome::Failed);
+        }
     }
     firewall.remove(&scope.id.rule_name())?;
     if firewall_reads(&firewall, scope, FirewallState::Missing) {

@@ -3,6 +3,7 @@
 
 mod device;
 mod lane;
+mod place;
 mod topology;
 
 use self::device::{ControlDevice, locate};
@@ -15,6 +16,7 @@ use crate::model::{
 };
 use crosspane_platform::PlatformError;
 use std::{
+    collections::BTreeMap,
     fmt,
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::{self, JoinHandle},
@@ -40,10 +42,18 @@ impl Default for TwinConfig {
 /// The twin client: one lane per twin, a heartbeat thread that renews their leases, and the
 /// journal-ordered ledger. Every method runs on the caller's thread. The heartbeat thread only
 /// beats lanes that are registered with it.
+///
+/// Placement: Windows puts a new twin flush against the desktop's right edge, where the cursor and
+/// new windows can reach it. After each ADD the client moves the twin to a corner that touches no
+/// display along an edge (`model::twin_place`), best effort: a refused move leaves the twin where
+/// Windows put it. The displays it returns, and `display`, carry the rect Windows reports after
+/// that move.
 pub struct TwinClient {
     ledger: TwinLedger<NativeBackend>,
     beats: Arc<Beats>,
     heartbeat: Option<JoinHandle<()>>,
+    /// Each live twin as placed. The ledger's own copy keeps the rect of the first sighting.
+    shown: BTreeMap<TwinKey, TwinDisplay>,
 }
 
 impl fmt::Debug for TwinClient {
@@ -71,46 +81,84 @@ impl TwinClient {
             ledger: TwinLedger::new(backend),
             beats,
             heartbeat,
+            shown: BTreeMap::new(),
         })
     }
 
-    /// Adds a twin in `mode`. The ledger is saved before each IOCTL that changes a twin.
+    /// Adds a twin in `mode`, then moves it out of the user's reach. The ledger is saved before
+    /// each IOCTL that changes a twin.
     pub fn add(
         &mut self,
         journal: &mut JournalFile,
         mode: TwinMode,
     ) -> Result<TwinDisplay, TwinError> {
-        self.ledger.add(journal, mode)
+        let display = self.ledger.add(journal, mode)?;
+        Ok(self.place(display))
     }
 
-    /// Changes a twin's mode by REMOVE then ADD on its lane. The monitor id changes.
+    /// Changes a twin's mode by REMOVE then ADD on its lane. The monitor id changes, and Windows
+    /// places the new monitor afresh, so it is moved out of reach again. An unchanged mode is a
+    /// no-op.
     pub fn resize(
         &mut self,
         journal: &mut JournalFile,
         key: TwinKey,
         mode: TwinMode,
     ) -> Result<TwinDisplay, TwinError> {
-        self.ledger.resize(journal, key, mode)
+        let result = self.ledger.resize(journal, key, mode);
+        self.forget_gone();
+        let display = result?;
+        match self.shown.get(&key) {
+            Some(held) if held.monitor_id == display.monitor_id => Ok(held.clone()),
+            _ => Ok(self.place(display)),
+        }
     }
 
     /// Removes a twin and closes its lane.
     pub fn remove(&mut self, journal: &mut JournalFile, key: TwinKey) -> Result<(), TwinError> {
-        self.ledger.remove(journal, key)
+        let result = self.ledger.remove(journal, key);
+        self.forget_gone();
+        result
     }
 
     /// The fast rollback: closes the lane and forgets the twin's record.
     pub fn discard(&mut self, journal: &mut JournalFile, key: TwinKey) -> Result<(), TwinError> {
-        self.ledger.discard(journal, key)
+        let result = self.ledger.discard(journal, key);
+        self.forget_gone();
+        result
     }
 
     /// Closes and forgets every twin whose lease was lost, and returns their keys.
     pub fn reap_lost(&mut self, journal: &mut JournalFile) -> Result<Vec<TwinKey>, TwinError> {
-        self.ledger.reap_lost(journal)
+        let result = self.ledger.reap_lost(journal);
+        self.forget_gone();
+        result
     }
 
-    /// The Windows display of a live twin.
+    /// The Windows display of a live twin, with the rect it has after placement.
     pub fn display(&self, key: TwinKey) -> Option<&TwinDisplay> {
-        self.ledger.display(key)
+        let ledger = self.ledger.display(key)?;
+        Some(self.shown.get(&key).unwrap_or(ledger))
+    }
+
+    /// Moves a new twin to its isolated corner and records it as shown. Best effort: Windows
+    /// refusing the move, or no display to hang the twin on, leaves it where Windows put it.
+    fn place(&mut self, mut display: TwinDisplay) -> TwinDisplay {
+        match place::place_twin(self.ledger.backend().adapter(), &display) {
+            Ok(Some(rect)) => display.rect = rect,
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "twin display stays where Windows placed it");
+            }
+        }
+        self.shown.insert(display.key, display.clone());
+        display
+    }
+
+    /// Drops the shown copy of every twin the ledger no longer holds.
+    fn forget_gone(&mut self) {
+        let ledger = &self.ledger;
+        self.shown.retain(|key, _| ledger.display(*key).is_some());
     }
 
     /// How many of our own active display paths exist right now.

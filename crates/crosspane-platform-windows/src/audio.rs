@@ -4,18 +4,28 @@
 //! Render owns all COM objects on one MTA thread. The control thread alone delivers events.
 //! \[U\] A stalled OS call can outlive a bounded return: disabled workers retain their resources.
 //! Gate/stop latch consumption silent immediately; already submitted endpoint audio is not revoked.
-//! Device/default changes terminate a stream; only an explicit new open can restart playback.
+//! A default-render or active-endpoint change is posted (event + latch, nothing else) from the
+//! MMDevice callback to the render worker, which alone tears the client down and reopens it on
+//! the new default endpoint with the same format negotiation. Reopens are bounded (at most 5 per
+//! minute per stream, with backoff); once the budget or an attempt fails the stream ends exactly
+//! as a device loss always did. Process-tree capture is endpoint-independent and is not affected.
 //! \[E\] Process-tree loopback needs build20348; it does not mute the original application.
 //! <https://learn.microsoft.com/en-us/windows/win32/api/audioclientactivationparams/ns-audioclientactivationparams-audioclient_process_loopback_params>
-//! \[U\] The frozen source API carries PIDs, not original process claims. Refreshing projected
-//! PIDs and retaining a liveness handle mitigates, but cannot authenticate against PID reuse.
+//! The frozen source API still carries bare PIDs. Before any capture each PID is checked against
+//! the process identity the window source verified for a live projected window (the
+//! `model::process_claims` registry: the PID and its process creation time), and the handle
+//! opened for that check is retained for the capture's lifetime, which pins the PID: a reused
+//! PID is refused and never reaches another process.
 
 #![allow(unsafe_code)]
 
 use crate::model::audio::{
-    BorrowedDescriptor, Converter, MAX_RENDER_FRAMES, MixFormat, SPEAKER_FRAME_SAMPLES,
-    SourceLifecycle, SourceSet, SpeakerMixer, StreamControl, wait_open,
+    BorrowedDescriptor, CAPTURE_IDLE, ChangeSignal, Converter, EndpointEvent, MAX_PEER_SOURCES,
+    MAX_RENDER_FRAMES, MixFormat, ReopenLimiter, ReopenStep, SPEAKER_FRAME_SAMPLES,
+    SourceLifecycle, SourceSet, SpeakerMixer, StreamControl, capture_excess,
+    endpoint_event_relevant, frames_to_mix, wait_open,
 };
+use crate::model::process_claims;
 use crosspane_platform::{
     AudioCapture, AudioDeviceError, AudioEvent, AudioFormat, AudioHost, AudioKind, AudioPlayback,
     AudioStop, EventSink, IoGate, PlatformError, VirtualPorts,
@@ -50,14 +60,14 @@ use windows::{
     core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, PCWSTR},
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, WAIT_FAILED, WAIT_OBJECT_0},
+    Foundation::{CloseHandle, FILETIME, WAIT_FAILED, WAIT_OBJECT_0},
     System::{
         Diagnostics::Debug::OutputDebugStringW,
         LibraryLoader::{GetModuleHandleW, GetProcAddress},
         SystemInformation::OSVERSIONINFOW,
         Threading::{
-            CreateEventW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-            SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+            CreateEventW, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
         },
     },
 };
@@ -808,6 +818,18 @@ impl ProcessHandle {
         // SAFETY: retained process handle; zero wait observes termination without changing it.
         unsafe { WaitForSingleObject(self.0, 0) == windows_sys::Win32::Foundation::WAIT_TIMEOUT }
     }
+    /// The creation time of exactly the process this handle refers to, as a FILETIME `u64`.
+    fn created(&self) -> Option<u64> {
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: retained process handle with query rights; initialized exact FILETIME outputs.
+        let ok =
+            unsafe { GetProcessTimes(self.0, &mut created, &mut exited, &mut kernel, &mut user) }
+                != 0;
+        ok.then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
 }
 struct SourceCapture {
     pid: u32,
@@ -819,6 +841,10 @@ struct SourceCapture {
     mix: Consumer<f32>,
     started: bool,
     ready: bool,
+    /// When `drain` last received a packet; `None` until the first. Drives idle detection.
+    heard: Option<Instant>,
+    /// Frames `drain` dropped because `pcm` was full, not yet moved into the worker's counter.
+    dropped: u64,
 }
 impl SourceCapture {
     fn open(
@@ -838,7 +864,16 @@ impl SourceCapture {
         };
         check()?;
         let process = ProcessHandle::open(pid)?;
-        if !process.alive() {
+        // Bind the bare PID to the projected window's process before any activation: a claim
+        // with a live window must exist for `pid`, and the process this handle opened must have
+        // been created exactly when the claimed one was, and still be running. Windows never
+        // reuses a PID while any handle to its process is open, so holding `process` (kept for
+        // the capture's lifetime) while activating by PID reaches exactly the verified process.
+        if !process
+            .created()
+            .is_some_and(|created| process_claims::claim_admits(pid, created))
+            || !process.alive()
+        {
             return Err(unavailable());
         }
         let event = Arc::new(Wake::new()?);
@@ -885,6 +920,8 @@ impl SourceCapture {
             mix,
             started: false,
             ready: false,
+            heard: None,
+            dropped: 0,
         };
         check()?;
         if !client.process.alive() {
@@ -946,8 +983,13 @@ impl SourceCapture {
             let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
             let valid = frames as usize <= MAX_RENDER_FRAMES && (silent || !data.is_null());
             if valid && epoch.permits() && control.permits() {
+                if frames > 0 {
+                    self.heard = Some(Instant::now());
+                }
                 for frame in 0..frames as usize {
                     if self.pcm.slots() < 2 {
+                        let lost = (frames as usize - frame) as u64;
+                        self.dropped = self.dropped.saturating_add(lost);
                         break;
                     }
                     for channel in 0..2 {
@@ -1022,7 +1064,10 @@ fn source_worker(
     let mut revision = 0;
     let mut mixer = SpeakerMixer::new();
     let mut frame = [0.0; SPEAKER_FRAME_SAMPLES];
-    let mut next_mix = Instant::now();
+    // Frames lost to a full capture ring or a full speaker ring; logged only when it changes.
+    let mut overflow: u64 = 0;
+    let mut logged_overflow: u64 = 0;
+    let mut logged_at: Option<Instant> = None;
     while !control.eligibility.is_cancelled() {
         if !epoch.permits() {
             control.eligibility.disable();
@@ -1114,16 +1159,35 @@ fn source_worker(
             captures.clear();
             log_source_failure(pid);
         }
+        // Found while reviewing audio/video sync raised by Thiago Goncalves (2026-10).
+        // Mixing is clocked by the captured data (the audio engine's clock), never by `Instant`:
+        // each pass mixes every whole 10 ms frame that all live captures have delivered, so
+        // consumption matches production. Idle captures (no data for CAPTURE_IDLE) are skipped.
         let now = Instant::now();
-        if !captures.is_empty() && now >= next_mix {
+        let live = captures.len().min(MAX_PEER_SOURCES);
+        let mut queued = [0usize; MAX_PEER_SOURCES];
+        let mut idle = [true; MAX_PEER_SOURCES];
+        for (index, client) in captures.iter_mut().take(live).enumerate() {
+            queued[index] = client.mix.slots();
+            idle[index] = client
+                .heard
+                .is_none_or(|heard| now.saturating_duration_since(heard) >= CAPTURE_IDLE);
+            overflow = overflow.saturating_add(mem::take(&mut client.dropped));
+        }
+        let frames = frames_to_mix(&queued[..live], &idle[..live]);
+        for _ in 0..frames {
             mixer.begin();
-            for client in &mut captures {
-                mixer.add(&mut client.mix);
+            for (index, client) in captures.iter_mut().take(live).enumerate() {
+                if !idle[index] {
+                    mixer.add(&mut client.mix);
+                }
             }
             mixer.finish(&mut frame);
             if epoch.permits() && control.permits() {
-                for pair in frame.as_chunks::<2>().0 {
+                for (index, pair) in frame.as_chunks::<2>().0.iter().enumerate() {
                     if speaker.slots() < 2 {
+                        let lost = (SPEAKER_FRAME_SAMPLES / 2 - index) as u64;
+                        overflow = overflow.saturating_add(lost);
                         break;
                     }
                     if !epoch.permits() || !control.permits() {
@@ -1133,7 +1197,26 @@ fn source_worker(
                     let _ = speaker.push(pair[1]);
                 }
             }
-            next_mix = now + Duration::from_millis(10);
+        }
+        // Only a pass that mixed says which capture sets the pace; a pass stalled on a live
+        // capture with less than a frame (at most CAPTURE_IDLE) trims nothing.
+        if frames > 0 {
+            for client in captures.iter_mut().take(live) {
+                let excess = capture_excess(client.mix.slots());
+                if excess > 0
+                    && let Ok(chunk) = client.mix.read_chunk(excess)
+                {
+                    chunk.commit_all();
+                }
+            }
+        }
+        if overflow != logged_overflow
+            && logged_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(1))
+        {
+            tracing::debug!(dropped_frames = overflow, "Windows source audio overflow");
+            logged_overflow = overflow;
+            logged_at = Some(now);
         }
         let mut handles = [null_mut(); crate::model::audio::MAX_PEER_SOURCES + 1];
         handles[0] = wake.0;
@@ -1214,7 +1297,10 @@ struct Notification {
     active: AtomicU32,
     enabled: AtomicBool,
     id: Vec<u16>,
-    control: Arc<StreamControl>,
+    // The callback may only raise this latch and signal `wake`: the render worker owns every
+    // WASAPI call, so teardown and reopen never run on the MMDevice notification thread.
+    changes: Arc<ChangeSignal>,
+    wake: Arc<Wake>,
 }
 struct Callback<'a>(&'a Notification);
 impl Drop for Callback<'_> {
@@ -1229,19 +1315,32 @@ impl Notification {
         me.active.fetch_add(1, Ordering::Acquire);
         Callback(me)
     }
-    fn matches(&self, id: PCWSTR) -> bool {
-        if id.0.is_null() {
-            return false;
+    /// Posts a relevant change to the owning worker; never blocks, allocates or calls WASAPI.
+    fn notify(&self, event: EndpointEvent<'_>) {
+        if self.enabled.load(Ordering::Acquire) && endpoint_event_relevant(&self.id, event) {
+            self.changes.raise();
+            self.wake.signal();
         }
-        for (i, expected) in self.id.iter().enumerate() {
-            // SAFETY: SDK callback argument is a UTF16 endpoint ID, compared bounded to our ID.
-            if unsafe { *id.0.add(i) } != *expected {
-                return false;
-            }
-        }
-        // SAFETY: SDK null-terminated string and bounded stored ID length.
-        unsafe { *id.0.add(self.id.len()) == 0 }
     }
+}
+/// Bounded view of an SDK endpoint ID (UTF-16, null-terminated, at most `MAX_ID` units).
+/// A null pointer is `None`; an unterminated string is cut at `MAX_ID` units, which can never
+/// equal a stored ID because `endpoint_id` only accepts IDs shorter than that.
+///
+/// # Safety
+/// `id` must be null or point to a null-terminated UTF-16 string valid for the returned borrow.
+unsafe fn read_id<'a>(id: PCWSTR) -> Option<&'a [u16]> {
+    if id.0.is_null() {
+        return None;
+    }
+    let mut len = 0;
+    // SAFETY: the caller guarantees a null-terminated string; the walk stops at the terminator
+    // or after `MAX_ID` units and reads nothing beyond either.
+    while len < MAX_ID && unsafe { *id.0.add(len) } != 0 {
+        len += 1;
+    }
+    // SAFETY: `len` initialized units were just read from this allocation.
+    Some(unsafe { std::slice::from_raw_parts(id.0, len) })
 }
 unsafe extern "system" fn query(
     this: *mut c_void,
@@ -1280,17 +1379,26 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     }
     refs
 }
-unsafe extern "system" fn changed(this: *mut c_void, id: PCWSTR, _: DEVICE_STATE) -> HRESULT {
+unsafe extern "system" fn changed(this: *mut c_void, id: PCWSTR, state: DEVICE_STATE) -> HRESULT {
     // SAFETY: SDK callback, registered lifetime retained; guard counts only atomically.
     let call = unsafe { Notification::enter(this) };
-    if call.0.enabled.load(Ordering::Acquire) && call.0.matches(id) {
-        call.0.control.fail();
+    // SAFETY: the SDK passes a null-terminated endpoint ID valid for this callback.
+    if let Some(id) = unsafe { read_id(id) } {
+        call.0.notify(EndpointEvent::State {
+            id,
+            active: state.0 == DEVICE_STATE_ACTIVE.0,
+        });
     }
     HRESULT(0)
 }
 unsafe extern "system" fn removed(this: *mut c_void, id: PCWSTR) -> HRESULT {
-    // SAFETY: same registered callback and ID contract as changed; no blocking/native calls.
-    unsafe { changed(this, id, DEVICE_STATE(0)) }
+    // SAFETY: SDK callback, registered lifetime retained; guard counts only atomically.
+    let call = unsafe { Notification::enter(this) };
+    // SAFETY: the SDK passes a null-terminated endpoint ID valid for this callback.
+    if let Some(id) = unsafe { read_id(id) } {
+        call.0.notify(EndpointEvent::Removed { id });
+    }
+    HRESULT(0)
 }
 unsafe extern "system" fn added(_: *mut c_void, _: PCWSTR) -> HRESULT {
     HRESULT(0)
@@ -1303,18 +1411,24 @@ unsafe extern "system" fn default_changed(
 ) -> HRESULT {
     // SAFETY: SDK callback and retained object.
     let call = unsafe { Notification::enter(this) };
-    if call.0.enabled.load(Ordering::Acquire)
-        && flow == eRender
-        && role == eConsole
-        && !call.0.matches(id)
-    {
-        call.0.control.fail();
-    }
+    // SAFETY: the SDK passes null or a null-terminated endpoint ID valid for this callback.
+    let id = unsafe { read_id(id) };
+    call.0.notify(EndpointEvent::DefaultChanged {
+        render: flow == eRender,
+        console: role == eConsole,
+        id,
+    });
     HRESULT(0)
 }
 unsafe extern "system" fn property(this: *mut c_void, id: PCWSTR, _: PROPERTYKEY) -> HRESULT {
-    // SAFETY: property changes on the selected endpoint conservatively invalidate its mix.
-    unsafe { changed(this, id, DEVICE_STATE(0)) }
+    // SAFETY: SDK callback, registered lifetime retained; guard counts only atomically.
+    let call = unsafe { Notification::enter(this) };
+    // SAFETY: the SDK passes a null-terminated endpoint ID valid for this callback.
+    if let Some(id) = unsafe { read_id(id) } {
+        // Property changes on the selected endpoint conservatively invalidate its mix.
+        call.0.notify(EndpointEvent::Property { id });
+    }
+    HRESULT(0)
 }
 static NOTIFICATION: IMMNotificationClient_Vtbl = IMMNotificationClient_Vtbl {
     base__: IUnknown_Vtbl {
@@ -1336,7 +1450,8 @@ impl Registration {
     fn new(
         enumerator: IMMDeviceEnumerator,
         id: Vec<u16>,
-        control: Arc<StreamControl>,
+        changes: Arc<ChangeSignal>,
+        wake: Arc<Wake>,
     ) -> Result<Self, PlatformError> {
         let object = Box::new(Notification {
             table: &NOTIFICATION,
@@ -1344,11 +1459,13 @@ impl Registration {
             active: AtomicU32::new(0),
             enabled: AtomicBool::new(true),
             id,
-            control,
+            changes,
+            wake,
         });
         // SAFETY: reprC object's first member is its exact COM vtable; interface owns initial ref.
         let callback = unsafe { IMMNotificationClient::from_raw(Box::into_raw(object).cast()) };
-        // SAFETY: reference is held through successful unregister; callback performs only atomics.
+        // SAFETY: reference is held through successful unregister; the callback performs only
+        // atomics and SetEvent on an event this object keeps alive through its own Arc.
         unsafe { enumerator.RegisterEndpointNotificationCallback(&callback) }
             .map_err(|_| unavailable())?;
         Ok(Self {
@@ -1396,7 +1513,8 @@ struct Client {
 impl Client {
     fn open(
         format: AudioFormat,
-        control: &Arc<StreamControl>,
+        control: &StreamControl,
+        changes: &Arc<ChangeSignal>,
         wake: Arc<Wake>,
         deadline: Instant,
     ) -> Result<Self, PlatformError> {
@@ -1426,13 +1544,19 @@ impl Client {
             })?;
         check()?;
         let id = endpoint_id(&device)?;
-        let registration = Registration::new(enumerator.clone(), id.clone(), control.clone())?;
+        let registration = Registration::new(
+            enumerator.clone(),
+            id.clone(),
+            changes.clone(),
+            wake.clone(),
+        )?;
         check()?;
         // SAFETY: read-back after registering closes the snapshot/subscribe race.
         let current = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
             .map_err(|_| unavailable())?;
         if endpoint_id(&current)? != id {
-            control.fail();
+            // The default moved between snapshot and registration: this open fails and the
+            // worker's bounded reopen policy decides whether to try again.
             return Err(unavailable());
         }
         check()?;
@@ -1579,6 +1703,73 @@ impl Drop for Client {
     }
 }
 
+/// Waits up to `wait` on the owner's event in bounded slices, observing cancellation and the
+/// gate throughout. False when the stream no longer permits playback.
+fn pause(control: &StreamControl, wake: &Wake, wait: Duration) -> bool {
+    let until = Instant::now() + wait;
+    loop {
+        if !control.permits() {
+            return false;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        // SAFETY: live owned event; the slice is at most 10 ms so cancellation and gate epochs
+        // are observed promptly. Notification wake-ups merely shorten a slice.
+        let waited = unsafe { WaitForSingleObject(wake.0, left.as_millis().clamp(1, 10) as u32) };
+        if waited == WAIT_FAILED {
+            control.fail();
+            return false;
+        }
+    }
+}
+
+/// Retires `old` and opens a replacement on the current default render endpoint, with the same
+/// format negotiation as the first open. Bounded by `limiter` (5 attempts per minute, backoff
+/// between failures). `None` means the stream is over: the budget or an attempt failed (the
+/// control is latched Failed, which the observer reports once, as any device loss always did) or
+/// the stream was cancelled/gated meanwhile. Runs on the render worker, never in a callback.
+fn reopen(
+    old: Client,
+    format: AudioFormat,
+    control: &StreamControl,
+    changes: &Arc<ChangeSignal>,
+    wake: &Arc<Wake>,
+    limiter: &mut ReopenLimiter,
+) -> Option<Client> {
+    // Stop, unregister and release the old endpoint's objects before the new open.
+    drop(old);
+    loop {
+        let ReopenStep::Attempt { after } = limiter.next(Instant::now()) else {
+            control.fail();
+            return None;
+        };
+        if !pause(control, wake, after) {
+            return None;
+        }
+        // The open below reads the live default after registering, so anything raised until now
+        // (including the burst this reopen coalesces) is answered by it.
+        changes.take();
+        let deadline = Instant::now() + OPEN_TIME;
+        let opened = Client::open(format, control, changes, wake.clone(), deadline).and_then(
+            |mut client| {
+                client.start()?;
+                Ok(client)
+            },
+        );
+        match opened {
+            Ok(client) if control.permits() => {
+                limiter.succeeded();
+                return Some(client);
+            }
+            Ok(_) => return None,
+            Err(_) if !control.permits() => return None,
+            Err(_) => limiter.failed(),
+        }
+    }
+}
+
 fn worker(
     format: AudioFormat,
     mut pcm: Consumer<f32>,
@@ -1596,7 +1787,9 @@ fn worker(
     let _retire = Retire(control.clone());
     let result = (|| {
         let _apartment = Apartment::new()?;
-        let mut client = Client::open(format, &control, wake.clone(), deadline)?;
+        let changes = Arc::new(ChangeSignal::new());
+        let mut limiter = ReopenLimiter::new();
+        let mut client = Client::open(format, &control, &changes, wake.clone(), deadline)?;
         if Instant::now() >= deadline {
             return Err(PlatformError::Timeout);
         }
@@ -1615,6 +1808,14 @@ fn worker(
             return Ok(());
         }
         while control.permits() {
+            if changes.take() {
+                // The default render endpoint (or ours) changed. Reopen here, on the owner.
+                match reopen(client, format, &control, &changes, &wake, &mut limiter) {
+                    Some(next) => client = next,
+                    None => break,
+                }
+                continue;
+            }
             // SAFETY: live owned event; short wait also observes gate epochs even without audio events.
             let waited = unsafe { WaitForSingleObject(wake.0, 2) };
             if waited == WAIT_FAILED {
@@ -1691,6 +1892,60 @@ mod tests {
             "idempotent stop unexpectedly waited"
         );
         assert!(!control.is_retired());
+    }
+    fn notification(id: &str, changes: &Arc<ChangeSignal>, wake: &Arc<Wake>) -> Notification {
+        Notification {
+            table: &NOTIFICATION,
+            refs: AtomicU32::new(1),
+            active: AtomicU32::new(0),
+            enabled: AtomicBool::new(true),
+            id: id.encode_utf16().collect(),
+            changes: changes.clone(),
+            wake: wake.clone(),
+        }
+    }
+    fn signaled(wake: &Wake) -> bool {
+        // SAFETY: test-owned event; zero wait consumes the auto-reset signal.
+        unsafe { WaitForSingleObject(wake.0, 0) == WAIT_OBJECT_0 }
+    }
+    #[test]
+    fn relevant_endpoint_change_is_posted_to_the_owner_without_touching_the_stream() {
+        let (changes, wake) = (
+            Arc::new(ChangeSignal::new()),
+            Arc::new(Wake::new().unwrap()),
+        );
+        let note = notification("speakers", &changes, &wake);
+        let headset: Vec<u16> = "headset".encode_utf16().collect();
+        note.notify(EndpointEvent::Removed { id: &headset });
+        assert!(!changes.take() && !signaled(&wake));
+        note.notify(EndpointEvent::DefaultChanged {
+            render: true,
+            console: true,
+            id: Some(&headset),
+        });
+        assert!(signaled(&wake));
+        assert!(changes.take());
+        note.enabled.store(false, Ordering::Release);
+        note.notify(EndpointEvent::DefaultChanged {
+            render: true,
+            console: true,
+            id: None,
+        });
+        assert!(!changes.take() && !signaled(&wake));
+    }
+    #[test]
+    fn endpoint_ids_are_read_bounded() {
+        let text: Vec<u16> = "ab\0cd\0".encode_utf16().collect();
+        let long: Vec<u16> = std::iter::repeat_n(7u16, MAX_ID + 5).chain([0]).collect();
+        // SAFETY: both buffers are null-terminated and outlive the borrows.
+        unsafe {
+            assert_eq!(read_id(PCWSTR(text.as_ptr())), Some(&text[..2]));
+            assert_eq!(read_id(PCWSTR::null()), None);
+            assert_eq!(
+                read_id(PCWSTR(long.as_ptr())).map(<[u16]>::len),
+                Some(MAX_ID)
+            );
+        }
     }
     #[test]
     fn host_drop_disables_live_and_pending_streams_without_opening_devices() {

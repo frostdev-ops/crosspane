@@ -847,6 +847,30 @@ fn projected_child() -> ProbeResult<()> {
         .add_peer(peer, "owned")
         .map_err(|_| "SOURCE_PEER_FAILED")?;
     source_stage("own_tree_capture_opening")?;
+    // Capture admits only a PID claimed by a projected window (PID-reuse guard). This probe has no
+    // window, so it claims its own just-created child, by creation time, under a test window id.
+    let created = {
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: the owned child's live process handle and initialized FILETIME outputs.
+        let ok = unsafe {
+            GetProcessTimes(
+                tone.0.as_raw_handle() as HANDLE,
+                &mut created,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        if ok == 0 {
+            return Err("TONE_TIMES");
+        }
+        (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime)
+    };
+    model::process_claims::record_claim(u64::MAX, tone.0.id(), created);
     // The only PID is obtained from the genuine just-created private tone child. No external
     // environment, arbitrary PID, existing process, endpoint loopback or owner audio is captured.
     host.set_peer_sources(peer, &[tone.0.id()])

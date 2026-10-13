@@ -5,11 +5,25 @@
 //! | Observation before non-release input | Decision |
 //! | --- | --- |
 //! | Closed/changed gate | Cancel repeat, attempt all owed ups, return `Locked` |
-//! | Unknown/higher-integrity foreground | Cancel repeat, attempt owed ups, return `SecureInput` |
-//! | Changed held foreground identity/generation | Drain both ledgers, refuse this submission |
+//! | Unknown/null/incomplete/higher-integrity foreground | Cancel repeat, attempt owed ups, return `SecureInput` |
+//! | Changed foreground, a non-modifier key or a lock toggle owed | Drain both ledgers, refuse this submission |
+//! | Changed foreground, only buttons and/or modifier keys held, new one complete and integrity <= ours | Adopt it as the owner; the drag or modifier chord continues, nothing is released |
+//! | Changed foreground, nothing held | Normal admission |
 //! | Fresh matching foreground and open gate | Record possible down before submission |
 //! | Any release/recovery | Cancel repeat first; submit ups regardless of the guard |
 //! | Failed up | Retain it as owed; never claim delivery |
+//!
+//! A *modifier* is one of the eight Left/Right Shift, Ctrl, Alt and Win keys (`HidUsage::is_modifier`).
+//! A *non-modifier key* is every other usage held, including Caps/Num/Scroll Lock; an owed
+//! lock-toggle up counts the same.
+//!
+//! The adoption row exists because a click normally activates the clicked window: the button down
+//! is admitted against the old foreground, so the very next move of the drag sees a new one. The
+//! same holds for a Shift-, Ctrl- or Alt-click-drag, where the modifier was admitted against the
+//! old foreground too. Modifiers are safe to carry over because the injector never repeats them
+//! (only the down of a non-modifier, non-lock key arms the typematic repeat, and any key up
+//! cancels it), so a repeat can only exist while a non-modifier key is held, and that always
+//! releases. `judge_foreground` is the whole decision; `Driver::guard` only applies it.
 
 use super::geometry::{DisplayIds, MonitorProbe, displays};
 use super::hook::DragSettlementResult;
@@ -31,6 +45,139 @@ pub struct Foreground {
     pub born: u64,
     pub generation: u64,
     pub integrity: u32,
+}
+
+/// What input is still owed an up when a foreground observation is judged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeldInput {
+    /// At least one injected (or owed) pointer button.
+    pub buttons: bool,
+    /// At least one injected (or owed) modifier key (`HidUsage::is_modifier`: Left/Right Shift,
+    /// Ctrl, Alt or Win). Modifiers are never repeated and produce no character on their own.
+    pub modifiers: bool,
+    /// At least one injected (or owed) key that is not a modifier (a typing key, which can arm the
+    /// typematic repeat, or a Caps/Num/Scroll Lock usage), or an owed lock-toggle up.
+    pub keys: bool,
+}
+impl HeldInput {
+    /// Classifies the driver's three ledgers. Anything on the keyboard that is not one of the
+    /// eight modifier usages counts as `keys`, including usages on other pages, so an unknown
+    /// usage can only make the verdict stricter.
+    pub fn classify(
+        keys: &BTreeSet<HidUsage>,
+        toggle_ups: &BTreeSet<HidUsage>,
+        buttons: &BTreeSet<MouseButton>,
+    ) -> Self {
+        Self {
+            buttons: !buttons.is_empty(),
+            modifiers: keys.iter().any(|usage| usage.is_modifier()),
+            keys: !toggle_ups.is_empty() || keys.iter().any(|usage| !usage.is_modifier()),
+        }
+    }
+}
+
+/// The outcome of judging one foreground observation against the foreground that owns the held
+/// input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForegroundVerdict {
+    /// Same owner, or nothing held: admit the submission against the observed foreground.
+    Admit,
+    /// A pointer drag, or a held modifier, outlives the click that activated another window: the
+    /// observed foreground becomes the owner and the submission is admitted.
+    Adopt,
+    /// Fail safe: release everything owed once and refuse the submission.
+    Release,
+}
+
+/// `[P]` Pure foreground decision for non-release input.
+///
+/// `observed` is `None` when the native read failed (a secure desktop, a null foreground, an
+/// unreadable token or an unstable read). `owned` is the foreground under which the held input was
+/// admitted, `None` while nothing is held. A foreground is usable only with a window, process and
+/// thread and an integrity no higher than `own_integrity`; anything else is released, whatever is
+/// held, so this never injects into a more privileged or unknown target.
+///
+/// A changed foreground follows the click only while every owed up is a pointer button or a
+/// modifier key (a Shift/Ctrl-click-drag, or a held Ctrl with the wheel), with no other key and no
+/// lock-toggle up owed, and only when the new identity is complete (a process creation time, so
+/// PID reuse is still told apart). A held non-modifier key keeps the original rule: its typematic
+/// repeat and its up are tied to one focus owner. Modifiers have no repeat to leak into the new
+/// window, and Adopt moves only the ownership: the ledger, and so the single owed up of every
+/// held button and modifier, is untouched.
+pub fn judge_foreground(
+    observed: Option<Foreground>,
+    owned: Option<Foreground>,
+    own_integrity: u32,
+    held: HeldInput,
+) -> ForegroundVerdict {
+    let Some(now) = observed.filter(|f| {
+        f.window != 0 && f.process != 0 && f.thread != 0 && f.integrity <= own_integrity
+    }) else {
+        return ForegroundVerdict::Release;
+    };
+    match owned {
+        None => ForegroundVerdict::Admit,
+        Some(owner) if owner == now => ForegroundVerdict::Admit,
+        Some(_) if held == HeldInput::default() => ForegroundVerdict::Admit,
+        Some(_) if !held.keys && now.born != 0 => ForegroundVerdict::Adopt,
+        Some(_) => ForegroundVerdict::Release,
+    }
+}
+
+/// Oldest a monitor table may be for the pointer injector to consult it without a fresh
+/// acquisition. Even a younger table is reused only after it matches the live monitors.
+pub const MONITOR_CACHE_MAX_AGE_MS: u64 = 1000;
+
+/// Pure age rule: a table is consultable only if it has rows and was read strictly less than
+/// `MONITOR_CACHE_MAX_AGE_MS` ago. `None` means never read (or invalidated), which is never fresh.
+pub fn monitor_cache_fresh(rows: usize, age_ms: Option<u64>) -> bool {
+    rows != 0 && age_ms.is_some_and(|age| age < MONITOR_CACHE_MAX_AGE_MS)
+}
+
+/// Reuse rule for the cached monitor table. `validate` (the live comparison and the move
+/// resolution against the cached rows) runs only for a fresh table, so a stale, empty or
+/// invalidated table never reaches it, and a table that fails it is never reused.
+pub fn reuse_monitors(rows: usize, age_ms: Option<u64>, validate: impl FnOnce() -> bool) -> bool {
+    monitor_cache_fresh(rows, age_ms) && validate()
+}
+
+/// The identity under which an admitted foreground decision may be reused. Any difference in the
+/// window, process, thread or foreground-event generation forces the full process and token check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionKey {
+    pub window: u64,
+    pub process: u32,
+    pub thread: u32,
+    pub generation: u64,
+}
+
+/// The last foreground that passed the full process and token check, with the process creation
+/// time and integrity it was admitted with. It holds an admission only: a refusal or a changed
+/// key empties it, so a refusal is never reused and the full check always follows a key change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdmissionCache {
+    admitted: Option<Foreground>,
+}
+impl AdmissionCache {
+    /// The cached admission, only for exactly this key.
+    pub fn reuse(&self, key: AdmissionKey) -> Option<Foreground> {
+        self.admitted.filter(|f| {
+            f.window != 0
+                && f.process != 0
+                && f.thread != 0
+                && f.born != 0
+                && (f.window, f.process, f.thread, f.generation)
+                    == (key.window, key.process, key.thread, key.generation)
+        })
+    }
+    /// Remembers a foreground that has just passed the full check and its post-check.
+    pub fn admit(&mut self, foreground: Foreground) {
+        self.admitted = Some(foreground);
+    }
+    /// Forgets the admission; the next observation runs the full check.
+    pub fn invalidate(&mut self) {
+        self.admitted = None;
+    }
 }
 
 /// `[E]` Native packets contain physical scancodes, never text or virtual keys.
@@ -343,13 +490,22 @@ impl<P: InjectionPort> Driver<P> {
             let _ = self.release_everything();
             return Err(PlatformError::Locked);
         }
-        let foreground = match self.port.foreground() {
-            Ok(f)
-                if f.window != 0
-                    && f.process != 0
-                    && f.thread != 0
-                    && f.integrity <= self.own_integrity =>
-            {
+        let observed = self.port.foreground().ok();
+        let verdict = judge_foreground(
+            observed,
+            self.focus.map(|(owned, _)| owned),
+            self.own_integrity,
+            HeldInput::classify(&self.keys, &self.toggle_ups, &self.buttons),
+        );
+        let foreground = match (verdict, observed) {
+            (ForegroundVerdict::Admit, Some(f)) => f,
+            (ForegroundVerdict::Adopt, Some(f)) => {
+                // The drag (or Shift/Ctrl chord) follows the click into the window it activated.
+                // Only ownership moves; every held button and modifier keeps its single owed up.
+                // Adopt never sees a typematic repeat (it needs a held non-modifier key, which
+                // releases), but a repeat must never outlive its owner, so clear it regardless.
+                self.cancel_repeat();
+                self.focus = Some((f, epoch));
                 f
             }
             _ => {
@@ -358,11 +514,6 @@ impl<P: InjectionPort> Driver<P> {
                 return Err(PlatformError::SecureInput);
             }
         };
-        if self.focus.is_some_and(|(old, _)| old != foreground) {
-            self.cancel_repeat();
-            let _ = self.release_everything();
-            return Err(PlatformError::SecureInput);
-        }
         // Re-read the gate after native observation, immediately before submission.
         if !self.gate.is_open() || self.gate.epoch() != epoch {
             self.cancel_repeat();
@@ -463,6 +614,10 @@ impl<P: InjectionPort> Driver<P> {
         };
         // Check on every timer turn, even before due: closed/changed gates cancel immediately.
         self.guard()?;
+        if self.repeat.is_none() {
+            // The guard cancelled it without refusing (an adopted foreground never keeps one).
+            return Ok(());
+        }
         if now_ms >= due {
             let result = self.port.submit(key_packet(usage, true)?);
             if result.is_err() {
@@ -678,4 +833,438 @@ pub fn absolute_move(
         },
         probe.clone(),
     ))
+}
+
+#[cfg(test)]
+mod judge_tests {
+    use super::ForegroundVerdict::{Admit, Adopt, Release};
+    use super::*;
+
+    const OWN: u32 = 0x2000;
+    const fn held(buttons: bool, modifiers: bool, keys: bool) -> HeldInput {
+        HeldInput {
+            buttons,
+            modifiers,
+            keys,
+        }
+    }
+    const NOTHING: HeldInput = held(false, false, false);
+    const BUTTONS: HeldInput = held(true, false, false);
+    const MODIFIERS: HeldInput = held(false, true, false);
+    const BUTTONS_AND_MODIFIERS: HeldInput = held(true, true, false);
+    /// Every held set that carries a non-modifier key or an owed lock-toggle up.
+    const WITH_KEYS: [HeldInput; 4] = [
+        held(false, false, true),
+        held(true, false, true),
+        held(false, true, true),
+        held(true, true, true),
+    ];
+    /// Held sets whose owed ups are only pointer buttons and/or modifier keys.
+    const FOLLOWS: [HeldInput; 3] = [BUTTONS, MODIFIERS, BUTTONS_AND_MODIFIERS];
+    /// Every combination of the three flags.
+    const ALL: [HeldInput; 8] = [
+        NOTHING,
+        BUTTONS,
+        MODIFIERS,
+        BUTTONS_AND_MODIFIERS,
+        WITH_KEYS[0],
+        WITH_KEYS[1],
+        WITH_KEYS[2],
+        WITH_KEYS[3],
+    ];
+
+    fn fg(window: u64, integrity: u32) -> Foreground {
+        Foreground {
+            window,
+            process: 11,
+            thread: 12,
+            born: 13,
+            generation: 0,
+            integrity,
+        }
+    }
+    fn judge(
+        observed: Option<Foreground>,
+        owned: Option<Foreground>,
+        held: HeldInput,
+    ) -> ForegroundVerdict {
+        judge_foreground(observed, owned, OWN, held)
+    }
+
+    #[test]
+    fn inject_same_foreground_or_no_owner_is_normal_admission() {
+        for held in ALL {
+            assert_eq!(judge(Some(fg(1, OWN)), Some(fg(1, OWN)), held), Admit);
+            assert_eq!(judge(Some(fg(1, 0x1000)), Some(fg(1, 0x1000)), held), Admit);
+            assert_eq!(judge(Some(fg(1, OWN)), None, held), Admit);
+        }
+    }
+
+    #[test]
+    fn inject_changed_foreground_with_nothing_held_is_normal_admission() {
+        for observed in [fg(2, OWN), fg(2, 0x1000)] {
+            assert_eq!(judge(Some(observed), Some(fg(1, OWN)), NOTHING), Admit);
+        }
+        // A changed identity of the same window (new generation, new process start) is no
+        // different when nothing is owed.
+        let reborn = Foreground {
+            born: 99,
+            generation: 7,
+            ..fg(1, OWN)
+        };
+        assert_eq!(judge(Some(reborn), Some(fg(1, OWN)), NOTHING), Admit);
+    }
+
+    #[test]
+    fn inject_changed_foreground_with_buttons_or_modifiers_held_continues_at_equal_or_lower_integrity()
+     {
+        for held in FOLLOWS {
+            for integrity in [OWN, 0x1000, 0x0000] {
+                assert_eq!(
+                    judge(Some(fg(2, integrity)), Some(fg(1, OWN)), held),
+                    Adopt,
+                    "integrity {integrity:#x} while {held:?}"
+                );
+            }
+        }
+        // The owner may also have been a lower-integrity window, and a bumped generation, a
+        // reused pid or a new thread of the same window all count as a changed foreground.
+        let owner = fg(1, 0x1000);
+        for observed in [
+            fg(2, OWN),
+            Foreground {
+                generation: 1,
+                ..owner
+            },
+            Foreground { born: 14, ..owner },
+            Foreground {
+                thread: 99,
+                ..owner
+            },
+            Foreground {
+                process: 99,
+                ..owner
+            },
+        ] {
+            for held in FOLLOWS {
+                assert_eq!(judge(Some(observed), Some(owner), held), Adopt, "{held:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn inject_changed_foreground_above_our_integrity_or_unusable_releases() {
+        let owner = Some(fg(1, OWN));
+        let unusable = [
+            None,
+            Some(fg(2, OWN + 1)),
+            Some(fg(2, 0x3000)),
+            Some(fg(2, u32::MAX)),
+            Some(fg(0, OWN)),
+            Some(Foreground {
+                process: 0,
+                ..fg(2, OWN)
+            }),
+            Some(Foreground {
+                thread: 0,
+                ..fg(2, OWN)
+            }),
+            // An incomplete identity (no process creation time) never inherits a drag.
+            Some(Foreground {
+                born: 0,
+                ..fg(2, OWN)
+            }),
+        ];
+        for observed in unusable {
+            // With nothing held there is nothing to follow, so an incomplete identity is still
+            // admitted as before (the unchanged rule); everything held releases.
+            for held in ALL.into_iter().filter(|held| *held != NOTHING) {
+                assert_eq!(
+                    judge(observed, owner, held),
+                    Release,
+                    "{observed:?} while {held:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inject_unusable_foreground_releases_whatever_is_held_or_owned() {
+        // The same rule applies to a foreground that did not change: unknown, null or more
+        // privileged is never admitted, with or without an owner and with nothing held.
+        let unusable = [
+            None,
+            Some(fg(1, 0x3000)),
+            Some(fg(0, OWN)),
+            Some(Foreground {
+                process: 0,
+                ..fg(1, OWN)
+            }),
+            Some(Foreground {
+                thread: 0,
+                ..fg(1, OWN)
+            }),
+        ];
+        for observed in unusable {
+            for held in ALL {
+                assert_eq!(judge(observed, None, held), Release, "{observed:?}");
+                assert_eq!(
+                    judge(observed, Some(fg(1, OWN)), held),
+                    Release,
+                    "{observed:?}"
+                );
+                assert_eq!(
+                    judge(observed, observed, held),
+                    Release,
+                    "an owner never makes an unusable foreground usable: {observed:?}"
+                );
+            }
+        }
+        // Without an owner, only a missing process creation time is tolerated (unchanged rule).
+        let no_born = Foreground {
+            born: 0,
+            ..fg(1, OWN)
+        };
+        assert_eq!(judge(Some(no_born), None, NOTHING), Admit);
+    }
+
+    #[test]
+    fn inject_changed_foreground_with_a_non_modifier_key_or_lock_toggle_held_keeps_the_fail_safe() {
+        // A held typing key (typematic repeat) or an owed lock-toggle up releases, whatever else is
+        // held with it, and whatever the integrity of the new foreground.
+        for held in WITH_KEYS {
+            for integrity in [OWN, 0x1000] {
+                assert_eq!(
+                    judge(Some(fg(2, integrity)), Some(fg(1, OWN)), held),
+                    Release,
+                    "{held:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inject_verdict_matches_the_decision_table_over_a_lattice() {
+        // Exhaustive over a small lattice: Adopt happens exactly when the owner differs, the new
+        // foreground is usable and complete, something is held, and what is held is only buttons
+        // and/or modifiers (no non-modifier key, no lock-toggle up).
+        let owners = [None, Some(fg(1, OWN)), Some(fg(1, 0x1000))];
+        let observations = [
+            None,
+            Some(fg(1, OWN)),
+            Some(fg(1, 0x1000)),
+            Some(fg(2, OWN)),
+            Some(fg(2, 0x1000)),
+            Some(fg(2, 0x3000)),
+            Some(fg(0, OWN)),
+            Some(Foreground {
+                born: 0,
+                ..fg(2, OWN)
+            }),
+        ];
+        for owned in owners {
+            for observed in observations {
+                for held in ALL {
+                    let usable = observed.is_some_and(|f| f.window != 0 && f.integrity <= OWN);
+                    let changed = owned.is_some() && owned != observed;
+                    let expected = if !usable {
+                        Release
+                    } else if !changed || held == NOTHING {
+                        Admit
+                    } else if !WITH_KEYS.contains(&held) && observed.is_some_and(|f| f.born != 0) {
+                        Adopt
+                    } else {
+                        Release
+                    };
+                    assert_eq!(
+                        judge(observed, owned, held),
+                        expected,
+                        "{owned:?} -> {observed:?} while {held:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn classify(keys: &[u16], toggle_ups: &[u16], buttons: &[MouseButton]) -> HeldInput {
+        let usages = |ids: &[u16]| -> BTreeSet<HidUsage> {
+            ids.iter().map(|&id| HidUsage::keyboard(id)).collect()
+        };
+        HeldInput::classify(
+            &usages(keys),
+            &usages(toggle_ups),
+            &buttons.iter().copied().collect(),
+        )
+    }
+
+    #[test]
+    fn inject_held_input_counts_exactly_the_eight_modifier_usages_as_modifiers() {
+        assert_eq!(classify(&[], &[], &[]), NOTHING);
+        // Left/Right Ctrl, Shift, Alt and Win (GUI), one at a time and all at once.
+        for id in 0xE0..=0xE7 {
+            assert_eq!(classify(&[id], &[], &[]), MODIFIERS, "{id:#x}");
+        }
+        let all: Vec<u16> = (0xE0..=0xE7).collect();
+        assert_eq!(classify(&all, &[], &[]), MODIFIERS);
+        // Buttons are independent of the keyboard.
+        assert_eq!(classify(&[], &[], &[MouseButton::PRIMARY]), BUTTONS);
+        assert_eq!(
+            classify(
+                &[0xE1],
+                &[],
+                &[MouseButton::PRIMARY, MouseButton::SECONDARY]
+            ),
+            BUTTONS_AND_MODIFIERS
+        );
+    }
+
+    #[test]
+    fn inject_held_input_counts_every_other_key_and_an_owed_toggle_up_as_a_key() {
+        // Letters, Enter, Space, the three lock toggles (HID Caps 0x39, Scroll 0x47, Num 0x53),
+        // F-keys, and the usages just outside the modifier range.
+        for id in [
+            0x04, 0x28, 0x2C, 0x39, 0x47, 0x53, 0x3A, 0x65, 0xDF, 0xE8, 0xFF,
+        ] {
+            assert_eq!(
+                classify(&[id], &[], &[]),
+                held(false, false, true),
+                "{id:#x}"
+            );
+        }
+        // An owed lock-toggle up counts even though the key is no longer in the key ledger.
+        for id in [0x39, 0x47, 0x53] {
+            assert_eq!(
+                classify(&[], &[id], &[]),
+                held(false, false, true),
+                "{id:#x}"
+            );
+            assert_eq!(
+                classify(&[0xE1], &[id], &[MouseButton::PRIMARY]),
+                held(true, true, true),
+                "{id:#x}"
+            );
+        }
+        // One typing key among modifiers makes both flags true; the judge then releases.
+        assert_eq!(classify(&[0xE1, 0x04], &[], &[]), held(false, true, true));
+        // A usage on another page is never a modifier, even with a modifier's id.
+        let consumer = BTreeSet::from([HidUsage {
+            page: 0x0C,
+            id: 0xE1,
+        }]);
+        assert_eq!(
+            HeldInput::classify(&consumer, &BTreeSet::new(), &BTreeSet::new()),
+            held(false, false, true)
+        );
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn admitted(window: u64, process: u32, thread: u32, generation: u64) -> Foreground {
+        Foreground {
+            window,
+            process,
+            thread,
+            born: 77,
+            generation,
+            integrity: 0x2000,
+        }
+    }
+    fn key(window: u64, process: u32, thread: u32, generation: u64) -> AdmissionKey {
+        AdmissionKey {
+            window,
+            process,
+            thread,
+            generation,
+        }
+    }
+
+    #[test]
+    fn monitor_cache_age_rule_is_strict_and_needs_rows_and_a_read() {
+        assert_eq!(MONITOR_CACHE_MAX_AGE_MS, 1000);
+        assert!(monitor_cache_fresh(1, Some(0)));
+        assert!(monitor_cache_fresh(3, Some(MONITOR_CACHE_MAX_AGE_MS - 1)));
+        assert!(!monitor_cache_fresh(3, Some(MONITOR_CACHE_MAX_AGE_MS)));
+        assert!(!monitor_cache_fresh(3, Some(u64::MAX)));
+        assert!(!monitor_cache_fresh(0, Some(0)));
+        assert!(!monitor_cache_fresh(3, None));
+    }
+
+    #[test]
+    fn monitor_reuse_validates_only_a_fresh_table_and_needs_the_validation_to_pass() {
+        let runs = Cell::new(0);
+        let validate = |passes: bool| {
+            let runs = &runs;
+            move || {
+                runs.set(runs.get() + 1);
+                passes
+            }
+        };
+        // Stale, empty and never-read tables never reach the live validation.
+        assert!(!reuse_monitors(
+            2,
+            Some(MONITOR_CACHE_MAX_AGE_MS),
+            validate(true)
+        ));
+        assert!(!reuse_monitors(0, Some(1), validate(true)));
+        assert!(!reuse_monitors(2, None, validate(true)));
+        assert_eq!(runs.get(), 0);
+        // A fresh table is reused only when the validation passes, and is validated once.
+        assert!(reuse_monitors(2, Some(1), validate(true)));
+        assert_eq!(runs.get(), 1);
+        assert!(!reuse_monitors(2, Some(1), validate(false)));
+        assert_eq!(runs.get(), 2);
+    }
+
+    #[test]
+    fn admission_is_reused_only_for_exactly_the_admitted_key() {
+        let mut cache = AdmissionCache::default();
+        assert_eq!(cache.reuse(key(1, 2, 3, 4)), None);
+        cache.admit(admitted(1, 2, 3, 4));
+        assert_eq!(cache.reuse(key(1, 2, 3, 4)), Some(admitted(1, 2, 3, 4)));
+        // Each key field changes the decision: a new window, pid, thread or event generation.
+        for changed in [
+            key(9, 2, 3, 4),
+            key(1, 9, 3, 4),
+            key(1, 2, 9, 4),
+            key(1, 2, 3, 9),
+        ] {
+            assert_eq!(cache.reuse(changed), None, "{changed:?}");
+        }
+        // A miss does not forget the admission; the caller invalidates before the full check.
+        assert_eq!(cache.reuse(key(1, 2, 3, 4)), Some(admitted(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn admission_invalidate_and_replacement_drop_the_old_identity() {
+        let mut cache = AdmissionCache::default();
+        cache.admit(admitted(1, 2, 3, 4));
+        cache.invalidate();
+        assert_eq!(cache.reuse(key(1, 2, 3, 4)), None);
+        cache.admit(admitted(1, 2, 3, 4));
+        cache.admit(admitted(5, 6, 7, 8));
+        assert_eq!(cache.reuse(key(1, 2, 3, 4)), None);
+        assert_eq!(cache.reuse(key(5, 6, 7, 8)), Some(admitted(5, 6, 7, 8)));
+    }
+
+    #[test]
+    fn admission_never_reuses_an_incomplete_identity() {
+        for (window, process, thread, born) in
+            [(0, 2, 3, 77), (1, 0, 3, 77), (1, 2, 0, 77), (1, 2, 3, 0)]
+        {
+            let mut cache = AdmissionCache::default();
+            cache.admit(Foreground {
+                window,
+                process,
+                thread,
+                born,
+                generation: 4,
+                integrity: 0x2000,
+            });
+            assert_eq!(cache.reuse(key(window, process, thread, 4)), None);
+        }
+    }
 }

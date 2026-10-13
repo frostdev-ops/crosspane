@@ -280,7 +280,11 @@ impl Engine {
             self.audio.engine_gate(permits, &mut out);
             self.clip.engine_gate(permits, &mut out);
         }
-        self.audio.handle(&input, now, &mut out);
+        // Audio sees every input, after everything that can change what E2 shows or projects
+        // (E2 itself, the drag commit): the view is taken here, so a projection ending, a
+        // revoked `present`, a lock or the grace running out ends its sound in this very call.
+        let view = self.e2.audio_view();
+        self.audio.handle(&input, now, &view, &mut out);
         let controlled = self.target.is_controlled();
         if controlled {
             out.retain(|o| !matches!(o, Output::SetPortals(_)));

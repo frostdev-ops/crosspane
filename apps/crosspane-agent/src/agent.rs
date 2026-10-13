@@ -19,7 +19,7 @@ use crosspane_platform::{
     CaptureEvent, CaptureTarget, EventSink, FrameEvent, LinkClass, Permission, PermissionState,
     PlatformError, StreamId, WindowEvent, WindowInfo, WindowRole, WindowState,
 };
-use crosspane_protocol::audio::AudioPacket;
+use crosspane_protocol::audio::{AudioPacket, PROJECTION_AUDIO_FEATURE};
 use crosspane_protocol::clip::{CLIP_FEATURE, ClipDataHeader};
 use crosspane_protocol::link::{LinkEvent, PeerLink};
 use crosspane_protocol::msg::{
@@ -159,6 +159,11 @@ struct PeerInfo {
     rtt: Option<Duration>,
     /// What the engine was last told about audio with this peer (`Input::AudioPeer`).
     audio: bool,
+    /// What the engine was last told about projection audio ("sound follows the window") with
+    /// this peer (`Input::ProjectionAudioPeer`). A replacement connection resets it to false
+    /// before the engine hears `Input::AudioConnectionReplaced`, which makes the engine forget
+    /// the feature too, so the new `Hello` has to announce it again.
+    projection_audio: bool,
     drag: bool,
     /// Last bilateral drag/1 availability fed to the engine.
     drag_in: bool,
@@ -189,6 +194,15 @@ fn discovery_switched_off(value: Option<&str>) -> bool {
 fn audio_negotiated(local_features: &[String], peer_features: &[String]) -> bool {
     let has = |features: &[String]| features.iter().any(|f| f == "audio");
     has(local_features) && has(peer_features)
+}
+
+/// Whether projection audio ("sound follows the window") with a peer is available: audio is
+/// negotiated and both `Hello`s also advertise [`PROJECTION_AUDIO_FEATURE`]. The engine is only
+/// told of it for a peer that is already an audio peer, so an old peer (which never advertises
+/// `audio/1`) only ever gets the whole-machine `AudioOpen`.
+fn projection_audio_negotiated(local_features: &[String], peer_features: &[String]) -> bool {
+    let has = |features: &[String]| features.iter().any(|f| f == PROJECTION_AUDIO_FEATURE);
+    audio_negotiated(local_features, peer_features) && has(local_features) && has(peer_features)
 }
 
 /// The audio worker as the loop drives it. [`AudioWorker`] is the one implementation; the tests at
@@ -602,6 +616,11 @@ pub struct Agent {
     parking_next: Option<u64>,
     /// Only this request may answer the engine's current Park/Resize for each window.
     parking_latest: BTreeMap<WindowId, u64>,
+    /// Returns of parked windows the engine asked for, by window: the one in flight, and the ones
+    /// refused while the session was closed, which are submitted again when it opens. A window
+    /// stays here until its return succeeds or its retries are used up, so a session that
+    /// flickers closed never leaves it parked for good (04 §5, no window is lost).
+    restore_retry: BTreeMap<WindowId, RestoreRetry>,
     net: Net,
     trust: SharedTrust,
     links: HashMap<NodeId, Box<dyn PeerLink>>,
@@ -687,7 +706,6 @@ pub struct Agent {
     revocations: crate::revocations::Issued,
     /// The audio worker (WP-3.6d); `None` when audio sharing is off or has no backend.
     audio: Option<Box<dyn AudioPlane>>,
-    audio_sources: crate::audio::SourceCatalogue,
     clipboard: Option<crate::clipboard::Worker>,
     /// Accepted local promises only, to retire this connection's transport work on withdrawal.
     clip_promises: BTreeMap<u64, NodeId>,
@@ -887,6 +905,79 @@ struct Waiter {
     pull: bool,
     deadline: Instant,
 }
+
+/// How long the return of a parked window waits before each retry, once the session is open and
+/// the return was refused anyway: three retries over about five seconds. After that the journal's
+/// startup recovery has the window (a warning says so).
+const RESTORE_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_millis(1500),
+    Duration::from_secs(3),
+];
+
+/// The return of one parked window that the engine asked for (`Output::Restore`), kept until it
+/// succeeds. The engine does not hear how a return went: the projection has ended and the engine
+/// has forgotten it, so a return refused while the session was closed would leave the window
+/// parked, out of sight, until the next start. The agent retries it when the session opens.
+#[derive(Debug)]
+struct RestoreRetry {
+    place: Option<(DisplayId, PointDevice)>,
+    /// The operation queued or running; `None` while the return waits to be submitted again.
+    in_flight: Option<u64>,
+    /// Refusals met with the session open. Each spends a step of [`RESTORE_BACKOFF`].
+    spent: usize,
+    /// A waiting return is not submitted before this.
+    not_before: Instant,
+}
+
+/// What a refused return does to its retry.
+#[derive(Debug, PartialEq, Eq)]
+enum RetryStep {
+    /// An older submission answered, not the one in flight: nothing changes.
+    Stale,
+    /// Submitted again once the session is open and `not_before` has passed.
+    Waiting,
+    /// The retries are used up.
+    GaveUp,
+}
+
+impl RestoreRetry {
+    fn new(place: Option<(DisplayId, PointDevice)>, id: u64, now: Instant) -> Self {
+        Self {
+            place,
+            in_flight: Some(id),
+            spent: 0,
+            not_before: now,
+        }
+    }
+
+    /// Whether a retry may be submitted now, if the session is open.
+    fn due(&self, now: Instant) -> bool {
+        self.in_flight.is_none() && self.not_before <= now
+    }
+
+    /// Operation `id` was refused for a session reason (`Locked`, `SecureInput`). A refusal met
+    /// with the session closed was the session's doing: it costs nothing and the retry waits only
+    /// for the session to open. A refusal met with the session open spends a backoff step.
+    fn refused(&mut self, id: u64, session_open: bool, now: Instant) -> RetryStep {
+        if self.in_flight != Some(id) {
+            return RetryStep::Stale;
+        }
+        self.in_flight = None;
+        if !session_open {
+            self.not_before = now;
+            return RetryStep::Waiting;
+        }
+        match RESTORE_BACKOFF.get(self.spent) {
+            Some(delay) => {
+                self.spent += 1;
+                self.not_before = now + *delay;
+                RetryStep::Waiting
+            }
+            None => RetryStep::GaveUp,
+        }
+    }
+}
 /// A grant change restarts the agent only after it has run this long, so a flapping permission
 /// state can't make it restart in a tight loop.
 const MIN_RUN_BEFORE_RESTART: Duration = Duration::from_secs(10);
@@ -916,6 +1007,7 @@ impl Agent {
             parking_available: false,
             parking_next: Some(1),
             parking_latest: BTreeMap::new(),
+            restore_retry: BTreeMap::new(),
             net,
             trust,
             links: HashMap::new(),
@@ -978,7 +1070,6 @@ impl Agent {
             port: e2.port,
             revocations: e2.revocations,
             audio,
-            audio_sources: crate::audio::SourceCatalogue::default(),
             clipboard: None,
             clip_promises: BTreeMap::new(),
             clip_readers: BTreeSet::new(),
@@ -1038,17 +1129,19 @@ impl Agent {
         self.home_startup();
         self.execute(startup);
         self.feed(Input::LocalDisplays(self.local_displays.clone()));
-        // Speaker v0 hosts no microphone: the worker refuses to open one, and the engine refuses
-        // microphone sessions without admitting them or showing an indicator (AUDIO-v0 §1).
-        self.feed(Input::AudioMicrophoneSupport { available: false });
+        self.feed_audio_support();
         self.send_grants();
         self.update_layout(false);
         // The first look at the backends: later differences advance `epochs.backends`.
         self.backends_now();
         loop {
+            let t0 = Instant::now();
             self.settle();
+            let settled = t0.elapsed();
             let now = platform::now();
             let timeout = self.receive_timeout(now, Instant::now());
+            let received;
+            let t1;
             match events.recv_timeout(timeout) {
                 Ok(Event::Shutdown) => {
                     return Stopped {
@@ -1056,8 +1149,15 @@ impl Agent {
                         restart: false,
                     };
                 }
-                Ok(event) => self.on_event(event),
-                Err(RecvTimeoutError::Timeout) => {}
+                Ok(event) => {
+                    received = Instant::now();
+                    self.on_event(event);
+                    t1 = received.elapsed();
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    received = Instant::now();
+                    t1 = Duration::ZERO;
+                }
                 Err(RecvTimeoutError::Disconnected) => {
                     return Stopped {
                         outcomes: self.shutdown(),
@@ -1065,6 +1165,7 @@ impl Agent {
                     };
                 }
             }
+            let t2 = Instant::now();
             if self
                 .engine
                 .next_deadline()
@@ -1072,8 +1173,25 @@ impl Agent {
             {
                 self.feed(Input::Tick);
             }
+            let ticked = t2.elapsed();
+            let t3 = Instant::now();
             self.housekeeping();
+            let kept = t3.elapsed();
+            let t4 = Instant::now();
             self.update_tray();
+            let trayed = t4.elapsed();
+            let busy = settled + received.elapsed();
+            if busy >= Duration::from_millis(8) {
+                tracing::debug!(
+                    total_ms = busy.as_millis() as u64,
+                    settle_ms = settled.as_millis() as u64,
+                    event_ms = t1.as_millis() as u64,
+                    tick_ms = ticked.as_millis() as u64,
+                    housekeeping_ms = kept.as_millis() as u64,
+                    tray_ms = trayed.as_millis() as u64,
+                    "slow loop pass"
+                );
+            }
             if self.quit_requested {
                 return Stopped {
                     outcomes: self.shutdown(),
@@ -1087,6 +1205,19 @@ impl Agent {
                 };
             }
         }
+    }
+
+    /// What this node's audio backend supports, told to the engine once at start (`run`).
+    fn feed_audio_support(&mut self) {
+        // Speaker v0 hosts no microphone: the worker refuses to open one, and the engine refuses
+        // microphone sessions without admitting them or showing an indicator (AUDIO-v0 §1).
+        self.feed(Input::AudioMicrophoneSupport { available: false });
+        // "Sound follows the window": whether this node can capture a projected app's sound. The
+        // engine decides, per projection and peer, which processes' sound goes where, and says so
+        // with `Output::AudioProjectionSources`; a node that cannot capture never gets one.
+        self.feed(Input::AudioProjectionCapture {
+            available: platform::projection_audio_capture(self.audio.is_some()),
+        });
     }
 
     /// The receive loop must wake for the watchdog even without engine deadlines or input.
@@ -1124,6 +1255,24 @@ impl Agent {
             .fold(timeout, |wait, (_, next, _)| {
                 wait.min(next.saturating_duration_since(clock_now))
             });
+        // A return that waits out a backoff with the session open wakes the loop when it is due.
+        // (With the session closed it waits for the event that opens it, and the loop's usual
+        // housekeeping tick.)
+        let timeout = if self.platform.gate.is_open() {
+            self.restore_retry
+                .values()
+                .filter(|retry| retry.in_flight.is_none())
+                .fold(timeout, |wait, retry| {
+                    wait.min(
+                        retry
+                            .not_before
+                            .saturating_duration_since(clock_now)
+                            .max(Duration::from_millis(10)),
+                    )
+                })
+        } else {
+            timeout
+        };
         if self.home_watchdog_needed() {
             let deadline = self
                 .home
@@ -1187,15 +1336,6 @@ impl Agent {
             _ => {}
         }
         self.revalidate_proxy_observation(&mut input);
-        // Already decoded and delivered through the transport's current-connection check.
-        self.audio_sources.observe(&input);
-        let source_window = match &input {
-            Input::Parked {
-                window,
-                result: Ok(_),
-            } => Some(*window),
-            _ => None,
-        };
         if tracing::enabled!(tracing::Level::DEBUG) {
             log_input(&input);
         }
@@ -1229,8 +1369,6 @@ impl Agent {
             self.engine.controlled_by(),
         );
         let outputs = self.engine.handle(input, now);
-        self.audio_sources
-            .outputs(self.node, source_window, &outputs);
         if let Some(peer) = offering {
             for output in &outputs {
                 if let Output::ClipPromise { offer, .. } = output {
@@ -1247,26 +1385,8 @@ impl Agent {
         #[cfg(test)]
         self.emitted.extend(outputs.iter().cloned());
         self.execute(outputs);
-        self.sync_projection_audio();
         self.tracker.executed();
         self.flush_placements();
-    }
-
-    fn sync_projection_audio(&mut self) {
-        let changes = self.audio_sources.changes(self.node, |window| {
-            if !self.projectable_windows.contains(&window) {
-                return None;
-            }
-            self.placement
-                .windows
-                .get(&window)
-                .and_then(|info| info.pid)
-        });
-        if let Some(audio) = &self.audio {
-            for (peer, pids) in changes {
-                audio.set_peer_sources(peer, &pids);
-            }
-        }
     }
 
     /// A worker may have queued geometry before our synchronous move. Read back conflicting
@@ -1650,7 +1770,12 @@ impl Agent {
         }
         if let Some(backend) = self.platform.parking.take() {
             self.parking_available = true;
-            match crate::parking_worker::Worker::start(backend, self.events.clone()) {
+            let activator = self.platform.window_activator.take();
+            match crate::parking_worker::Worker::start_with_activator(
+                backend,
+                activator,
+                self.events.clone(),
+            ) {
                 Ok(worker) => self.parking = Some(worker),
                 Err(error) => {
                     tracing::error!(%error, "parking worker could not start; recovery remains pending")
@@ -1659,7 +1784,14 @@ impl Agent {
         }
     }
 
-    fn parking_submit(&mut self, command: crate::parking_worker::Command) {
+    /// Returns the operation's ID.
+    fn parking_submit(&mut self, command: crate::parking_worker::Command) -> u64 {
+        self.parking_submit_as(command, true)
+    }
+
+    /// `asked`: the engine asked for this operation. A retry of a refused return is not a new
+    /// return, so the installer tracker does not count it.
+    fn parking_submit_as(&mut self, command: crate::parking_worker::Command, asked: bool) -> u64 {
         self.parking_start();
         let id = self.parking_next.unwrap_or(0);
         self.parking_next = self.parking_next.and_then(|id| id.checked_add(1));
@@ -1667,8 +1799,17 @@ impl Agent {
             crate::parking_worker::Command::Park { window, .. }
             | crate::parking_worker::Command::Resize { window, .. } => {
                 self.parking_latest.insert(window, id);
+                // The window is being projected again: a return that waits for the session to
+                // open must not undo that.
+                self.restore_retry.remove(&window);
             }
-            crate::parking_worker::Command::Restore { .. } => self.tracker.restore_started(id),
+            crate::parking_worker::Command::Restore { .. } => {
+                if asked {
+                    self.tracker.restore_started(id);
+                }
+            }
+            // A focus request leaves no state to settle: a failure is logged when it completes.
+            crate::parking_worker::Command::Activate { .. } => {}
         }
         if let Some(worker) = &mut self.parking
             && id != 0
@@ -1681,6 +1822,60 @@ impl Agent {
             let _ = self.events.send(Event::Parking(
                 crate::parking_worker::Completion::unavailable(id, command),
             ));
+        }
+        id
+    }
+
+    /// The returns of windows that were refused while the session was closed, or that the session
+    /// could not be proven open for: submitted again once the gate is open and the backoff has
+    /// passed. Run after every event, so the one that reopens the gate retries at once.
+    fn retry_restores(&mut self) {
+        if self.restore_retry.is_empty() || !self.platform.gate.is_open() {
+            return;
+        }
+        let now = Instant::now();
+        let due: Vec<_> = self
+            .restore_retry
+            .iter()
+            .filter(|(_, retry)| retry.due(now))
+            .map(|(window, retry)| (*window, retry.place))
+            .collect();
+        for (window, place) in due {
+            tracing::info!(
+                window = window.0,
+                "the session is open: retrying the return of a parked window"
+            );
+            let id = self.parking_submit_as(
+                crate::parking_worker::Command::Restore { window, place },
+                false,
+            );
+            if let Some(retry) = self.restore_retry.get_mut(&window) {
+                retry.in_flight = Some(id);
+            }
+        }
+    }
+
+    /// A return failed for a session reason: keep it pending, or give up on it.
+    fn restore_refused(&mut self, window: WindowId, id: u64) {
+        let session_open = self.platform.gate.is_open();
+        let step = self
+            .restore_retry
+            .get_mut(&window)
+            .map(|retry| retry.refused(id, session_open, Instant::now()));
+        match step {
+            Some(RetryStep::Waiting) => tracing::info!(
+                window = window.0,
+                session_open,
+                "the return of a parked window was refused by a closed session: retrying when it opens"
+            ),
+            Some(RetryStep::GaveUp) => {
+                self.restore_retry.remove(&window);
+                tracing::warn!(
+                    window = window.0,
+                    "a parked window could not be returned while the session was open; its journal entry stays and the next start restores it"
+                );
+            }
+            Some(RetryStep::Stale) | None => {}
         }
     }
 
@@ -1733,7 +1928,11 @@ impl Agent {
                     );
                 }
             }
-            crate::parking_worker::Outcome::Restored { window, ok } => {
+            crate::parking_worker::Outcome::Restored {
+                window,
+                ok,
+                failure,
+            } => {
                 if !ok && let Some(cached) = self.placement.windows.get(window) {
                     tracing::warn!(
                         operation = completion.id,
@@ -1746,6 +1945,32 @@ impl Agent {
                 self.tracker.restored(*window, completion.id, *ok);
                 if *ok {
                     self.home.twins.remove(window);
+                    self.restore_retry.remove(window);
+                } else if matches!(failure, Some(Failure::Locked | Failure::SecureInput)) {
+                    // The session was closed, or the OS could not prove it open, when the return
+                    // ran. The window is still parked and still journaled: it stays tracked
+                    // (`tracker.parked`, `home.twins`, `restore_retry`) until a return succeeds.
+                    self.restore_refused(*window, completion.id);
+                } else if self
+                    .restore_retry
+                    .get(window)
+                    .is_some_and(|retry| retry.in_flight == Some(completion.id))
+                {
+                    // Another failure is not the session's: the journal's startup recovery has
+                    // it. (A newer return of the window in flight keeps its entry.)
+                    self.restore_retry.remove(window);
+                }
+            }
+            crate::parking_worker::Outcome::Activated { window, result } => {
+                // The focus change itself reaches the engine as a window event. A refused request
+                // leaves the keys held back, as when the focus call ran on the loop.
+                if let Err(failure) = result {
+                    tracing::warn!(
+                        operation = completion.id,
+                        window = window.0,
+                        ?failure,
+                        "a projected window was not focused: its keys are held back"
+                    );
                 }
             }
             crate::parking_worker::Outcome::Panicked => {}
@@ -1757,6 +1982,9 @@ impl Agent {
     }
 
     fn parking_shutdown(&mut self, wait: Duration) -> crate::lifecycle::Parking {
+        // The final recovery below returns every parked window from the journal: nothing is left
+        // to retry once it has run.
+        self.restore_retry.clear();
         self.parking_start();
         let Some(worker) = &mut self.parking else {
             return if self.parking_available {
@@ -1959,6 +2187,7 @@ impl Agent {
                 }
                 let peer = *peer;
                 self.feed(Input::Link(event));
+                self.sync_projection_audio_peer(peer);
                 self.sync_drag_peer(peer);
                 self.sync_drag_in_peer(peer);
                 return;
@@ -2000,6 +2229,7 @@ impl Agent {
         self.feed(Input::PeerUp { peer });
         // After `PeerUp`: the engine ignores audio availability for a peer that isn't up.
         self.sync_audio_peer(peer);
+        self.sync_projection_audio_peer(peer);
         self.sync_drag_peer(peer);
         self.sync_drag_in_peer(peer);
         self.sync_clip_peer(peer);
@@ -2042,8 +2272,12 @@ impl Agent {
     ///
     /// 1. the cache takes the new features and displays;
     /// 2. the worker stops every stream with the peer (they were bound to the old connection),
-    ///    and then the engine is told, so it ends the sessions and keeps its identity counters;
-    /// 3. audio availability is re-evaluated from the new features;
+    ///    and then the engine is told, so it ends the sessions and keeps its identity counters.
+    ///    Projection audio (`audio/1`) is negotiated per connection, so the engine forgets it
+    ///    with that input and the loop's note of what it told the engine goes first: nothing is
+    ///    sent on the new connection until step 3 announces the feature from its `Hello`;
+    /// 3. audio availability is re-evaluated from the new features, and `audio/1` is announced
+    ///    again only if the new `Hello` still carries it;
     /// 4. running video streams pick up the new features (after the cache update).
     fn on_hello_refresh(&mut self, peer: NodeId, hello: &Hello) {
         if !self.peers.get(&peer).is_some_and(|info| info.connected) {
@@ -2068,8 +2302,15 @@ impl Agent {
             peer,
             available: false,
         });
+        // Fail closed: `audio/1` holds per connection, and this is the first the loop hears of
+        // the new one. The engine forgets it for this peer with the replacement (so no projection
+        // stream is opened on a connection that has not announced the feature), and the note of
+        // what it was told goes with it. The sync below feeds `available: true` again only if the
+        // new `Hello` still carries `audio/1`; the engine then reopens by itself.
+        self.peers.entry(peer).or_default().projection_audio = false;
         self.feed(Input::AudioConnectionReplaced { peer });
         self.sync_audio_peer(peer);
+        self.sync_projection_audio_peer(peer);
         self.sync_drag_peer(peer);
         self.sync_drag_in_peer(peer);
         self.sync_clip_peer(peer);
@@ -2102,6 +2343,22 @@ impl Agent {
             name,
             available,
         });
+    }
+
+    /// Tell the engine whether projection audio ("sound follows the window") with `peer` is
+    /// available (an audio peer whose `Hello` and ours both advertise `audio/1`), when that
+    /// differs from what it was last told. Always after [`Self::sync_audio_peer`], which the
+    /// engine's availability here builds on.
+    fn sync_projection_audio_peer(&mut self, peer: NodeId) {
+        let Some(info) = self.peers.get_mut(&peer) else {
+            return;
+        };
+        let available =
+            info.connected && projection_audio_negotiated(&self.features, &info.features);
+        if info.projection_audio != available {
+            info.projection_audio = available;
+            self.feed(Input::ProjectionAudioPeer { peer, available });
+        }
     }
 
     fn sync_drag_peer(&mut self, peer: NodeId) {
@@ -2264,7 +2521,9 @@ impl Agent {
             }
             Output::BeginDrag { id, portal, button } => {
                 self.capture_motion_seen = false;
-                #[cfg(target_os = "linux")]
+                // Hyprland and Windows detect the gesture natively (the Windows capture is built
+                // with its drag observer in `platform::create`); the Mac has no detector yet.
+                #[cfg(any(target_os = "linux", windows))]
                 let result = self
                     .platform
                     .capture
@@ -2272,7 +2531,7 @@ impl Agent {
                     .ok_or(PlatformError::Unsupported("no capture backend"))
                     .and_then(|capture| capture.begin_drag(id, portal, button))
                     .map_err(failure);
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", windows)))]
                 let result = {
                     let _ = (portal, button);
                     Err(failure(PlatformError::Unsupported(
@@ -2493,10 +2752,24 @@ impl Agent {
             Output::Restore { window, place } => {
                 let place =
                     place.map(|p| (p.display, PointDevice::new(f64::from(p.x), f64::from(p.y))));
-                self.parking_submit(crate::parking_worker::Command::Restore { window, place });
+                // A new return replaces what an earlier one left pending for this window.
+                self.restore_retry.remove(&window);
+                let id =
+                    self.parking_submit(crate::parking_worker::Command::Restore { window, place });
+                self.restore_retry
+                    .insert(window, RestoreRetry::new(place, id, Instant::now()));
             }
             Output::ActivateWindow { window } => {
-                if let Some(w) = &mut self.platform.windows
+                // A backend whose focus call can wait (Windows: up to two seconds when the OS
+                // denies the foreground request) hands the call to the parking worker: the loop
+                // does not wait, the result comes back as a completion event, and a later park or
+                // return of the same window queues behind it. Others focus in place.
+                if self.platform.window_activator.is_some() {
+                    self.parking_start();
+                }
+                if self.parking.as_ref().is_some_and(|w| w.can_activate()) {
+                    self.parking_submit(crate::parking_worker::Command::Activate { window });
+                } else if let Some(w) = &mut self.platform.windows
                     && let Err(e) = w.activate(window)
                 {
                     tracing::warn!(error = %e, "could not focus a projected window: its keys are held back");
@@ -2879,6 +3152,16 @@ impl Agent {
             | Output::CloseAudioPlayback { .. }
             | Output::StartAudioStream { .. }
             | Output::StopAudioStream { .. } => self.audio_output(output),
+            // "Sound follows the window": the engine's latest set of processes whose sound goes to
+            // `peer` (empty stops it). The worker keeps only the latest set per peer and holds it
+            // until the peer's virtual devices exist; it never blocks this loop. Without a worker
+            // there is nothing to capture, and the engine only asks when `AudioProjectionCapture`
+            // said there is.
+            Output::AudioProjectionSources { peer, pids } => {
+                if let Some(audio) = &self.audio {
+                    audio.set_peer_sources(peer, &pids);
+                }
+            }
             Output::AudioIndicators {
                 microphones,
                 speakers,
@@ -3068,6 +3351,12 @@ impl Agent {
                     peer_name(self, peer)
                 )
             }
+            // The window refused to be parked: it is mirrored where it stands, so ending the
+            // projection returns nothing (and is not a failed return).
+            Notice::ProjectionShownInPlace { key, title } => {
+                self.tracker.projection_in_place(*key);
+                format!("{title} is shown in place: it could not be hidden")
+            }
             Notice::SpeakerInUseBy(p) => {
                 format!("{} is playing sound on these speakers", peer_name(self, p))
             }
@@ -3198,10 +3487,12 @@ impl Agent {
             if let Some(link) = self.links.get_mut(&node) {
                 link.close("forgotten");
             }
-            // Retire both negotiated drag capabilities before forgetting their cached state.
+            // Retire the negotiated drag and projection-audio capabilities before forgetting their
+            // cached state.
             if let Some(info) = self.peers.get_mut(&node) {
                 info.connected = false;
             }
+            self.sync_projection_audio_peer(node);
             self.sync_drag_peer(node);
             self.sync_drag_in_peer(node);
             self.peers.remove(&node);
@@ -4410,6 +4701,7 @@ impl Agent {
         {
             self.twin_video_retry(stream);
         }
+        self.retry_restores();
         self.home_housekeeping();
         self.discovery_housekeeping();
         // Known limit (WP-4.5): a backend that flips and flips back within one tick is missed.
@@ -6183,7 +6475,16 @@ fn write_snapshot(
     for pixel in bgra[..w * h * 4].as_chunks::<4>().0 {
         ppm.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
     }
-    let path = std::env::temp_dir().join(format!(
+    // Windows' %TEMP% grants SYSTEM and Administrators too; a private file needs a private parent.
+    #[cfg(windows)]
+    let dir = {
+        let dir = std::env::temp_dir().join("Crosspane snapshots");
+        crate::paths::create_private_dir(&dir)?;
+        dir
+    };
+    #[cfg(not(windows))]
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
         "crosspane-snapshot-{}-{}.ppm",
         key.source.short(),
         key.projection.0
@@ -6427,6 +6728,17 @@ fn log_input(input: &Input) {
         }
         Input::CaptureReleased { op, result } => {
             tracing::debug!(op = op.0, ?result, "in: capture released")
+        }
+        // The end reason is a fixed enum: no key or pointer data.
+        Input::Capture(crosspane_platform::CaptureEvent::Ended { reason, .. }) => {
+            #[cfg(windows)]
+            if *reason == crosspane_platform::EndReason::Lost {
+                tracing::info!(
+                    cause = crosspane_platform_windows::capture::last_loss(),
+                    "capture lost"
+                );
+            }
+            tracing::debug!(?reason, "in: capture ended")
         }
         Input::HomeBindSet {
             op,
@@ -6773,6 +7085,10 @@ mod installer {
         /// Projections of this node's windows that are parked but whose capture hasn't started:
         /// what `ProjectionStarted` said, kept until the matching `CaptureStarted` succeeds.
         pending_sources: BTreeMap<ProjectionKey, (NodeId, ParkingKind)>,
+        /// Projections of this node's windows that are mirrored where the window stands because
+        /// it could not be parked (`ProjectionShownInPlace`): their end returns nothing, so it
+        /// is neither a return nor a failed return.
+        in_place: BTreeSet<ProjectionKey>,
         /// How the latest projection of this node's window to each peer is parked (`twin` or
         /// `mirror`). Never reset, and absent until the first projection to that peer.
         last_parking: BTreeMap<NodeId, &'static str>,
@@ -6828,6 +7144,7 @@ mod installer {
                 backends: RefCell::new(BackendsSeen::default()),
                 sources: BTreeMap::new(),
                 pending_sources: BTreeMap::new(),
+                in_place: BTreeSet::new(),
                 last_parking: BTreeMap::new(),
                 proxies: BTreeSet::new(),
                 last_restore: None,
@@ -7024,6 +7341,11 @@ mod installer {
             }
         }
 
+        /// This node's projection `key` is mirrored in place: its window could not be parked.
+        pub fn projection_in_place(&mut self, key: ProjectionKey) {
+            self.in_place.insert(key);
+        }
+
         /// A `CloseProxy` was carried out; `queued` says whether the proxy host was sent its
         /// `Close` (the host doesn't acknowledge it).
         pub fn proxy_closed(&mut self, queued: bool) {
@@ -7056,9 +7378,12 @@ mod installer {
             if key.source == local {
                 self.pending_sources.remove(&key);
                 let operation = self.last_restore.take();
+                let in_place = self.in_place.remove(&key);
                 if let Some(peer) = self.sources.remove(&key) {
                     match reason {
                         ProjectionEndReason::WindowClosed => {}
+                        // Nothing was parked, so nothing was returned and none failed to come back.
+                        _ if in_place => {}
                         _ => {
                             if let Some(pending) =
                                 operation.and_then(|id| self.restores.get_mut(&id))
@@ -9239,6 +9564,318 @@ mod audio_tests {
         }
     }
 
+    /// "Sound follows the window": what the agent tells the engine and what it does with the
+    /// engine's answer. Which process's sound goes to which peer is the engine's decision (and its
+    /// tests'); these pin only the wiring, so they hold whatever that policy is.
+    mod projection_audio_wiring_tests {
+        use super::*;
+
+        const BOTH: &[&str] = &["e1", "audio", PROJECTION_AUDIO_FEATURE];
+
+        fn availability(inputs: &[Input], wanted: bool) -> usize {
+            inputs
+                .iter()
+                .filter(|input| {
+                    matches!(input,
+                        Input::ProjectionAudioPeer { available, .. } if *available == wanted)
+                })
+                .count()
+        }
+
+        fn position(inputs: &[Input], what: impl Fn(&Input) -> bool) -> usize {
+            inputs.iter().position(what).expect("the input was fed")
+        }
+
+        /// Every `set_peer_sources` the worker got, in order.
+        fn source_calls(rig: &Rig) -> Vec<(NodeId, Vec<u32>)> {
+            rig.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|call| match call {
+                    Call::Sources(peer, pids) => Some((*peer, pids.clone())),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn projection_audio_needs_audio_and_its_own_feature_on_both_sides() {
+            let both = features(BOTH);
+            let plain = features(&["e1", "audio"]);
+            let orphan = features(&["e1", PROJECTION_AUDIO_FEATURE]);
+            assert!(projection_audio_negotiated(&both, &both));
+            assert!(!projection_audio_negotiated(&both, &plain));
+            assert!(!projection_audio_negotiated(&plain, &both));
+            // `audio/1` means nothing without `audio` (the transport refuses audio then).
+            assert!(!projection_audio_negotiated(&both, &orphan));
+            assert!(!projection_audio_negotiated(&orphan, &both));
+            assert!(!projection_audio_negotiated(&orphan, &orphan));
+            assert!(!projection_audio_negotiated(&[], &both));
+            assert!(!projection_audio_negotiated(&both, &[]));
+            // The name is exact.
+            let near = features(&[
+                "audio", "audio/0", "audio/2", "audio/10", "Audio/1", "audio/1 ",
+            ]);
+            assert!(!projection_audio_negotiated(&both, &near));
+        }
+
+        #[test]
+        fn the_engine_hears_of_projection_audio_after_the_audio_peer_and_only_when_both_have_it() {
+            for local_audio in [false, true] {
+                for local_feature in [false, true] {
+                    for remote in [
+                        vec!["e1"],
+                        vec!["e1", "audio"],
+                        vec!["e1", PROJECTION_AUDIO_FEATURE],
+                        BOTH.to_vec(),
+                    ] {
+                        let mut r = rig(local_audio);
+                        if local_feature {
+                            r.agent.features.push(PROJECTION_AUDIO_FEATURE.into());
+                        }
+                        let wanted = local_audio
+                            && local_feature
+                            && remote.contains(&"audio")
+                            && remote.contains(&PROJECTION_AUDIO_FEATURE);
+                        let what = format!("{local_audio} {local_feature} {remote:?}");
+                        r.agent.fed.clear();
+                        r.hello(&remote);
+                        assert_eq!(
+                            availability(&r.agent.fed, true),
+                            usize::from(wanted),
+                            "{what}"
+                        );
+                        assert_eq!(availability(&r.agent.fed, false), 0, "{what}");
+                        if wanted {
+                            let up = position(&r.agent.fed, |i| matches!(i, Input::PeerUp { .. }));
+                            let audio = position(&r.agent.fed, |i| {
+                                matches!(
+                                    i,
+                                    Input::AudioPeer {
+                                        available: true,
+                                        ..
+                                    }
+                                )
+                            });
+                            let projection = position(&r.agent.fed, |i| {
+                                matches!(
+                                    i,
+                                    Input::ProjectionAudioPeer {
+                                        available: true,
+                                        ..
+                                    }
+                                )
+                            });
+                            assert!(up < audio && audio < projection, "{what}");
+                        }
+                        // A replacement connection that carries the same features: the engine
+                        // forgets `audio/1` with the replacement and hears of it again only
+                        // because this `Hello` still carries it, after the replacement. (It
+                        // is never withdrawn with `available: false`: the replacement does that.)
+                        r.agent.fed.clear();
+                        r.refresh(&remote);
+                        assert_eq!(
+                            availability(&r.agent.fed, true),
+                            usize::from(wanted),
+                            "{what}"
+                        );
+                        assert_eq!(availability(&r.agent.fed, false), 0, "{what}");
+                        if wanted {
+                            let replaced = position(&r.agent.fed, |i| {
+                                matches!(i, Input::AudioConnectionReplaced { .. })
+                            });
+                            let projection = position(&r.agent.fed, |i| {
+                                matches!(
+                                    i,
+                                    Input::ProjectionAudioPeer {
+                                        available: true,
+                                        ..
+                                    }
+                                )
+                            });
+                            assert!(replaced < projection, "{what}");
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn a_refresh_that_loses_the_feature_withdraws_it_and_one_that_returns_it_restores_it() {
+            let mut r = rig(true);
+            r.agent.features.push(PROJECTION_AUDIO_FEATURE.into());
+            r.hello(BOTH);
+            r.agent.fed.clear();
+            // A replacement connection whose peer no longer has `audio/1`: the replacement itself
+            // withdraws it from the engine (it is fed first, before the new `Hello` is looked at),
+            // and nothing announces it again.
+            r.refresh(&["e1", "audio"]);
+            assert!(
+                r.agent
+                    .fed
+                    .iter()
+                    .any(|i| matches!(i, Input::AudioConnectionReplaced { .. }))
+            );
+            assert_eq!(availability(&r.agent.fed, true), 0);
+            assert_eq!(availability(&r.agent.fed, false), 0);
+            assert!(!r.agent.peers[&r.peer].projection_audio);
+            // Audio itself is still available: only the new feature went.
+            assert!(
+                !r.agent
+                    .fed
+                    .iter()
+                    .any(|i| matches!(i, Input::AudioPeer { .. }))
+            );
+            r.agent.fed.clear();
+            r.refresh(BOTH);
+            assert_eq!(availability(&r.agent.fed, true), 1);
+            // The audio peer is told first on a refresh that changes both.
+            r.refresh(&["e1"]);
+            r.agent.fed.clear();
+            r.refresh(BOTH);
+            let audio = position(&r.agent.fed, |i| {
+                matches!(
+                    i,
+                    Input::AudioPeer {
+                        available: true,
+                        ..
+                    }
+                )
+            });
+            let projection = position(&r.agent.fed, |i| {
+                matches!(
+                    i,
+                    Input::ProjectionAudioPeer {
+                        available: true,
+                        ..
+                    }
+                )
+            });
+            assert!(audio < projection);
+        }
+
+        #[test]
+        fn a_closed_link_withdraws_it_after_the_close_and_a_new_link_restores_it() {
+            let mut r = rig(true);
+            r.agent.features.push(PROJECTION_AUDIO_FEATURE.into());
+            r.hello(BOTH);
+            r.agent.fed.clear();
+            r.close();
+            assert_eq!(availability(&r.agent.fed, false), 1);
+            let closed = position(&r.agent.fed, |i| {
+                matches!(i, Input::Link(LinkEvent::Closed { .. }))
+            });
+            let withdrawn = position(&r.agent.fed, |i| {
+                matches!(
+                    i,
+                    Input::ProjectionAudioPeer {
+                        available: false,
+                        ..
+                    }
+                )
+            });
+            assert!(closed < withdrawn);
+            // A second close says nothing more.
+            r.agent.fed.clear();
+            r.close();
+            assert_eq!(availability(&r.agent.fed, false), 0);
+            // A new link negotiates it again, from scratch.
+            r.agent.fed.clear();
+            r.hello(BOTH);
+            assert_eq!(availability(&r.agent.fed, true), 1);
+        }
+
+        #[test]
+        fn forgetting_or_revoking_a_peer_withdraws_it_before_the_cache_goes() {
+            for revoke in [false, true] {
+                let mut r = rig(true);
+                r.agent.features.push(PROJECTION_AUDIO_FEATURE.into());
+                r.hello(BOTH);
+                assert_eq!(availability(&r.agent.fed, true), 1);
+                r.agent.fed.clear();
+                let peer = "peer-name".into();
+                let response = r.agent.on_ctl(if revoke {
+                    Request::Revoke { peer }
+                } else {
+                    Request::Forget { peer }
+                });
+                assert!(response.ok, "{response:?}");
+                assert!(!r.agent.peers.contains_key(&r.peer));
+                assert_eq!(availability(&r.agent.fed, false), 1);
+                // The native link's later close doesn't publish it again.
+                r.close();
+                assert_eq!(availability(&r.agent.fed, false), 1);
+            }
+        }
+
+        #[test]
+        fn the_engines_source_sets_reach_the_worker_in_order_and_an_empty_set_stops_the_peer() {
+            let mut r = rig(true);
+            let (peer, other) = (r.peer, NodeId([9; 32]));
+            r.agent.execute(vec![
+                Output::AudioProjectionSources {
+                    peer,
+                    pids: vec![42, 7],
+                },
+                Output::AudioProjectionSources {
+                    peer: other,
+                    pids: vec![5],
+                },
+                Output::AudioProjectionSources { peer, pids: vec![] },
+            ]);
+            assert_eq!(
+                source_calls(&r),
+                [(peer, vec![42, 7]), (other, vec![5]), (peer, vec![])]
+            );
+            // They are not audio commands for the worker's data thread.
+            assert!(
+                r.calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|call| matches!(call, Call::Sources(..)))
+            );
+        }
+
+        #[test]
+        fn a_node_without_a_worker_has_nothing_to_capture_and_drops_the_sets() {
+            let mut r = rig(false);
+            let peer = r.peer;
+            r.agent.execute(vec![Output::AudioProjectionSources {
+                peer,
+                pids: vec![1],
+            }]);
+            assert!(r.calls.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn capture_support_is_told_to_the_engine_once_at_start_and_needs_the_worker_on_windows() {
+            for audio in [false, true] {
+                let mut r = rig(audio);
+                r.agent.fed.clear();
+                r.agent.feed_audio_support();
+                let told: Vec<bool> = r
+                    .agent
+                    .fed
+                    .iter()
+                    .filter_map(|input| match input {
+                        Input::AudioProjectionCapture { available } => Some(*available),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(told, [audio && cfg!(windows)]);
+                // Next to the microphone support the start already told the engine.
+                assert!(
+                    r.agent
+                        .fed
+                        .iter()
+                        .any(|i| matches!(i, Input::AudioMicrophoneSupport { available: false }))
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_hello_replaces_what_the_cache_knew_and_reports_changed_displays() {
         let mut info = PeerInfo::default();
@@ -9263,6 +9900,8 @@ mod audio_tests {
         Submit(Output),
         Packet(NodeId, AudioStreamId),
         Cancel(NodeId),
+        /// `set_peer_sources`: the latest projected-process set for a peer.
+        Sources(NodeId, Vec<u32>),
         Shutdown,
     }
 
@@ -9288,6 +9927,7 @@ mod audio_tests {
                 Call::Submit(_) => "other",
                 Call::Packet(..) => "packet",
                 Call::Cancel(_) => "cancel",
+                Call::Sources(..) => "sources",
                 Call::Shutdown => "shutdown",
             }
         }
@@ -9303,7 +9943,10 @@ mod audio_tests {
     }
 
     impl AudioPlane for Recorder {
-        fn set_peer_sources(&self, _peer: NodeId, _pids: &[u32]) {}
+        fn set_peer_sources(&self, peer: NodeId, pids: &[u32]) {
+            self.push(Call::Sources(peer, pids.to_vec()));
+        }
+
         fn submit(&self, output: Output) {
             self.push(Call::Submit(output));
         }
@@ -9485,6 +10128,7 @@ mod audio_tests {
             keystore: None,
             permissions: Box::new(FakePermissions),
             windows: None,
+            window_activator: None,
             parking: None,
             frames: None,
             tray: None,
@@ -12054,7 +12698,7 @@ mod home_tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn begin_drag_routes_button_and_preserves_pointer_button_held_after_physical_callbacks() {
         for error in [
@@ -12113,6 +12757,117 @@ mod home_tests {
                 ..
             })
         ));
+    }
+
+    /// AGENT-WIN: a Mac has no drag detector, so its `BeginDrag` is refused without reaching the
+    /// capture (Linux and Windows route it, in the test above).
+    #[cfg(not(any(target_os = "linux", windows)))]
+    #[test]
+    fn begin_drag_is_refused_without_reaching_the_capture_where_no_detector_exists() {
+        let mut h = home();
+        h.rig.agent.execute_one(Output::BeginDrag {
+            id: CaptureId(7),
+            portal: PortalId(9),
+            button: MouseButton::PRIMARY,
+        });
+        assert!(h.capture.lock().unwrap().drags.is_empty());
+        assert!(matches!(
+            h.rig.events.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Event::Input(Input::CaptureBegun { result: Err(_), .. })
+        ));
+    }
+
+    /// AGENT-WIN: the focus request of a projected window leaves the agent loop. A request that
+    /// waits for the OS runs on the parking worker; its result comes back as a completion event;
+    /// the return of the same window queues behind it and cannot overtake it.
+    #[test]
+    fn activation_runs_on_the_parking_worker_and_reports_back_without_blocking_the_loop() {
+        let mut h = home();
+        let (backend, controls) = crate::parking_worker::tests::fake(None);
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        h.rig.agent.platform.parking = Some(Box::new(backend));
+        h.rig.agent.platform.window_activator = Some(Box::new(move |window| {
+            entered_tx.send(window).unwrap();
+            gate.recv().unwrap();
+            Ok(())
+        }));
+        let began = Instant::now();
+        h.rig.agent.execute_one(Output::ActivateWindow {
+            window: WindowId(5),
+        });
+        // The loop is free while the request waits.
+        assert!(began.elapsed() < Duration::from_millis(500));
+        assert_eq!(
+            entered.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WindowId(5)
+        );
+        h.rig.agent.execute_one(Output::Restore {
+            window: WindowId(5),
+            place: None,
+        });
+        assert!(
+            controls
+                .observed
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "the return of the window waits behind its activation"
+        );
+        open.send(()).unwrap();
+        let mut activated = false;
+        let mut restored = false;
+        while !(activated && restored) {
+            let Event::Parking(completion) =
+                h.rig.events.recv_timeout(Duration::from_secs(2)).unwrap()
+            else {
+                continue;
+            };
+            match &completion.outcome {
+                crate::parking_worker::Outcome::Activated { window, result } => {
+                    assert_eq!((*window, *result), (WindowId(5), Ok(())));
+                    assert!(!restored, "the activation completed before the return ran");
+                    activated = true;
+                }
+                crate::parking_worker::Outcome::Restored { window, ok, .. } => {
+                    assert_eq!((*window, *ok), (WindowId(5), true));
+                    restored = true;
+                }
+                _ => {}
+            }
+            h.rig.agent.on_event(Event::Parking(completion));
+        }
+    }
+
+    /// AGENT-WIN: without an activator (Linux, the Mac, a Windows source in an isolated mode) the
+    /// agent focuses the window itself, as before.
+    #[test]
+    fn activation_without_an_activator_calls_the_window_source_on_the_loop() {
+        struct Focus(Arc<Mutex<Vec<WindowId>>>);
+        impl crosspane_platform::WindowSource for Focus {
+            fn windows(&self) -> Result<Vec<WindowInfo>, PlatformError> {
+                Ok(Vec::new())
+            }
+            fn focused(&self) -> Result<Option<WindowId>, PlatformError> {
+                Ok(None)
+            }
+            fn activate(&mut self, window: WindowId) -> Result<(), PlatformError> {
+                self.0.lock().unwrap().push(window);
+                Ok(())
+            }
+            fn subscribe(
+                &mut self,
+                _: Arc<dyn EventSink<WindowEvent>>,
+            ) -> Result<(), PlatformError> {
+                Ok(())
+            }
+        }
+        let mut h = home();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        h.rig.agent.platform.windows = Some(Box::new(Focus(seen.clone())));
+        h.rig.agent.execute_one(Output::ActivateWindow {
+            window: WindowId(6),
+        });
+        assert_eq!(*seen.lock().unwrap(), [WindowId(6)]);
     }
 
     struct CommandHost {
@@ -12246,6 +13001,303 @@ mod home_tests {
                 .unwrap()
                 .shutdown(crate::parking_worker::SHUTDOWN_WAIT);
         }
+    }
+
+    // ---- a return refused by a closed session is retried when the session opens (04 §5) ----
+
+    /// How the fixture backend answers a return.
+    const RETURN_OK: u8 = 0;
+    const RETURN_SECURE_INPUT: u8 = 1;
+    const RETURN_LOCKED: u8 = 2;
+    const RETURN_OTHER: u8 = 3;
+
+    /// A parking backend that refuses the return of a window the way the live backend did when the
+    /// session state flickered to Unknown: the OS could not prove the input desktop was the default
+    /// one. It records every return it was asked for.
+    struct SessionParking {
+        mode: Arc<std::sync::atomic::AtomicU8>,
+        returns: Arc<Mutex<Vec<WindowId>>>,
+    }
+
+    impl crosspane_platform::WindowParking for SessionParking {
+        fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+            Err(PlatformError::Unsupported("fixture"))
+        }
+        fn park(
+            &mut self,
+            window: WindowId,
+            size: PixelSize,
+            scale: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            crosspane_platform::WindowParking::park(&mut FakeParking, window, size, scale)
+        }
+        fn resize(
+            &mut self,
+            window: WindowId,
+            size: PixelSize,
+            scale: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            self.park(window, size, scale)
+        }
+        fn geometry(&self, window: WindowId) -> Result<crosspane_platform::Parked, PlatformError> {
+            crosspane_platform::WindowParking::geometry(&FakeParking, window)
+        }
+        fn restore(&mut self, window: WindowId) -> Result<(), PlatformError> {
+            self.returns.lock().unwrap().push(window);
+            match self.mode.load(std::sync::atomic::Ordering::SeqCst) {
+                RETURN_OK => Ok(()),
+                RETURN_SECURE_INPUT => Err(PlatformError::SecureInput),
+                RETURN_LOCKED => Err(PlatformError::Locked),
+                _ => Err(PlatformError::NotFound),
+            }
+        }
+        fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+            Ok(Vec::new())
+        }
+    }
+
+    type Returns = Arc<Mutex<Vec<WindowId>>>;
+
+    /// An agent whose parking backend answers returns as `mode` says.
+    fn session_parking(mode: u8) -> (Home, Arc<std::sync::atomic::AtomicU8>, Returns) {
+        let mut h = home();
+        let mode = Arc::new(std::sync::atomic::AtomicU8::new(mode));
+        let returns: Returns = Arc::new(Mutex::new(Vec::new()));
+        h.rig.agent.platform.parking = Some(Box::new(SessionParking {
+            mode: mode.clone(),
+            returns: returns.clone(),
+        }));
+        h.rig.agent.parking_start();
+        (h, mode, returns)
+    }
+
+    fn session_state(lock: crosspane_platform::LockState, active: Option<bool>) -> Input {
+        Input::Session(crosspane_platform::SessionEvent::State(
+            crosspane_platform::SessionState { lock, active },
+        ))
+    }
+
+    fn unknown_session() -> Input {
+        session_state(crosspane_platform::LockState::Unknown, None)
+    }
+
+    fn unlocked_session() -> Input {
+        session_state(crosspane_platform::LockState::Unlocked, Some(true))
+    }
+
+    /// The incident: the session state flickers to Unknown, the projection ends and asks for the
+    /// window back, the OS refuses while it cannot prove the session open, and 1.7 s later the
+    /// session is Unlocked again. The window must come back then, without anyone asking again.
+    #[test]
+    fn a_return_refused_while_the_session_is_unknown_is_retried_when_it_unlocks() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (mut h, mode, returns) = session_parking(RETURN_SECURE_INPUT);
+        let window = WindowId(10);
+        // The backend closes the gate before it announces anything.
+        h.gate.set_session_permits(false);
+        step(&mut h, unknown_session());
+        h.rig.agent.execute_one(Output::Restore {
+            window,
+            place: None,
+        });
+        process_events(&mut h);
+        assert_eq!(*returns.lock().unwrap(), [window]);
+        assert!(
+            h.rig.agent.restore_retry.contains_key(&window),
+            "a refused return stays tracked"
+        );
+        // While the session stays closed, passes of the loop do not retry (nor give up).
+        for _ in 0..3 {
+            h.rig.agent.housekeeping();
+        }
+        process_events(&mut h);
+        assert_eq!(returns.lock().unwrap().len(), 1);
+        assert!(h.rig.agent.restore_retry.contains_key(&window));
+        // The session opens: the backend opens the gate first, then the event reaches the loop.
+        mode.store(RETURN_OK, SeqCst);
+        h.gate.set_session_permits(true);
+        step(&mut h, unlocked_session());
+        h.rig.agent.housekeeping();
+        process_events(&mut h);
+        assert_eq!(*returns.lock().unwrap(), [window, window]);
+        assert!(
+            h.rig.agent.restore_retry.is_empty(),
+            "a successful return is done"
+        );
+        // Nothing is submitted again once it succeeded.
+        h.rig.agent.housekeeping();
+        process_events(&mut h);
+        assert_eq!(returns.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_locked_refusal_is_retried_like_a_secure_input_one_and_other_failures_are_not() {
+        for (mode, retried) in [
+            (RETURN_SECURE_INPUT, true),
+            (RETURN_LOCKED, true),
+            (RETURN_OTHER, false),
+        ] {
+            let (mut h, _, returns) = session_parking(mode);
+            h.rig.agent.execute_one(Output::Restore {
+                window: WindowId(10),
+                place: None,
+            });
+            process_events(&mut h);
+            assert_eq!(returns.lock().unwrap().len(), 1);
+            assert_eq!(
+                h.rig.agent.restore_retry.contains_key(&WindowId(10)),
+                retried,
+                "mode {mode}"
+            );
+        }
+    }
+
+    /// The gate stays open and the OS keeps refusing (a window of a more privileged process, say):
+    /// three retries over about five seconds, then the journal's startup recovery has it.
+    #[test]
+    fn a_return_refused_with_the_session_open_gives_up_after_three_retries() {
+        let (mut h, _, returns) = session_parking(RETURN_SECURE_INPUT);
+        let window = WindowId(10);
+        assert!(h.gate.is_open());
+        h.rig.agent.execute_one(Output::Restore {
+            window,
+            place: None,
+        });
+        process_events(&mut h);
+        assert_eq!(returns.lock().unwrap().len(), 1);
+        // The backoff holds the retry back until it has passed.
+        h.rig.agent.housekeeping();
+        process_events(&mut h);
+        assert_eq!(
+            returns.lock().unwrap().len(),
+            1,
+            "the backoff has not passed"
+        );
+        for retry in 1..=3 {
+            h.rig
+                .agent
+                .restore_retry
+                .get_mut(&window)
+                .unwrap()
+                .not_before = Instant::now();
+            h.rig.agent.housekeeping();
+            process_events(&mut h);
+            assert_eq!(returns.lock().unwrap().len(), 1 + retry);
+        }
+        assert!(
+            h.rig.agent.restore_retry.is_empty(),
+            "the retries are used up"
+        );
+        h.rig.agent.housekeeping();
+        process_events(&mut h);
+        assert_eq!(returns.lock().unwrap().len(), 4);
+    }
+
+    /// A refusal that comes from the session closing again does not spend the budget: the window
+    /// is retried as often as the session opens.
+    #[test]
+    fn refusals_met_with_the_session_closed_do_not_spend_the_retries() {
+        let (mut h, mode, returns) = session_parking(RETURN_SECURE_INPUT);
+        let window = WindowId(10);
+        h.gate.set_session_permits(false);
+        h.rig.agent.execute_one(Output::Restore {
+            window,
+            place: None,
+        });
+        process_events(&mut h);
+        for round in 2..=6 {
+            h.gate.set_session_permits(true);
+            h.rig.agent.housekeeping();
+            // The session closes again before the OS answers: refused with the gate closed.
+            h.gate.set_session_permits(false);
+            process_events(&mut h);
+            assert_eq!(returns.lock().unwrap().len(), round);
+            assert!(h.rig.agent.restore_retry.contains_key(&window));
+        }
+        mode.store(RETURN_OK, std::sync::atomic::Ordering::SeqCst);
+        h.gate.set_session_permits(true);
+        h.rig.agent.housekeeping();
+        process_events(&mut h);
+        assert!(h.rig.agent.restore_retry.is_empty());
+    }
+
+    /// A window that is projected again is not returned behind the projection's back.
+    #[test]
+    fn a_new_park_cancels_the_return_that_waits_for_the_session() {
+        let (mut h, mode, returns) = session_parking(RETURN_SECURE_INPUT);
+        let window = WindowId(10);
+        h.gate.set_session_permits(false);
+        h.rig.agent.execute_one(Output::Restore {
+            window,
+            place: None,
+        });
+        process_events(&mut h);
+        assert!(h.rig.agent.restore_retry.contains_key(&window));
+        h.rig.agent.execute_one(Output::Park {
+            window,
+            size: PixelSize::new(400, 300),
+            scale: 1.0,
+        });
+        process_events(&mut h);
+        assert!(h.rig.agent.restore_retry.is_empty());
+        mode.store(RETURN_OK, std::sync::atomic::Ordering::SeqCst);
+        h.gate.set_session_permits(true);
+        h.rig.agent.housekeeping();
+        process_events(&mut h);
+        assert_eq!(returns.lock().unwrap().len(), 1, "no return was retried");
+    }
+
+    /// A second return of the window replaces the first one's retry state, and an older answer
+    /// cannot touch the newer one.
+    #[test]
+    fn an_older_answer_does_not_touch_the_newer_return_of_a_window() {
+        let t0 = Instant::now();
+        let mut retry = RestoreRetry::new(None, 7, t0);
+        assert_eq!(retry.refused(6, true, t0), RetryStep::Stale);
+        assert_eq!(retry.in_flight, Some(7));
+        assert_eq!(retry.spent, 0);
+        assert_eq!(retry.refused(7, true, t0), RetryStep::Waiting);
+        assert_eq!(retry.in_flight, None);
+        assert_eq!(retry.refused(7, true, t0), RetryStep::Stale);
+    }
+
+    #[test]
+    fn the_return_backoff_is_three_steps_over_about_five_seconds() {
+        let t0 = Instant::now();
+        let mut retry = RestoreRetry::new(Some((DisplayId(1), PointDevice::new(2.0, 3.0))), 1, t0);
+        let mut waited = Duration::ZERO;
+        for (index, delay) in RESTORE_BACKOFF.iter().enumerate() {
+            let id = 1 + index as u64;
+            retry.in_flight = Some(id);
+            assert_eq!(retry.refused(id, true, t0), RetryStep::Waiting);
+            assert!(!retry.due(t0), "step {index} waits");
+            assert!(!retry.due(t0 + *delay - Duration::from_millis(1)));
+            assert!(retry.due(t0 + *delay));
+            waited += *delay;
+        }
+        assert_eq!(waited, Duration::from_secs(5));
+        retry.in_flight = Some(9);
+        assert_eq!(retry.refused(9, true, t0), RetryStep::GaveUp);
+        // The place survives the retries.
+        assert_eq!(
+            retry.place,
+            Some((DisplayId(1), PointDevice::new(2.0, 3.0)))
+        );
+    }
+
+    #[test]
+    fn a_refusal_met_with_the_session_closed_costs_nothing_and_is_due_at_once() {
+        let t0 = Instant::now();
+        let mut retry = RestoreRetry::new(None, 1, t0);
+        for id in 1..=10 {
+            retry.in_flight = Some(id);
+            assert_eq!(retry.refused(id, false, t0), RetryStep::Waiting);
+            assert!(retry.due(t0));
+            assert_eq!(retry.spent, 0);
+        }
+        // In flight, a return is not due.
+        retry.in_flight = Some(11);
+        assert!(!retry.due(t0));
     }
 
     fn at() -> MonoTime {
@@ -12620,6 +13672,7 @@ mod home_tests {
         h
     }
 
+    /// Records `set_peer_sources` and ignores everything else a worker is asked.
     type SourceCalls = Arc<Mutex<Vec<(NodeId, Vec<u32>)>>>;
     struct SourceRecorder(SourceCalls);
     impl AudioPlane for SourceRecorder {
@@ -12634,116 +13687,170 @@ mod home_tests {
         }
         fn shutdown(self: Box<Self>) {}
     }
-    fn source_audio_fixture() -> (Home, SourceRecorder) {
+
+    /// The one end-to-end check of "sound follows the window" in the agent: with the engine told
+    /// what the agent tells it (capture available, an `audio/1` audio peer), the process of a
+    /// window projected to that peer reaches the worker, and returning the window stops it. It
+    /// assumes only the engine's frozen rule that a capture-capable node sends an `audio/1` peer
+    /// the pids of the windows projected to it; the policy's details are the engine's tests'.
+    #[test]
+    fn a_projected_windows_process_reaches_the_worker_and_its_return_stops_it() {
         let mut h = bare_scenario();
-        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls: SourceCalls = Arc::new(Mutex::new(Vec::new()));
         h.rig.agent.audio = Some(Box::new(SourceRecorder(calls.clone())));
         let peer = h.rig.peer;
+        step(&mut h, Input::AudioProjectionCapture { available: true });
         step(
             &mut h,
-            control_input(peer, ControlMessage::Grants(vec![Capability::AudioSpeaker])),
-        );
-        project(&mut h, 1);
-        (h, SourceRecorder(calls))
-    }
-    fn source_calls(h: &Home, recorder: &SourceRecorder) -> Vec<Vec<u32>> {
-        recorder
-            .0
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(peer, _)| *peer == h.rig.peer)
-            .map(|(_, pids)| pids.clone())
-            .collect()
-    }
-    #[test]
-    fn source_projection_hook_start_and_final_end_use_original_window_pid() {
-        let (mut h, calls) = source_audio_fixture();
-        assert_eq!(source_calls(&h, &calls), [vec![42]]);
-        give_back(&mut h, 1);
-        assert_eq!(source_calls(&h, &calls), [vec![42], vec![]]);
-    }
-    #[test]
-    fn source_projection_hook_second_window_same_pid_does_not_resubmit() {
-        let (mut h, calls) = source_audio_fixture();
-        step(
-            &mut h,
-            Input::Windows(WindowEvent::Added(window(
-                20,
-                "fixture",
-                42,
-                Some(1),
-                (0.0, 0.0, 320.0, 240.0),
-                WindowState::Normal,
-            ))),
-        );
-        let peer = h.rig.peer;
-        step(
-            &mut h,
-            Input::Command(Command::Project {
-                window: WindowId(20),
-                to: peer,
-                place: None,
-            }),
-        );
-        step(
-            &mut h,
-            projection_input(
+            Input::AudioPeer {
                 peer,
-                ProjectionMessage::Accepted {
-                    projection: ProjectionId(2),
-                    size: PixelSize::new(400, 300),
-                    scale: 1.0,
-                },
-            ),
+                name: "peer-name".into(),
+                available: true,
+            },
         );
-        assert_eq!(source_calls(&h, &calls), [vec![42]]);
+        step(
+            &mut h,
+            Input::ProjectionAudioPeer {
+                peer,
+                available: true,
+            },
+        );
+        assert!(calls.lock().unwrap().is_empty(), "nothing is projected yet");
+        project(&mut h, 1);
+        // The window `bare_scenario` added belongs to process 42.
+        assert_eq!(*calls.lock().unwrap(), [(peer, vec![42])]);
         give_back(&mut h, 1);
-        assert_eq!(source_calls(&h, &calls), [vec![42]]);
-        give_back(&mut h, 2);
-        assert_eq!(source_calls(&h, &calls), [vec![42], vec![]]);
+        assert_eq!(*calls.lock().unwrap(), [(peer, vec![42]), (peer, vec![])]);
     }
+
+    /// `audio/1` is negotiated per connection, and the loop feeds `AudioConnectionReplaced`
+    /// before it has looked at the replacement's `Hello`. With the projection stream already
+    /// open, a replacement whose `Hello` no longer carries `audio/1` must end the sound and never
+    /// announce the feature again, so the engine sends no `ProjectionAudioOpen` on it; one that
+    /// still carries it announces the feature after the replacement and the stream reopens.
     #[test]
-    fn source_projection_hook_received_revoke_and_connection_loss_clear() {
-        for replacement in [false, true] {
-            let (mut h, calls) = source_audio_fixture();
+    fn a_refresh_without_audio1_never_reopens_the_projection_stream_and_one_with_it_does() {
+        let opens = |outputs: &[Output]| {
+            outputs
+                .iter()
+                .filter(|o| {
+                    matches!(
+                        o,
+                        Output::SendControl {
+                            msg: ControlMessage::ProjectionAudioOpen { .. },
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        for carries_audio1 in [false, true] {
+            let mut h = bare_scenario();
+            let calls: SourceCalls = Arc::new(Mutex::new(Vec::new()));
+            h.rig.agent.audio = Some(Box::new(SourceRecorder(calls.clone())));
             let peer = h.rig.peer;
-            if replacement {
-                step(&mut h, Input::AudioConnectionReplaced { peer });
+            // A negotiated connection: both ends advertise projection audio, and the loop has
+            // told the engine so (as `on_hello` does).
+            let owned = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+            h.rig
+                .agent
+                .features
+                .extend(owned(&["audio", PROJECTION_AUDIO_FEATURE]));
+            let info = h.rig.agent.peers.get_mut(&peer).unwrap();
+            info.features = owned(&["e1", "audio", PROJECTION_AUDIO_FEATURE]);
+            info.audio = true;
+            info.projection_audio = true;
+            step(&mut h, Input::AudioProjectionCapture { available: true });
+            step(
+                &mut h,
+                Input::AudioPeer {
+                    peer,
+                    name: "peer-name".into(),
+                    available: true,
+                },
+            );
+            step(
+                &mut h,
+                Input::ProjectionAudioPeer {
+                    peer,
+                    available: true,
+                },
+            );
+            project(&mut h, 1);
+            // The host reports the capture of the window's process (42) active: the stream opens.
+            step(
+                &mut h,
+                Input::Audio(crosspane_platform::AudioEvent::VirtualActive {
+                    peer,
+                    kind: AudioKind::Speaker,
+                    active: true,
+                }),
+            );
+            assert_eq!(opens(&h.rig.agent.emitted), 1, "{carries_audio1}");
+            assert_eq!(*calls.lock().unwrap(), [(peer, vec![42])]);
+
+            // The connection is replaced. Its `Hello` has the same displays, so only audio moves.
+            let (fed_mark, emitted_mark) = (h.rig.agent.fed.len(), h.rig.agent.emitted.len());
+            let displays = h.rig.agent.peers[&peer].displays.clone();
+            let features = if carries_audio1 {
+                owned(&["e1", "audio", PROJECTION_AUDIO_FEATURE])
             } else {
-                step(
-                    &mut h,
-                    control_input(peer, ControlMessage::Grants(Vec::new())),
-                );
+                owned(&["e1", "audio"])
+            };
+            h.rig.agent.on_link(LinkEvent::HelloRefresh {
+                peer,
+                hello: Hello {
+                    minor: crosspane_protocol::PROTOCOL_MINOR,
+                    name: "peer-announced".into(),
+                    features,
+                    displays,
+                },
+            });
+            process_events(&mut h);
+
+            // The feed order: the replacement first, then `available: true` only if the new
+            // `Hello` carries `audio/1`; the engine is never told `available: false`.
+            let fed = &h.rig.agent.fed[fed_mark..];
+            let replaced = fed
+                .iter()
+                .position(|i| matches!(i, Input::AudioConnectionReplaced { .. }))
+                .expect("the engine heard of the replacement");
+            let announced = fed.iter().position(|i| {
+                matches!(
+                    i,
+                    Input::ProjectionAudioPeer {
+                        available: true,
+                        ..
+                    }
+                )
+            });
+            assert_eq!(announced.is_some(), carries_audio1, "{fed:?}");
+            if let Some(announced) = announced {
+                assert!(replaced < announced);
             }
-            assert_eq!(source_calls(&h, &calls), [vec![42], vec![]]);
-            step(&mut h, Input::Tick);
-            assert_eq!(source_calls(&h, &calls), [vec![42], vec![]]);
+            assert!(!fed.iter().any(|i| matches!(
+                i,
+                Input::ProjectionAudioPeer {
+                    available: false,
+                    ..
+                }
+            )));
+            assert_eq!(h.rig.agent.peers[&peer].projection_audio, carries_audio1);
+
+            // The engine opens a stream on the replacement connection only in the second case.
+            assert_eq!(
+                opens(&h.rig.agent.emitted[emitted_mark..]),
+                usize::from(carries_audio1),
+                "{carries_audio1}"
+            );
+            let mut expected = vec![(peer, vec![42]), (peer, vec![])];
+            if carries_audio1 {
+                expected.push((peer, vec![42]));
+            }
+            assert_eq!(*calls.lock().unwrap(), expected, "{carries_audio1}");
         }
-        let (mut h, calls) = source_audio_fixture();
-        h.rig.agent.on_link(LinkEvent::Closed {
-            peer: h.rig.peer,
-            error: crosspane_protocol::link::LinkError::Closed,
-        });
-        assert_eq!(source_calls(&h, &calls), [vec![42], vec![]]);
     }
-    #[test]
-    fn source_projection_hook_current_window_pid_refresh_and_missing_pid_clear() {
-        let (mut h, calls) = source_audio_fixture();
-        let mut info = window(
-            10,
-            "fixture",
-            52,
-            Some(1),
-            (0.0, 0.0, 320.0, 240.0),
-            WindowState::Normal,
-        );
-        step(&mut h, Input::Windows(WindowEvent::Changed(info.clone())));
-        assert_eq!(source_calls(&h, &calls), [vec![42], vec![52]]);
-        info.pid = None;
-        step(&mut h, Input::Windows(WindowEvent::Changed(info)));
-        assert_eq!(source_calls(&h, &calls), [vec![42], vec![52], vec![]]);
-    }
+
     fn cross_scenario(h: &mut Home) {
         let portal = h
             .rig
@@ -19942,6 +21049,129 @@ mod home_tests {
         );
         // The journal entry is still there: the window is not restored.
         assert_eq!(status_installer(&h)["recovery_pending"], json!(1));
+    }
+
+    /// Parking that refuses every window as the Mac's does when it has no accessibility window
+    /// for it: nothing is moved, and a return finds nothing to put back.
+    struct Unparkable;
+
+    impl crosspane_platform::WindowParking for Unparkable {
+        fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+            Err(PlatformError::Unsupported("fullscreen is not implemented"))
+        }
+        fn park(
+            &mut self,
+            _: WindowId,
+            _: PixelSize,
+            _: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            Err(PlatformError::NotFound)
+        }
+        fn resize(
+            &mut self,
+            _: WindowId,
+            _: PixelSize,
+            _: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            Err(PlatformError::NotFound)
+        }
+        fn geometry(&self, _: WindowId) -> Result<crosspane_platform::Parked, PlatformError> {
+            Err(PlatformError::NotFound)
+        }
+        fn restore(&mut self, _: WindowId) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_window_that_refuses_to_be_parked_is_mirrored_in_place_and_its_end_returns_nothing() {
+        let mut h = bare_scenario();
+        replace_parking(&mut h.rig.agent, Box::new(Unparkable));
+        let peer = h.rig.peer;
+        let mut out = step(
+            &mut h,
+            Input::Command(Command::Project {
+                window: WindowId(10),
+                to: peer,
+                place: None,
+            }),
+        );
+        out.extend(step(
+            &mut h,
+            projection_input(
+                peer,
+                ProjectionMessage::Accepted {
+                    projection: ProjectionId(1),
+                    size: PixelSize::new(400, 300),
+                    scale: 1.0,
+                },
+            ),
+        ));
+        // The failed park is balanced once, and the window is captured where it stands.
+        let restores = |out: &[Output]| {
+            out.iter()
+                .filter(|o| {
+                    matches!(
+                        o,
+                        Output::Restore {
+                            window: WindowId(10),
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        assert_eq!(restores(&out), 1, "{out:?}");
+        assert!(
+            out.iter().any(|o| matches!(
+                o,
+                Output::StartCapture {
+                    target: CaptureTarget::Window(WindowId(10)),
+                    crop: None,
+                    ..
+                }
+            )),
+            "{out:?}"
+        );
+        // The projection is live as a mirror, and the user is told so once.
+        let said = |h: &Home| {
+            h.rig
+                .agent
+                .notices
+                .iter()
+                .filter(|n| n.as_str() == "fixture is shown in place: it could not be hidden")
+                .count()
+        };
+        assert_eq!(said(&h), 1, "{:?}", h.rig.agent.notices);
+        assert!(
+            !h.rig.agent.notices.iter().any(|n| n.contains("ended")),
+            "{:?}",
+            h.rig.agent.notices
+        );
+        assert_eq!(nonzero(&h), json!({ "e2_source_started": 1 }));
+        let shown = status_installer(&h);
+        assert_eq!(shown["peers"][0]["last_source_parking"], json!("mirror"));
+        assert_eq!(shown["recovery_pending"], json!(0));
+        // Its end puts nothing back, and that is not a failed return.
+        let before = h.rig.agent.emitted.len();
+        give_back(&mut h, 1);
+        let out = h.rig.agent.emitted[before..].to_vec();
+        assert_eq!(restores(&out), 0, "{out:?}");
+        assert!(
+            h.rig
+                .agent
+                .notices
+                .iter()
+                .any(|n| n.contains("projection 1 ended: Returned")),
+            "{:?}",
+            h.rig.agent.notices
+        );
+        assert_eq!(nonzero(&h), json!({ "e2_source_started": 1 }));
+        assert_eq!(status_installer(&h)["recovery_pending"], json!(0));
+        assert_eq!(said(&h), 1);
     }
 
     #[test]
