@@ -39,6 +39,11 @@ pub(crate) struct SetupLog {
 
 /// Appends one line to the process's setup log. Never panics, returns nothing and never retries.
 pub(crate) fn note(args: std::fmt::Arguments<'_>) {
+    // Unit tests never write the real `%TEMP%\Crosspane\setup.log`.
+    if cfg!(test) {
+        let _ = args;
+        return;
+    }
     let Some(_entry) = Entry::enter() else {
         return;
     };

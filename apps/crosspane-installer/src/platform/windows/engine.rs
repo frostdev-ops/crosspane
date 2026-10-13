@@ -43,6 +43,8 @@ use windows_sys::Win32::{
 const AGENT_WAIT: Duration = Duration::from_secs(45);
 /// The longest silence between two progress lines while waiting.
 const HEARTBEAT: Duration = Duration::from_secs(15);
+/// How long a running supervisor's agent has to answer before it counts as hung.
+const HUNG_PROBE: Duration = Duration::from_secs(10);
 /// How long the sign-in task has to start the supervisor before it is started directly.
 const SUPERVISOR_WAIT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(250);
@@ -289,17 +291,58 @@ impl ConvergeReport {
     }
 }
 
-/// lock → sources → plan → [stop] → `legacy::clean` → `files::place` → task (if !Healthy || route
-/// != Install) → `shell::ensure` → elevated per policy → start (`task::run`, fallback direct
-/// spawn) → wait ≤45 s → `state::write` (only if `files_ok && task_ok`) → `legacy::prune(5)`.
-/// Idempotent; reads no prior state.
+/// Moves this process out of the install folder if its current directory is in it. A process
+/// whose current directory is the program folder (the Start menu's "Crosspane Setup" shortcut used
+/// to start there) keeps Windows from deleting or renaming that folder, and the operation would
+/// report the program files as left behind forever. Best effort: a failure is only logged.
+fn leave_install_dir(paths: &Paths) {
+    let inside = match std::env::current_dir() {
+        Ok(dir) => paths::is_under(&dir, &paths.install),
+        // Unknown, and moving is harmless.
+        Err(_) => true,
+    };
+    if !inside {
+        return;
+    }
+    let candidates = exit_candidates(
+        paths,
+        std::env::var_os("SystemRoot").map(PathBuf::from),
+        std::env::temp_dir(),
+    );
+    for dir in candidates {
+        if fs::create_dir_all(&dir).is_ok() && std::env::set_current_dir(&dir).is_ok() {
+            setup_note!("moved this process out of the program folder");
+            return;
+        }
+    }
+    setup_note!("couldn't move this process out of the program folder");
+}
+
+/// The folders to move to, best first, none inside the install folder. Folders that an operation
+/// may delete itself come last: the state folder goes away with "Also remove settings and
+/// pairings", and a process standing in a folder keeps it from being deleted.
+fn exit_candidates(paths: &Paths, system_root: Option<PathBuf>, temp: PathBuf) -> Vec<PathBuf> {
+    system_root
+        .into_iter()
+        .chain([temp, paths.state.clone()])
+        .filter(|dir| !paths::is_under(dir, &paths.install))
+        .collect()
+}
+
+/// leave the install folder → lock → sources → plan → [stop] → `legacy::clean` → `files::place` →
+/// task (if !Healthy || route != Install) → `shell::ensure` → elevated per policy →
+/// `state::write` (only if `files_ok && task_ok`) → `legacy::prune(5)` → unlock → start
+/// (`task::run`, fallback direct spawn) → wait ≤45 s.
+/// Idempotent; reads no prior state. The lock is released before the start: starting changes no
+/// files, and the supervisor gives up on an agent that fails while the lock exists.
 pub(crate) fn converge(
     paths: &Paths,
     inventory: &Inventory,
     options: &ConvergeOptions,
     progress: &dyn Progress,
 ) -> SetupResult<ConvergeReport> {
-    let _lock = OperationLock::acquire()?;
+    leave_install_dir(paths);
+    let lock = OperationLock::acquire()?;
     let route = options.route;
     let payload = payload_of(options);
     let sources = files::sources(payload.as_deref(), inventory)?;
@@ -408,18 +451,23 @@ pub(crate) fn converge(
     // Crosspane is started whenever the sign-in task is right and the two programs that run (the
     // agent and the supervisor, which is this installer) match their approved files. A damaged
     // file that can't be restored here (the interface, say) must not leave Crosspane stopped.
+    let start_wanted = task_ok && file_ok(PayloadFile::Agent) && file_ok(PayloadFile::Installer);
+    if files_ok && task_ok {
+        write_state(paths, inventory, &states, &mut lines);
+    }
+    legacy::prune(paths, BACKUPS_KEPT);
+
+    // Everything that changes files is done. Starting changes none, so the lock is released here:
+    // the supervisor sees the lock as a setup replacing files and would give up on an agent whose
+    // first start fails, while this waits for it.
+    drop(lock);
     let mut agent_answering = false;
-    if task_ok && file_ok(PayloadFile::Agent) && file_ok(PayloadFile::Installer) {
+    if start_wanted {
         agent_answering = start_inner(paths, progress);
         if !agent_answering {
             lines.push(text::NOT_STARTED_YET.to_owned());
         }
     }
-    if files_ok && task_ok {
-        write_state(paths, inventory, &states, &mut lines);
-    }
-
-    legacy::prune(paths, BACKUPS_KEPT);
 
     let mut report = ConvergeReport {
         files_ok,
@@ -457,7 +505,8 @@ fn estimated_kb(inventory: &Inventory) -> u32 {
     u32::try_from(bytes / 1024).unwrap_or(u32::MAX)
 }
 
-/// `installed.json`: informational only, written last. A failure is a line, never a stop.
+/// `installed.json`: informational only, written after the files and the task are settled. A
+/// failure is a line, never a stop.
 fn write_state(
     paths: &Paths,
     inventory: &Inventory,
@@ -573,24 +622,53 @@ fn outcome_name(outcome: &ElevatedOutcome) -> &'static str {
     }
 }
 
-/// Lock; if `!supervisor::running()`: `task::run` (fallback spawn); wait ≤45 s.
+/// Refuses while another setup is working; then `start_inner`: if `!supervisor::running()`:
+/// `task::run` (fallback spawn); wait ≤45 s. The lock is held only for the check, never for the
+/// start or the wait: starting changes no files, and the supervisor gives up on a failing agent
+/// while the lock exists.
 pub(crate) fn start(paths: &Paths, progress: &dyn Progress) -> SetupResult<bool> {
-    let _lock = OperationLock::acquire()?;
-    if !paths.file(PayloadFile::Agent).is_file() {
+    let lock = OperationLock::acquire()?;
+    let installed = paths.file(PayloadFile::Agent).is_file();
+    drop(lock);
+    if !installed {
         return Err(SetupError::before(text::NOT_INSTALLED));
     }
     Ok(start_inner(paths, progress))
 }
 
-/// Starts the sign-in supervisor unless one already runs, then waits for the agent to answer.
-/// The caller holds the operation lock.
+/// Starts the sign-in supervisor, then waits for the agent to answer. A supervisor that already
+/// runs is left alone when the agent answers within `HUNG_PROBE`; otherwise the agent is hung, and
+/// everything is stopped (under the operation lock) and started again.
+///
+/// The caller must not hold the operation lock: the supervisor treats it as a setup replacing
+/// files and gives up on an agent that fails, so it is taken here only around the stop.
 fn start_inner(paths: &Paths, progress: &dyn Progress) -> bool {
     if supervisor::running() {
         setup_note!("start: the supervisor is already running");
-    } else {
-        progress.step("Starting Crosspane…");
-        launch_supervisor(paths);
+        progress.step("Checking that Crosspane answers…");
+        if agent_pipe::wait_until_answering(paths, HUNG_PROBE).is_some() {
+            return true;
+        }
+        setup_note!("start: the agent doesn't answer, so it is stopped and started again");
+        match OperationLock::acquire() {
+            Ok(lock) => {
+                let stopped = stop::stop_all(paths, progress);
+                drop(lock);
+                setup_note!(
+                    "start: stop graceful={} remaining={}",
+                    stopped.graceful,
+                    stopped.remaining.len()
+                );
+            }
+            Err(error) => {
+                // Another setup is working on Crosspane and starts it itself when it is done.
+                setup_note!("start: not restarting the agent: {}", error.text);
+                return wait_for_agent(paths, progress);
+            }
+        }
     }
+    progress.step("Starting Crosspane…");
+    launch_supervisor(paths);
     wait_for_agent(paths, progress)
 }
 
@@ -740,15 +818,16 @@ const KEY_NOT_ERASED: &str = "Your settings were removed but the sign-in key cou
 const ADMIN_NOT_CHECKED: &str =
     "The firewall rule and display driver can't be checked right now, so they stay as they are.";
 
-/// lock → stop → `task::delete` → [teardown] → [erase-identity if `remove_settings`] →
-/// `shell::remove` → remove the install dir (move our own exe to backups or temp first) → [remove
-/// the state and config dirs].
+/// leave the install folder → lock → stop → `task::delete` → [teardown] → [erase-identity if
+/// `remove_settings`] → `shell::remove` → remove the install dir (move our own exe to backups or
+/// temp first) → [remove the state and config dirs].
 pub(crate) fn uninstall(
     paths: &Paths,
     inventory: &Inventory,
     options: &UninstallOptions,
     progress: &dyn Progress,
 ) -> SetupResult<UninstallReport> {
+    leave_install_dir(paths);
     let _lock = OperationLock::acquire()?;
     let mut left: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -1357,6 +1436,38 @@ mod tests {
         assert!(!is_crosspane_dir(Path::new(r"C:\Users\x\AppData\Local")));
         assert!(!is_crosspane_dir(Path::new(r"C:\")));
         assert!(!is_crosspane_dir(Path::new(r"C:\Users\x\Crosspane-old")));
+    }
+
+    fn sample_paths() -> Paths {
+        Paths::at(
+            Path::new(r"C:\Users\test\AppData\Local"),
+            Path::new(r"C:\Users\test\AppData\Roaming"),
+            Path::new(r"C:\Users\test\AppData\Local\Temp"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_folders_to_move_to_are_outside_the_program_folder_and_the_state_folder_is_last() {
+        let paths = sample_paths();
+        let temp = PathBuf::from(r"C:\Users\test\AppData\Local\Temp");
+        let windows = PathBuf::from(r"C:\WINDOWS");
+        assert_eq!(
+            exit_candidates(&paths, Some(windows.clone()), temp.clone()),
+            vec![windows, temp.clone(), paths.state.clone()]
+        );
+        // No system folder known: the others still work.
+        assert_eq!(
+            exit_candidates(&paths, None, temp.clone()),
+            vec![temp, paths.state.clone()]
+        );
+        // Nothing inside the program folder is ever offered, however it is spelled.
+        let inside = PathBuf::from(r"\\?\c:\users\TEST\appdata\local\programs\crosspane\sub");
+        let candidates = exit_candidates(&paths, Some(inside.clone()), inside);
+        assert_eq!(candidates, vec![paths.state.clone()]);
+        for dir in candidates {
+            assert!(!paths::is_under(&dir, &paths.install));
+        }
     }
 
     #[test]

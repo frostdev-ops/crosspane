@@ -1,7 +1,6 @@
 //! The headless command line (L14): argument routing and the CLI runner on the shared engine.
 
 use super::{
-    elevated::ElevatedOutcome,
     engine::{
         self, ConvergeOptions, ConvergeReport, ElevatedPolicy, Progress, Route, UninstallOptions,
         UninstallReport, text,
@@ -351,19 +350,11 @@ fn converge_command(options: ConvergeOptions) -> i32 {
     }
 }
 
+/// Prints what the converge did, then `ok` or `failed: …`. The administrator step's outcome is
+/// already one of `report.lines` (the engine adds it), so it is not repeated here.
 fn finish_converge(report: &ConvergeReport) -> i32 {
     for line in &report.lines {
         out(line);
-    }
-    match &report.elevated {
-        ElevatedOutcome::Declined => out(
-            "Windows administrator approval wasn't given, so the firewall rule and display \
-             driver weren't set up. Run this again to finish them.",
-        ),
-        ElevatedOutcome::Failed(why) => out(&format!(
-            "The firewall rule and display driver weren't set up: {why}"
-        )),
-        ElevatedOutcome::NotNeeded | ElevatedOutcome::Configured(_) => {}
     }
     if report.ok() {
         out("ok");

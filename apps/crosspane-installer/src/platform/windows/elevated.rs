@@ -135,7 +135,9 @@ pub(crate) fn observe(
 }
 
 /// firewall ∈ {Missing, Mismatch} || driver ∈ {Absent, PackageOnly, DeviceWithoutDriver}. A state
-/// that couldn't be read is not a reason to ask for administrator approval.
+/// that couldn't be read is not a reason to ask for administrator approval. A driver `Mismatch`
+/// isn't either: the helper's `setup` refuses it (`plan_install` returns `Mismatch` for every
+/// shape `driver_state` calls `Mismatch`), so asking would only repeat a refused prompt.
 pub(crate) fn setup_needed(report: &StatusReport) -> bool {
     matches!(
         report.firewall.state,

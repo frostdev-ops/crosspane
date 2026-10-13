@@ -2,7 +2,7 @@
 
 use super::{
     error::{SetupError, SetupResult, note_io},
-    paths::{Paths, PayloadFile, same_path},
+    paths::{Paths, PayloadFile, is_under, same_path},
     setup_log::setup_note,
 };
 use std::{
@@ -124,6 +124,7 @@ struct LinkSpec {
     /// Empty = none.
     arguments: &'static str,
     description: &'static str,
+    /// The folder the program starts in. Empty = none.
     working_dir: String,
 }
 
@@ -135,7 +136,13 @@ impl LinkSpec {
 }
 
 fn link_specs(paths: &Paths) -> [LinkSpec; 2] {
-    let working_dir = plain(&paths.install);
+    link_specs_in(paths, &profile_dir(paths))
+}
+
+/// `setup_dir` is where the setup shortcut starts. It must never be the program folder: a setup
+/// that started there could not delete that folder when it uninstalls Crosspane. The interface
+/// shortcut keeps the program folder, because that program is stopped before the folder goes.
+fn link_specs_in(paths: &Paths, setup_dir: &str) -> [LinkSpec; 2] {
     let link = |file: &str| plain(&paths.start_menu.join(file));
     [
         LinkSpec {
@@ -144,7 +151,7 @@ fn link_specs(paths: &Paths) -> [LinkSpec; 2] {
             target: plain(&paths.file(PayloadFile::Ui)),
             arguments: "",
             description: "Crosspane settings",
-            working_dir: working_dir.clone(),
+            working_dir: plain(&paths.install),
         },
         LinkSpec {
             name: LINK_SETUP.0,
@@ -152,9 +159,19 @@ fn link_specs(paths: &Paths) -> [LinkSpec; 2] {
             target: plain(&paths.file(PayloadFile::Installer)),
             arguments: MAINTENANCE_ARGUMENT,
             description: "Repair or uninstall Crosspane",
-            working_dir,
+            working_dir: setup_dir.to_owned(),
         },
     ]
+}
+
+/// The user's profile folder, for the setup shortcut to start in. Empty (no working directory)
+/// when it is unknown, not a full path, or somehow inside the program folder.
+fn profile_dir(paths: &Paths) -> String {
+    std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_absolute() && !is_under(dir, &paths.install))
+        .map(|dir| plain(&dir))
+        .unwrap_or_default()
 }
 
 fn ensure_links(paths: &Paths) -> SetupResult<()> {
@@ -230,7 +247,9 @@ fn write_link(spec: &LinkSpec) -> windows::core::Result<()> {
     unsafe {
         shell_link.SetPath(PCWSTR(target.as_ptr()))?;
         shell_link.SetDescription(PCWSTR(description.as_ptr()))?;
-        shell_link.SetWorkingDirectory(PCWSTR(working_dir.as_ptr()))?;
+        if !spec.working_dir.is_empty() {
+            shell_link.SetWorkingDirectory(PCWSTR(working_dir.as_ptr()))?;
+        }
         if !spec.arguments.is_empty() {
             shell_link.SetArguments(PCWSTR(arguments.as_ptr()))?;
         }
@@ -597,7 +616,7 @@ mod tests {
 
     #[test]
     fn shortcuts_point_at_the_installed_files() {
-        let [app, setup] = link_specs(&paths());
+        let [app, setup] = link_specs_in(&paths(), r"C:\Users\test");
         let install = r"C:\Users\test\AppData\Local\Programs\Crosspane";
         let folder =
             r"C:\Users\test\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Crosspane";
@@ -612,7 +631,23 @@ mod tests {
         assert_eq!(setup.icon(), setup.target);
         assert_eq!(setup.arguments, "--maintenance");
         assert_eq!(setup.description, "Repair or uninstall Crosspane");
-        assert_eq!(setup.working_dir, install);
+        // Setup must not start in the folder it may have to delete.
+        assert_eq!(setup.working_dir, r"C:\Users\test");
+        assert!(!is_under(Path::new(&setup.working_dir), &paths().install));
+    }
+
+    #[test]
+    fn the_setup_shortcut_never_starts_in_the_program_folder() {
+        for spec in link_specs(&paths()) {
+            if spec.name == LINK_SETUP.0 {
+                assert!(
+                    spec.working_dir.is_empty()
+                        || !is_under(Path::new(&spec.working_dir), &paths().install),
+                    "{}",
+                    spec.working_dir
+                );
+            }
+        }
     }
 
     #[test]

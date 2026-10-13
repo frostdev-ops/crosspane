@@ -11,21 +11,27 @@
 //! - no inherited handles and no standard handles (the release agent is a GUI program);
 //! - the install folder as the current directory, `NORMAL_PRIORITY_CLASS` and no console window.
 //!   Never `CREATE_BREAKAWAY_FROM_JOB`: the agent's self-restart must stay inside the job.
+//!
+//! What the supervisor watches: only processes whose image is the installed agent. The agent also
+//! starts the settings window (`crosspane-ui.exe`) into the same job; that window's exit says
+//! nothing about whether the agent should run, so it is not tracked and its handle is not held.
+//! A restart decision is taken when the last agent process has ended, not when the job is empty.
 
 use std::{
     collections::VecDeque,
     ffi::{OsStr, OsString, c_void},
     os::windows::{
-        ffi::OsStrExt,
+        ffi::{OsStrExt, OsStringExt},
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use windows_sys::Win32::{
     Foundation::{
         ERROR_ALREADY_EXISTS, FILETIME, GetLastError, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     },
     System::{
         IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED},
@@ -35,12 +41,16 @@ use windows_sys::Win32::{
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
             JobObjectExtendedLimitInformation, SetInformationJobObject,
         },
-        SystemServices::{JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, JOB_OBJECT_MSG_NEW_PROCESS},
+        SystemServices::{
+            JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS, JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO,
+            JOB_OBJECT_MSG_EXIT_PROCESS, JOB_OBJECT_MSG_NEW_PROCESS,
+        },
         Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateMutexW,
             CreateProcessW, GetExitCodeProcess, GetProcessTimes, INFINITE, NORMAL_PRIORITY_CLASS,
-            OpenProcess, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-            PROCESS_SYNCHRONIZE, ResumeThread, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+            OpenProcess, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
+            ResumeThread, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
         },
     },
 };
@@ -48,7 +58,7 @@ use windows_sys::Win32::{
 use super::{
     error::note_io,
     lock::{OPERATION_MUTEX, mutex_exists},
-    paths::{Paths, PayloadFile},
+    paths::{Paths, PayloadFile, same_path},
     setup_log::setup_note,
 };
 
@@ -66,6 +76,12 @@ const BACKOFF_SECS: [u64; 6] = [1, 2, 4, 8, 16, 30];
 const JOB_KEY: usize = 0x5350_5356;
 /// How long to wait for an already-ended process to report its exit status.
 const EXIT_STATUS_WAIT_MS: u32 = 2_000;
+/// How long an agent's clean exit waits for a replacement agent to join the job before it counts
+/// as the user quitting. The agent starts its replacement into the job before it exits, so the
+/// replacement is normally known already; this only covers a late job message.
+const REPLACEMENT_GRACE: Duration = Duration::from_secs(2);
+/// How long the job-empty fallback gives each held agent to report that it has ended.
+const EMPTY_JOB_WAIT_MS: u32 = 100;
 
 /// Exactly one argument, and it is the flag or its alias.
 pub fn is_supervisor(arguments: &[OsString]) -> bool {
@@ -74,9 +90,11 @@ pub fn is_supervisor(arguments: &[OsString]) -> bool {
 
 /// Mutex (a second instance → 0); job `KILL_ON_JOB_CLOSE` + completion port associated BEFORE the
 /// first assign; `CreateProcessW(agent, CREATE_SUSPENDED | NORMAL_PRIORITY_CLASS, cwd install)` →
-/// assign → resume; handles opened on `JOB_OBJECT_MSG_NEW_PROCESS`; on `ACTIVE_PROCESS_ZERO` the
-/// exit code of the held handle with the latest `ExitTime` decides via `RestartPolicy`. Logs via
-/// `setup_note!`. Returns the process exit code.
+/// assign → resume; on `JOB_OBJECT_MSG_NEW_PROCESS` a handle is opened and kept only for a process
+/// whose image is the agent (the settings window and anything else in the job are ignored). When
+/// the last held agent has ended (`EXIT_PROCESS`, `ABNORMAL_EXIT_PROCESS`, or `ACTIVE_PROCESS_ZERO`
+/// as the fallback), the exit code of the one with the latest `ExitTime` decides via
+/// `RestartPolicy`. Logs via `setup_note!`. Returns the process exit code.
 pub fn run() -> i32 {
     let _instance = match Instance::acquire() {
         Instance::First(held) => held,
@@ -174,6 +192,35 @@ fn latest_exit(exits: impl IntoIterator<Item = (u64, u32)>) -> Option<u32> {
         .into_iter()
         .max_by_key(|&(time, code)| (time, code != 0))
         .map(|(_, code)| code)
+}
+
+/// How a held agent process stands when a job message makes the supervisor look at it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Standing {
+    Running,
+    /// Ended; `(exit time, exit code)` when they could be read.
+    Ended(Option<(u64, u32)>),
+}
+
+/// `None` while any agent process still runs. Otherwise every agent has ended, and this is
+/// `Some(exit code of the one that ended last)`; the inner `None` means no exit code could be read
+/// (which includes there being no agent process at all).
+fn settled(standings: impl IntoIterator<Item = Standing>) -> Option<Option<u32>> {
+    let mut exits = Vec::new();
+    for standing in standings {
+        match standing {
+            Standing::Running => return None,
+            Standing::Ended(facts) => exits.extend(facts),
+        }
+    }
+    Some(latest_exit(exits))
+}
+
+/// Whether a process that joined the job is tracked as an agent. `image` is its image path. A path
+/// that could not be read counts as the agent: wrongly dropping a replacement agent would end it
+/// with the supervisor, while wrongly keeping another process only delays a restart decision.
+fn is_agent_image(image: Option<&Path>, agent: &Path) -> bool {
+    image.is_none_or(|image| same_path(image, agent))
 }
 
 /// The single-instance mutex of this sign-in session.
@@ -275,7 +322,7 @@ impl Job {
     }
 }
 
-/// A process of the job whose exit status the supervisor keeps.
+/// An agent process of the job whose exit status the supervisor keeps.
 #[derive(Debug)]
 struct Member {
     pid: u32,
@@ -287,13 +334,14 @@ struct Member {
 enum Spawn {
     /// The agent runs inside the job.
     Running(Member),
-    /// The agent joined the job but could not be resumed and was ended; the job will report empty.
+    /// The agent joined the job but could not be resumed and was ended; its exit will be reported.
     Ended(Member),
     /// No process was left in the job.
     Failed,
 }
 
-/// Starts the agent, waits for the job to empty, decides, and repeats. Returns the exit code.
+/// Starts the agent, waits until no agent process is left, decides, and repeats. Returns the exit
+/// code. Other processes in the job (the settings window) neither delay nor trigger a decision.
 fn supervise(job: &Job, agent: &Path, directory: &Path, policy: &mut RestartPolicy) -> i32 {
     loop {
         let mut members = Vec::new();
@@ -312,7 +360,7 @@ fn supervise(job: &Job, agent: &Path, directory: &Path, policy: &mut RestartPoli
                 false
             }
         };
-        if waiting && let Err(code) = wait_until_empty(job, &mut members) {
+        if waiting && let Err(code) = wait_until_agents_end(job, agent, &mut members) {
             return code;
         }
         let last_exit = latest_exit(members.iter().filter_map(|member| {
@@ -327,7 +375,9 @@ fn supervise(job: &Job, agent: &Path, directory: &Path, policy: &mut RestartPoli
         members.clear();
         let busy = mutex_exists(OPERATION_MUTEX);
         let next = policy.on_empty(Instant::now(), last_exit, busy);
-        setup_note!("supervisor: job empty last_exit={last_exit:?} installer_busy={busy} {next:?}");
+        setup_note!(
+            "supervisor: agent ended last_exit={last_exit:?} installer_busy={busy} {next:?}"
+        );
         match next {
             Next::Exit(code) => return code,
             Next::RestartAfter(delay) => std::thread::sleep(delay),
@@ -431,57 +481,145 @@ fn end_child(process: &OwnedHandle) {
     let _ = unsafe { WaitForSingleObject(process.as_raw_handle(), 5_000) };
 }
 
-/// Reads job messages until the job has no active process. Every process that joins the job (the
-/// agent's own restart child among them) is opened so its exit status can be read at the end.
-/// `Err` carries the supervisor's exit code when the wait itself fails.
-fn wait_until_empty(job: &Job, members: &mut Vec<Member>) -> Result<(), i32> {
-    loop {
-        let mut message = 0u32;
-        let mut key = 0usize;
-        let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
-        // SAFETY: `port` is our live completion port, and the three outputs point to writable
-        // locals. Job messages carry the message id as the byte count and, for process messages,
-        // the process id in the overlapped pointer value; the pointer is never dereferenced.
-        let dequeued = unsafe {
-            GetQueuedCompletionStatus(
-                job.port.as_raw_handle(),
-                &mut message,
-                &mut key,
-                &mut overlapped,
-                INFINITE,
-            )
+/// What reading the job's completion port produced.
+#[derive(Debug)]
+enum Dequeued {
+    /// A job message: its id and the process id it carries (meaningful for process messages).
+    Message { id: u32, pid: u32 },
+    /// A packet that is not a job message of ours, or a failed I/O packet.
+    Ignored,
+    /// The wait ran out with nothing queued.
+    TimedOut,
+    /// The wait itself failed.
+    Failed(std::io::Error),
+}
+
+/// Reads one packet from the job's completion port, waiting at most `timeout_ms`.
+fn dequeue(job: &Job, timeout_ms: u32) -> Dequeued {
+    let mut message = 0u32;
+    let mut key = 0usize;
+    let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
+    // SAFETY: `port` is our live completion port, and the three outputs point to writable
+    // locals. Job messages carry the message id as the byte count and, for process messages,
+    // the process id in the overlapped pointer value; the pointer is never dereferenced.
+    let dequeued = unsafe {
+        GetQueuedCompletionStatus(
+            job.port.as_raw_handle(),
+            &mut message,
+            &mut key,
+            &mut overlapped,
+            timeout_ms,
+        )
+    };
+    if dequeued == 0 {
+        if !overlapped.is_null() {
+            return Dequeued::Ignored;
+        }
+        let error = std::io::Error::last_os_error();
+        let code = error
+            .raw_os_error()
+            .and_then(|code| u32::try_from(code).ok());
+        return if code == Some(WAIT_TIMEOUT) {
+            Dequeued::TimedOut
+        } else {
+            Dequeued::Failed(error)
         };
-        if dequeued == 0 {
-            if overlapped.is_null() {
-                note_io(
-                    "supervisor: wait for the job",
-                    &std::io::Error::last_os_error(),
-                );
-                return Err(1);
-            }
-            continue;
-        }
-        if key != JOB_KEY {
-            continue;
-        }
-        match message {
-            JOB_OBJECT_MSG_NEW_PROCESS => {
-                if let Ok(pid) = u32::try_from(overlapped.addr()) {
-                    adopt(job, members, pid);
-                }
-            }
-            JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO => return Ok(()),
-            _ => {}
-        }
+    }
+    if key != JOB_KEY {
+        return Dequeued::Ignored;
+    }
+    Dequeued::Message {
+        id: message,
+        pid: u32::try_from(overlapped.addr()).unwrap_or(0),
     }
 }
 
-/// Opens a process that joined the job so its exit status can be read later. A process whose
-/// handle the supervisor already holds, or that is not in the job (a reused process id), is
-/// skipped.
-fn adopt(job: &Job, members: &mut Vec<Member>, pid: u32) {
-    if pid == 0 || members.iter().any(|member| member.pid == pid) {
-        return;
+/// Reads job messages until no agent process is left, holding a handle to each agent that joins
+/// the job (the agent's own restart child among them) and to nothing else. A decision is due when
+/// the last held agent has ended: on its `EXIT_PROCESS` / `ABNORMAL_EXIT_PROCESS` message, or, as a
+/// fallback, on `ACTIVE_PROCESS_ZERO`.
+///
+/// The agent restarts itself by starting a replacement into the job and then exiting 0. The job's
+/// messages arrive in order, so the replacement's `NEW_PROCESS` is handled (and the replacement
+/// held and running) before the old agent's exit is. As a safeguard, a clean exit with no agent
+/// left waits `REPLACEMENT_GRACE` for another agent to join before it counts as the user quitting.
+///
+/// `Err` carries the supervisor's exit code when the wait itself fails.
+fn wait_until_agents_end(job: &Job, agent: &Path, members: &mut Vec<Member>) -> Result<(), i32> {
+    // Set while a clean exit waits to see whether a replacement agent joins.
+    let mut grace_ends: Option<Instant> = None;
+    loop {
+        let timeout_ms = grace_ends.map_or(INFINITE, |end| {
+            let left = end.saturating_duration_since(Instant::now());
+            u32::try_from(left.as_millis()).unwrap_or(u32::MAX)
+        });
+        let (id, pid) = match dequeue(job, timeout_ms) {
+            Dequeued::Message { id, pid } => (id, pid),
+            Dequeued::Ignored => continue,
+            // Only a running grace period has a timeout, and nothing replaced the agent in it.
+            Dequeued::TimedOut => return Ok(()),
+            Dequeued::Failed(error) => {
+                note_io("supervisor: wait for the job", &error);
+                return Err(1);
+            }
+        };
+        match id {
+            JOB_OBJECT_MSG_NEW_PROCESS => {
+                if adopt(job, agent, members, pid) == Joined::Agent {
+                    grace_ends = None;
+                }
+                continue;
+            }
+            // Only the end of a held agent can settle anything; other processes are not tracked.
+            JOB_OBJECT_MSG_EXIT_PROCESS | JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS
+                if members.iter().any(|member| member.pid == pid) => {}
+            // The fallback: the job has no process left. A packet from an earlier cycle can arrive
+            // late; the held agents tell it apart, because one of them is still running then.
+            JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO => {}
+            _ => continue,
+        }
+        let job_empty = id == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO;
+        let Some(last_exit) = settled(members.iter().map(|member| {
+            // The process the job just reported may be a moment from signalling its handle.
+            let patience_ms = if job_empty {
+                EMPTY_JOB_WAIT_MS
+            } else if member.pid == pid {
+                EXIT_STATUS_WAIT_MS
+            } else {
+                0
+            };
+            standing(member, patience_ms)
+        })) else {
+            continue;
+        };
+        if last_exit == Some(0) && !job_empty {
+            // A clean exit is the user quitting, unless the agent's replacement is still on its way.
+            grace_ends.get_or_insert_with(|| Instant::now() + REPLACEMENT_GRACE);
+            continue;
+        }
+        return Ok(());
+    }
+}
+
+/// What came of a process that joined the job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Joined {
+    /// An agent process, now held.
+    Agent,
+    /// A process whose handle is already held (the agent this supervisor started).
+    Held,
+    /// Not tracked: not the agent, not in the job (a reused process id), or already gone.
+    Other,
+}
+
+/// Opens a process that joined the job and keeps it only if its image is the agent, so its exit
+/// status can be read later. Any other process (the settings window) is closed again.
+fn adopt(job: &Job, agent: &Path, members: &mut Vec<Member>, pid: u32) -> Joined {
+    if pid == 0 {
+        return Joined::Other;
+    }
+    if members.iter().any(|member| member.pid == pid) {
+        return Joined::Held;
     }
     // SAFETY: OpenProcess takes plain values and returns a new handle or null; only
     // synchronise and limited-query rights are requested, never terminate.
@@ -497,7 +635,7 @@ fn adopt(job: &Job, members: &mut Vec<Member>, pid: u32) {
             "supervisor: open a job process",
             &std::io::Error::last_os_error(),
         );
-        return;
+        return Joined::Other;
     }
     // SAFETY: OpenProcess returned a new handle that only this function owns.
     let process = unsafe { OwnedHandle::from_raw_handle(raw) };
@@ -512,10 +650,57 @@ fn adopt(job: &Job, members: &mut Vec<Member>, pid: u32) {
     };
     if known == 0 || inside == 0 {
         setup_note!("supervisor: pid={pid} is not in the job; ignoring it");
-        return;
+        return Joined::Other;
+    }
+    let image = image_path(&process);
+    if !is_agent_image(image.as_deref(), agent) {
+        setup_note!(
+            "supervisor: pid={pid} joined the job; it is not the agent, so it is not tracked"
+        );
+        return Joined::Other;
+    }
+    if image.is_none() {
+        setup_note!("supervisor: pid={pid} has no readable image path; tracking it as the agent");
     }
     setup_note!("supervisor: pid={pid} joined the job");
     members.push(Member { pid, process });
+    Joined::Agent
+}
+
+/// The Win32 path of the program a process runs; `None` when it cannot be read.
+fn image_path(process: &OwnedHandle) -> Option<PathBuf> {
+    // A Win32 path is at most 32 767 UTF-16 units.
+    let mut buffer = vec![0u16; 32_768];
+    let mut length = u32::try_from(buffer.len()).ok()?;
+    // SAFETY: the handle is live with limited-query rights; `buffer` holds `length` writable
+    // units, and `length` is the writable in/out size.
+    let read = unsafe {
+        QueryFullProcessImageNameW(
+            process.as_raw_handle(),
+            PROCESS_NAME_WIN32,
+            buffer.as_mut_ptr(),
+            &mut length,
+        )
+    };
+    if read == 0 {
+        return None;
+    }
+    buffer.truncate(usize::try_from(length).ok()?);
+    Some(PathBuf::from(OsString::from_wide(&buffer)))
+}
+
+/// Looks at a held agent process: still running, or ended with whatever exit status can be read.
+/// `patience_ms` is how long to wait for a process the job has just reported as ended to signal
+/// its handle.
+fn standing(member: &Member, patience_ms: u32) -> Standing {
+    // SAFETY: waits, for a bounded time, on a live handle that has synchronise rights.
+    match unsafe { WaitForSingleObject(member.process.as_raw_handle(), patience_ms) } {
+        WAIT_OBJECT_0 => Standing::Ended(exit_facts(&member.process)),
+        WAIT_TIMEOUT => Standing::Running,
+        // The wait itself failed: count the process as ended, with nothing readable, rather than
+        // wait on it forever.
+        _ => Standing::Ended(None),
+    }
 }
 
 /// `(exit time, exit code)` of a process that has ended; `None` if it has not, or cannot be read.
@@ -673,6 +858,69 @@ mod tests {
     #[test]
     fn no_exits_means_no_exit_code() {
         assert_eq!(latest_exit([]), None);
+    }
+
+    #[test]
+    fn a_running_agent_keeps_the_decision_open() {
+        use Standing::{Ended, Running};
+        assert_eq!(settled([Running]), None);
+        assert_eq!(settled([Ended(Some((10, 1))), Running]), None);
+        assert_eq!(settled([Running, Ended(Some((10, 0)))]), None);
+        assert_eq!(settled([Ended(None), Running]), None);
+    }
+
+    #[test]
+    fn the_last_agent_to_end_settles_with_the_latest_exit() {
+        use Standing::Ended;
+        // The agent restarts itself: the parent leaves with 0, the replacement later fails.
+        assert_eq!(
+            settled([Ended(Some((10, 0))), Ended(Some((20, 1)))]),
+            Some(Some(1))
+        );
+        // The replacement was the user's clean quit.
+        assert_eq!(
+            settled([Ended(Some((10, 1))), Ended(Some((20, 0)))]),
+            Some(Some(0))
+        );
+        assert_eq!(settled([Ended(Some((7, 3)))]), Some(Some(3)));
+    }
+
+    #[test]
+    fn unreadable_exits_do_not_hold_the_decision_or_outvote_readable_ones() {
+        use Standing::Ended;
+        assert_eq!(settled([Ended(None)]), Some(None));
+        assert_eq!(settled([Ended(None), Ended(Some((5, 2)))]), Some(Some(2)));
+        assert_eq!(settled([]), Some(None));
+    }
+
+    #[test]
+    fn only_the_installed_agent_image_is_tracked() {
+        let agent = Path::new(r"X:\no\such\folder\Programs\Crosspane\crosspane-agent.exe");
+        assert!(is_agent_image(Some(agent), agent));
+        // The kernel's spelling of the same path: other case, extended-length prefix.
+        assert!(is_agent_image(
+            Some(Path::new(
+                r"\\?\x:\NO\such\FOLDER\programs\crosspane\CROSSPANE-AGENT.EXE"
+            )),
+            agent
+        ));
+        // The settings window the agent starts into the same job, and a same-named file elsewhere.
+        assert!(!is_agent_image(
+            Some(Path::new(
+                r"X:\no\such\folder\Programs\Crosspane\crosspane-ui.exe"
+            )),
+            agent
+        ));
+        assert!(!is_agent_image(
+            Some(Path::new(r"X:\elsewhere\crosspane-agent.exe")),
+            agent
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_image_path_is_tracked_as_the_agent() {
+        let agent = Path::new(r"X:\no\such\folder\Programs\Crosspane\crosspane-agent.exe");
+        assert!(is_agent_image(None, agent));
     }
 
     #[test]
