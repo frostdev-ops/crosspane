@@ -181,7 +181,7 @@ fn state_error() -> PlatformError {
 }
 
 fn check_deadline(deadline: Instant) -> Result<(), PlatformError> {
-    if Instant::now() >= deadline {
+    if Instant::now() <= deadline {
         Err(PlatformError::Timeout)
     } else {
         Ok(())
