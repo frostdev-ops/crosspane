@@ -95,6 +95,13 @@ function Get-PeFacts([string]$Path) {
     }
 }
 
+# The runtime host gate admits native x64 only; inspection can still read ARM64 metadata.
+function Get-X64PeFacts([string]$Path) {
+    $facts = Get-PeFacts $Path
+    if ($facts.Machine -ne 0x8664) { Stop-Stage "$Path must be an x64 image for the supported Windows target" }
+    return $facts
+}
+
 # Size and SHA-256 only, for the kit files (kit.rs pins no PE facts).
 function Get-DigestFacts([string]$Path) {
     $size = [long]((Get-Item -LiteralPath $Path).Length)
@@ -202,10 +209,11 @@ try {
     $catSource = Get-DriverFile $driverDir 'CrosspaneIdd.cat'
     $dllSource = Get-DriverFile $driverDir 'CrosspaneIdd.dll'
 
-    $agentFacts = Get-PeFacts $agentExe
-    $uiFacts = Get-PeFacts $uiExe
-    $ctlFacts = Get-PeFacts $ctlExe
-    $helperFacts = Get-PeFacts $helperExe
+    $agentFacts = Get-X64PeFacts $agentExe
+    $uiFacts = Get-X64PeFacts $uiExe
+    $ctlFacts = Get-X64PeFacts $ctlExe
+    $helperFacts = Get-X64PeFacts $helperExe
+    $null = Get-X64PeFacts $dllSource
     $infFacts = Get-DigestFacts $infSource
     $catFacts = Get-DigestFacts $catSource
     $dllFacts = Get-DigestFacts $dllSource
@@ -264,7 +272,9 @@ try {
     } finally {
         Clear-InventoryVariables
     }
-    Copy-Item -LiteralPath (Join-Path $release 'crosspane-installer.exe') -Destination (Join-Path $work 'crosspane-installer.exe')
+    $installerSource = Join-Path $release 'crosspane-installer.exe'
+    $null = Get-X64PeFacts $installerSource
+    Copy-Item -LiteralPath $installerSource -Destination (Join-Path $work 'crosspane-installer.exe')
 
     # The embedded strings must be exactly the JSON that was written. A build that ignored either
     # variable (or one that cargo left stale) fails here, not on the VM.
@@ -286,7 +296,7 @@ try {
         $found = @($approvedPins | Where-Object { $_.role -ceq $item.Role })
         if ($found.Count -ne 1) { Stop-Stage "approved-inventory.json has no single $($item.Role) entry" }
         $entry = $found[0]
-        $copy = Get-PeFacts (Join-Path $payload $item.Leaf)
+        $copy = Get-X64PeFacts (Join-Path $payload $item.Leaf)
         if ($entry.leaf -cne $item.Leaf -or [long]$entry.size -ne $copy.Size -or $entry.sha256 -cne $copy.Sha256 -or [int]$entry.machine -ne $copy.Machine -or [int]$entry.subsystem -ne $copy.Subsystem -or $entry.version -cne $version) {
             Stop-Stage "$($item.Leaf) does not match approved-inventory.json"
         }

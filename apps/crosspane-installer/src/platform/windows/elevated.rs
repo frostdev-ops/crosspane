@@ -1273,7 +1273,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("Crosspane display driver: could not be changed"),
+            text.contains("Crosspane display driver: did not finish"),
             "{text}"
         );
     }

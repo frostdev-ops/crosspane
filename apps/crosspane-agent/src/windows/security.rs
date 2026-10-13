@@ -811,6 +811,18 @@ mod tests {
     }
 
     #[test]
+    fn existing_private_directory_coexists_with_a_no_delete_pin() -> Result<()> {
+        let root = Scratch::new();
+        let pin = open_path(&root.0, false)?;
+        let user = current_identity()?.user;
+        private_dacl(pin.0, &user, true)?;
+
+        create_private_directory(&root.0)?;
+
+        private_dacl(pin.0, &user, true)
+    }
+
+    #[test]
     fn missing_components_are_private_and_pins_prevent_substitution() {
         let root = Scratch::new();
         let first = root.0.join("first");
