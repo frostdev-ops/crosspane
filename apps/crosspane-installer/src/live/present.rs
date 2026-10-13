@@ -21,6 +21,10 @@ use crate::view::{
 
 const MAX_PROGRESS_LINES: usize = 24;
 
+/// Shown after a finished uninstall by a setup that has nothing to install from (it was started
+/// from the installed copy), in place of the install button.
+const INSTALL_AGAIN_HINT: &str = "To install Crosspane again, run the installer you downloaded.";
+
 /// Rows the pairing screen draws in place of the pairing step: what it is doing right now, and
 /// the computer it found. Outside both the step and the checklist id ranges.
 const LOOKING_ROW: u16 = 950;
@@ -1002,7 +1006,14 @@ impl LiveController {
                 MaintenanceOutcome::Refused => "Uninstall wasn't started.",
                 MaintenanceOutcome::Failed => "Uninstall failed.",
             };
-            return with_lines(head, lines);
+            let text = with_lines(head, lines);
+            // Nothing of Crosspane is left to install from, and this setup can't install either:
+            // say where the way on is, instead of a button that could only fail.
+            return if *outcome == MaintenanceOutcome::Removed && !self.can_install_here {
+                format!("{text}\n\n{INSTALL_AGAIN_HINT}")
+            } else {
+                text
+            };
         }
         if let Some(why) = &m.refused {
             return why.clone();
@@ -1026,7 +1037,10 @@ impl LiveController {
             || repair.driving
             || matches!(repair.phase, RepairPhase::Running | RepairPhase::Waiting)
         {
-            let head = if m.entry == MaintenanceEntry::Uninstall {
+            // What is running decides the line, not the way this screen was entered: a Start
+            // menu visit enters through the menu whichever it goes on to do. Only an uninstall
+            // is ever confirmed here; every other running change is a repair.
+            let head = if m.confirmed {
                 "Uninstalling Crosspane…"
             } else {
                 "Repairing Crosspane…"
@@ -1043,6 +1057,10 @@ impl LiveController {
         }
         if let Some(preview) = &m.preview {
             return preview.clone();
+        }
+        // A repair review is being prepared, whichever way this screen was entered.
+        if repair.phase == RepairPhase::Planning {
+            return "Checking the repair…".into();
         }
         let mut reasons: Vec<&String> = Vec::new();
         let asked = match m.entry {
@@ -1449,8 +1467,10 @@ impl LiveController {
         self.mutation_in_flight() && !self.following_auto_window()
     }
 
+    /// The quiet "Complete reinstall" link. It copies every file again, so a setup with nothing
+    /// to install from (started from the installed copy) doesn't offer it.
     fn windows_reinstall_link(&self, buttons: &mut Vec<ButtonView>) {
-        if self.windows_entry() {
+        if self.windows_entry() && self.can_install_here {
             buttons.push(button(
                 ids::COMPLETE_REINSTALL,
                 ButtonRole::Ordinary,
@@ -1505,7 +1525,7 @@ impl LiveController {
                 !self.native_change_running(),
                 ButtonKind::Secondary,
             ));
-            if r.finished.is_some() || r.refused.is_some() {
+            if (r.finished.is_some() || r.refused.is_some()) && self.can_install_here {
                 buttons.push(button(
                     ids::COMPLETE_REINSTALL,
                     ButtonRole::Ordinary,
@@ -1808,8 +1828,10 @@ impl LiveController {
                 ));
             }
             // Nothing of Crosspane is left after a finished uninstall, so the way on is the same
-            // install the first screen's "Install or reinstall" starts.
-            if self.windows_uninstalled() {
+            // install the first screen's "Install or reinstall" starts. A setup started from the
+            // installed copy has no downloaded files to install from: the message says to run the
+            // downloaded installer instead, and no button is offered that could only fail.
+            if self.windows_uninstalled() && self.can_install_here {
                 buttons.push(button(
                     ids::NEXT,
                     ButtonRole::Next,
@@ -1863,7 +1885,7 @@ impl LiveController {
     /// Set up again after an uninstall: back at the first screen, then on from it as its
     /// "Install or reinstall" does.
     fn install_again(&mut self) {
-        if !self.windows_uninstalled() || self.windows_busy() {
+        if !self.windows_uninstalled() || !self.can_install_here || self.windows_busy() {
             return;
         }
         self.go(ScreenId::Welcome);
@@ -1910,6 +1932,7 @@ impl LiveController {
     }
 
     pub(super) fn rebuild_view(&mut self) {
+        self.can_install_here = self.platform.can_install_here();
         let screen = self.display_screen();
         let (title, message) = self.title_and_message(screen);
         let (buttons, fields) = self.buttons_and_fields(screen);
@@ -2284,7 +2307,11 @@ impl LiveController {
     }
 
     fn plan_complete_reinstall(&mut self) {
-        if !self.windows_entry() || self.reinstall.running || self.windows_busy() {
+        if !self.windows_entry()
+            || !self.can_install_here
+            || self.reinstall.running
+            || self.windows_busy()
+        {
             return;
         }
         // A distinct new review; earlier main/maintenance consent and outcomes are untouched.

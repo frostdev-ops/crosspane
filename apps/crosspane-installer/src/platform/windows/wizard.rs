@@ -248,6 +248,10 @@ struct WindowsPlatform {
     agent: Box<dyn AgentPort>,
     checks: SupportChecksSlot,
     stop: Arc<AtomicBool>,
+    /// A payload folder was resolved when setup opened (an explicit `--payload`, or the folder
+    /// beside this installer), so it has files to install from. A setup started from the
+    /// installed copy has none.
+    can_install: bool,
 }
 
 impl std::fmt::Debug for WindowsPlatform {
@@ -259,6 +263,7 @@ impl std::fmt::Debug for WindowsPlatform {
 impl WindowsPlatform {
     /// Starts the worker and the agent's pipe port. `clock` is the controller's own clock.
     fn start(payload: Option<PathBuf>, clock: Clock) -> anyhow::Result<Self> {
+        let can_install = payload.is_some();
         let (jobs, queue) = mpsc::sync_channel(JOB_QUEUE);
         let (out, reports) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -290,6 +295,7 @@ impl WindowsPlatform {
             agent,
             checks,
             stop,
+            can_install,
         })
     }
 }
@@ -334,6 +340,10 @@ impl Platform for WindowsPlatform {
 
     fn support_checks(&mut self) -> Option<SupportChecklist> {
         self.checks.latest()
+    }
+
+    fn can_install_here(&mut self) -> bool {
+        self.can_install
     }
 }
 
@@ -1784,6 +1794,22 @@ mod tests {
         ));
         // Once spent, the same consent can't run it again.
         assert!(worker.consented(&apply, Some(consent(4, 5))).is_none());
+    }
+
+    #[test]
+    fn setup_installs_here_only_with_a_payload_folder_resolved_at_open() {
+        for can_install in [true, false] {
+            let (_out, reports) = mpsc::channel::<NativeReport>();
+            let mut platform = WindowsPlatform {
+                jobs: None,
+                reports,
+                agent: Box::new(NoAgent),
+                checks: SupportChecksSlot::new(SUPPORT),
+                stop: Arc::new(AtomicBool::new(false)),
+                can_install,
+            };
+            assert_eq!(platform.can_install_here(), can_install);
+        }
     }
 
     // ---- plan numbers ---------------------------------------------------------------------

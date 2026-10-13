@@ -168,9 +168,12 @@ is kept in Windows Credential Manager, and the key-file fallback is off on Windo
   menu opens Repair and Uninstall. Uninstall keeps your settings and pairings unless you choose to
   remove them, and removes the firewall rule and display driver only if you choose that (one more
   administrator approval). The same operations run without the window, for scripts:
-  `crosspane-installer.exe --install [--complete] [--skip-admin]`, `--repair`,
+  `crosspane-installer.exe --install [--payload DIR] [--complete] [--skip-admin]`, `--repair`,
   `--uninstall [--remove-settings] [--teardown]`, and `--status`, which prints one line of JSON.
-  The exit code is 0 on success. The installer's own log is `%TEMP%\Crosspane\setup.log`.
+  `--skip-admin` installs without asking for administrator approval. The exit code is 0 on
+  success. The installer is a windowed program, so run it with `Start-Process -Wait` (PowerShell)
+  or from a batch file to wait for it and read the exit code. Its own log is
+  `%TEMP%\Crosspane\setup.log`.
 
   The agent's logs are `%LOCALAPPDATA%\Crosspane\logs\agent.log`.
   Each run starts a fresh file and moves the previous run's log to `agent.log.1` (and `agent.log.1`

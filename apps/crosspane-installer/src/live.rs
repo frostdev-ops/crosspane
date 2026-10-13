@@ -491,6 +491,13 @@ pub trait Platform {
         std::collections::BTreeSet::new()
     }
     fn save_skipped(&mut self, _steps: &std::collections::BTreeSet<StepId>) {}
+    /// Whether this setup can install Crosspane's files from where it runs. A setup started from
+    /// an installed copy has no downloaded files beside it, so an install or a complete reinstall
+    /// from there can only fail: the controller then doesn't offer them. Linux and macOS keep the
+    /// default.
+    fn can_install_here(&mut self) -> bool {
+        true
+    }
 }
 
 /// The hiding choice (D7) an agent config file proves was made: `mac_virtual_display = true` at

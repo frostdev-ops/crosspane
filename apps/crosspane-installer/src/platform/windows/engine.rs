@@ -9,7 +9,7 @@ use super::{
     error::{SetupError, SetupResult, note_io},
     files::{self, FileState, FilesOutcome, Inventory, Sources},
     legacy::{self, Backup},
-    lock::OperationLock,
+    lock::{self, OperationLock},
     paths::{self, Paths, PayloadFile},
     process,
     setup_log::setup_note,
@@ -99,12 +99,48 @@ pub(crate) struct ConvergePlan {
     pub elevated_note: Option<String>,
 }
 
+/// The decline sentence of an install preview for a firewall rule on its own: what declining
+/// leaves, in the same words as the line shown after a declined prompt.
+const DECLINE_NOTE_FIREWALL: &str = "If you decline, Crosspane is still installed, but other computers may not reach this PC until the firewall rule is added.";
+/// The same for the display driver on its own.
+const DECLINE_NOTE_DRIVER: &str = "If you decline, Crosspane is still installed and mirrors windows in place without the display driver.";
+
+/// The decline sentence that follows the administrator block of `verb`: only the half that was
+/// asked for, and the core sentence when it was both.
+fn decline_note(verb: &Verb) -> &'static str {
+    match verb {
+        Verb::AddFirewall(_) => DECLINE_NOTE_FIREWALL,
+        Verb::InstallDriver => DECLINE_NOTE_DRIVER,
+        _ => INSTALL_DECLINE_NOTE,
+    }
+}
+
+/// Whether any Crosspane program is running now: one from the install folder, or the sign-in
+/// supervisor. When the folders can't be resolved there is no telling, so it counts as running.
+fn crosspane_running() -> bool {
+    match Paths::current() {
+        Ok(paths) => {
+            !process::under(std::slice::from_ref(&paths.install)).is_empty()
+                || supervisor::running()
+        }
+        Err(_) => true,
+    }
+}
+
 impl ConvergePlan {
-    /// The preview text, plus the elevated `preview_block` and `INSTALL_DECLINE_NOTE` when needed.
+    /// The preview text, plus the elevated `preview_block` and its decline sentence when needed.
     ///
     /// The core `PREVIEW_HEADER` appears only when an administrator step is planned: that is what
-    /// keeps the wizard from approving a prompt on its own.
+    /// keeps the wizard from approving a prompt on its own. The "Stop Crosspane" line appears only
+    /// when something is running to stop, so it looks at the machine, but only when the plan would
+    /// stop Crosspane at all.
     pub(crate) fn preview(&self, route: Route) -> String {
+        let running = self.restart && crosspane_running();
+        self.preview_with(route, running)
+    }
+
+    /// `preview` for a known `running` state (whether any Crosspane program is running now).
+    fn preview_with(&self, route: Route, running: bool) -> String {
         let mut lines: Vec<String> = Vec::new();
         lines.push(
             match route {
@@ -114,7 +150,7 @@ impl ConvergePlan {
             }
             .to_owned(),
         );
-        if self.restart {
+        if self.restart && running {
             lines.push(
                 if self.copies.is_empty() {
                     "Stop Crosspane for a moment."
@@ -148,7 +184,7 @@ impl ConvergePlan {
         }
         if let Some(plan) = &self.elevated {
             lines.push(plan.preview_block());
-            lines.push(INSTALL_DECLINE_NOTE.to_owned());
+            lines.push(decline_note(plan.verb()).to_owned());
         }
         if let Some(note) = &self.elevated_note {
             lines.push(note.clone());
@@ -343,7 +379,8 @@ fn exit_candidates(paths: &Paths, system_root: Option<PathBuf>, temp: PathBuf) -
         .collect()
 }
 
-/// leave the install folder → lock → sources → plan → [stop] → `legacy::clean` → `files::place` →
+/// leave the install folder → lock → sources → plan → [refuse an install that has files it can't
+/// restore] → [stop] → `legacy::clean` → `files::place` →
 /// task (if !Healthy || route != Install) → `shell::ensure` → elevated per policy (when it
 /// installs or removes the driver) → `state::write` (only if `files_ok && task_ok`) →
 /// `legacy::prune(5)` → unlock → start (`task::run`, fallback direct spawn) → wait ≤45 s →
@@ -372,6 +409,15 @@ pub(crate) fn converge(
         plan.task,
         plan.shell
     );
+    // Before anything is stopped or changed: Crosspane would be stopped, only some of its files
+    // replaced, and never started again.
+    if refuses_install(route, &plan) {
+        setup_note!(
+            "converge: install refused, {} files cannot be restored here",
+            plan.unrestorable.len()
+        );
+        return Err(SetupError::before(text::NEEDS_DOWNLOADED_INSTALLER));
+    }
     let mut lines: Vec<String> = Vec::new();
 
     if plan.restart {
@@ -520,6 +566,14 @@ pub(crate) fn converge(
         outcome_name(&report.elevated)
     );
     Ok(report)
+}
+
+/// Whether an install is refused before it changes anything. Files that are missing or damaged
+/// can't be put back without the downloaded files, so an install that would leave some of them
+/// behind stops here instead of replacing only the rest. A repair and a complete reinstall carry
+/// on: they restore what they can and report the rest.
+fn refuses_install(route: Route, plan: &ConvergePlan) -> bool {
+    route == Route::Install && !plan.unrestorable.is_empty()
 }
 
 fn success_line(route: Route) -> &'static str {
@@ -712,7 +766,9 @@ pub(crate) fn start(paths: &Paths, progress: &dyn Progress) -> SetupResult<bool>
 
 /// Starts the sign-in supervisor, then waits for the agent to answer. A supervisor that already
 /// runs is left alone when the agent answers within `HUNG_PROBE`; otherwise the agent is hung, and
-/// everything is stopped (under the operation lock) and started again.
+/// everything is stopped (under the operation lock) and started again. While another setup holds
+/// the operation lock nothing is launched from here: that setup starts Crosspane itself, and this
+/// only waits for the agent.
 ///
 /// The caller must not hold the operation lock: the supervisor treats it as a setup replacing
 /// files and gives up on an agent that fails, so it is taken here only around the stop.
@@ -740,6 +796,12 @@ fn start_inner(paths: &Paths, progress: &dyn Progress) -> bool {
                 return wait_for_agent(paths, progress);
             }
         }
+    }
+    // The lock was dropped before this call, so another setup may have taken it since. It starts
+    // Crosspane itself when it is done; launching the supervisor now would race it.
+    if lock::mutex_exists(lock::OPERATION_MUTEX) {
+        setup_note!("start: another setup is working, so the supervisor isn't started from here");
+        return wait_for_agent(paths, progress);
     }
     progress.step("Starting Crosspane…");
     launch_supervisor(paths);
@@ -1348,26 +1410,42 @@ mod tests {
 
     const ROUTES: [Route; 3] = [Route::Install, Route::Repair, Route::CompleteReinstall];
 
+    fn firewall_plan() -> ElevatedPlan {
+        ElevatedPlan::new(Verb::AddFirewall(rule_scope())).unwrap()
+    }
+
+    fn driver_plan() -> ElevatedPlan {
+        ElevatedPlan::new(Verb::InstallDriver).unwrap()
+    }
+
     #[test]
     fn the_preview_carries_the_approval_header_only_with_an_administrator_plan() {
         for route in ROUTES {
-            assert!(!has_header(&plain_plan().preview(route)));
-            assert!(!has_header(&full_plan(None).preview(route)));
-            let with = full_plan(Some(setup_plan())).preview(route);
+            assert!(!has_header(&plain_plan().preview_with(route, true)));
+            assert!(!has_header(&full_plan(None).preview_with(route, true)));
+            let with = full_plan(Some(setup_plan())).preview_with(route, true);
             assert!(has_header(&with), "{route:?}");
             assert!(with.contains(INSTALL_DECLINE_NOTE), "{route:?}");
         }
-        let without = full_plan(None).preview(Route::Install);
+        let without = full_plan(None).preview_with(Route::Install, true);
         assert!(!without.contains(INSTALL_DECLINE_NOTE));
     }
 
     #[test]
     fn the_preview_stays_in_plain_words() {
         for route in ROUTES {
-            for plan in [plain_plan(), full_plan(None), full_plan(Some(setup_plan()))] {
-                let preview = plan.preview(route).to_lowercase();
-                for word in BANNED {
-                    assert!(!preview.contains(word), "{route:?} mentions {word}");
+            for plan in [
+                plain_plan(),
+                full_plan(None),
+                full_plan(Some(setup_plan())),
+                full_plan(Some(firewall_plan())),
+                full_plan(Some(driver_plan())),
+            ] {
+                for running in [false, true] {
+                    let preview = plan.preview_with(route, running).to_lowercase();
+                    for word in BANNED {
+                        assert!(!preview.contains(word), "{route:?} mentions {word}");
+                    }
                 }
             }
         }
@@ -1376,14 +1454,112 @@ mod tests {
     #[test]
     fn the_preview_fits_the_controller_limit() {
         for route in ROUTES {
-            let preview = full_plan(Some(setup_plan())).preview(route);
+            let preview = full_plan(Some(setup_plan())).preview_with(route, true);
             assert!(preview.len() <= 2_400, "{} bytes", preview.len());
         }
     }
 
     #[test]
+    fn an_install_that_cannot_restore_its_files_is_refused() {
+        let missing = ConvergePlan {
+            unrestorable: vec![PayloadFile::Helper],
+            ..plain_plan()
+        };
+        // Stopping Crosspane for an install that can't finish would leave it stopped.
+        assert!(refuses_install(Route::Install, &missing));
+        assert!(!refuses_install(Route::Install, &plain_plan()));
+        // The other routes restore what they can and report the rest.
+        for route in [Route::Repair, Route::CompleteReinstall] {
+            assert!(!refuses_install(route, &missing), "{route:?}");
+            assert!(!refuses_install(route, &plain_plan()), "{route:?}");
+        }
+        // Files that can be copied don't count.
+        let copyable = ConvergePlan {
+            copies: vec![PayloadFile::Agent],
+            ..plain_plan()
+        };
+        assert!(!refuses_install(Route::Install, &copyable));
+    }
+
+    #[test]
+    fn the_stop_line_appears_only_when_something_is_running() {
+        let stops = |plan: &ConvergePlan, running: bool| {
+            plan.preview_with(Route::Install, running)
+                .lines()
+                .find(|line| line.starts_with("Stop Crosspane"))
+                .map(str::to_owned)
+        };
+        let replacing = ConvergePlan {
+            restart: true,
+            copies: vec![PayloadFile::Agent],
+            ..plain_plan()
+        };
+        assert_eq!(
+            stops(&replacing, true).as_deref(),
+            Some("Stop Crosspane while its files are replaced.")
+        );
+        // Nothing running, as right after an uninstall: nothing to stop.
+        assert_eq!(stops(&replacing, false), None);
+        let brief = ConvergePlan {
+            restart: true,
+            ..plain_plan()
+        };
+        assert_eq!(
+            stops(&brief, true).as_deref(),
+            Some("Stop Crosspane for a moment.")
+        );
+        assert_eq!(stops(&brief, false), None);
+        // A plan that doesn't stop Crosspane never says so.
+        assert_eq!(stops(&plain_plan(), true), None);
+        // The rest of the preview doesn't depend on it.
+        let without = replacing.preview_with(Route::Install, false);
+        assert!(without.lines().any(|line| line == "Replace 1 file."));
+        assert!(without.lines().any(|line| line == "Start Crosspane."));
+    }
+
+    #[test]
+    fn the_decline_sentence_follows_the_administrator_step() {
+        let preview = |plan: ElevatedPlan| full_plan(Some(plan)).preview_with(Route::Install, true);
+        let firewall = preview(firewall_plan());
+        let driver = preview(driver_plan());
+        let both = preview(setup_plan());
+        // The approval block stays whatever the step: consent depends on it.
+        for shown in [&firewall, &driver, &both] {
+            assert!(has_header(shown), "{shown}");
+        }
+        assert!(
+            firewall
+                .lines()
+                .any(|line| line == "If you decline, Crosspane is still installed, but other computers may not reach this PC until the firewall rule is added.")
+        );
+        assert!(
+            driver
+                .lines()
+                .any(|line| line == "If you decline, Crosspane is still installed and mirrors windows in place without the display driver.")
+        );
+        assert!(both.lines().any(|line| line == INSTALL_DECLINE_NOTE));
+        // The core "them" only fits a step that asked for both.
+        assert!(!firewall.contains(INSTALL_DECLINE_NOTE));
+        assert!(!driver.contains(INSTALL_DECLINE_NOTE));
+        // Exactly one decline sentence in each.
+        for shown in [&firewall, &driver, &both] {
+            assert_eq!(
+                shown
+                    .lines()
+                    .filter(|line| line.starts_with("If you decline"))
+                    .count(),
+                1,
+                "{shown}"
+            );
+        }
+        // Without a step there is no sentence.
+        let none = full_plan(None).preview_with(Route::Install, true);
+        assert!(!none.contains("If you decline"));
+    }
+
+    #[test]
     fn the_preview_lists_what_will_happen() {
-        let preview = full_plan(None).preview(Route::Install);
+        let preview = full_plan(None).preview_with(Route::Install, true);
         for expected in [
             "Install Crosspane for this account.",
             "Stop Crosspane while its files are replaced.",

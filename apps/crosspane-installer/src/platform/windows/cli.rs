@@ -286,12 +286,33 @@ pub fn usage_exit(message: &str) -> i32 {
     2
 }
 
+/// The complaint about an explicit `--payload` that isn't an existing folder, in plain words, or
+/// `None` when there is none or it is one. Checked before anything runs: a mistyped folder would
+/// otherwise look like an installer without its files.
+fn payload_problem(payload: Option<&Path>) -> Option<String> {
+    let payload = payload?;
+    (!payload.is_dir()).then(|| {
+        format!(
+            "--payload needs the folder that holds the Crosspane files, but {} isn't a folder.",
+            payload.display()
+        )
+    })
+}
+
 /// Attaches the parent console only if stdout/stderr are not inherited; refuses an unsupported
 /// machine (`support::check`); progress → stderr, result → stdout (`Status`: one JSON object);
-/// 0 ok, 1 failure, 2 usage. `Install`: `ElevatedPolicy::Never` if `skip_admin`, else `IfNeeded`.
+/// 0 ok, 1 failure, 2 usage (including an `Install` `--payload` that isn't a folder).
+/// `Install`: `ElevatedPolicy::Never` if `skip_admin`, else `IfNeeded`.
 /// `Uninstall`: `teardown` → `IfNeeded`, else `Never`.
 pub fn run(command: Command) -> i32 {
     attach_console();
+    if let Command::Install { payload, .. } = &command
+        && let Some(problem) = payload_problem(payload.as_deref())
+    {
+        setup_note!("cli: install not started, the payload folder isn't a folder");
+        err(&usage(&problem));
+        return 2;
+    }
     let name = match &command {
         Command::Install { .. } => "install",
         Command::Repair => "repair",
@@ -617,6 +638,26 @@ mod tests {
                 skip_admin: false,
             }))
         );
+    }
+
+    #[test]
+    fn an_explicit_payload_must_be_an_existing_folder() {
+        let folder = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // No `--payload`, or a folder: nothing to complain about.
+        assert_eq!(payload_problem(None), None);
+        assert_eq!(payload_problem(Some(folder)), None);
+        // A mistyped folder, and a file where a folder belongs, are told plainly.
+        let missing = folder.join("no-such-payload-folder");
+        let file = folder.join("Cargo.toml");
+        assert!(file.is_file());
+        for path in [&missing, &file] {
+            let problem = payload_problem(Some(path)).expect("a problem");
+            assert!(problem.contains("--payload"), "{problem}");
+            assert!(problem.contains("isn't a folder"), "{problem}");
+            assert!(problem.contains(&path.display().to_string()), "{problem}");
+        }
+        // It rides on the usual usage text.
+        assert!(usage(&payload_problem(Some(&missing)).expect("a problem")).contains("Usage"));
     }
 
     #[test]

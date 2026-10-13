@@ -148,6 +148,9 @@ pub struct LiveController {
     pub(super) saved_skipped: BTreeSet<StepId>,
     pub(super) pending_skip: Option<Vec<StepId>>,
     pub(super) reopened: Vec<ScreenId>,
+    /// What the platform last said about installing from where this setup runs. Read again with
+    /// every view, so the buttons that need it never come from an older answer.
+    pub(super) can_install_here: bool,
 }
 
 /// How long a finished screen stays up before the next one, so its last check is seen.
@@ -247,6 +250,7 @@ impl LiveController {
             let _ = flow.reduce(FlowEvent::Skip(*id), now);
         }
         let summary = flow.summary(now, &[]);
+        let can_install_here = platform.can_install_here();
         let mut controller = Self {
             platform,
             desc,
@@ -291,6 +295,7 @@ impl LiveController {
             saved_skipped,
             pending_skip: None,
             reopened: Vec::new(),
+            can_install_here,
         };
         controller.view.demo = false;
         controller.rebuild_view();
