@@ -11,8 +11,8 @@ use crosspane_types::id::NodeId;
 
 use super::graph::{self, Graph, StepKind};
 use super::ledger::Ledger;
-use super::present::MaintenanceState;
 use super::present::permissions::PermissionAsks;
+use super::present::{MaintenanceState, ReinstallState};
 use super::shared::ConnectState;
 use super::{
     Clock, Consent, LiveError, NativeJob, NativeOutcome, NativeReport, Platform,
@@ -110,6 +110,7 @@ pub struct LiveController {
     pub(super) peer: Option<NodeId>,
     pub(super) connect: ConnectState,
     pub(super) maintenance: MaintenanceState,
+    pub(super) reinstall: ReinstallState,
     pub(super) screen: ScreenId,
     pub(super) view: WizardView,
     pub(super) signature: String,
@@ -269,6 +270,7 @@ impl LiveController {
             peer: None,
             connect: ConnectState::default(),
             maintenance: MaintenanceState::default(),
+            reinstall: ReinstallState::default(),
             screen: ScreenId::Welcome,
             view: crate::demo::disconnected_view(),
             signature: String::new(),
@@ -876,7 +878,11 @@ impl LiveController {
     /// Each step goes ahead by itself at most once per run; after that it asks (see
     /// [`Self::auto_consented`]).
     fn auto_consent(&mut self) {
-        if !self.install_started || !automatic_screen(self.screen) || !self.agent_quiet() {
+        if !self.install_started
+            || self.reinstall.active
+            || !automatic_screen(self.screen)
+            || !self.agent_quiet()
+        {
             return;
         }
         let ready: Vec<StepId> = self
@@ -1072,6 +1078,7 @@ impl LiveController {
         self.jobs.values().any(|j| j.stage == JobStage::Apply)
             || self.maintenance.running()
             || self.maintenance.repair_waiting()
+            || self.reinstall.running
     }
 
     /// A native change (a platform Apply or a removal) that closing the window would cut short.
@@ -1079,6 +1086,7 @@ impl LiveController {
         self.jobs.values().any(|j| {
             j.stage == JobStage::Apply && self.graph.kind(j.step) == Some(StepKind::Native)
         }) || self.maintenance.running()
+            || self.reinstall.running
     }
 
     pub(super) fn try_close(&mut self) -> bool {

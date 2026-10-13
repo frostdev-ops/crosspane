@@ -200,7 +200,9 @@ fn maintenance_id(req: &MaintenanceRequest) -> live::MaintenanceId {
         | MaintenanceRequest::ConfirmRepair { id, .. }
         | MaintenanceRequest::VerifyRepair { id, .. }
         | MaintenanceRequest::DiscardRepair { id, .. }
-        | MaintenanceRequest::ResumeRepair { id, .. } => *id,
+        | MaintenanceRequest::ResumeRepair { id, .. }
+        | MaintenanceRequest::PlanReinstall { id, .. }
+        | MaintenanceRequest::ConfirmReinstall { id, .. } => *id,
     }
 }
 struct WindowsController {
@@ -870,6 +872,14 @@ pub(crate) fn run<D: Domains>(
                                     resumable: false,
                                 }
                             }
+                            MaintenanceRequest::PlanReinstall { .. }
+                            | MaintenanceRequest::ConfirmReinstall { .. } => {
+                                MaintenanceReport::Refused {
+                                    id,
+                                    reason: "Complete reinstall isn't available in this version of Setup."
+                                        .into(),
+                                }
+                            }
                             _ => MaintenanceReport::Refused {
                                 id,
                                 reason: "This follow-up is not available on Windows".into(),
@@ -963,6 +973,12 @@ fn maintenance_kind(report: &MaintenanceReport) -> (String, String) {
         }
         MaintenanceReport::RepairFinished { outcome, lines, .. } => {
             (format!("RepairFinished({outcome:?})"), text(lines))
+        }
+        MaintenanceReport::ReinstallPlanned { .. } => {
+            ("ReinstallPlanned".to_owned(), String::new())
+        }
+        MaintenanceReport::ReinstallFinished { outcome, lines, .. } => {
+            (format!("ReinstallFinished({outcome:?})"), text(lines))
         }
     }
 }

@@ -55,6 +55,31 @@ pub(super) struct MaintenanceState {
     pub refused: Option<String>,
     pub return_to: Option<ScreenId>,
     pub repair_state: RepairState,
+    entry: MaintenanceEntry,
+    entry_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MaintenanceEntry {
+    #[default]
+    Menu,
+    Repair,
+    Uninstall,
+}
+
+/// Independent explicit consent; entering this view never resets an earlier operation.
+#[derive(Default)]
+pub(super) struct ReinstallState {
+    pub(super) active: bool,
+    id: Option<MaintenanceId>,
+    plan: Option<u64>,
+    preview: Option<String>,
+    pub(super) running: bool,
+    finished: Option<super::ReinstallOutcome>,
+    /// Progress while it runs, then what the platform reported when it finished.
+    lines: Vec<String>,
+    /// Why the platform (or the request itself) turned this reinstall down, in the platform's words.
+    refused: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -279,7 +304,9 @@ impl LiveController {
 
     /// The screen shown: the pairing screen becomes the numbers comparison while one runs.
     pub(super) fn display_screen(&self) -> ScreenId {
-        if self.screen == ScreenId::Connect
+        if self.reinstall.active {
+            ScreenId::RepairRemove
+        } else if self.screen == ScreenId::Connect
             && matches!(
                 self.pairing_phase(),
                 Some(PairPhase::Confirm | PairPhase::Pick | PairPhase::Waiting)
@@ -635,10 +662,40 @@ impl LiveController {
     }
 
     fn title_and_message(&self, screen: ScreenId) -> (String, String) {
+        if self.reinstall.active {
+            let r = &self.reinstall;
+            let message = if let Some(outcome) = r.finished {
+                match outcome {
+                    super::ReinstallOutcome::Verified => "Crosspane was reinstalled.",
+                    super::ReinstallOutcome::NotSubmitted => "Reinstall wasn't started.",
+                    super::ReinstallOutcome::Incomplete | super::ReinstallOutcome::Unknown => {
+                        "Reinstall didn't finish."
+                    }
+                }
+                .to_owned()
+            } else if let Some(reason) = &r.refused {
+                reason.clone()
+            } else if r.running {
+                "Reinstalling Crosspane…".to_owned()
+            } else if let Some(preview) = &r.preview {
+                preview.clone()
+            } else {
+                "Checking the reinstall…".to_owned()
+            };
+            let message = if r.lines.is_empty() {
+                message
+            } else {
+                format!("{message}\n\n{}", r.lines.join("\n"))
+            };
+            return ("Complete reinstall".into(), bounded_lines(message));
+        }
         let preview = self.consent_preview(screen);
         let asking = !preview.is_empty();
         let peer = self.peer_name();
         let (title, message): (String, String) = match screen {
+            ScreenId::Welcome if self.windows_entry() => {
+                ("Crosspane".into(), "Choose what you'd like to do.".into())
+            }
             ScreenId::Welcome => ("Set up Crosspane".into(), {
                 let intro = "Use one keyboard and mouse across two computers, move windows \
                              between them and share sound. Setup asks only when it needs you.";
@@ -788,6 +845,15 @@ impl LiveController {
                     }
                 },
             ),
+            ScreenId::RepairRemove if self.windows_entry() => (
+                match self.maintenance.entry {
+                    MaintenanceEntry::Repair => "Repair Crosspane",
+                    MaintenanceEntry::Uninstall => "Uninstall Crosspane",
+                    MaintenanceEntry::Menu => "Crosspane setup",
+                }
+                .into(),
+                self.windows_maintenance_message(),
+            ),
             ScreenId::RepairRemove => (
                 "Remove or repair Crosspane".into(),
                 self.maintenance_message(),
@@ -904,41 +970,143 @@ impl LiveController {
         text.join("\n\n")
     }
 
+    fn windows_entry(&self) -> bool {
+        self.desc.platform == crate::agent_contract::AgentPlatform::Windows
+    }
+
+    /// What the Windows maintenance screen says: one plain head line, then whatever the platform
+    /// reported under it (its progress, or the lines it finished with), or its own reason when it
+    /// turned the request down or can't offer it.
+    fn windows_maintenance_message(&self) -> String {
+        fn with_lines(head: &str, lines: &[String]) -> String {
+            if lines.is_empty() {
+                head.to_owned()
+            } else {
+                format!("{head}\n\n{}", lines.join("\n"))
+            }
+        }
+        fn reason(availability: &Option<Availability>) -> Option<&String> {
+            match availability {
+                Some(Availability::Unavailable(reason) | Availability::NotAvailableYet(reason)) => {
+                    Some(reason)
+                }
+                _ => None,
+            }
+        }
+        let m = &self.maintenance;
+        let repair = &m.repair_state;
+        if let Some((outcome, lines)) = &m.finished {
+            let head = match outcome {
+                MaintenanceOutcome::Removed => "Crosspane was uninstalled.",
+                MaintenanceOutcome::Partial => "Uninstall didn't finish.",
+                MaintenanceOutcome::Refused => "Uninstall wasn't started.",
+                MaintenanceOutcome::Failed => "Uninstall failed.",
+            };
+            return with_lines(head, lines);
+        }
+        if let Some(why) = &m.refused {
+            return why.clone();
+        }
+        if let Some(end) = &repair.finished {
+            let head = match end.outcome {
+                RepairOutcome::Verified | RepairOutcome::CheckedAfterEarlierRepair => {
+                    "Crosspane is repaired."
+                }
+                RepairOutcome::HealthVerifiedCleanupIncomplete => {
+                    "Crosspane is repaired. Cleanup didn't finish."
+                }
+                RepairOutcome::Retired => "The earlier setup attempt was cleared.",
+                RepairOutcome::OutcomeUnknown | RepairOutcome::RecoveryRetained => {
+                    "Repair didn't finish."
+                }
+            };
+            return with_lines(head, &end.lines);
+        }
+        if m.confirmed
+            || repair.driving
+            || matches!(repair.phase, RepairPhase::Running | RepairPhase::Waiting)
+        {
+            let head = if m.entry == MaintenanceEntry::Uninstall {
+                "Uninstalling Crosspane…"
+            } else {
+                "Repairing Crosspane…"
+            };
+            return with_lines(head, &m.progress);
+        }
+        if repair.resumable.is_some() {
+            return "An earlier repair needs to finish.".into();
+        }
+        if let Some(preview) = &repair.preview
+            && repair.phase == RepairPhase::Previewed
+        {
+            return preview.clone();
+        }
+        if let Some(preview) = &m.preview {
+            return preview.clone();
+        }
+        let mut reasons: Vec<&String> = Vec::new();
+        let asked = match m.entry {
+            MaintenanceEntry::Repair => [None, reason(&m.repair)],
+            MaintenanceEntry::Uninstall => [reason(&m.uninstall), None],
+            MaintenanceEntry::Menu => [reason(&m.uninstall), reason(&m.repair)],
+        };
+        for why in asked.into_iter().flatten() {
+            if !reasons.contains(&why) {
+                reasons.push(why);
+            }
+        }
+        if !reasons.is_empty() {
+            return reasons
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n\n");
+        }
+        match m.entry {
+            MaintenanceEntry::Repair => "Checking the repair…",
+            MaintenanceEntry::Uninstall => "Checking what will be uninstalled…",
+            MaintenanceEntry::Menu if m.uninstall.is_none() => "Checking Crosspane…",
+            MaintenanceEntry::Menu => "Choose Repair or Uninstall.",
+        }
+        .into()
+    }
+
     /// The screen's actions. Each screen asks one question at a time: at most one primary button
     /// (its answer), outlined buttons beside it, quiet links for other ways, and tiles when the
     /// answer is picked from several.
     fn buttons_and_fields(&self, screen: ScreenId) -> (Vec<ButtonView>, Vec<FieldView>) {
+        if self.reinstall.active {
+            return (self.reinstall_controls(), Vec::new());
+        }
         let mut buttons = Vec::new();
         let mut fields = Vec::new();
         if self.pending_skip.is_some() {
-            return (
-                vec![button(
-                    ids::BACK,
-                    ButtonRole::Back,
-                    "Back",
-                    false,
-                    ButtonKind::Link,
-                )],
-                fields,
-            );
+            let mut buttons = vec![button(
+                ids::BACK,
+                ButtonRole::Back,
+                "Back",
+                false,
+                ButtonKind::Link,
+            )];
+            self.windows_reinstall_link(&mut buttons);
+            return (buttons, fields);
         }
         if self.skipped_on(screen)
             && !self.reopened.contains(&screen)
             && screen != ScreenId::Summary
         {
-            return (
-                vec![
-                    button(ids::BACK, ButtonRole::Back, "Back", true, ButtonKind::Link),
-                    button(
-                        ids::SET_UP_NOW,
-                        ButtonRole::Ordinary,
-                        "Set up now",
-                        true,
-                        ButtonKind::Primary,
-                    ),
-                ],
-                fields,
-            );
+            let mut buttons = vec![
+                button(ids::BACK, ButtonRole::Back, "Back", true, ButtonKind::Link),
+                button(
+                    ids::SET_UP_NOW,
+                    ButtonRole::Ordinary,
+                    "Set up now",
+                    true,
+                    ButtonKind::Primary,
+                ),
+            ];
+            self.windows_reinstall_link(&mut buttons);
+            return (buttons, fields);
         }
         // Waiting in setup's own pairing window is not work the person must sit through.
         let busy = self.mutation_in_flight() && !self.following_auto_window();
@@ -986,6 +1154,21 @@ impl LiveController {
             buttons.push(button(id, ButtonRole::Retry, label, true, kind));
         }
         match screen {
+            ScreenId::Welcome if self.windows_entry() => {
+                for (id, label) in [
+                    (ids::NEXT, "Install or reinstall"),
+                    (ids::REPAIR, "Repair"),
+                    (ids::REMOVE_REVIEW, "Uninstall"),
+                ] {
+                    buttons.push(button(
+                        id,
+                        ButtonRole::Ordinary,
+                        label,
+                        !busy,
+                        ButtonKind::Choice,
+                    ));
+                }
+            }
             ScreenId::Welcome => {
                 // Closing is the window's own button (or Escape) here.
                 buttons.push(button(
@@ -1002,6 +1185,11 @@ impl LiveController {
                     true,
                     ButtonKind::Primary,
                 ));
+            }
+            ScreenId::Compatibility | ScreenId::InstallPlan
+                if self.desc.platform == crate::agent_contract::AgentPlatform::Windows =>
+            {
+                self.windows_maintenance_links(&mut buttons, !busy);
             }
             ScreenId::Connect => self.connect_controls(&mut buttons, &mut fields),
             ScreenId::MatchNumbers => match self.pairing_phase() {
@@ -1171,13 +1359,17 @@ impl LiveController {
                         .all(|m| m.prerequisites.iter().all(|s| self.settled(*s))),
                     ButtonKind::Link,
                 ));
-                buttons.push(button(
-                    ids::REMOVE_OR_REPAIR,
-                    ButtonRole::Ordinary,
-                    "Remove or repair Crosspane…",
-                    !busy,
-                    ButtonKind::Link,
-                ));
+                if self.windows_entry() {
+                    self.windows_maintenance_links(&mut buttons, !busy);
+                } else {
+                    buttons.push(button(
+                        ids::REMOVE_OR_REPAIR,
+                        ButtonRole::Ordinary,
+                        "Remove or repair Crosspane…",
+                        !busy,
+                        ButtonKind::Link,
+                    ));
+                }
                 if !ready {
                     buttons.push(button(
                         ids::CLOSE,
@@ -1245,7 +1437,77 @@ impl LiveController {
                 ));
             }
         }
+        self.windows_reinstall_link(&mut buttons);
         (buttons, fields)
+    }
+
+    fn windows_reinstall_link(&self, buttons: &mut Vec<ButtonView>) {
+        if self.windows_entry() {
+            buttons.push(button(
+                ids::COMPLETE_REINSTALL,
+                ButtonRole::Ordinary,
+                "Complete reinstall",
+                true,
+                ButtonKind::Link,
+            ));
+        }
+    }
+
+    fn windows_maintenance_links(&self, buttons: &mut Vec<ButtonView>, enabled: bool) {
+        for (id, label) in [(ids::REPAIR, "Repair"), (ids::REMOVE_REVIEW, "Uninstall")] {
+            buttons.push(button(
+                id,
+                ButtonRole::Ordinary,
+                label,
+                enabled,
+                ButtonKind::Link,
+            ));
+        }
+    }
+
+    fn reinstall_controls(&self) -> Vec<ButtonView> {
+        let r = &self.reinstall;
+        let mut buttons = Vec::new();
+        if r.plan.is_some()
+            && r.preview.is_some()
+            && !r.running
+            && r.finished.is_none()
+            && r.refused.is_none()
+        {
+            buttons.push(button(
+                ids::REINSTALL_CONFIRM,
+                ButtonRole::Confirm,
+                "Confirm complete reinstall",
+                true,
+                ButtonKind::Destructive,
+            ));
+        }
+        if !r.running {
+            buttons.push(button(
+                ids::BACK,
+                ButtonRole::Back,
+                "Back",
+                !self.mutation_in_flight(),
+                ButtonKind::Secondary,
+            ));
+            buttons.push(button(
+                ids::CLOSE,
+                ButtonRole::Cancel,
+                "Close",
+                !self.native_change_running(),
+                ButtonKind::Secondary,
+            ));
+            if r.finished.is_some() || r.refused.is_some() {
+                buttons.push(button(
+                    ids::COMPLETE_REINSTALL,
+                    ButtonRole::Ordinary,
+                    "Complete reinstall",
+                    true,
+                    ButtonKind::Link,
+                ));
+            }
+        }
+        buttons
     }
 
     /// The pairing screen hides its retry while setup is about to look again by itself.
@@ -1493,6 +1755,85 @@ impl LiveController {
                 ButtonKind::Secondary,
             ));
         }
+        if self.windows_entry() {
+            match m.entry {
+                MaintenanceEntry::Repair => {
+                    fields.clear();
+                    buttons.retain(|b| {
+                        !matches!(b.id, ids::REMOVE_REVIEW | ids::REMOVE_CONFIRM)
+                            && !(5100..=5290).contains(&b.id)
+                    });
+                }
+                MaintenanceEntry::Uninstall => buttons.retain(|b| {
+                    !matches!(
+                        b.id,
+                        ids::REPAIR
+                            | ids::REPAIR_CONFIRM
+                            | ids::REPAIR_RESUME
+                            | ids::REPAIR_DISCARD
+                    )
+                }),
+                MaintenanceEntry::Menu => {}
+            }
+            for b in buttons.iter_mut() {
+                b.label = match b.id {
+                    ids::REMOVE_REVIEW => "Review uninstall".into(),
+                    ids::REMOVE_CONFIRM => "Uninstall".into(),
+                    ids::REPAIR => "Review repair".into(),
+                    ids::REPAIR_CONFIRM => "Repair".into(),
+                    ids::REPAIR_RESUME => "Continue repair".into(),
+                    _ => b.label.clone(),
+                };
+            }
+            // A request that ended short, or was turned down, is never a dead end: the same
+            // review action comes back as a button that starts over from a fresh reading.
+            if let Some(id) = self.windows_retry_action() {
+                buttons.retain(|b| b.id != id);
+                buttons.push(button(
+                    id,
+                    ButtonRole::Retry,
+                    "Try again",
+                    !self.mutation_in_flight(),
+                    ButtonKind::Primary,
+                ));
+            }
+        }
+    }
+
+    /// The review action to offer again on the Windows maintenance screen, when what it asked for
+    /// ended short (an uninstall that was partial, failed or wasn't started) or was refused.
+    fn windows_retry_action(&self) -> Option<u16> {
+        let m = &self.maintenance;
+        if !self.windows_entry() || self.screen != ScreenId::RepairRemove || m.current.is_none() {
+            return None;
+        }
+        let ended_short = m.refused.is_some()
+            || matches!(
+                m.finished,
+                Some((
+                    MaintenanceOutcome::Partial
+                        | MaintenanceOutcome::Failed
+                        | MaintenanceOutcome::Refused,
+                    _
+                ))
+            );
+        if !ended_short {
+            return None;
+        }
+        Some(match m.entry {
+            MaintenanceEntry::Repair => ids::REPAIR,
+            MaintenanceEntry::Uninstall | MaintenanceEntry::Menu => ids::REMOVE_REVIEW,
+        })
+    }
+
+    /// Start the Windows maintenance request over: inspect again, and when that answers, review
+    /// what the screen was opened for. Nothing is confirmed on the person's behalf.
+    fn retry_windows_maintenance(&mut self) {
+        if self.windows_retry_action().is_none() || self.mutation_in_flight() {
+            return;
+        }
+        self.maintenance.entry_pending = true;
+        self.inspect_maintenance();
     }
 
     pub(super) fn rebuild_view(&mut self) {
@@ -1565,7 +1906,7 @@ impl LiveController {
             .filter_map(|m| self.previews.get(&m.id))
             .collect();
         let signature = format!(
-            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
             view.screen,
             view.buttons
                 .iter()
@@ -1589,6 +1930,11 @@ impl LiveController {
                 self.maintenance.repair_state.plan,
                 &self.maintenance.repair_state.preview,
             ),
+            (
+                self.reinstall.id,
+                self.reinstall.plan,
+                &self.reinstall.preview
+            ),
         );
         if signature != self.signature {
             view.revision = self.view.revision.saturating_add(1);
@@ -1601,6 +1947,10 @@ impl LiveController {
         // Setup's own pairing window doesn't hold the person on this screen.
         self.abandon_auto_window();
         if self.mutation_in_flight() {
+            return;
+        }
+        if self.reinstall.active {
+            self.reinstall.active = false;
             return;
         }
         if self.screen == ScreenId::RepairRemove {
@@ -1619,6 +1969,16 @@ impl LiveController {
 
     /// Returns true when the window should close.
     pub(super) fn button(&mut self, id: u16) -> bool {
+        if self.reinstall.active {
+            match id {
+                ids::BACK => self.back(),
+                ids::CLOSE => return self.try_close(),
+                ids::COMPLETE_REINSTALL => self.plan_complete_reinstall(),
+                ids::REINSTALL_CONFIRM => self.confirm_complete_reinstall(),
+                _ => {}
+            }
+            return false;
+        }
         match id {
             ids::SKIP => self.skip_current(),
             ids::SET_UP_NOW => self.reopen(self.screen),
@@ -1654,6 +2014,8 @@ impl LiveController {
             ids::CLOSE => return self.try_close(),
             ids::REMOVE_OR_REPAIR => {
                 self.maintenance.return_to = Some(self.screen);
+                self.maintenance.entry = MaintenanceEntry::Menu;
+                self.maintenance.entry_pending = false;
                 self.go(ScreenId::RepairRemove);
             }
             ids::PAIR_LISTEN => self.pair_action(PairMode::Listen),
@@ -1681,12 +2043,22 @@ impl LiveController {
             ids::HIDING_RESTART => self.hiding_restart(),
             ids::HIDING_CHANGE => self.change_hiding(),
             ids::FINAL_CHECK => self.begin(steps::FINAL),
+            ids::REMOVE_REVIEW | ids::REPAIR if self.windows_retry_action() == Some(id) => {
+                self.retry_windows_maintenance()
+            }
+            ids::REMOVE_REVIEW if self.windows_entry() && self.screen != ScreenId::RepairRemove => {
+                self.open_windows_maintenance(MaintenanceEntry::Uninstall)
+            }
             ids::REMOVE_REVIEW => self.plan_uninstall(),
             ids::REMOVE_CONFIRM => self.confirm_uninstall(),
+            ids::REPAIR if self.windows_entry() && self.screen != ScreenId::RepairRemove => {
+                self.open_windows_maintenance(MaintenanceEntry::Repair)
+            }
             ids::REPAIR => self.review_repair(),
             ids::REPAIR_CONFIRM => self.confirm_repair(),
             ids::REPAIR_RESUME => self.resume_repair(),
             ids::REPAIR_DISCARD => self.discard_repair(),
+            ids::COMPLETE_REINSTALL => self.plan_complete_reinstall(),
             ids::RETRY_ALL => {
                 for step in self.retryable_on(self.display_screen()) {
                     self.begin(step);
@@ -1786,16 +2158,93 @@ impl LiveController {
 
     pub(super) fn inspect_maintenance(&mut self) {
         let return_to = self.maintenance.return_to;
+        let entry = self.maintenance.entry;
+        let entry_pending = self.maintenance.entry_pending;
         let next_id = self.maintenance.next_id.saturating_add(1);
         self.maintenance = MaintenanceState {
             next_id,
             current: Some(MaintenanceId(next_id)),
             return_to,
+            entry,
+            entry_pending,
             ..MaintenanceState::default()
         };
         self.submit_maintenance(MaintenanceRequest::Inspect {
             id: MaintenanceId(next_id),
         });
+    }
+
+    fn open_windows_maintenance(&mut self, entry: MaintenanceEntry) {
+        if self.mutation_in_flight() {
+            return;
+        }
+        self.maintenance.return_to = Some(self.screen);
+        self.maintenance.entry = entry;
+        self.maintenance.entry_pending = true;
+        self.go(ScreenId::RepairRemove);
+    }
+
+    /// Open the maintenance menu as if the person had chosen it from the Welcome screen. Setup
+    /// launched from the Start menu or Apps & Features starts here. Back returns to Welcome.
+    pub fn open_maintenance(&mut self) {
+        if self.mutation_in_flight() || self.screen == ScreenId::RepairRemove {
+            return;
+        }
+        self.maintenance.return_to = Some(ScreenId::Welcome);
+        self.maintenance.entry = MaintenanceEntry::Menu;
+        self.maintenance.entry_pending = false;
+        self.go(ScreenId::RepairRemove);
+        self.rebuild_view();
+    }
+
+    fn plan_complete_reinstall(&mut self) {
+        if !self.windows_entry() || self.reinstall.running {
+            return;
+        }
+        // A distinct new review; earlier main/maintenance consent and outcomes are untouched.
+        let Some(next) = self.maintenance.next_id.checked_add(1) else {
+            return;
+        };
+        self.maintenance.next_id = next;
+        let id = MaintenanceId(next);
+        self.reinstall = ReinstallState {
+            active: true,
+            id: Some(id),
+            ..ReinstallState::default()
+        };
+        let status = self.fresh_status();
+        if let Err(refusal) =
+            self.platform
+                .submit(NativeJob::Maintenance(MaintenanceRequest::PlanReinstall {
+                    id,
+                    status,
+                }))
+        {
+            self.reinstall.refused = Some(bounded(refusal.to_string()));
+        }
+    }
+
+    fn confirm_complete_reinstall(&mut self) {
+        let r = &self.reinstall;
+        let (Some(id), Some(plan), Some(_)) = (r.id, r.plan, &r.preview) else {
+            return;
+        };
+        if !r.active || r.running || r.finished.is_some() || r.refused.is_some() {
+            return;
+        }
+        self.reinstall.running = true;
+        let status = self.fresh_status();
+        if let Err(refusal) = self.platform.submit(NativeJob::Maintenance(
+            MaintenanceRequest::ConfirmReinstall {
+                id,
+                plan,
+                revision: self.view.revision,
+                status,
+            },
+        )) {
+            self.reinstall.running = false;
+            self.reinstall.refused = Some(bounded(refusal.to_string()));
+        }
     }
 
     fn submit_maintenance(&mut self, request: MaintenanceRequest) {
@@ -2090,8 +2539,52 @@ impl LiveController {
             | MaintenanceReport::RepairPlanned { id, .. }
             | MaintenanceReport::RepairResumable { id, .. }
             | MaintenanceReport::RepairWaiting { id, .. }
-            | MaintenanceReport::RepairFinished { id, .. } => *id,
+            | MaintenanceReport::RepairFinished { id, .. }
+            | MaintenanceReport::ReinstallPlanned { id, .. }
+            | MaintenanceReport::ReinstallFinished { id, .. } => *id,
         };
+        if self.reinstall.active && self.reinstall.id == Some(id) {
+            let r = &mut self.reinstall;
+            match report {
+                MaintenanceReport::ReinstallPlanned { plan, preview, .. }
+                    if plan != 0
+                        && !preview.trim().is_empty()
+                        && !r.running
+                        && r.preview.is_none()
+                        && r.finished.is_none()
+                        && r.refused.is_none() =>
+                {
+                    r.plan = Some(plan);
+                    r.preview = Some(bounded_lines(preview));
+                }
+                // What the platform is doing now, while it runs (a repeat of the last line is
+                // only a heartbeat).
+                MaintenanceReport::Progress { detail, .. }
+                    if r.running
+                        && r.lines.len() < MAX_PROGRESS_LINES
+                        && r.lines.last() != Some(&detail) =>
+                {
+                    r.lines.push(bounded(detail));
+                }
+                MaintenanceReport::ReinstallFinished { outcome, lines, .. } if r.running => {
+                    r.running = false;
+                    r.finished = Some(outcome);
+                    // Every line the platform finished with is shown, in its order.
+                    r.lines = lines
+                        .into_iter()
+                        .take(MAX_PROGRESS_LINES)
+                        .map(bounded)
+                        .collect();
+                }
+                MaintenanceReport::Refused { reason, .. } if r.finished.is_none() => {
+                    r.running = false;
+                    r.lines.clear();
+                    r.refused = Some(bounded(reason));
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.maintenance.current != Some(id) {
             return;
         }
@@ -2109,6 +2602,7 @@ impl LiveController {
             }
             return;
         }
+        let inspected = matches!(&report, MaintenanceReport::Inspected { .. });
         let (now, next_call) = (self.now, self.next_call);
         let m = &mut self.maintenance;
         match report {
@@ -2128,6 +2622,13 @@ impl LiveController {
                 m.uninstall = Some(uninstall);
                 m.repair = Some(repair);
                 m.choices = choices.into_iter().take(8).collect();
+                if self.desc.platform == crate::agent_contract::AgentPlatform::Windows {
+                    for choice in &mut m.choices {
+                        if choice.role == ToggleRole::DeleteIdentity {
+                            choice.checked = false;
+                        }
+                    }
+                }
             }
             // Only the answer to the outstanding review request is shown as the plan.
             MaintenanceReport::Planned { preview, .. } if m.planning && !m.confirmed => {
@@ -2251,6 +2752,17 @@ impl LiveController {
                 });
             }
             MaintenanceReport::RepairFinished { .. } => {}
+            MaintenanceReport::ReinstallPlanned { .. }
+            | MaintenanceReport::ReinstallFinished { .. } => {}
+        }
+        if inspected && self.windows_entry() && self.maintenance.entry_pending {
+            let entry = self.maintenance.entry;
+            self.maintenance.entry_pending = false;
+            match entry {
+                MaintenanceEntry::Repair => self.review_repair(),
+                MaintenanceEntry::Uninstall => self.plan_uninstall(),
+                MaintenanceEntry::Menu => {}
+            }
         }
     }
 }

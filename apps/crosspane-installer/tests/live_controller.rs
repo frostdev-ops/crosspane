@@ -2428,6 +2428,576 @@ fn platform_says(h: &mut H, report: MaintenanceReport) {
     h.tick();
 }
 
+fn windows_entry_fixture() -> H {
+    let mut d = description();
+    d.platform = AgentPlatform::Windows;
+    H::with(d)
+}
+
+#[test]
+fn windows_entry_has_three_direct_choices_and_other_platforms_keep_their_entry() {
+    let h = windows_entry_fixture();
+    let choices: Vec<_> = h
+        .view()
+        .buttons
+        .iter()
+        .filter(|b| b.kind == ButtonKind::Choice)
+        .map(|b| b.label.as_str())
+        .collect();
+    assert_eq!(choices, ["Install or reinstall", "Repair", "Uninstall"]);
+    assert!(h.button(ids::REMOVE_OR_REPAIR).is_none());
+    let reset = h.button(ids::COMPLETE_REINSTALL).unwrap();
+    assert!(reset.enabled);
+    assert_eq!(reset.kind, ButtonKind::Link);
+    for platform in [AgentPlatform::Linux, AgentPlatform::Macos] {
+        let mut d = description();
+        d.platform = platform;
+        let h = H::with(d);
+        assert_eq!(h.button(ids::NEXT).unwrap().label, "Start setup");
+        assert!(h.button(ids::REMOVE_OR_REPAIR).is_some());
+        assert!(h.button(ids::COMPLETE_REINSTALL).is_none());
+    }
+}
+
+#[test]
+fn windows_direct_uninstall_reviews_before_current_revision_confirmation_and_keeps_identity() {
+    let mut h = windows_entry_fixture();
+    h.click(ids::REMOVE_REVIEW);
+    assert_eq!(h.view().title, "Uninstall Crosspane");
+    let jobs = maintenance_jobs(&mut h);
+    let [MaintenanceRequest::Inspect { id }] = jobs.as_slice() else {
+        panic!("{jobs:?}")
+    };
+    let id = *id;
+    platform_says(
+        &mut h,
+        MaintenanceReport::Inspected {
+            id,
+            uninstall: live::Availability::Available,
+            repair: live::Availability::Available,
+            choices: vec![live::RemovalChoice {
+                id: 1,
+                role: ToggleRole::DeleteIdentity,
+                label: "Erase identity and trust".into(),
+                checked: true,
+                enabled: true,
+            }],
+        },
+    );
+    let jobs = maintenance_jobs(&mut h);
+    assert!(
+        matches!(jobs.as_slice(), [MaintenanceRequest::PlanUninstall { id: actual, choices, .. }] if *actual == id && choices == &vec![(1, false)])
+    );
+    assert!(h.button(ids::REPAIR).is_none());
+    assert!(h.button(ids::REMOVE_CONFIRM).is_none());
+    platform_says(
+        &mut h,
+        MaintenanceReport::Planned {
+            id,
+            preview: "Uninstall app files. Keep identity and trust.".into(),
+        },
+    );
+    let revision = h.view().revision;
+    h.act(revision - 1, WizardIntent::Button(ids::REMOVE_CONFIRM));
+    assert!(maintenance_jobs(&mut h).is_empty());
+    h.click(ids::REMOVE_CONFIRM);
+    assert!(
+        matches!(maintenance_jobs(&mut h).as_slice(), [MaintenanceRequest::ConfirmUninstall { id: actual, revision: accepted, .. }] if *actual == id && *accepted == revision)
+    );
+    h.act(revision, WizardIntent::Button(ids::REMOVE_CONFIRM));
+    assert!(maintenance_jobs(&mut h).is_empty());
+}
+
+#[test]
+fn windows_direct_repair_enters_its_review_without_an_uninstall_menu() {
+    let mut h = windows_entry_fixture();
+    h.click(ids::REPAIR);
+    assert_eq!(h.view().title, "Repair Crosspane");
+    let jobs = maintenance_jobs(&mut h);
+    let [MaintenanceRequest::Inspect { id }] = jobs.as_slice() else {
+        panic!("{jobs:?}")
+    };
+    let id = *id;
+    platform_says(
+        &mut h,
+        MaintenanceReport::Inspected {
+            id,
+            uninstall: live::Availability::Available,
+            repair: live::Availability::Available,
+            choices: Vec::new(),
+        },
+    );
+    assert!(h.button(ids::REMOVE_REVIEW).is_none());
+    assert!(h.button(ids::REMOVE_CONFIRM).is_none());
+    assert!(h.button(ids::REPAIR_CONFIRM).is_none());
+    h.advance(12_001);
+    h.tick();
+    assert!(
+        matches!(maintenance_jobs(&mut h).as_slice(), [MaintenanceRequest::PlanRepair { id: actual, .. }] if *actual == id)
+    );
+    platform_says(
+        &mut h,
+        MaintenanceReport::RepairPlanned {
+            id,
+            plan: 7,
+            preview: "Repair app files.".into(),
+        },
+    );
+    assert!(h.button(ids::REPAIR_CONFIRM).unwrap().enabled);
+    assert!(h.button(ids::COMPLETE_REINSTALL).unwrap().enabled);
+}
+
+#[test]
+fn windows_complete_reinstall_remains_separate_from_an_unknown_install_and_requires_new_consent() {
+    let mut h = windows_entry_fixture();
+    h.tick();
+    h.click(ids::NEXT);
+    h.pass(SUPPORT);
+    let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
+    h.report(&detect, NativeOutcome::Detected { needs_action: true });
+    let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
+    h.report(
+        &plan,
+        NativeOutcome::Planned {
+            preview: "Install app files.".into(),
+        },
+    );
+    let (apply, consent) = h.job(PAYLOAD, JobStage::Apply);
+    assert!(consent.is_some());
+    h.report(&apply, NativeOutcome::Applied(ApplyOutcome::Unknown));
+    let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
+    h.report(&detect, NativeOutcome::Waiting(WaitKind::User));
+    h.click(ids::COMPLETE_REINSTALL);
+    let jobs = maintenance_jobs(&mut h);
+    let [MaintenanceRequest::PlanReinstall { id, .. }] = jobs.as_slice() else {
+        panic!("{jobs:?}")
+    };
+    let id = *id;
+    assert!(h.button(ids::REINSTALL_CONFIRM).is_none());
+    assert_eq!(h.row(PAYLOAD).state, RowState::Waiting);
+    platform_says(
+        &mut h,
+        MaintenanceReport::ReinstallPlanned {
+            id,
+            plan: 91,
+            preview: "Reset app files and setup. Keep identity and trust.".into(),
+        },
+    );
+    let revision = h.view().revision;
+    h.act(revision - 1, WizardIntent::Button(ids::REINSTALL_CONFIRM));
+    assert!(maintenance_jobs(&mut h).is_empty());
+    h.click(ids::REINSTALL_CONFIRM);
+    assert!(
+        matches!(maintenance_jobs(&mut h).as_slice(), [MaintenanceRequest::ConfirmReinstall { id: actual, plan: 91, revision: accepted, .. }] if *actual == id && *accepted == revision)
+    );
+    h.act(revision, WizardIntent::Button(ids::REINSTALL_CONFIRM));
+    assert!(maintenance_jobs(&mut h).is_empty());
+    assert!(
+        !h.c.request_close(),
+        "a running independent reset still has a close guard"
+    );
+    platform_says(
+        &mut h,
+        MaintenanceReport::ReinstallFinished {
+            id,
+            outcome: live::ReinstallOutcome::Incomplete,
+            lines: vec![
+                "Crosspane's files were replaced.".into(),
+                "Crosspane is installed but hasn't started yet. Check again.".into(),
+            ],
+        },
+    );
+    assert_eq!(
+        h.row(PAYLOAD).state,
+        RowState::Waiting,
+        "the old unknown operation was not made verified or replayable"
+    );
+    assert_eq!(h.view().title, "Complete reinstall");
+    assert!(h.view().message.starts_with("Reinstall didn't finish."));
+    for line in [
+        "Crosspane's files were replaced.",
+        "Crosspane is installed but hasn't started yet. Check again.",
+    ] {
+        assert!(h.view().message.contains(line), "{}", h.view().message);
+    }
+    assert!(h.button(ids::COMPLETE_REINSTALL).unwrap().enabled);
+    h.click(ids::BACK);
+    assert!(
+        !h.take_jobs()
+            .iter()
+            .any(|j| matches!(j, NativeJob::Step { job, .. } if job.stage == JobStage::Apply))
+    );
+}
+
+#[test]
+fn windows_complete_reinstall_refuses_zero_empty_and_stale_plans() {
+    let mut h = windows_entry_fixture();
+    h.click(ids::NEXT);
+    h.click(ids::COMPLETE_REINSTALL);
+    let jobs = maintenance_jobs(&mut h);
+    let [MaintenanceRequest::PlanReinstall { id, .. }] = jobs.as_slice() else {
+        panic!("{jobs:?}")
+    };
+    let id = *id;
+    for (actual, plan, preview) in [
+        (MaintenanceId(id.0 + 1), 1, "Reset"),
+        (id, 0, "Reset"),
+        (id, 1, " "),
+    ] {
+        platform_says(
+            &mut h,
+            MaintenanceReport::ReinstallPlanned {
+                id: actual,
+                plan,
+                preview: preview.into(),
+            },
+        );
+        assert!(h.button(ids::REINSTALL_CONFIRM).is_none());
+        assert!(maintenance_jobs(&mut h).is_empty());
+    }
+}
+
+/// The Inspect a Windows maintenance entry sent, answered with these two availabilities.
+fn windows_inspected(
+    h: &mut H,
+    uninstall: live::Availability,
+    repair: live::Availability,
+) -> MaintenanceId {
+    let jobs = maintenance_jobs(h);
+    let [MaintenanceRequest::Inspect { id }] = jobs.as_slice() else {
+        panic!("{jobs:?}")
+    };
+    let id = *id;
+    platform_says(
+        h,
+        MaintenanceReport::Inspected {
+            id,
+            uninstall,
+            repair,
+            choices: Vec::new(),
+        },
+    );
+    id
+}
+
+#[test]
+fn windows_refused_reinstall_shows_the_reason_and_can_be_asked_again() {
+    let mut h = windows_entry_fixture();
+    h.click(ids::COMPLETE_REINSTALL);
+    let jobs = maintenance_jobs(&mut h);
+    let [MaintenanceRequest::PlanReinstall { id, .. }] = jobs.as_slice() else {
+        panic!("{jobs:?}")
+    };
+    let id = *id;
+    let reason = "Another Crosspane Setup is working right now. Try again when it finishes.";
+    platform_says(
+        &mut h,
+        MaintenanceReport::Refused {
+            id,
+            reason: reason.into(),
+        },
+    );
+    assert_eq!(h.view().title, "Complete reinstall");
+    assert_eq!(h.view().message, reason);
+    assert!(h.button(ids::REINSTALL_CONFIRM).is_none());
+    h.click(ids::COMPLETE_REINSTALL);
+    let jobs = maintenance_jobs(&mut h);
+    let [MaintenanceRequest::PlanReinstall { id: again, .. }] = jobs.as_slice() else {
+        panic!("{jobs:?}")
+    };
+    let again = *again;
+    assert!(again > id);
+    platform_says(
+        &mut h,
+        MaintenanceReport::ReinstallPlanned {
+            id: again,
+            plan: 1,
+            preview: "Reset app files and setup. Keep identity and trust.".into(),
+        },
+    );
+    assert!(h.button(ids::REINSTALL_CONFIRM).unwrap().enabled);
+    assert!(!h.view().message.contains(reason));
+}
+
+#[test]
+fn windows_reinstall_the_platform_cannot_take_says_why() {
+    let mut h = windows_entry_fixture();
+    h.native.borrow_mut().refuse = true;
+    h.click(ids::COMPLETE_REINSTALL);
+    assert_eq!(h.view().message, NativeRefusal::Busy.to_string());
+    assert!(h.button(ids::REINSTALL_CONFIRM).is_none());
+    h.native.borrow_mut().refuse = false;
+    h.click(ids::COMPLETE_REINSTALL);
+    assert!(matches!(
+        maintenance_jobs(&mut h).as_slice(),
+        [MaintenanceRequest::PlanReinstall { .. }]
+    ));
+}
+
+#[test]
+fn windows_reinstall_shows_progress_while_it_runs_then_every_finishing_line() {
+    let mut h = windows_entry_fixture();
+    h.click(ids::COMPLETE_REINSTALL);
+    let jobs = maintenance_jobs(&mut h);
+    let [MaintenanceRequest::PlanReinstall { id, .. }] = jobs.as_slice() else {
+        panic!("{jobs:?}")
+    };
+    let id = *id;
+    platform_says(
+        &mut h,
+        MaintenanceReport::ReinstallPlanned {
+            id,
+            plan: 3,
+            preview: "Reset app files and setup. Keep identity and trust.".into(),
+        },
+    );
+    h.click(ids::REINSTALL_CONFIRM);
+    assert!(matches!(
+        maintenance_jobs(&mut h).as_slice(),
+        [MaintenanceRequest::ConfirmReinstall { .. }]
+    ));
+    for _ in 0..2 {
+        platform_says(
+            &mut h,
+            MaintenanceReport::Progress {
+                id,
+                detail: "Replacing Crosspane's files…".into(),
+            },
+        );
+    }
+    let message = h.view().message.clone();
+    assert!(message.starts_with("Reinstalling Crosspane…"), "{message}");
+    assert_eq!(message.matches("Replacing Crosspane's files…").count(), 1);
+    let lines: Vec<String> = (0..30).map(|n| format!("Line number {n}.")).collect();
+    platform_says(
+        &mut h,
+        MaintenanceReport::ReinstallFinished {
+            id,
+            outcome: live::ReinstallOutcome::Verified,
+            lines,
+        },
+    );
+    let message = h.view().message.clone();
+    assert!(
+        message.starts_with("Crosspane was reinstalled."),
+        "{message}"
+    );
+    assert!(!message.contains("Replacing Crosspane's files…"));
+    assert!(message.contains("Line number 0."));
+    assert!(message.contains("Line number 23."));
+    assert!(!message.contains("Line number 24."), "bounded: {message}");
+}
+
+#[test]
+fn windows_partial_uninstall_shows_its_lines_and_try_again_reviews_it_again() {
+    let mut h = windows_entry_fixture();
+    h.click(ids::REMOVE_REVIEW);
+    let id = windows_inspected(
+        &mut h,
+        live::Availability::Available,
+        live::Availability::Available,
+    );
+    assert!(matches!(
+        maintenance_jobs(&mut h).as_slice(),
+        [MaintenanceRequest::PlanUninstall { id: actual, .. }] if *actual == id
+    ));
+    platform_says(
+        &mut h,
+        MaintenanceReport::Planned {
+            id,
+            preview: "Uninstall app files. Keep settings and pairings.".into(),
+        },
+    );
+    h.click(ids::REMOVE_CONFIRM);
+    assert!(matches!(
+        maintenance_jobs(&mut h).as_slice(),
+        [MaintenanceRequest::ConfirmUninstall { id: actual, .. }] if *actual == id
+    ));
+    platform_says(
+        &mut h,
+        MaintenanceReport::Progress {
+            id,
+            detail: "Stopping Crosspane…".into(),
+        },
+    );
+    let message = h.view().message.clone();
+    assert!(message.starts_with("Uninstalling Crosspane…"), "{message}");
+    assert!(message.contains("Stopping Crosspane…"), "{message}");
+    platform_says(
+        &mut h,
+        MaintenanceReport::Finished {
+            id,
+            outcome: live::MaintenanceOutcome::Partial,
+            lines: vec![
+                "The Crosspane folder is still in use.".into(),
+                "Try again.".into(),
+            ],
+        },
+    );
+    let message = h.view().message.clone();
+    assert!(message.starts_with("Uninstall didn't finish."), "{message}");
+    assert!(message.contains("The Crosspane folder is still in use."));
+    assert!(message.contains("Try again."));
+    assert!(h.button(ids::REMOVE_CONFIRM).is_none());
+    let retry = h.button(ids::REMOVE_REVIEW).unwrap();
+    assert_eq!(retry.label, "Try again");
+    assert!(retry.enabled);
+    h.click(ids::REMOVE_REVIEW);
+    let again = windows_inspected(
+        &mut h,
+        live::Availability::Available,
+        live::Availability::Available,
+    );
+    assert!(again > id);
+    assert!(matches!(
+        maintenance_jobs(&mut h).as_slice(),
+        [MaintenanceRequest::PlanUninstall { id: actual, .. }] if *actual == again
+    ));
+    assert!(
+        h.button(ids::REMOVE_CONFIRM).is_none(),
+        "nothing is confirmed on the person's behalf"
+    );
+}
+
+#[test]
+fn windows_finished_uninstall_has_no_try_again_unless_it_ended_short() {
+    let mut h = windows_entry_fixture();
+    h.click(ids::REMOVE_REVIEW);
+    let id = windows_inspected(
+        &mut h,
+        live::Availability::Available,
+        live::Availability::Available,
+    );
+    let _ = maintenance_jobs(&mut h);
+    platform_says(
+        &mut h,
+        MaintenanceReport::Planned {
+            id,
+            preview: "Uninstall app files.".into(),
+        },
+    );
+    h.click(ids::REMOVE_CONFIRM);
+    platform_says(
+        &mut h,
+        MaintenanceReport::Finished {
+            id,
+            outcome: live::MaintenanceOutcome::Removed,
+            lines: vec!["Crosspane was removed from this account.".into()],
+        },
+    );
+    assert!(h.view().message.starts_with("Crosspane was uninstalled."));
+    assert!(h.button(ids::REMOVE_REVIEW).is_none());
+    assert!(h.button(ids::REMOVE_CONFIRM).is_none());
+}
+
+#[test]
+fn windows_refused_repair_shows_the_reason_and_try_again_reviews_it_again() {
+    let mut h = windows_entry_fixture();
+    h.click(ids::REPAIR);
+    assert_eq!(h.view().title, "Repair Crosspane");
+    let id = windows_inspected(
+        &mut h,
+        live::Availability::Available,
+        live::Availability::Available,
+    );
+    h.advance(12_001);
+    h.tick();
+    assert!(matches!(
+        maintenance_jobs(&mut h).as_slice(),
+        [MaintenanceRequest::PlanRepair { id: actual, .. }] if *actual == id
+    ));
+    let reason = "Crosspane's files don't match this installer. Download Crosspane again.";
+    platform_says(
+        &mut h,
+        MaintenanceReport::Refused {
+            id,
+            reason: reason.into(),
+        },
+    );
+    assert_eq!(h.view().message, reason);
+    assert_eq!(
+        h.view()
+            .buttons
+            .iter()
+            .filter(|b| b.id == ids::REPAIR)
+            .count(),
+        1
+    );
+    let retry = h.button(ids::REPAIR).unwrap();
+    assert_eq!(retry.label, "Try again");
+    assert!(retry.enabled);
+    h.click(ids::REPAIR);
+    let again = windows_inspected(
+        &mut h,
+        live::Availability::Available,
+        live::Availability::Available,
+    );
+    assert!(again > id);
+    h.advance(12_001);
+    h.tick();
+    assert!(matches!(
+        maintenance_jobs(&mut h).as_slice(),
+        [MaintenanceRequest::PlanRepair { id: actual, .. }] if *actual == again
+    ));
+    platform_says(
+        &mut h,
+        MaintenanceReport::RepairPlanned {
+            id: again,
+            plan: 2,
+            preview: "Repair app files.".into(),
+        },
+    );
+    assert!(h.button(ids::REPAIR_CONFIRM).unwrap().enabled);
+    assert_eq!(h.view().message, "Repair app files.");
+}
+
+#[test]
+fn windows_maintenance_that_is_unavailable_says_the_platforms_reason() {
+    let mut h = windows_entry_fixture();
+    h.click(ids::REPAIR);
+    let reason = "Crosspane isn't installed for this account.";
+    windows_inspected(
+        &mut h,
+        live::Availability::Unavailable(reason.into()),
+        live::Availability::Unavailable(reason.into()),
+    );
+    assert_eq!(h.view().message, reason);
+    assert!(maintenance_jobs(&mut h).is_empty());
+    assert!(h.button(ids::REPAIR).is_none_or(|b| !b.enabled));
+    h.click(ids::BACK);
+    h.click(ids::REMOVE_REVIEW);
+    windows_inspected(
+        &mut h,
+        live::Availability::NotAvailableYet("Crosspane is still starting.".into()),
+        live::Availability::Available,
+    );
+    assert_eq!(h.view().message, "Crosspane is still starting.");
+    assert!(maintenance_jobs(&mut h).is_empty());
+}
+
+#[test]
+fn open_maintenance_opens_the_menu_as_the_welcome_screen_would_and_back_returns() {
+    let mut h = windows_entry_fixture();
+    h.c.open_maintenance();
+    assert_eq!(h.view().screen, ScreenId::RepairRemove);
+    assert_eq!(h.view().title, "Crosspane setup");
+    windows_inspected(
+        &mut h,
+        live::Availability::Available,
+        live::Availability::Available,
+    );
+    assert_eq!(h.view().message, "Choose Repair or Uninstall.");
+    assert_eq!(
+        h.button(ids::REMOVE_REVIEW).unwrap().label,
+        "Review uninstall"
+    );
+    assert_eq!(h.button(ids::REPAIR).unwrap().label, "Review repair");
+    assert!(maintenance_jobs(&mut h).is_empty());
+    h.click(ids::BACK);
+    assert_eq!(h.view().screen, ScreenId::Welcome);
+    assert_eq!(h.view().title, "Crosspane");
+}
+
 /// Open "Remove or repair" and answer its inspection with `repair`.
 fn open_repair(h: &mut H, repair: live::Availability) -> MaintenanceId {
     h.tick();

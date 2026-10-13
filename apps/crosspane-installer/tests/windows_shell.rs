@@ -3,10 +3,6 @@
 
 pub use crosspane_installer::{agent_contract, demo, gui, live, view};
 
-#[allow(dead_code, unused_imports)]
-#[path = "../src/platform/windows/mod.rs"]
-mod shell;
-
 use clap::Parser;
 
 fn options(extra: &[&str]) -> gui::ReviewOptions {
