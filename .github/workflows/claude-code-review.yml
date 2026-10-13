@@ -39,6 +39,8 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # TEMPORARY: debugging why reviews stop early. Remove after one run.
+          show_full_output: true
           prompt: |
             Review pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
             Base branch: ${{ github.event.pull_request.base.ref }}. Head commit: ${{ github.event.pull_request.head.sha }}.
@@ -96,4 +98,5 @@ jobs:
                line: `<!-- claude-review-head: ${{ github.event.pull_request.head.sha }} -->`
           claude_args: >-
             --model claude-opus-5-5
+            --disallowedTools "Read(//proc/**),Read(//home/runner/work/_temp/**),Read(//home/runner/.claude/**),Read(//home/runner/.config/**)"
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments:*),Bash(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git cat-file:*),Bash(git merge-base:*),Bash(git rev-parse:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(sort:*),Bash(uniq:*),Bash(cut:*),Bash(grep:*),Read,Grep,Glob,Task,Write"
