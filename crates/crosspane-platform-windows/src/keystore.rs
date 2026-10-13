@@ -378,19 +378,36 @@ mod tests {
 
     #[test]
     fn timeout_keeps_inflight_tracked_until_worker_quiescence() {
-        let store = WindowsKeyStore::new();
-        let (release, wait) = mpsc::channel();
-        let result = store.bounded(Duration::from_millis(10), move |_deadline| {
-            wait.recv().unwrap(); // Models a nonpreemptible native call, without OS access.
-            Ok(())
-        });
-        assert!(matches!(result, Err(PlatformError::Timeout)));
-        assert!(matches!(
-            store.wait_quiescent(Duration::ZERO),
-            Err(PlatformError::Timeout)
-        ));
-        release.send(()).unwrap();
-        store.wait_quiescent(Duration::from_secs(1)).unwrap();
+        // A worker that starts after a short deadline refuses to run the call and leaves nothing in
+        // flight, so the in-flight assertions only mean something once the worker is known to be
+        // inside the call. Retry with a longer bound until it is, so thread start latency on a
+        // loaded runner can delay the test but never fail it.
+        let mut bound = Duration::from_millis(10);
+        for _ in 0..10 {
+            let store = WindowsKeyStore::new();
+            let (release, wait) = mpsc::channel();
+            let (entered_tx, entered) = mpsc::channel();
+            let result = store.bounded(bound, move |_deadline| {
+                entered_tx.send(()).unwrap();
+                wait.recv().unwrap(); // Models a nonpreemptible native call, without OS access.
+                Ok(())
+            });
+            assert!(matches!(result, Err(PlatformError::Timeout)));
+            // A worker that ran the call has signalled; one that refused it dropped the closure,
+            // and with it `entered_tx`, so this returns promptly and without a signal.
+            if entered.recv().is_err() {
+                bound *= 2;
+                continue;
+            }
+            assert!(matches!(
+                store.wait_quiescent(Duration::ZERO),
+                Err(PlatformError::Timeout)
+            ));
+            release.send(()).unwrap();
+            store.wait_quiescent(Duration::from_secs(1)).unwrap();
+            return;
+        }
+        panic!("keystore worker never started the call");
     }
 
     #[test]
