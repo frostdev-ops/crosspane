@@ -469,21 +469,31 @@ pub(crate) fn converge(
 
     progress.step("Copying Crosspane's files…");
     let mut needs_download = false;
+    let mut files_reported = false;
     match files::place(
         paths,
         inventory,
         &sources,
         route == Route::CompleteReinstall,
         &mut backup,
-    )? {
-        FilesOutcome::Unchanged => setup_note!("converge: files unchanged"),
-        FilesOutcome::Replaced(replaced) => {
+    ) {
+        Ok(FilesOutcome::Unchanged) => setup_note!("converge: files unchanged"),
+        Ok(FilesOutcome::Replaced(replaced)) => {
             setup_note!("converge: replaced {} files", replaced.len());
         }
-        FilesOutcome::NeedsDownloadedInstaller(missing) => {
+        Ok(FilesOutcome::NeedsDownloadedInstaller(missing)) => {
             setup_note!("converge: {} files cannot be restored here", missing.len());
             needs_download = true;
             lines.push(text::NEEDS_DOWNLOADED_INSTALLER.to_owned());
+        }
+        // Crosspane may already be stopped, with some files replaced: each replacement is whole,
+        // so every file is either its old or its new version. Report the failure and carry on, so
+        // that the sign-in task check (which removes the task if the agent or the installer is no
+        // longer valid), the Start menu and the restart below still run on what is in place now.
+        Err(error) => {
+            setup_note!("converge: placing files failed: {}", error.text);
+            files_reported = true;
+            lines.push(error.text);
         }
     }
     let states = files::inspect(paths, inventory);
@@ -493,7 +503,7 @@ pub(crate) fn converge(
             .any(|(file, state)| *file == wanted && *state == FileState::Ok)
     };
     let files_ok = !states.is_empty() && states.iter().all(|(_, state)| *state == FileState::Ok);
-    if !files_ok && !needs_download {
+    if !files_ok && !needs_download && !files_reported {
         lines.push("Some of Crosspane's files are still missing or different.".to_owned());
     }
 
