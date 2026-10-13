@@ -181,10 +181,16 @@ fn state_error() -> PlatformError {
 }
 
 fn check_deadline(deadline: Instant) -> Result<(), PlatformError> {
-    if Instant::now() <= deadline {
-        Err(PlatformError::Timeout)
+    remaining(deadline).map(|_| ()).ok_or(PlatformError::Timeout)
+}
+
+/// The time left before `deadline`, or `None` once it has passed.
+fn remaining(deadline: Instant) -> Option<Duration> {
+    let now = Instant::now();
+    if now <= deadline {
+        None
     } else {
-        Ok(())
+        Some(deadline - now)
     }
 }
 
