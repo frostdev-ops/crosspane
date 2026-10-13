@@ -1445,10 +1445,11 @@ fn a_notification_still_queued_when_the_binding_is_removed_is_flushed_boundedly_
 fn retirement_waits_for_an_outstanding_callback_while_forwarding_continues_correctly() {
     let (rig, mut ports, callback) = Rig::forwarding();
     let stop = Arc::new(AtomicBool::new(false));
+    let hammer_stop = Arc::new(AtomicBool::new(false));
     let flowed = Arc::new(AtomicUsize::new(0));
     let hammer = {
         let callback = callback.clone();
-        let stop = stop.clone();
+        let stop = hammer_stop.clone();
         std::thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
                 forward(&*callback, &stereo_pattern(0, 64));
@@ -1489,9 +1490,12 @@ fn retirement_waits_for_an_outstanding_callback_while_forwarding_continues_corre
         0,
         "the state is kept while a callback is outstanding"
     );
+    // The HAL calls no IOProc once it has stopped it, so the hammer ends here. Left running, it
+    // keeps a callback inside almost all the time on a fast machine, and the retirement, which
+    // waits for an idle moment, could starve.
+    hammer_stop.store(true, Ordering::SeqCst);
+    hammer.join().unwrap();
     drop(held);
-    // The hammer keeps calling in, so on a loaded machine one of its callbacks can still be inside
-    // when this thread syncs; the state goes as soon as no callback is outstanding.
     wait_until("the state released once the callback left", || {
         rig.sync();
         rig.hal.dropped_total() >= 1
@@ -1499,7 +1503,6 @@ fn retirement_waits_for_an_outstanding_callback_while_forwarding_continues_corre
     assert_eq!(rig.hal.dropped_total(), 1, "released exactly once");
     assert_eq!(rig.hal.active_sessions(), 0);
     stop.store(true, Ordering::SeqCst);
-    hammer.join().unwrap();
     let samples = drainer.join().unwrap();
     assert!(
         !samples.is_empty(),
