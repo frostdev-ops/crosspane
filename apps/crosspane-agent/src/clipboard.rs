@@ -473,7 +473,12 @@ mod tests {
     use crosspane_protocol::msg::ClipFetchId;
     use crosspane_types::ClipKind;
 
-    const READ_BOUND: Duration = Duration::from_millis(200);
+    /// How long the blocked fake's native read takes. A withdraw behind it must wait for that one
+    /// read only: it is observed within `READ_BOUND + READ_SLACK`, while waiting for a second
+    /// queued read would take at least `2 * READ_BOUND`. The margin keeps a loaded CI runner apart
+    /// from a real regression.
+    const READ_BOUND: Duration = Duration::from_millis(500);
+    const READ_SLACK: Duration = Duration::from_millis(250);
 
     #[test]
     fn clipboard_counters_saturate_and_expose_only_fixed_numeric_fields() {
@@ -1004,12 +1009,10 @@ mod tests {
         }
         let _ = worker.submit(Output::ClipWithdraw { offer: 1 });
         assert_eq!(
-            observed
-                .recv_timeout(READ_BOUND + Duration::from_millis(100))
-                .unwrap(),
+            observed.recv_timeout(READ_BOUND + READ_SLACK).unwrap(),
             Call::Withdraw
         );
-        assert!(started.elapsed() <= READ_BOUND + Duration::from_millis(100));
+        assert!(started.elapsed() <= READ_BOUND + READ_SLACK);
     }
 
     #[test]
