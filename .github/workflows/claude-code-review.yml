@@ -1,0 +1,42 @@
+# Automatic Claude review of every pull request from a branch of this repository.
+#
+# Setup (once): install the Claude GitHub App on this repository
+# (https://github.com/apps/claude), and add one repository secret: CLAUDE_CODE_OAUTH_TOKEN
+# (from `claude setup-token`) or ANTHROPIC_API_KEY (from the Claude Console).
+#
+# Fork pull requests are skipped: GitHub withholds secrets from them on a public repository, and
+# this workflow deliberately uses `pull_request`, never `pull_request_target`.
+name: Claude review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
+          plugins: "code-review@claude-code-plugins"
+          prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
+          claude_args: '--model claude-opus-5-5 --allowedTools "mcp__github_inline_comment__create_inline_comment"'
