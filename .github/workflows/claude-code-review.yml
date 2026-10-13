@@ -39,8 +39,6 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # TEMPORARY: debugging why reviews stop early. Remove after one run.
-          show_full_output: true
           prompt: |
             Review pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
             Base branch: ${{ github.event.pull_request.base.ref }}. Head commit: ${{ github.event.pull_request.head.sha }}.
@@ -54,6 +52,11 @@ jobs:
             sort, uniq, cut or grep. Filter `gh` output with `--jq`. If a command is denied, rewrite it
             more simply and carry on: a denied command is never a reason to stop. Give every subagent
             these rules too.
+
+            Subagents: launch every Agent call with `run_in_background: false`, so that you wait for
+            its result. This run is non-interactive and ends as soon as you end your turn, and
+            background subagents would be killed before they report. Several foreground Agent calls in
+            one message still run in parallel. Do not end your turn before step 6 is done.
 
             1. Eligibility. Run `gh pr view ${{ github.event.pull_request.number }} --json state,isDraft,title,body`.
                If the pull request is closed or a draft, stop without posting anything.
@@ -99,4 +102,4 @@ jobs:
           claude_args: >-
             --model claude-opus-5-5
             --disallowedTools "Read(//proc/**),Read(//home/runner/work/_temp/**),Read(//home/runner/.claude/**),Read(//home/runner/.config/**)"
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments:*),Bash(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git cat-file:*),Bash(git merge-base:*),Bash(git rev-parse:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(sort:*),Bash(uniq:*),Bash(cut:*),Bash(grep:*),Read,Grep,Glob,Task,Write"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments:*),Bash(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git cat-file:*),Bash(git merge-base:*),Bash(git rev-parse:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(sort:*),Bash(uniq:*),Bash(cut:*),Bash(grep:*),Read,Grep,Glob,Agent,Write"
