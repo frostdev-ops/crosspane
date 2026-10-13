@@ -113,6 +113,42 @@ The package test regenerates and compares the inventory, checks its exact bytes 
 binary (absent from the bootstrap), checks all hashes/modes and verifies the nested code signature.
 
 
+## Windows
+
+The installer supports native x64 Windows 11 24H2 or later (build 26100 or later) and runs in
+your own signed-in, non-elevated session; its profile folders must be on a local drive. It refuses
+ARM64 and older Windows before it changes anything.
+
+From the Windows checkout, install the native build prerequisites in `docs/running.md`, load the
+session-only CMake and prebuilt NASM settings, and stage into a fresh output folder with the
+existing signed x64 driver directory:
+
+```powershell
+. .\scripts\windows\dev-env.ps1
+$windowsOut = Join-Path $PWD 'target\windows-tier1'
+& .\scripts\installer\stage-windows.ps1 -Out $windowsOut -Driver 'C:\path	o\signed-driver' -AgentFeatures video
+& .\scripts\installer	est-stage-windows.ps1
+```
+
+Leave `CARGO_BUILD_TARGET` unset: the stager reads native `targetelease` output. The driver
+directory must contain `CrosspaneIdd.inf`, `CrosspaneIdd.cat` and `CrosspaneIdd.dll`. The stager
+builds the agent (with video), UI, control tool, elevated setup helper and installer; it does not
+build or sign the driver, sign the executables, install or launch anything. Before it publishes
+the kit it checks that every image is an x64 PE within the size limits, that the installer embeds
+exactly the inventories it wrote, and that the staged copies match them. A nonempty output folder
+is refused. The packaging test runs the real stager with inert fixtures and a mocked `cargo`; it
+executes no artifact.
+
+Keep the published kit together: `crosspane-installer.exe`, the `payload` folder beside it and the
+inventory JSONs. Double-click the installer; it installs from that `payload` folder, or from the
+folder named by `--payload`. The JSONs are inspection copies: the installer trusts only the
+inventories embedded in it, so an ordinary Cargo build of the installer cannot install anything.
+
+Only the elevated setup helper asks for administrator approval, and only when the firewall rule or
+the display driver is missing. The installer and the agent stay non-elevated. Running the installer
+again installs, upgrades or repairs in place (see `docs/running.md`). Windows Tier 1 uses local
+developer artifacts; executable signing and download trust are separate work.
+
 ## Read-only installer diagnostics
 
 On the machine you want to inspect, run an already built installer against an existing staged

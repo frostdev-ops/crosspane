@@ -445,9 +445,22 @@ struct Journal {
     reboot: bool,
 }
 
-/// Undoes what the run created: the device node first, then the package it newly staged. Both undos
-/// are attempted. A failed undo is noted and otherwise ignored, because the run has already failed.
+/// Attempts to undo what the run created: the device node first, then the package it newly staged.
+/// Both undos are attempted; cleanup failure is noted while preserving the original run failure.
 fn rollback(journal: &Journal, windir: &Path) {
+    if !rollback_with(journal, remove_device, |name| {
+        delete_package(&windir.join(name))
+    }) {
+        note("part of what this run created could not be removed; the rest is kept");
+    }
+}
+
+/// `rollback` with both undos passed in. True when everything the journal names was undone.
+fn rollback_with(
+    journal: &Journal,
+    mut remove_device: impl FnMut(&str) -> HelperResult<bool>,
+    mut delete_package: impl FnMut(&str) -> HelperResult<bool>,
+) -> bool {
     let device_undone = journal
         .device
         .as_deref()
@@ -455,10 +468,8 @@ fn rollback(journal: &Journal, windir: &Path) {
     let package_undone = journal
         .staged
         .as_deref()
-        .is_none_or(|name| delete_package(&windir.join(name)).is_ok());
-    if !(device_undone && package_undone) {
-        note("part of what this run created could not be removed; the rest is kept");
-    }
+        .is_none_or(|name| delete_package(name).is_ok());
+    device_undone && package_undone
 }
 
 /// `<helper directory>\driver`, where the one Crosspane package sits next to the helper.
@@ -602,4 +613,72 @@ fn last_error() -> u32 {
 /// NUL-terminated UTF-16 for a Win32 string argument.
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::{HelperError, Journal, rollback_with};
+    use std::cell::RefCell;
+
+    #[test]
+    fn cleanup_attempts_both_created_objects_in_order_and_preserves_failure() {
+        let journal = Journal {
+            device: Some("ROOT\\CROSSPANE\\fixture".into()),
+            staged: Some("oem42.inf".into()),
+            ..Journal::default()
+        };
+        for (device_succeeds, package_succeeds) in
+            [(false, true), (true, false), (false, false), (true, true)]
+        {
+            let calls = RefCell::new(Vec::new());
+            let cleaned = rollback_with(
+                &journal,
+                |id| {
+                    calls.borrow_mut().push(format!("device:{id}"));
+                    device_succeeds
+                        .then_some(false)
+                        .ok_or(HelperError::Win32("fixture device cleanup", 5))
+                },
+                |name| {
+                    calls.borrow_mut().push(format!("package:{name}"));
+                    package_succeeds
+                        .then_some(false)
+                        .ok_or(HelperError::Win32("fixture package cleanup", 5))
+                },
+            );
+            assert_eq!(cleaned, device_succeeds && package_succeeds);
+            assert_eq!(
+                calls.into_inner(),
+                ["device:ROOT\\CROSSPANE\\fixture", "package:oem42.inf"]
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_journal_never_calls_cleanup() {
+        assert!(rollback_with(
+            &Journal::default(),
+            |_| panic!("no device was created"),
+            |_| panic!("no package was newly staged"),
+        ));
+    }
+
+    #[test]
+    fn a_preexisting_package_is_never_removed_during_device_rollback() {
+        let journal = Journal {
+            device: Some("ROOT\\CROSSPANE\\fixture".into()),
+            ..Journal::default()
+        };
+        let mut called = false;
+        assert!(rollback_with(
+            &journal,
+            |id| {
+                assert_eq!(id, "ROOT\\CROSSPANE\\fixture");
+                called = true;
+                Ok(false)
+            },
+            |_| panic!("the package already existed before this run"),
+        ));
+        assert!(called);
+    }
 }

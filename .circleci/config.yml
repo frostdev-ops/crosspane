@@ -151,6 +151,12 @@ jobs:
             printf 'export CROSSPANE_TEST_FONT=%q\n' "$test_font" >> "$BASH_ENV"
       - restore-rust-cache:
           job: windows
+      - run:
+          name: Check Windows agent video build
+          command: cargo clippy -p crosspane-agent --all-targets --features video --locked -- -D warnings
+      - run:
+          name: Test Windows installer packaging
+          command: powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/installer/test-stage-windows.ps1
       - native-checks
       - save-rust-cache:
           job: windows
