@@ -1480,21 +1480,31 @@ fn retirement_waits_for_an_outstanding_callback_while_forwarding_continues_corre
         }
         std::thread::yield_now();
     };
-    rig.hal.app_stop(SPEAKERS_APP);
-    wait_until("the owner to stop the IOProc", || {
-        rig.hal.stopped_total() == 1
-    });
-    std::thread::sleep(Duration::from_millis(10));
-    assert_eq!(
-        rig.hal.dropped_total(),
-        0,
-        "the state is kept while a callback is outstanding"
-    );
-    // The HAL calls no IOProc once it has stopped it, so the hammer ends here. Left running, it
-    // keeps a callback inside almost all the time on a fast machine, and the retirement, which
-    // waits for an idle moment, could starve.
+    // While `held` is inside, every hammer cycle finds a callback inside and does nothing, so the
+    // hammer ends now rather than competing for the CPU during the retirement below.
     hammer_stop.store(true, Ordering::SeqCst);
     hammer.join().unwrap();
+    rig.hal.app_stop(SPEAKERS_APP);
+    // The owner waits at most `RETIRE_WAIT` (100 ms) for the callback to leave, then keeps the
+    // state forever. So `held` must leave well inside that window: this thread spins instead of
+    // sleeping, because a sleep can overshoot by tens of milliseconds on a loaded CI machine.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rig.hal.stopped_total() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the owner to stop the IOProc"
+        );
+        std::thread::yield_now();
+    }
+    let outstanding = Instant::now() + Duration::from_millis(5);
+    while Instant::now() < outstanding {
+        assert_eq!(
+            rig.hal.dropped_total(),
+            0,
+            "the state is kept while a callback is outstanding"
+        );
+        std::thread::yield_now();
+    }
     drop(held);
     wait_until("the state released once the callback left", || {
         rig.sync();
